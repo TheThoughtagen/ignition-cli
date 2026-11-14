@@ -28,6 +28,22 @@
 #                    test printed its LIVE-RAN line
 #   g2real TAG       static counts of a real repository at a release tag
 #                    (G2_REAL_REPO, a local clone outside this repository)
+#   files27          write the rig compose file and the git server files only
+#                    (the pair driver reuses the git server build context)
+#   trigger27        remove CapApp's .git, then run the module's own
+#                    setupLocalRepo on it (the Designer "set up repo" RPC)
+#   images27 ensure|list   gateway images g3a.svg and g3b.svg; ensure creates
+#                    the missing ones, list prints the user images by name
+#   shape27 LABEL    the shape of CapApp's .git (names, counts, no URL/secret)
+#   g3               (27-04) per git.yaml flag, what a gateway start does to a
+#                    project whose .git ign kept; needs the advanced state
+#                    (reset27, then live27 <log> git_advance_status)
+#   g6               (27-04) the .git shapes both git.yaml variants leave, the
+#                    setupLocalRepo partial state, enforceBranch
+#   g9why SETTING   (27-04) why a second overwrite import did not delete the
+#                    advanced .git: SETTING restart|scan|status|imports-on; needs
+#                    the advanced state and ends with .git deleted or not
+#   g7               (27-04) reset27, then the git_pull_push_roundtrip gate
 #   down27           remove the rig, its volumes and its state directory
 #
 # This script calls the `ign` on PATH (`ign rig up`, `ign script run`,
@@ -305,10 +321,23 @@ publish27() {
 #   production  production_mode true, production_branch production,
 #               production_tagPattern "v*"
 # GIT27_IMPORTS=true turns the three commissioning imports on (default false).
+# GIT27_FLAG=importImages|importTags|importThemes|tags_importOnStartup turns on
+# exactly that one flag (G3). GIT27_ENFORCE=true sets commissioning_enforceBranch.
 yaml27() {
   local mode=${1:?MODE (template or production)} imports=${GIT27_IMPORTS:-false} out
+  local flag=${GIT27_FLAG:-} enforce=${GIT27_ENFORCE:-false}
+  local f_themes=$imports f_tags=$imports f_images=$imports f_startup=false
   case "$mode" in template | production) ;; *) die "yaml27: MODE is template or production" ;; esac
   case "$imports" in true | false) ;; *) die "yaml27: GIT27_IMPORTS is true or false" ;; esac
+  case "$enforce" in true | false) ;; *) die "yaml27: GIT27_ENFORCE is true or false" ;; esac
+  case "$flag" in
+    "") ;;
+    importImages) f_images=true ;;
+    importTags) f_tags=true ;;
+    importThemes) f_themes=true ;;
+    tags_importOnStartup) f_startup=true ;;
+    *) die "yaml27: GIT27_FLAG is importImages, importTags, importThemes or tags_importOnStartup" ;;
+  esac
   mkdir -p "$DATA"
   out=$TMPD/git.yaml
   {
@@ -320,10 +349,11 @@ yaml27() {
     printf '  user_name: rig\n'
     printf '  user_email: rig@example.invalid\n'
     printf '  user_password: not-checked\n'
-    printf '  commissioning_importThemes: %s\n' "$imports"
-    printf '  commissioning_importTags: %s\n' "$imports"
-    printf '  commissioning_importImages: %s\n' "$imports"
-    printf '  commissioning_enforceBranch: false\n'
+    printf '  commissioning_importThemes: %s\n' "$f_themes"
+    printf '  commissioning_importTags: %s\n' "$f_tags"
+    printf '  commissioning_importImages: %s\n' "$f_images"
+    printf '  commissioning_enforceBranch: %s\n' "$enforce"
+    printf '  tags_importOnStartup: %s\n' "$f_startup"
     if [ "$mode" = production ]; then
       printf '  production_mode: true\n'
       printf '  production_branch: production\n'
@@ -334,7 +364,7 @@ yaml27() {
   } > "$out"
   cat "$out" > "$DATA/git.yaml"
   chmod 644 "$DATA/git.yaml"
-  echo "yaml27: git.yaml written ($mode; the credential key is not shown)"
+  echo "yaml27: git.yaml written ($mode, flag=${flag:-none}, imports=$imports, enforce=$enforce; the credential key is not shown)"
 }
 
 # --------------------------------------------------------------- gateway waits
@@ -460,7 +490,9 @@ reset27() {
   token_env
   [ -n "$(cid)" ] || die "reset27: no running gw container: run up27 first"
   seed27
-  yaml27 template
+  yaml27 "${GIT27_YAML_MODE:-template}"
+  # A save a failed gate left behind would make the next save refuse.
+  /bin/rm -rf "$DATA/ign-deploy"
   curl -sS -m 60 -o /dev/null -X DELETE -H "X-Ignition-API-Token: $IGN_GIT27_RIG_TOKEN" "$BASE$PRJ/$APP?confirm=true" || true
   # The module cloned into the directory: remove what the API delete left.
   docker exec -u root "$(cid)" sh -c "rm -rf $CONTAINER_DATA/projects/$APP"
@@ -543,6 +575,312 @@ down27() {
   echo "down27: removed compose project $PROJ and its state (the evidence directory is kept)"
 }
 
+# ----------------------------------------------------------- 27-04 captures
+
+PDIR=$DATA/projects/$APP
+IMG_ROOT=ignition/images/
+
+# ignp27 ARGS...: the installed ign with the rig profile (token from tokens.env).
+ignp27() {
+  cfg27
+  IGNITION_CLI_CONFIG=$CFG "$IGN" --profile git27 --yes "$@"
+}
+
+# root_rm NAME: remove one fixed entry below the project directory, as root
+# inside the container (the gateway wrote some of it as another user).
+root_rm() {
+  case "$1" in .git | tags | images) ;; *) die "root_rm: not an allowed name: $1" ;; esac
+  docker exec -u root "$(cid)" sh -c "rm -rf $CONTAINER_DATA/projects/$APP/$1"
+}
+
+# trigger27: remove CapApp's .git, then run the module's own setupLocalRepo on
+# it (the same implementation the Designer RPC calls). The result is the
+# partial state of a project set up from the Designer against this remote.
+trigger27() {
+  local py=$TMPD/trigger27.py
+  token_env
+  if app_has_git; then root_rm .git; fi
+  cat > "$py" <<'PY'
+from com.inductiveautomation.ignition.gateway import IgnitionGateway
+ctx = IgnitionGateway.get()
+hook = ctx.getModule("com.axone_io.ignition.git")
+f = hook.getClass().getDeclaredField("scriptModule")
+f.setAccessible(True)
+sm = f.get(hook)
+sm.setupLocalRepo("CapApp", "admin")
+print "TRIGGER setupLocalRepo returned"
+PY
+  script27 "$py" | grep -E '^TRIGGER |^error' || true
+}
+
+# images27 ensure|list: the user images of the gateway, by name and count.
+images27() {
+  local mode=${1:?ensure or list} py=$TMPD/images27.py
+  case "$mode" in ensure | list) ;; *) die "images27: ensure or list" ;; esac
+  cat > "$py" <<PY
+from com.inductiveautomation.ignition.gateway import IgnitionGateway
+from com.inductiveautomation.ignition.common.images import ImageFormat
+from jarray import array
+im = IgnitionGateway.get().getImageManager()
+root = "$IMG_ROOT"
+def walk(path, out):
+    for r in im.getImages(path):
+        p = str(r.path())
+        rel = p[len(root):] if p.startswith(root) else p
+        if r.format() is None:
+            if rel != "Builtin":
+                walk(rel, out)
+        else:
+            out.append(rel)
+have = []
+walk("", have)
+if "$mode" == "ensure":
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>'
+    for name in ["g3a.svg", "g3b.svg"]:
+        if name not in have:
+            data = array([ord(c) for c in svg], 'b')
+            im.insertImage(name, "", ImageFormat.SVG, "", data, 4, 4, len(data))
+    have = []
+    walk("", have)
+print "IMAGES count=%d names=%s" % (len(have), ",".join(sorted(have)))
+PY
+  script27 "$py" | grep -E '^IMAGES |^error' || die "images27: no IMAGES line"
+}
+
+# tagprobe27 exists|clean: the synthetic tag G3Probe in the provider `default`.
+tagprobe27() {
+  local mode=${1:?exists or clean} py=$TMPD/tagprobe27.py
+  case "$mode" in exists | clean) ;; *) die "tagprobe27: exists or clean" ;; esac
+  cat > "$py" <<PY
+import system
+if "$mode" == "clean":
+    system.tag.deleteTags(["[default]G3Probe"])
+    print "TAGPROBE cleaned"
+else:
+    print "TAGPROBE exists=%s" % system.tag.exists("[default]G3Probe")
+PY
+  script27 "$py" | grep -E '^TAGPROBE |^error' || die "tagprobe27: no TAGPROBE line"
+}
+
+# exp27: the read-back export as counts and a digest of (member, content hash).
+exp27() {
+  local z=$TMPD/exp27.zip list=$TMPD/exp27.list n
+  ignp27 project export "$APP" --output "$z" > /dev/null
+  : > "$list"
+  while IFS= read -r n; do
+    printf '%s %s\n' "$n" "$(unzip -p "$z" "$n" | shasum -a 256 | cut -c1-16)" >> "$list"
+  done < <(unzip -Z1 "$z" | grep -v '/$' | LC_ALL=C sort)
+  printf 'members=%s git_members=%s digest=%s' "$(wc -l < "$list" | tr -d ' ')" \
+    "$(grep -c '^\.git/' "$list" || true)" "$(shasum -a 256 < "$list" | cut -c1-12)"
+}
+
+# gitmanifest27: .git as a short digest of its small files plus an object count
+# (FETCH_HEAD, ORIG_HEAD, locks and logs excluded: sync rewrites them).
+gitmanifest27() {
+  local g=$PDIR/.git
+  if [ ! -d "$g" ]; then printf 'absent'; return 0; fi
+  printf 'head=%s small_files=%s objects=%s digest=%s' \
+    "$(seedgit -C "$PDIR" rev-parse --short HEAD 2> /dev/null || echo unborn)" \
+    "$(cd "$g" && find . -type f ! -name FETCH_HEAD ! -name ORIG_HEAD ! -name '*.lock' ! -path './objects/*' ! -path './logs/*' | wc -l | tr -d ' ')" \
+    "$(cd "$g" && find objects -type f | wc -l | tr -d ' ')" \
+    "$(cd "$g" && find . -type f ! -name FETCH_HEAD ! -name ORIG_HEAD ! -name '*.lock' ! -path './objects/*' ! -path './logs/*' | LC_ALL=C sort | while IFS= read -r f; do shasum -a 256 "$f"; done | shasum -a 256 | cut -c1-12)"
+}
+
+# logs27 SINCE: the module's start-sync log lines since SINCE (UTC, RFC 3339).
+logs27() {
+  docker logs --since "$1" "$(cid)" 2>&1 \
+    | grep -E "Project 'CapApp'|Syncing existing|Fetching from remote|Skipping branch|Switching project|tash|Sync complete|Importing (tags|images|themes|project)|Imported tags|Startup tag import|Pull result|Pulling latest|No tags directory|Tag provider|tag import|has no \.git" \
+    | grep -v -E 'field:|password|secret' | cut -c1-230 || true
+}
+
+# restart_tol27: restart without requiring a .git afterwards (G3 may delete it).
+restart_tol27() {
+  token_env
+  docker restart "$(cid)" > /dev/null
+  wait_running 600 || die "restart_tol27: the gateway is not RUNNING within 600 s"
+  wait_app 600 || die "restart_tol27: $APP did not answer find within 600 s"
+  # the module's start sync, then the startup tag import, settle after this
+  sleep 75
+}
+
+# shape27 LABEL: the shape of CapApp's .git. Names, counts and hex only: no URL,
+# no value of any key.
+shape27() {
+  local g=$PDIR/.git label=$1 ix
+  echo "SHAPE [$label]"
+  if [ ! -d "$g" ]; then echo "  .git: absent"; return 0; fi
+  echo "  HEAD: $(head -c 200 "$g/HEAD" | tr -d '\n')"
+  echo "  config keys: $(seedgit config --file "$g/config" --list --name-only | LC_ALL=C sort -u | paste -sd' ' -)"
+  echo "  remotes: $(seedgit config --file "$g/config" --get-regexp '^remote\..*\.fetch$' | sed -E 's/^remote\.//' | paste -sd'|' -)"
+  echo "  branch sections: $(seedgit config --file "$g/config" --get-regexp '^branch\.' | paste -sd'|' -)"
+  echo "  url_has_userinfo: $(seedgit config --file "$g/config" --get-regexp '^remote\..*\.url$' | grep -c '@' || true)"
+  echo "  loose refs: $(cd "$g" && find refs -type f | LC_ALL=C sort | paste -sd' ' -)"
+  if [ -f "$g/packed-refs" ]; then
+    echo "  packed-refs: $(grep -vc '^#' "$g/packed-refs") lines: $(grep -v '^[#^]' "$g/packed-refs" | awk '{print $2}' | LC_ALL=C sort | paste -sd' ' -)"
+  else
+    echo "  packed-refs: none"
+  fi
+  if [ -f "$g/index" ]; then
+    ix=$(od -An -tx1 -N12 "$g/index" | tr -d ' \n')
+    echo "  index: signature+version+entries hex=$ix assume_unchanged=$(seedgit -C "$PDIR" ls-files -v 2> /dev/null | grep -c '^h' || true)"
+  else
+    echo "  index: absent"
+  fi
+  echo "  objects: loose=$(cd "$g" && find objects -type f ! -path 'objects/pack/*' ! -path 'objects/info/*' | wc -l | tr -d ' ') packs=$(cd "$g" && find objects/pack -name '*.pack' 2> /dev/null | wc -l | tr -d ' ')"
+  echo "  stash: $(seedgit -C "$PDIR" stash list 2> /dev/null | wc -l | tr -d ' ') entries"
+}
+
+# classify27 LABEL: what GitHostRead::read_git_state and classify make of .git
+# (the git_state_probe gate), the LIVE-CLASSIFY lines only.
+classify27() {
+  live27 "27-04-g6-$1" git_state_probe 2>&1 | grep -E '^LIVE-CLASSIFY' || true
+}
+
+# require_advanced27: CapApp's HEAD is v1.1.0 and tags/ and images/ are absent.
+require_advanced27() {
+  local bare=$STATE/repo/$BARE head rel
+  app_has_git || die "CapApp has no .git: run reset27, then live27 <log> git_advance_status"
+  head=$(seedgit -C "$PDIR" rev-parse HEAD)
+  rel=$(seedgit -C "$bare" rev-parse 'v1.1.0^{commit}')
+  [ "$head" = "$rel" ] || die "CapApp's HEAD is not v1.1.0: run reset27, then live27 <log> git_advance_status"
+}
+
+g6() {
+  local variant ts
+  token_env
+  for variant in template production; do
+    echo "== G6 variant=$variant"
+    GIT27_YAML_MODE=$variant reset27 > /dev/null
+    shape27 "$variant: the module's clone after a fresh CapApp and a restart"
+    classify27 "$variant-clone"
+    trigger27
+    shape27 "$variant: partial state after setupLocalRepo on a project with no .git"
+    classify27 "$variant-partial"
+  done
+  echo "== G6 enforceBranch=true, the gateway repo on another local branch"
+  GIT27_YAML_MODE=template reset27 > /dev/null
+  seedgit -C "$PDIR" checkout -q -b g6-other
+  echo "before: branch=$(seedgit -C "$PDIR" symbolic-ref --short HEAD) head=$(seedgit -C "$PDIR" rev-parse --short HEAD) uncommitted=$(seedgit -C "$PDIR" status --porcelain | wc -l | tr -d ' ')"
+  GIT27_ENFORCE=true yaml27 template
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  restart_tol27
+  echo "after:  branch=$(seedgit -C "$PDIR" symbolic-ref --short HEAD) head=$(seedgit -C "$PDIR" rev-parse --short HEAD) uncommitted=$(seedgit -C "$PDIR" status --porcelain | wc -l | tr -d ' ')"
+  shape27 "enforceBranch after the start sync"
+  echo "module log lines:"
+  logs27 "$ts"
+  yaml27 template > /dev/null
+}
+
+# g3_run FLAG PRESENCE: one gateway start with exactly one import flag on.
+g3_run() {
+  local flag=$1 presence=$2 ts ib ia tb ta xb xa gb ga verdict_img verdict_tag verdict_proj verdict_git
+  tagprobe27 clean > /dev/null
+  images27 ensure > /dev/null
+  root_rm tags
+  root_rm images
+  if [ "$presence" = present ]; then
+    mkdir -p "$PDIR/tags" "$PDIR/images"
+    printf '{"tags":[{"name":"G3Probe","tagType":"AtomicTag","valueSource":"memory","dataType":"Int4","value":1}]}\n' > "$PDIR/tags/default.json"
+    printf '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4"/></svg>\n' > "$PDIR/images/p1.svg"
+  fi
+  ib=$(images27 list)
+  tb=$(tagprobe27 exists)
+  xb=$(exp27)
+  gb=$(gitmanifest27)
+  GIT27_FLAG=$flag yaml27 template > /dev/null
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  restart_tol27
+  ia=$(images27 list)
+  ta=$(tagprobe27 exists)
+  xa=$(exp27)
+  ga=$(gitmanifest27)
+  echo "-- G3 run flag=$flag images_dir=$presence tags_dir=$presence"
+  echo "   gateway images before: ${ib#IMAGES }"
+  echo "   gateway images after:  ${ia#IMAGES }"
+  echo "   tag G3Probe before: ${tb#TAGPROBE }  after: ${ta#TAGPROBE }"
+  echo "   project export before: $xb"
+  echo "   project export after:  $xa"
+  echo "   .git before: $gb"
+  echo "   .git after:  $ga"
+  echo "   module log lines:"
+  logs27 "$ts" | sed 's/^/     /'
+  if [ "$ib" = "$ia" ]; then verdict_img="images unchanged (${ia#IMAGES })"; else verdict_img="images ${ib#IMAGES } -> ${ia#IMAGES }"; fi
+  if [ "$tb" = "$ta" ]; then verdict_tag="tag ${ta#TAGPROBE }"; else verdict_tag="tag ${tb#TAGPROBE } -> ${ta#TAGPROBE }"; fi
+  if [ "$xb" = "$xa" ]; then verdict_proj="project content unchanged"; else verdict_proj="project content changed"; fi
+  if [ "$gb" = "$ga" ]; then verdict_git=".git unchanged"; elif [ "$ga" = absent ]; then verdict_git=".git deleted"; else verdict_git=".git changed"; fi
+  echo "G3-EFFECT $flag images $([ "$presence" = present ] && echo present || echo absent) tags $([ "$presence" = present ] && echo present || echo absent) -> $verdict_img; $verdict_tag; $verdict_proj; $verdict_git"
+}
+
+g3() {
+  local presence flag
+  token_env
+  require_advanced27
+  echo "== G3 start state: CapApp at v1.1.0 (ign-advanced), project ign-kept .git, flags off"
+  for presence in absent present; do
+    for flag in importImages importTags importThemes tags_importOnStartup; do
+      g3_run "$flag" "$presence"
+      require_advanced27
+    done
+  done
+  yaml27 template > /dev/null
+  tagprobe27 clean > /dev/null
+  root_rm tags
+  root_rm images
+}
+
+# g9why SETTING: why the second overwrite import of 27-03 did not delete the
+# advanced .git. Starting from the advanced state: restart (commissioning imports
+# off, or on with SETTING imports-on), then an optional step between the restart
+# and the import (SETTING scan: a project scan; SETTING status: a JGit status
+# read through the module; SETTING restart: nothing), then an overwrite import of
+# the project's own export, polling for .git to go away.
+g9why() {
+  local setting=${1:-restart} imports=false ts i gone x code z=$TMPD/g9why.zip
+  token_env
+  require_advanced27
+  case "$setting" in
+    restart | scan | status) ;;
+    imports-on) imports=true ;;
+    *) die "g9why: SETTING is restart, scan, status or imports-on" ;;
+  esac
+  echo "== g9why setting=$setting commissioning imports=$imports"
+  GIT27_IMPORTS=$imports yaml27 template > /dev/null
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  restart_tol27
+  x=$(exp27)
+  echo "   after the restart: .git present=$(app_has_git && echo yes || echo no); export $x"
+  echo "   module log lines:"
+  logs27 "$ts" | grep -v 'Tag provider' | sed 's/^/     /'
+  case "$setting" in
+    scan)
+      code=$(curl -sS -m 60 -o /dev/null -w '%{http_code}' -X POST -H "X-Ignition-API-Token: $IGN_GIT27_RIG_TOKEN" "$BASE/data/api/v1/scan/projects" || true)
+      echo "   project scan triggered: HTTP $code"
+      sleep 25
+      echo "   after the scan: .git present=$(app_has_git && echo yes || echo no)"
+      ;;
+    status)
+      status27 | grep -E '^uncommitted=|^branch=' | sed 's/^/   status read: /'
+      sleep 5
+      echo "   after the status read: .git present=$(app_has_git && echo yes || echo no)"
+      ;;
+  esac
+  ignp27 project export "$APP" --output "$z" > /dev/null
+  ignp27 project import "$APP" --file "$z" --collision-policy overwrite > /dev/null
+  gone=no
+  for i in $(seq 1 45); do
+    if ! app_has_git; then gone="yes after $((i * 2)) s"; break; fi
+    sleep 2
+  done
+  echo "   second overwrite import: .git deleted=$gone (polled 90 s)"
+  echo "   after the import: export $(exp27)"
+  yaml27 template > /dev/null
+}
+
+g7() {
+  reset27
+  live27 27-04 git_pull_push_roundtrip
+}
+
 # ------------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -557,6 +895,14 @@ case "${1:-}" in
   status27) status27 ;;
   live27) shift; live27 "$@" ;;
   g2real) g2real "${2:-}" ;;
+  files27) write_rig_files ;;
+  trigger27) trigger27 ;;
+  images27) images27 "${2:-}" ;;
+  shape27) shape27 "${2:-shape}" ;;
+  g3) g3 ;;
+  g6) g6 ;;
+  g7) g7 ;;
+  g9why) g9why "${2:-restart}" ;;
   down27) down27 ;;
-  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|down27" >&2; exit 64 ;;
+  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|trigger27|images27 ensure|list|shape27 LABEL|g3|g6|g7|g9why SETTING|down27" >&2; exit 64 ;;
 esac

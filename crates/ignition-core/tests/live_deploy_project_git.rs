@@ -851,3 +851,631 @@ async fn git_restore_survival() {
         }),
     );
 }
+
+// ------------------------------------------------------------------- 27-04
+
+/// The gateway's data directory inside the container.
+const CONTAINER_DATA: &str = "/usr/local/bin/ignition/data";
+/// The file the pushed commits change (a script no resource.json rewrite
+/// touches, so a pull is a fast-forward even with the gateway-form drift).
+const CODE_PY: &str = "ignition/script-python/cap/util/code.py";
+
+/// `git` with an explicit environment and optional stdin; trimmed stdout.
+fn git_with(dir: &Path, env: &[(&str, &str)], args: &[&str], stdin: Option<&[u8]>) -> String {
+    use std::io::Write;
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().expect("git spawns");
+    if let Some(bytes) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(bytes)
+            .expect("stdin write");
+    }
+    let out = child.wait_with_output().expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        ignition_core::deploy::git_state::redact_text(&String::from_utf8_lossy(&out.stderr))
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Run `code` through the scriptExec route; the stdout, or a short redacted
+/// error text (a refusal the module throws is an observation, not a panic).
+async fn try_script(
+    api: &ReqwestGatewayApi,
+    config: &Config,
+    code: &str,
+) -> Result<String, String> {
+    match script_run(api, config, "rig", WEBDEV_PROJECT, code).await {
+        Ok(result) => Ok(result.stdout),
+        Err(err) => {
+            let text =
+                ignition_core::deploy::git_state::redact_text(&format!("{}: {err}", err.code()));
+            Err(text.replace('\n', " ").chars().take(360).collect())
+        }
+    }
+}
+
+/// The reflection that reaches the module's script module (research Probe).
+const MODULE_PREAMBLE: &str = "import system\n\
+    from com.inductiveautomation.ignition.gateway import IgnitionGateway\n\
+    hook = IgnitionGateway.get().getModule(\"com.axone_io.ignition.git\")\n\
+    f = hook.getClass().getDeclaredField(\"scriptModule\")\n\
+    f.setAccessible(True)\n\
+    sm = f.get(hook)\n";
+
+/// What the host read of `.git` makes of the repo now; never panics.
+async fn classify_now(rig: &Rig, host: &HostGit) -> (GitState, usize, usize) {
+    let files = rig
+        .node()
+        .read_git_state(APP)
+        .await
+        .expect("host read of .git");
+    let config = match files.config.as_deref() {
+        Some(bytes) => host.parse_config(bytes).await.ok(),
+        None => None,
+    };
+    let refs = if files.head.is_some() {
+        host.parse_refs(&files).await.ok().flatten()
+    } else {
+        None
+    };
+    let state = classify(&files, config.as_ref(), refs.as_ref());
+    let heads = refs.as_ref().map_or(0, |r| r.heads.len());
+    let remotes = refs.as_ref().map_or(0, |r| r.remotes.len());
+    (state, heads, remotes)
+}
+
+/// Observation only: what `GitHostRead::read_git_state` and `classify` make of
+/// CapApp's `.git` right now (G6 shapes). Always green once the rig answers.
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_state_probe() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_state_probe");
+    let host = HostGit::new();
+    let (state, heads, remotes) = classify_now(&rig, &host).await;
+    let files = rig
+        .node()
+        .read_git_state(APP)
+        .await
+        .expect("host read of .git");
+    eprintln!(
+        "LIVE-CLASSIFY kind={} reason={:?} head={:?} remote={} tracked={:?} markers={:?} index_present={} loose_refs={} refs_heads={heads} refs_remotes={remotes}",
+        state.kind.as_str(),
+        state.reason,
+        state.head,
+        state
+            .remote
+            .as_ref()
+            .map(|r| r.name.as_str())
+            .unwrap_or("-"),
+        state.tracked,
+        files.markers,
+        files.index_present,
+        files.loose_refs.len()
+    );
+}
+
+/// Push a new commit on `production` of the rig remote (a temp clone changes
+/// `code.py`); returns the new commit id.
+fn push_next_commit(rig: &Rig, body: &str, message: &str) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = dir.path().join("w");
+    let remote = rig.remote.to_str().expect("utf8");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-hardlinks",
+            "-b",
+            "production",
+            remote,
+            work.to_str().expect("utf8"),
+        ],
+    );
+    std::fs::write(work.join(CODE_PY), body).expect("code.py");
+    git(&work, &["add", "-A"]);
+    git(
+        &work,
+        &[
+            "-c",
+            "user.name=rig",
+            "-c",
+            "user.email=rig@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+    git(&work, &["push", "-q", remote, "HEAD:refs/heads/production"]);
+    // The git server container reads this tree as another user.
+    let _ = Command::new("chmod")
+        .args(["-R", "a+rX", remote])
+        .status()
+        .expect("chmod");
+    git(&work, &["rev-parse", "HEAD"])
+}
+
+/// Restart the gateway and wait for it, the project and the module's sync.
+async fn restart_gateway(api: &ReqwestGatewayApi) {
+    let cid = rig_container();
+    let restarted = Command::new("docker")
+        .args(["restart", &cid])
+        .output()
+        .expect("docker restart");
+    assert!(restarted.status.success(), "docker restart failed");
+    let started = Instant::now();
+    loop {
+        if GatewayApi::gateway_info(api).await.is_ok()
+            && GatewayProjects(api)
+                .project_find(APP)
+                .await
+                .map(|found| found.is_some())
+                .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the gateway or {APP} did not come back within 600 s"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    eprintln!(
+        "LIVE-RESTART back_after_secs={:.0}",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// The production git.yaml of `capture27.sh yaml27 production` (all import
+/// flags off), written in place.
+fn write_production_yaml(rig: &Rig) {
+    let text = "- repo_uri: http://git-server/git/capapp.git\n\
+        \x20 repo_branch: production\n\
+        \x20 ignition_projectName: CapApp\n\
+        \x20 ignition_userName: admin\n\
+        \x20 ignition_inheritable: false\n\
+        \x20 user_name: rig\n\
+        \x20 user_email: rig@example.invalid\n\
+        \x20 user_password: not-checked\n\
+        \x20 commissioning_importThemes: false\n\
+        \x20 commissioning_importTags: false\n\
+        \x20 commissioning_importImages: false\n\
+        \x20 commissioning_enforceBranch: false\n\
+        \x20 tags_importOnStartup: false\n\
+        \x20 production_mode: true\n\
+        \x20 production_branch: production\n\
+        \x20 production_tagPattern: \"v*\"\n";
+    std::fs::write(rig.data.join("git.yaml"), text).expect("git.yaml write");
+    eprintln!("LIVE-YAML production variant written (the credential key is not shown)");
+}
+
+/// The module's `pull` through the script function; the error is the module's
+/// refusal text.
+async fn module_pull(api: &ReqwestGatewayApi, config: &Config, label: &str) -> Result<(), String> {
+    let code = format!(
+        "import system\nprint \"PULL %s\" % system.git.pull(\"{APP}\", \"{APP_USER}\", False, False, False)\n"
+    );
+    let outcome = try_script(api, config, &code).await;
+    match &outcome {
+        Ok(out) => eprintln!("LIVE-PULL {label} ok stdout={}", out.trim()),
+        Err(text) => eprintln!("LIVE-PULL {label} refused_or_failed {text}"),
+    }
+    outcome.map(|_| ())
+}
+
+/// After a pull: HEAD is `tip`, one parent, and that parent is `before`
+/// (a fast-forward); returns the export of the project.
+fn assert_fast_forward(rig: &Rig, label: &str, before: &str, tip: &str) {
+    let proj = rig.project_dir();
+    assert!(
+        proj.join(".git").is_dir(),
+        "{label}: .git is gone after the pull"
+    );
+    let head = git(&proj, &["rev-parse", "HEAD"]);
+    let parents = git(&proj, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    let ids: Vec<&str> = parents.split_whitespace().collect();
+    eprintln!(
+        "LIVE-FF {label} head_is_tip={} parents={} parent_is_before={} merge_commit={}",
+        head == tip,
+        ids.len().saturating_sub(1),
+        ids.get(1) == Some(&before),
+        ids.len() > 2
+    );
+    assert_eq!(head, tip, "{label}: HEAD did not reach the pushed commit");
+    assert_eq!(ids.len(), 2, "{label}: not a single-parent commit");
+    assert_eq!(ids[1], before, "{label}: not a fast-forward from {before}");
+}
+
+/// The read-back export against the release at `tip`: same member names, every
+/// `.py` byte-identical; counts the resource.json and project.json members
+/// the gateway re-serialises.
+async fn assert_export_matches(
+    rig: &Rig,
+    api: &ReqwestGatewayApi,
+    label: &str,
+    tip: &str,
+    expect_code: &str,
+) {
+    let (_keep, checkout, _c) = release_checkout(rig, tip);
+    let artifact = build_artifact(&checkout).expect("artifact builds");
+    let wanted = zip_members(&artifact.zip);
+    let export = zip_members(
+        &GatewayProjects(api)
+            .export_bytes(APP)
+            .await
+            .expect("export"),
+    );
+    let wanted_names: BTreeSet<&String> = wanted.keys().collect();
+    let export_names: BTreeSet<&String> = export.keys().collect();
+    let mut py_differs = Vec::new();
+    let mut json_reserialised = 0usize;
+    for (name, bytes) in &wanted {
+        match export.get(name) {
+            Some(got) if got == bytes => {}
+            Some(_) if name.ends_with(".py") => py_differs.push(name.clone()),
+            Some(_) => json_reserialised += 1,
+            None => {}
+        }
+    }
+    eprintln!(
+        "LIVE-EXPORT-MATCH {label} members_equal={} py_identical={} json_reserialised={json_reserialised} code_py_is_expected={}",
+        wanted_names == export_names,
+        py_differs.is_empty(),
+        export
+            .get(CODE_PY)
+            .map(|b| String::from_utf8_lossy(b).trim().to_string())
+            == Some(expect_code.trim().to_string())
+    );
+    assert_eq!(wanted_names, export_names, "{label}: export members differ");
+    assert!(
+        py_differs.is_empty(),
+        "{label}: scripts differ: {py_differs:?}"
+    );
+    assert_eq!(
+        export
+            .get(CODE_PY)
+            .map(|b| String::from_utf8_lossy(b).trim().to_string()),
+        Some(expect_code.trim().to_string()),
+        "{label}: the gateway does not hold the pulled script"
+    );
+}
+
+/// G7 (A5): after ign's advance, `system.git.pull` fast-forwards a commit pushed
+/// by someone else; the same on a partial `setupLocalRepo` state adopted by
+/// hand; and in the production variant the module commits the drift and pushes,
+/// leaving the files outside the artifact scope in the remote tree (R-8).
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_pull_push_roundtrip() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_pull_push_roundtrip");
+    let api = rig.api();
+    let host = HostGit::new();
+    let (_work, config) = script_config(&api, &rig.url).await;
+
+    // 1. ign's advance to v1.1.0 (as git_advance_status does).
+    let advanced = run_handover(&rig, &api).await;
+    assert!(
+        advanced.report.restored && advanced.report.advanced && advanced.report.verified,
+        "{:?}",
+        advanced.report
+    );
+    let drift = jgit(&api, &config).await;
+    eprintln!(
+        "LIVE-JGIT after advance: uncommitted={} unpushed={} branch={}",
+        drift.paths.len(),
+        drift.unpushed,
+        drift.branch
+    );
+    assert_eq!(drift.unpushed, 0);
+
+    // 2. Pull half, template variant: a commit pushed by someone else.
+    let tip_a = push_next_commit(&rig, "def f():\n    return 4\n", "release 1.2.0");
+    module_pull(&api, &config, "template-after-advance")
+        .await
+        .expect("the module's pull answers");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_fast_forward(&rig, "advance", &advanced.c2, &tip_a);
+    let after_pull = jgit(&api, &config).await;
+    eprintln!(
+        "LIVE-JGIT after pull: uncommitted={} unpushed={} same_set_as_before={}",
+        after_pull.paths.len(),
+        after_pull.unpushed,
+        after_pull.paths == drift.paths
+    );
+    assert_eq!(after_pull.paths, drift.paths, "the pull changed the status");
+    assert_eq!(after_pull.unpushed, 0, "unpushed after the pull");
+    assert_export_matches(&rig, &api, "advance", &tip_a, "def f():\n    return 4\n").await;
+    eprintln!(
+        "LIVE-CHECK pull_fast_forwards_after_advance tip={}",
+        &tip_a[..7]
+    );
+
+    // 3. Pull half on a partial state adopted by hand (research R-9 recipe).
+    let cid = rig_container();
+    let removed = Command::new("docker")
+        .args([
+            "exec",
+            "-u",
+            "root",
+            &cid,
+            "sh",
+            "-c",
+            &format!("rm -rf {CONTAINER_DATA}/projects/{APP}/.git"),
+        ])
+        .output()
+        .expect("docker exec");
+    assert!(removed.status.success(), "removing .git failed");
+    let trigger = format!(
+        "{MODULE_PREAMBLE}sm.setupLocalRepo(\"{APP}\", \"{APP_USER}\")\nprint \"TRIGGER done\"\n"
+    );
+    let triggered = try_script(&api, &config, &trigger).await;
+    eprintln!("LIVE-TRIGGER setupLocalRepo {triggered:?}");
+    triggered.expect("setupLocalRepo answers");
+    let (partial, heads, remotes) = classify_now(&rig, &host).await;
+    eprintln!(
+        "LIVE-PARTIAL kind={} reason={:?} head={:?} remote={} refs_heads={heads} refs_remotes={remotes}",
+        partial.kind.as_str(),
+        partial.reason,
+        partial.head,
+        partial
+            .remote
+            .as_ref()
+            .map(|r| r.name.as_str())
+            .unwrap_or("-")
+    );
+    let proj = rig.project_dir();
+    let gitdir = proj.join(".git");
+    let gd = format!("--git-dir={}", gitdir.display());
+    let tip = git(&rig.remote, &["rev-parse", "refs/heads/production"]);
+    assert_eq!(tip, tip_a, "the remote's production is the pulled commit");
+    git(&proj, &[&gd, "update-ref", "refs/heads/production", &tip]);
+    git(
+        &proj,
+        &[&gd, "symbolic-ref", "HEAD", "refs/heads/production"],
+    );
+    git(
+        &proj,
+        &[&gd, "config", "branch.production.remote", "origin"],
+    );
+    git(
+        &proj,
+        &[
+            &gd,
+            "config",
+            "branch.production.merge",
+            "refs/heads/production",
+        ],
+    );
+    let index = gitdir.join("index");
+    let index_env = [("GIT_INDEX_FILE", index.to_str().expect("utf8"))];
+    git_with(&proj, &index_env, &[&gd, "read-tree", &tip], None);
+    let listed = git(&proj, &[&gd, "ls-tree", "-r", "--name-only", &tip]);
+    let mut absent = Vec::new();
+    for path in listed.lines() {
+        if !proj.join(path).exists() {
+            absent.push(path.to_string());
+        }
+    }
+    let stdin: Vec<u8> = absent
+        .iter()
+        .flat_map(|p| p.bytes().chain(std::iter::once(0)))
+        .collect();
+    git_with(
+        &proj,
+        &index_env,
+        &[&gd, "update-index", "--assume-unchanged", "-z", "--stdin"],
+        Some(&stdin),
+    );
+    eprintln!(
+        "LIVE-ADOPT head=production tip={} absent_assume_unchanged={}",
+        &tip[..7],
+        absent.len()
+    );
+    let (adopted, _h, _r) = classify_now(&rig, &host).await;
+    eprintln!(
+        "LIVE-ADOPT classify kind={} reason={:?} tracked={:?}",
+        adopted.kind.as_str(),
+        adopted.reason,
+        adopted.tracked
+    );
+    let adopted_status = jgit(&api, &config).await;
+    eprintln!(
+        "LIVE-JGIT after adoption: uncommitted={} unpushed={} same_set_as_before={}",
+        adopted_status.paths.len(),
+        adopted_status.unpushed,
+        adopted_status.paths == drift.paths
+    );
+    assert_eq!(
+        adopted_status.paths, drift.paths,
+        "JGit's status differs after the hand adoption"
+    );
+    let tip_b = push_next_commit(&rig, "def f():\n    return 5\n", "release 1.3.0");
+    module_pull(&api, &config, "template-after-adoption")
+        .await
+        .expect("the module's pull answers");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_fast_forward(&rig, "adoption", &tip_a, &tip_b);
+    let after_adopt_pull = jgit(&api, &config).await;
+    assert_eq!(after_adopt_pull.paths, drift.paths);
+    assert_eq!(
+        after_adopt_pull.unpushed, 0,
+        "unpushed after the adopted pull"
+    );
+    assert_export_matches(&rig, &api, "adoption", &tip_b, "def f():\n    return 5\n").await;
+    eprintln!(
+        "LIVE-CHECK pull_fast_forwards_after_adoption tip={}",
+        &tip_b[..7]
+    );
+
+    // 4. Production variant: refusal with drift, then commit the drift and push.
+    write_production_yaml(&rig);
+    restart_gateway(&api).await;
+    let (_work2, config) = script_config(&api, &rig.url).await;
+    let before_prod = jgit(&api, &config).await;
+    eprintln!(
+        "LIVE-JGIT production start: uncommitted={} unpushed={}",
+        before_prod.paths.len(),
+        before_prod.unpushed
+    );
+    assert_eq!(
+        before_prod.paths, drift.paths,
+        "the restart changed the status"
+    );
+    let pull_refused = module_pull(&api, &config, "production-with-drift").await;
+    let push_code =
+        format!("{MODULE_PREAMBLE}print \"PUSH %s\" % sm.push(\"{APP}\", \"{APP_USER}\")\n");
+    let push_with_drift = try_script(&api, &config, &push_code).await;
+    eprintln!("LIVE-PUSH production-with-drift {push_with_drift:?}");
+    eprintln!(
+        "LIVE-PROD drift_blocks pull_refused={} push_refused={}",
+        pull_refused.is_err(),
+        push_with_drift.is_err()
+    );
+    let remote_before = git(&rig.remote, &["rev-parse", "refs/heads/production"]);
+    let literal: Vec<String> = before_prod
+        .paths
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect();
+    let commit_code = format!(
+        "{MODULE_PREAMBLE}print \"COMMIT %s\" % sm.commit(\"{APP}\", \"{APP_USER}\", [{}], \"normalize gateway form\")\n",
+        literal.join(", ")
+    );
+    let committed = try_script(&api, &config, &commit_code).await;
+    eprintln!("LIVE-COMMIT {committed:?}");
+    committed.expect("the module's commit answers");
+    let after_commit = jgit(&api, &config).await;
+    eprintln!(
+        "LIVE-JGIT after commit: uncommitted={} unpushed={}",
+        after_commit.paths.len(),
+        after_commit.unpushed
+    );
+    let changed = git(
+        &proj,
+        &["diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD"],
+    );
+    let deleted_paths: Vec<&str> = changed
+        .lines()
+        .filter(|l| l.starts_with('D'))
+        .filter_map(|l| l.split_once('\t').map(|(_, path)| path))
+        .collect();
+    let deleted = deleted_paths.len();
+    eprintln!(
+        "LIVE-COMMIT files={} deleted={deleted} deleted_paths={deleted_paths:?}",
+        changed.lines().count()
+    );
+    // Observed (27-04): the module's `add` of a resource folder stages the
+    // absence of an in-scope member the gateway dropped (NOTES.txt, an
+    // assume-unchanged entry) as a deletion. Anything else deleted, or a file
+    // outside the artifact scope, would be a different and worse result.
+    assert!(
+        deleted_paths.iter().all(|p| *p == NOTES),
+        "the module's commit deleted files other than the dropped in-scope member: {changed}"
+    );
+    eprintln!(
+        "LIVE-CHECK drift_commit_deletes_dropped_member {}",
+        deleted_paths.contains(&NOTES)
+    );
+    assert!(
+        after_commit.paths.is_empty(),
+        "the status is not clean after committing the drift: {:?}",
+        after_commit.rows
+    );
+    assert_eq!(after_commit.unpushed, 1, "one commit to push");
+    let pushed = try_script(&api, &config, &push_code).await;
+    eprintln!("LIVE-PUSH production-after-commit {pushed:?}");
+    pushed.expect("the module's push in production mode succeeds once the status is clean");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let remote_after = git(&rig.remote, &["rev-parse", "refs/heads/production"]);
+    let local_head = git(&proj, &["rev-parse", "HEAD"]);
+    eprintln!(
+        "LIVE-PUSH remote_moved={} remote_is_local_head={}",
+        remote_after != remote_before,
+        remote_after == local_head
+    );
+    assert_ne!(remote_after, remote_before, "the remote tip did not move");
+    assert_eq!(
+        remote_after, local_head,
+        "the remote tip is not the pushed HEAD"
+    );
+    let tree = git(
+        &rig.remote,
+        &["ls-tree", "-r", "--name-only", "refs/heads/production"],
+    );
+    let outside = [
+        "README.md",
+        "tags/default/tags.json",
+        "images/logo.txt",
+        "deploy/project.yaml",
+        ".gitignore",
+    ];
+    let missing: Vec<&str> = outside
+        .iter()
+        .copied()
+        .filter(|p| !tree.lines().any(|l| l == *p))
+        .collect();
+    eprintln!(
+        "LIVE-CHECK remote_tree_keeps_out_of_scope_files kept={} missing={missing:?} total_files={}",
+        outside.len() - missing.len(),
+        tree.lines().count()
+    );
+    assert!(
+        missing.is_empty(),
+        "the pushed tree lost files: {missing:?}"
+    );
+    let final_status = jgit(&api, &config).await;
+    eprintln!(
+        "LIVE-JGIT final: uncommitted={} unpushed={}",
+        final_status.paths.len(),
+        final_status.unpushed
+    );
+
+    rig.node()
+        .remove_git_save(GATEWAY, APP, RUN)
+        .await
+        .expect("remove the save");
+    write_evidence(
+        &rig,
+        "git_pull_push_roundtrip",
+        &serde_json::json!({
+            "advance_tip": advanced.c2,
+            "pulled_tip_after_advance": tip_a,
+            "pulled_tip_after_adoption": tip_b,
+            "partial_kind": partial.kind.as_str(),
+            "partial_reason": partial.reason,
+            "absent_assume_unchanged": absent.len(),
+            "drift_paths": drift.rows,
+            "production_pull_refused_with_drift": pull_refused.is_err(),
+            "production_push_refused_with_drift": push_with_drift.is_err(),
+            "remote_before": remote_before,
+            "remote_after": remote_after,
+            "committed_deleted_files": deleted,
+        }),
+    );
+}
