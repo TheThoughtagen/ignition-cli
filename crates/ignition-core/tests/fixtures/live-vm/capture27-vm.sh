@@ -85,7 +85,7 @@ case "$STEP" in
 esac
 
 PROJ=CapApp27
-PROJG=CapApp27g
+PROJG=${CAPTURE27_PROJG:-CapApp27g}
 SCRATCH_REL=ign-live-scratch/git27
 IGN=${IGN_BIN:-ign}
 VMS=${CAPTURE27_VMS:-lnx win}
