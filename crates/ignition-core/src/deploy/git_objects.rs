@@ -475,17 +475,24 @@ async fn fetch_packs(
         if chosen.is_empty() {
             break;
         }
-        for i in chosen {
+        // One fetch for every pack of the round, so the number of host
+        // connections follows the rounds and not the packs (27-11, D-24: a
+        // production gateway holds dozens of packs, and a Windows host costs
+        // a connection or more per fetch).
+        let mut round: Vec<GitObjectFile> = Vec::with_capacity(chosen.len());
+        for &i in &chosen {
             let pack = &list.packs[i];
             reserve(stats, pack.pack_size)?;
-            let file = GitObjectFile {
+            round.push(GitObjectFile {
                 rel: pack.pack_rel(),
                 size: pack.pack_size,
-            };
-            read.fetch_git_objects(project, std::slice::from_ref(&file), scratch.git_dir())
-                .await
-                .map_err(|e| host("a gateway pack cannot be read", e))?;
-            install_index(&stage, scratch.git_dir(), pack)?;
+            });
+        }
+        read.fetch_git_objects(project, &round, scratch.git_dir())
+            .await
+            .map_err(|e| host("a gateway pack cannot be read", e))?;
+        for i in chosen {
+            install_index(&stage, scratch.git_dir(), &list.packs[i])?;
             fetched[i] = true;
             stats.packs += 1;
         }
