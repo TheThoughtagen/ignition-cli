@@ -3091,3 +3091,419 @@ fn every_row_runs_against_the_local_host() {
         );
     }
 }
+
+// ---- the git host rows (plan 27-08) ------------------------------------------
+//
+// `GitHostRead` / `GitStateWriter` run the same rows through the local
+// filesystem implementation and through the POSIX scripts of `SftpTransport`
+// (the local `sftp-server` and `sh`), so the two answer identically for the
+// same `.git`. 27-09 adds the Windows arm where the table runs the Windows
+// bodies under `pwsh`.
+
+#[cfg(unix)]
+mod git_rows {
+    use super::*;
+    use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use ignition_core::deploy::git_state::GitFiles;
+    use ignition_core::deploy::transport::projects::{GitEntry, GitHostRead, GitStateWriter};
+    use ignition_core::error::CoreError;
+
+    const RUN: &str = "20261114T101500Z-ab12";
+
+    /// Runs the real processes, with the `stat` shim for a BSD host (the
+    /// Phase 25 probe is a GNU `stat -c %F` script).
+    struct ShimRunner;
+
+    #[async_trait::async_trait]
+    impl ignition_core::deploy::transport::process::ProcessRunner for ShimRunner {
+        async fn run(
+            &self,
+            program: &std::ffi::OsStr,
+            args: &[std::ffi::OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: std::time::Duration,
+        ) -> ignition_core::deploy::transport::process::ProcessOutput {
+            let (program, args) = common::posix_exec::shimmed(program, args);
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    /// A fixture `.git` and the pair of traits under test.
+    pub struct GitCtx {
+        pub fx: GitFixture,
+        pub read: Box<dyn GitHostRead>,
+        pub write: Box<dyn GitStateWriter>,
+        /// The directory `ign-deploy/` lands in: the data dir for the local
+        /// implementation, the account home for the POSIX one.
+        pub ledger: PathBuf,
+        _home: Option<tempfile::TempDir>,
+    }
+
+    impl GitCtx {
+        pub fn local() -> GitCtx {
+            let fx = GitFixture::new();
+            let ledger = fx.data_dir.clone();
+            GitCtx {
+                read: Box::new(LocalFsTransport::new(fx.data_dir.clone(), "nodes.local")),
+                write: Box::new(LocalFsTransport::new(fx.data_dir.clone(), "nodes.local")),
+                ledger,
+                _home: None,
+                fx,
+            }
+        }
+
+        pub fn posix() -> GitCtx {
+            let fx = GitFixture::new();
+            let home = tempfile::tempdir().expect("home");
+            let build = || {
+                let shell = RemoteShell::local_sftp_server(
+                    &common::sftp_server::sftp_server_path(),
+                    Arc::new(ShimRunner),
+                    std::time::Duration::from_secs(120),
+                )
+                .local_exec();
+                let data = posix_root(&fx.data_dir.display().to_string()).expect("posix root");
+                let home_root = posix_root(&home.path().display().to_string()).expect("home");
+                SftpTransport::new(shell, data, "nodes.sh").with_home(&home_root)
+            };
+            GitCtx {
+                read: Box::new(build()),
+                write: Box::new(build()),
+                ledger: home.path().to_path_buf(),
+                _home: Some(home),
+                fx,
+            }
+        }
+
+        /// The local-filesystem implementation over the same `.git`: the
+        /// reference every host's answer is compared with.
+        pub fn reference(&self) -> LocalFsTransport {
+            LocalFsTransport::new(self.fx.data_dir.clone(), "nodes.reference")
+        }
+
+        pub fn save_repo(&self) -> PathBuf {
+            self.ledger
+                .join("ign-deploy")
+                .join(GATEWAY)
+                .join("projects")
+                .join(PROJECT)
+                .join("git-save")
+                .join(RUN)
+                .join("repo")
+        }
+    }
+
+    fn is_transport_failed(err: &CoreError) -> bool {
+        matches!(err, CoreError::TransportFailed { .. })
+    }
+
+    /// Whether this process ignores mode bits (root).
+    fn ignores_modes(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = dir.join(".mode-probe");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let ignored = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::remove_dir(&probe).expect("rm probe");
+        ignored
+    }
+
+    pub async fn git_state_reads_same(c: &GitCtx) {
+        std::fs::write(c.fx.git_dir().join("index.lock"), "").expect("lock");
+        c.fx.git_in_project(&["branch", "feature/x"]);
+        let want: GitFiles = c
+            .reference()
+            .read_git_state(PROJECT)
+            .await
+            .expect("reference");
+        let got = c.read.read_git_state(PROJECT).await.expect("host");
+        assert_eq!(got, want);
+        assert_eq!(got.kind, GitEntry::Directory);
+        assert!(got.markers.contains(&"index.lock".to_string()));
+        // an entry that is not a directory is answered by kind
+        std::fs::remove_dir_all(c.fx.git_dir()).expect("rm");
+        let absent = c.read.read_git_state(PROJECT).await.expect("absent");
+        assert_eq!(absent, GitFiles::without_contents(GitEntry::Absent));
+    }
+
+    pub async fn git_save_restore_round_trip(c: &GitCtx) {
+        let reference = c
+            .reference()
+            .git_manifest(PROJECT)
+            .await
+            .expect("reference");
+        assert_eq!(
+            c.read.git_manifest(PROJECT).await.expect("manifest"),
+            reference,
+            "every implementation digests a .git alike"
+        );
+        let saved = c.write.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        assert_eq!(saved, reference);
+        assert_eq!(
+            c.read
+                .save_manifest(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("save manifest"),
+            reference
+        );
+        assert!(c.save_repo().is_dir(), "{}", c.save_repo().display());
+        // a second save of the same run is refused
+        let err = c
+            .write
+            .save_git(GATEWAY, PROJECT, RUN)
+            .await
+            .expect_err("again");
+        assert!(is_transport_failed(&err), "{err:?}");
+
+        std::fs::remove_dir_all(c.fx.git_dir()).expect("rm .git");
+        let back = c
+            .write
+            .restore_git(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("restore");
+        assert_eq!(back, reference);
+        assert_eq!(c.read.git_manifest(PROJECT).await.expect("live"), reference);
+
+        c.write
+            .remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("remove");
+        assert!(!c.save_repo().exists());
+        c.write
+            .remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("absent is fine");
+    }
+
+    pub async fn git_restore_refuses_present(c: &GitCtx) {
+        c.write.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        let before = c.read.git_manifest(PROJECT).await.expect("manifest");
+        let err = c
+            .write
+            .restore_git(GATEWAY, PROJECT, RUN)
+            .await
+            .expect_err("present");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert!(err.to_string().contains("never replaced"), "{err}");
+        // a symlink where `.git` would go counts as present too
+        assert_eq!(
+            c.read.git_manifest(PROJECT).await.expect("untouched"),
+            before
+        );
+        std::fs::remove_dir_all(c.fx.git_dir()).expect("rm");
+        std::os::unix::fs::symlink("/", c.fx.git_dir()).expect("symlink");
+        let err = c
+            .write
+            .restore_git(GATEWAY, PROJECT, RUN)
+            .await
+            .expect_err("symlink");
+        assert!(is_transport_failed(&err), "{err:?}");
+        std::fs::remove_file(c.fx.git_dir()).expect("rm link");
+        c.write
+            .restore_git(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("restore when absent");
+    }
+
+    pub async fn git_write_lock_refuses(c: &GitCtx) {
+        let head = std::fs::read(c.fx.git_dir().join("HEAD")).expect("head");
+        std::fs::write(c.fx.git_dir().join("config.lock"), "held").expect("lock");
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Config,
+                bytes: b"[core]\n".to_vec(),
+            },
+        ];
+        let err = c
+            .write
+            .write_git_files(PROJECT, &writes)
+            .await
+            .expect_err("held");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert!(err.to_string().contains("config"), "{err}");
+        assert_eq!(
+            std::fs::read(c.fx.git_dir().join("HEAD")).expect("head"),
+            head
+        );
+        std::fs::remove_file(c.fx.git_dir().join("config.lock")).expect("rm lock");
+        // with the lock gone the same write lands, and reads back equal
+        c.write
+            .write_git_files(PROJECT, &writes)
+            .await
+            .expect("write");
+        for write in &writes {
+            assert_eq!(
+                std::fs::read(c.fx.git_dir().join(write.name.rel())).expect("file"),
+                write.bytes
+            );
+            let digest = c
+                .read
+                .git_file_digest(PROJECT, &write.name)
+                .await
+                .expect("digest");
+            assert_eq!(digest, Some(sha256_hex(&write.bytes)));
+        }
+    }
+
+    pub async fn git_probe_denied_names_path(c: &GitCtx) {
+        use std::os::unix::fs::PermissionsExt;
+        c.write.probe_write(PROJECT, RUN).await.expect("probe");
+        let probe = format!(".ign-probe-{RUN}");
+        assert!(!c.fx.project_dir().join(&probe).exists());
+        assert!(!c.fx.git_dir().join(&probe).exists());
+        if ignores_modes(&c.fx.data_dir) {
+            return;
+        }
+        std::fs::set_permissions(c.fx.project_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let err = c
+            .write
+            .probe_write(PROJECT, RUN)
+            .await
+            .expect_err("project");
+        std::fs::set_permissions(c.fx.project_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert!(err.to_string().contains("projects/CapApp"), "{err}");
+        assert!(!err.to_string().contains("projects/CapApp/.git"), "{err}");
+        std::fs::set_permissions(c.fx.git_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let err = c.write.probe_write(PROJECT, RUN).await.expect_err("git");
+        std::fs::set_permissions(c.fx.git_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert!(err.to_string().contains("projects/CapApp/.git"), "{err}");
+    }
+
+    pub async fn git_save_rm_refuses_foreign_path(c: &GitCtx) {
+        c.write.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        // a run id that is a path never builds one
+        for run in ["../x", "a/b", "", "a\nb"] {
+            let err = c
+                .write
+                .remove_git_save(GATEWAY, PROJECT, run)
+                .await
+                .expect_err(run);
+            assert!(
+                matches!(
+                    err,
+                    CoreError::TransportFailed { .. } | CoreError::DeployRunInvalid { .. }
+                ),
+                "{run:?}: {err:?}"
+            );
+        }
+        // a symlink on the way is never followed: the target keeps its files
+        let save_dir = c
+            .ledger
+            .join("ign-deploy")
+            .join(GATEWAY)
+            .join("projects")
+            .join(PROJECT);
+        let elsewhere = c.fx.data_dir.join("elsewhere-keep");
+        std::fs::create_dir_all(elsewhere.join(RUN).join("repo")).expect("keep");
+        std::fs::write(elsewhere.join(RUN).join("repo").join("precious"), "x").expect("file");
+        std::fs::rename(save_dir.join("git-save"), save_dir.join("git-save.real")).expect("rename");
+        std::os::unix::fs::symlink(&elsewhere, save_dir.join("git-save")).expect("link");
+        let err = c
+            .write
+            .remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect_err("link");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert!(elsewhere.join(RUN).join("repo").join("precious").is_file());
+        assert!(
+            save_dir
+                .join("git-save.real")
+                .join(RUN)
+                .join("repo")
+                .is_dir()
+        );
+    }
+
+    pub async fn git_size_matches_manifest(c: &GitCtx) {
+        let manifest = c.read.git_manifest(PROJECT).await.expect("manifest");
+        let size = c.read.git_size(PROJECT).await.expect("size");
+        assert_eq!(size.files, manifest.files);
+        assert_eq!(size.bytes, manifest.bytes);
+        let free = c.read.free_bytes(GATEWAY, PROJECT).await.expect("free");
+        assert!(free > 0);
+        // a symlink inside refuses
+        std::os::unix::fs::symlink("/", c.fx.git_dir().join("l")).expect("symlink");
+        let err = c.read.git_size(PROJECT).await.expect_err("symlink");
+        assert!(is_transport_failed(&err), "{err:?}");
+        std::fs::remove_file(c.fx.git_dir().join("l")).expect("rm");
+        // `git.yaml`: absent is None, present reads back, a symlink refuses
+        assert_eq!(c.read.read_git_yaml().await.expect("absent"), None);
+        std::fs::write(c.fx.data_dir.join("git.yaml"), "a: 1\n").expect("yaml");
+        assert_eq!(
+            c.read.read_git_yaml().await.expect("present"),
+            Some(b"a: 1\n".to_vec())
+        );
+        let yaml = c.fx.data_dir.join("git.yaml");
+        std::fs::rename(&yaml, c.fx.data_dir.join("real.yaml")).expect("rename");
+        std::os::unix::fs::symlink("real.yaml", &yaml).expect("symlink");
+        let err = c.read.read_git_yaml().await.expect_err("symlink");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    }
+
+    macro_rules! git_row_tests {
+        ($($name:ident, $ctor:path, $row:ident;)*) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    let ctx = $ctor();
+                    $row(&ctx).await;
+                }
+            )*
+        };
+    }
+
+    git_row_tests! {
+        conformance_git_local_git_state_reads_same, GitCtx::local, git_state_reads_same;
+        conformance_git_local_git_save_restore_round_trip, GitCtx::local, git_save_restore_round_trip;
+        conformance_git_local_git_restore_refuses_present, GitCtx::local, git_restore_refuses_present;
+        conformance_git_local_git_write_lock_refuses, GitCtx::local, git_write_lock_refuses;
+        conformance_git_local_git_probe_denied_names_path, GitCtx::local, git_probe_denied_names_path;
+        conformance_git_local_git_save_rm_refuses_foreign_path, GitCtx::local, git_save_rm_refuses_foreign_path;
+        conformance_git_local_git_size_matches_manifest, GitCtx::local, git_size_matches_manifest;
+    }
+
+    git_row_tests! {
+        conformance_git_sh_git_state_reads_same, GitCtx::posix, git_state_reads_same;
+        conformance_git_sh_git_save_restore_round_trip, GitCtx::posix, git_save_restore_round_trip;
+        conformance_git_sh_git_restore_refuses_present, GitCtx::posix, git_restore_refuses_present;
+        conformance_git_sh_git_write_lock_refuses, GitCtx::posix, git_write_lock_refuses;
+        conformance_git_sh_git_probe_denied_names_path, GitCtx::posix, git_probe_denied_names_path;
+        conformance_git_sh_git_save_rm_refuses_foreign_path, GitCtx::posix, git_save_rm_refuses_foreign_path;
+        conformance_git_sh_git_size_matches_manifest, GitCtx::posix, git_size_matches_manifest;
+    }
+
+    /// Every row has a test for each host, so a row added without wiring fails
+    /// here.
+    #[test]
+    fn git_rows_run_against_every_host() {
+        let source = include_str!("deploy_host_conformance.rs");
+        for row in [
+            "git_state_reads_same",
+            "git_save_restore_round_trip",
+            "git_restore_refuses_present",
+            "git_write_lock_refuses",
+            "git_probe_denied_names_path",
+            "git_save_rm_refuses_foreign_path",
+            "git_size_matches_manifest",
+        ] {
+            for host in ["local", "sh"] {
+                let wired = format!("conformance_git_{host}_{row}, GitCtx::");
+                assert!(source.contains(&wired), "row {row} is not run on {host}");
+            }
+        }
+    }
+}

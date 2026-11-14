@@ -3128,3 +3128,164 @@ fn git_prodshape_handover() {
         assert_eq!(paths, want);
     });
 }
+
+// ---- the same handover through the POSIX host scripts (plan 27-08) -----------
+//
+// The POSIX scripts of `SftpTransport` (save, restore, manifest, size) run
+// under the local `sh` (the `local_exec` seam) on the same generated `.git`
+// the rows above use, so the numbers are the scripts' own on this machine, and
+// the ssh connection count is asserted to be fixed: one exec per operation, no
+// sftp session, whatever the file count.
+
+#[cfg(unix)]
+mod prodshape_posix {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ignition_core::deploy::transport::process::{
+        ProcessOutput, ProcessRunner, TokioProcessRunner,
+    };
+    use ignition_core::deploy::transport::remote::RemoteShell;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+
+    /// Counts the exec calls (`sh -c`) and the sftp sessions.
+    #[derive(Default)]
+    pub struct Count {
+        execs: Mutex<Vec<String>>,
+        sftp: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Count {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program == "sh" {
+                self.execs.lock().expect("execs").push(
+                    args.last()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+            } else {
+                self.sftp.fetch_add(1, Ordering::Relaxed);
+            }
+            let (program, args) = common::posix_exec::shimmed(program, args);
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    impl Count {
+        pub fn execs(&self) -> usize {
+            self.execs.lock().expect("execs").len()
+        }
+        pub fn sftp(&self) -> usize {
+            self.sftp.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The POSIX transport over the fixture's data dir, with a fresh account
+    /// home outside it.
+    pub fn posix_node(
+        data_dir: &std::path::Path,
+        home: &std::path::Path,
+    ) -> (SftpTransport, Arc<Count>) {
+        let count = Arc::new(Count::default());
+        let shell = RemoteShell::local_sftp_server(
+            &common::sftp_server::sftp_server_path(),
+            count.clone(),
+            Duration::from_secs(900),
+        )
+        .local_exec();
+        let data = posix_root(&data_dir.display().to_string()).expect("posix root");
+        let home = posix_root(&home.display().to_string()).expect("home root");
+        (
+            SftpTransport::new(shell, data, "nodes.posix").with_home(&home),
+            count,
+        )
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_save_restore() {
+    use prodshape_posix::posix_node;
+    use shape_git::{HOST_LINUX_RESTORE_VERIFY, HOST_LINUX_SAVE};
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (node, count) = posix_node(&f.data_dir, home.path());
+        let reference = f.node().git_manifest(PROJECT).await.expect("reference");
+
+        // the live manifest, then the save (the script compares both itself)
+        let live = node.git_manifest(PROJECT).await.expect("live manifest");
+        assert_eq!(live, reference, "the host digest equals the local one");
+        let started = Instant::now();
+        let saved = node
+            .save_git(GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("save");
+        let save_took = started.elapsed();
+        assert_eq!(saved, reference, "the save equals the gateway .git");
+        prodshape_within("git_prodshape_posix_save", save_took, HOST_LINUX_SAVE);
+
+        // the import deletes `.git`; restore plus the manifest of the result
+        std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
+        let started = Instant::now();
+        let back = node
+            .restore_git(GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("restore");
+        let after = node.git_manifest(PROJECT).await.expect("manifest after");
+        let restore_took = started.elapsed();
+        assert_eq!(back, reference);
+        assert_eq!(after, reference);
+        prodshape_within(
+            "git_prodshape_posix_restore_verify",
+            restore_took,
+            HOST_LINUX_RESTORE_VERIFY,
+        );
+
+        // a fixed number of connections: one exec per operation (manifest,
+        // save, restore, manifest) and no sftp session at all
+        assert_eq!(count.execs(), 4, "one ssh connection per operation");
+        assert_eq!(count.sftp(), 0, "no per-file sftp traffic");
+        eprintln!(
+            "git_prodshape_posix_save_restore: {} ssh connections for {} files",
+            count.execs(),
+            reference.files
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_size() {
+    use prodshape_posix::posix_node;
+    use shape_git::HOST_LINUX_PREFLIGHT;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (node, count) = posix_node(&f.data_dir, home.path());
+        let reference = f.node().git_manifest(PROJECT).await.expect("reference");
+        let started = Instant::now();
+        let size = node.git_size(PROJECT).await.expect("size");
+        let took = started.elapsed();
+        assert_eq!(size.files, reference.files);
+        assert_eq!(size.bytes, reference.bytes);
+        assert_eq!(count.execs(), 1, "one ssh connection");
+        assert_eq!(count.sftp(), 0, "no sftp session");
+        prodshape_within("git_prodshape_posix_size", took, HOST_LINUX_PREFLIGHT);
+    });
+}
