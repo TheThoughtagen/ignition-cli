@@ -7225,6 +7225,10 @@ const GIT_RUN: &str = "20261114T101500Z-w27a";
 const GIT_SAVE_BUDGET: Duration = Duration::from_secs(120);
 const GIT_RESTORE_VERIFY_BUDGET: Duration = Duration::from_secs(120);
 const GIT_PREFLIGHT_BUDGET: Duration = Duration::from_secs(20);
+/// Listing plus fetch of the gateway-object read, and the resolve and digest
+/// after it (`HOST_WINDOWS_GATEWAY_OBJECTS`, `OFFLINE_GATEWAY_DIGEST`).
+const GIT_OBJECTS_BUDGET: Duration = Duration::from_secs(120);
+const GIT_OBJECTS_DIGEST_BUDGET: Duration = Duration::from_secs(15);
 
 /// Copy a tree host-locally with the tool G4 chose.
 const GIT_HOST_COPY: &str = "& robocopy $p.s $p.d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP|Out-Null;if($LASTEXITCODE -ge 8){throw ('robocopy failed with exit code '+$LASTEXITCODE)};E @{ok=1}";
@@ -7265,6 +7269,8 @@ fn wincap_git_budgets_are_the_27_06_ones() {
         ("HOST_WINDOWS_SAVE", GIT_SAVE_BUDGET),
         ("HOST_WINDOWS_RESTORE_VERIFY", GIT_RESTORE_VERIFY_BUDGET),
         ("HOST_WINDOWS_PREFLIGHT", GIT_PREFLIGHT_BUDGET),
+        ("HOST_WINDOWS_GATEWAY_OBJECTS", GIT_OBJECTS_BUDGET),
+        ("OFFLINE_GATEWAY_DIGEST", GIT_OBJECTS_DIGEST_BUDGET),
     ] {
         let line = format!(
             "pub const {name}: Duration = Duration::from_secs({});",
@@ -7603,4 +7609,320 @@ async fn wincap_git_scripts() {
         "the 27-07 source is kept for 27-11"
     );
     println!("LIVE-RAN wincap_git_scripts");
+}
+
+// ---- the gateway-object read of 27-11 (checker W14, D-24) ---------------------
+//
+// `list_git_objects` and the worst case of `gateway_head_digest` through
+// `SftpTransport` as the deploy account, on the production-shape `.git` that
+// 27-07 uploaded, before the 27-12 contract checkpoint. The worst case is the
+// override over an unpushed Designer commit with ign's own object store empty:
+// every pack that holds an object of the HEAD's tree is fetched, as one archive
+// per round, staged below the account home. Bound to the scratch data root
+// `ign-live-scratch\data27` (project `CapApp27`), removed at the start and at
+// the end; the gateway's own data directory is never named.
+//
+// ```text
+// set -o pipefail; set -a; . "$HOME/.config/ign-azure-win/env"; set +a
+// IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST="$IGN_WINVM_HOST" IGN_WINCAP_KEY="$IGN_WINVM_KEY" \
+//   IGN_WINCAP_PROFILE="$IGN_WINVM_PROFILE" \
+//   cargo test -p ignition-core --test live_transport_wincap wincap_git_objects -- --ignored --nocapture --test-threads=1
+// ```
+
+/// The staging directories a read left in the account home (`.ign-ctl-*`).
+const GIT_HOST_LEFT: &str = "$n=@();foreach($e in [IO.Directory]::GetFileSystemEntries($p.path,'.ign-ctl-*')){$n+=[IO.Path]::GetFileName($e)};E @{ok=1;n=$n}";
+
+fn objects_step(name: &str, took: Duration, budget: Duration) {
+    println!(
+        "wincap_git_objects {name}: measured {} ms budget {} ms",
+        took.as_millis(),
+        budget.as_millis()
+    );
+    assert!(
+        took <= budget,
+        "{name}: measured {} ms is over the budget of {} ms",
+        took.as_millis(),
+        budget.as_millis()
+    );
+}
+
+/// The commit a gateway's HEAD names, from the files `read_git_state` returned.
+fn gateway_head_commit(files: &ignition_core::deploy::git_state::GitFiles) -> String {
+    let head = String::from_utf8(files.head.clone().expect("HEAD")).expect("HEAD is text");
+    let head = head.trim();
+    let Some(name) = head.strip_prefix("ref: ") else {
+        return head.to_string();
+    };
+    if let Some((_, bytes)) = files.loose_refs.iter().find(|(path, _)| path == name) {
+        return String::from_utf8_lossy(bytes).trim().to_string();
+    }
+    let packed = String::from_utf8_lossy(files.packed_refs.as_deref().expect("packed-refs"));
+    packed
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(_, path)| *path == name)
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_else(|| panic!("{name} is neither loose nor packed"))
+}
+
+/// A [`GitHostRead`](ignition_core::deploy::transport::projects::GitHostRead)
+/// over a node that adds up the time of the two object reads (the same
+/// accounting `TimedRead` does in the offline rows).
+struct TimedNode<'a> {
+    node: &'a SftpTransport,
+    spent: std::sync::Mutex<Duration>,
+    fetches: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ignition_core::deploy::transport::projects::GitHostRead for TimedNode<'_> {
+    async fn read_git_state(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_state::GitFiles, CoreError> {
+        self.node.read_git_state(project).await
+    }
+    async fn git_manifest(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+        self.node.git_manifest(project).await
+    }
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+        self.node.save_manifest(gateway, project, run_id).await
+    }
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &ignition_core::deploy::git_advance::GitWriteName,
+    ) -> Result<Option<String>, CoreError> {
+        self.node.git_file_digest(project, name).await
+    }
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        self.node.read_git_yaml().await
+    }
+    async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+        self.node.free_bytes(gateway, project).await
+    }
+    async fn git_size(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::transport::projects::GitSize, CoreError> {
+        self.node.git_size(project).await
+    }
+    async fn list_git_objects(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_objects::GitObjectList, CoreError> {
+        let started = Instant::now();
+        let out = self.node.list_git_objects(project).await;
+        *self.spent.lock().expect("lock") += started.elapsed();
+        out
+    }
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[ignition_core::deploy::git_objects::GitObjectFile],
+        dest: &Path,
+    ) -> Result<(), CoreError> {
+        let started = Instant::now();
+        let before = self.node.sessions();
+        let out = self.node.fetch_git_objects(project, files, dest).await;
+        *self.spent.lock().expect("lock") += started.elapsed();
+        println!(
+            "wincap_git_objects fetch: {} files, {} bytes, {} ms, {} ssh connections",
+            files.len(),
+            files.iter().map(|f| f.size).sum::<u64>(),
+            started.elapsed().as_millis(),
+            self.node.sessions() - before
+        );
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and ign-live-scratch\\git27\\src.git from capture27-vm.sh upload"]
+async fn wincap_git_objects() {
+    use ignition_core::deploy::git_objects::gateway_head_digest;
+    use ignition_core::deploy::git_remote::HostGit;
+    use ignition_core::deploy::transport::projects::{GitEntry, GitHostRead};
+
+    let Some(live) = live() else { return };
+    let host_repo = repo(&live, "git27o-home", &live.data_dir, None);
+    let host_shell = shell_of(host_repo.path(), "git27o-home");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let data27 = format!("{home_native}\\{SCRATCH}\\data27");
+    let src_git = format!("{home_native}\\{SCRATCH}\\git27\\src.git");
+    let git_dir = format!("{data27}\\projects\\{GIT_PROJECT}\\.git");
+    // the scratch root is the account's own, never the gateway's data directory
+    assert!(!data27.to_ascii_lowercase().contains("program files"));
+    assert!(data27.contains(SCRATCH));
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    println!(
+        "wincap_git_objects host: PSEdition {} PSVersion {} computer {}",
+        facts["e"], facts["v"], facts["c"]
+    );
+    assert_eq!(
+        facts["e"], "Desktop",
+        "the deploy account's ssh runs Windows PowerShell"
+    );
+
+    // leftovers of an earlier run, then the source must exist
+    remove_tree(&host_shell, &data27).await;
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "{src_git} is missing: run capture27-vm.sh upload first"
+    );
+
+    let repo_dir = repo(&live, "git27o", &data27, None);
+    let shell = shell_of(repo_dir.path(), "git27o");
+    let (_, ssh, _) = ssh_of(repo_dir.path(), "git27o");
+    let node = SftpTransport::new_windows(
+        shell,
+        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
+        "nodes.master",
+    );
+
+    // the production-shape `.git` goes in with the host copy tool, Hidden as
+    // the module's is
+    host_shell
+        .exec_powershell(&script(
+            "git_host_copy",
+            GIT_HOST_COPY,
+            serde_json::json!({ "s": src_git, "d": git_dir }),
+        ))
+        .await
+        .expect("copy src.git in");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_hide",
+            GIT_HOST_HIDE,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("hide");
+    let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let state = node.read_git_state(GIT_PROJECT).await.expect("state");
+        assert_eq!(state.kind, GitEntry::Directory);
+        let head = gateway_head_commit(&state);
+        println!("wincap_git_objects HEAD resolved: {} characters", head.len());
+        let size = node.git_size(GIT_PROJECT).await.expect("size");
+        println!(
+            "wincap_git_objects shape: {} files, {} bytes",
+            size.files, size.bytes
+        );
+
+        // 1. the listing alone, as one WinScript
+        let started = Instant::now();
+        let list = node.list_git_objects(GIT_PROJECT).await.expect("list");
+        objects_step("list_git_objects", started.elapsed(), GIT_OBJECTS_BUDGET);
+        println!(
+            "wincap_git_objects listing: {} loose objects, {} packs, {} bytes",
+            list.loose.len(),
+            list.packs.len(),
+            list.total_bytes()
+        );
+        assert!(list.validate().is_ok());
+        assert!(
+            list.loose.len() + 2 * list.packs.len() <= size.files,
+            "the listing names no more files than the .git holds"
+        );
+        assert!(list.total_bytes() <= size.bytes);
+
+        // 2. the worst case: ign's own store is empty, so every pack holding
+        //    an object of the HEAD's tree is fetched
+        let empty = tempfile::tempdir().expect("empty store");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(empty.path())
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        let timed = TimedNode {
+            node: &node,
+            spent: std::sync::Mutex::new(Duration::ZERO),
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let before = node.sessions();
+        let started = Instant::now();
+        let (digest, stats) =
+            gateway_head_digest(&HostGit::new(), empty.path(), &timed, GIT_PROJECT, &head)
+                .await
+                .expect("the gateway's objects supply HEAD");
+        let total = started.elapsed();
+        let objects = *timed.spent.lock().expect("lock");
+        let resolve = total.saturating_sub(objects);
+        println!(
+            "wincap_git_objects FetchStats: {} loose, {} idx, {} packs, {} bytes in {} fetches, {} ssh connections",
+            stats.loose,
+            stats.idx,
+            stats.packs,
+            stats.bytes,
+            timed.fetches.load(std::sync::atomic::Ordering::Relaxed),
+            node.sessions() - before
+        );
+        objects_step(
+            "listing plus fetch (gateway_head_digest)",
+            objects,
+            GIT_OBJECTS_BUDGET,
+        );
+        objects_step(
+            "resolve and digest (gateway_head_digest)",
+            resolve,
+            GIT_OBJECTS_DIGEST_BUDGET,
+        );
+        assert!(stats.loose + stats.packs > 0, "something was fetched");
+        assert!(stats.bytes <= size.bytes);
+        println!(
+            "wincap_git_objects digest: {} members",
+            digest.members.len()
+        );
+
+        // 3. the staging directory is gone, and the source is untouched
+        let left = host_shell
+            .exec_powershell(&script(
+                "git_host_left",
+                GIT_HOST_LEFT,
+                path_params(&home_native),
+            ))
+            .await
+            .expect("left");
+        assert_eq!(
+            left["n"].as_array().map(Vec::len),
+            Some(0),
+            "no .ign-ctl-* staging directory is left in the account home: {left}"
+        );
+        println!("wincap_git_objects staging: no .ign-ctl-* left in the account home");
+        let after = node.git_size(GIT_PROJECT).await.expect("size after");
+        assert_eq!(
+            (after.files, after.bytes),
+            (size.files, size.bytes),
+            "the read changed nothing in the gateway's .git"
+        );
+    }))
+    .await;
+
+    // cleanup: the scratch root (also after a failure), quoted
+    let data_gone = remove_tree(&host_shell, &data27).await;
+    println!("wincap_git_objects cleanup: data27 gone {data_gone}");
+    assert!(data_gone);
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "the 27-07 source is kept"
+    );
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    println!("LIVE-RAN wincap_git_objects");
 }
