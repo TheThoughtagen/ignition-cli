@@ -44,7 +44,7 @@
 #            IGN_LNXVM_CONFIG (the ign config holding the profile; default
 #            $HOME/.cache/ign-lnxvm01/ign-config.toml), IGN_LNXVM_PROFILE
 #            (azure-lnx), IGN_LNXVM_DATA_DIR (/usr/local/bin/ignition/data),
-#            IGN_LNXVM_GATEWAY_NAME (Ignition-ignlnx836), IGN_LNXVM_GATEWAY_PORT (8088)
+#            IGN_LNXVM_GATEWAY_NAME (Ignition-ign-lnx-836), IGN_LNXVM_GATEWAY_PORT (8088)
 #   Windows: IGN_WINVM_HOST (REQUIRED: the address changes on every VM start; read
 #            it after the start and export it), IGN_WINVM_KEY (key text) or
 #            IGN_WINVM_KEY_FILE, IGN_WINVM_PROFILE, IGN_WINVM_KNOWN_HOSTS (default:
@@ -345,6 +345,16 @@ function Copy-Ps([string]$src, [string]$dst) {
 function Copy-With([string]$tool, [string]$src, [string]$dst) {
   if ($tool -eq 'robocopy') { Copy-Robo $src $dst } else { Copy-Ps $src $dst }
 }
+function Show-GwService {
+  # A non-admin deploy account cannot query Win32_Service (CIM "Access denied") and
+  # sees no services; that must not abort the step (g1-after would leave its copy behind).
+  try {
+    $s = @(Get-CimInstance Win32_Service -ErrorAction Stop | Where-Object { $_.Name -like '*gnition*' -or $_.DisplayName -like '*gnition*' })
+    foreach ($x in $s) { Write-Output ("service={0} startname={1} state={2}" -f $x.Name, $x.StartName, $x.State) }
+    if ($s.Count -eq 0) { Write-Output "service: none named *gnition* visible to this account" }
+  } catch { Write-Output ("service-accounts: not readable as this account (" + $_.Exception.Message.Trim() + ")") }
+  foreach ($p in @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match 'java|ignition' })) { Write-Output ("process={0} id={1}" -f $p.ProcessName, $p.Id) }
+}
 function Get-Median3($a) { return (($a | Sort-Object)[1]) }
 function Fmt([double]$x) { return $x.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) }
 EOS
@@ -357,8 +367,7 @@ B_win_g1_before() {
 $projDir = Join-Path $Data "projects\$Proj"
 Write-Output "== identity"; Write-Output (& whoami.exe)
 Write-Output "== gateway service accounts (name, log-on account, state)"
-Get-CimInstance Win32_Service | Where-Object { $_.Name -like '*gnition*' -or $_.DisplayName -like '*gnition*' } |
-  ForEach-Object { Write-Output ("service={0} startname={1} state={2}" -f $_.Name, $_.StartName, $_.State) }
+Show-GwService
 Write-Output "== owner and ACL"
 Show-Acl (Join-Path $Data 'projects')
 Show-Acl $projDir
@@ -514,8 +523,7 @@ Show-Acl (Join-Path $gitdir 'HEAD')
 Show-Acl (Join-Path $gitdir 'objects')
 if ($pack) { Show-Acl $pack.FullName }
 Write-Output "== gateway service accounts (the rows above must carry an inherited Modify or FullControl entry for one of them, or a group it is in)"
-Get-CimInstance Win32_Service | Where-Object { $_.Name -like '*gnition*' -or $_.DisplayName -like '*gnition*' } |
-  ForEach-Object { Write-Output ("service={0} startname={1}" -f $_.Name, $_.StartName) }
+Show-GwService
 Write-Output "== removing the copy as the deploy account"
 Remove-Tree $gitdir
 Write-Output ("removed: " + (-not (Test-Path -LiteralPath $gitdir)))
@@ -619,8 +627,13 @@ vm_select() {
       PROFILE=${IGN_LNXVM_PROFILE:-azure-lnx}
       IGN_CFG=${IGN_LNXVM_CONFIG:-$HOME/.cache/ign-lnxvm01/ign-config.toml}
       DATA=${IGN_LNXVM_DATA_DIR:-/usr/local/bin/ignition/data}
-      GW_NAME=${IGN_LNXVM_GATEWAY_NAME:-Ignition-ignlnx836}
+      GW_NAME=${IGN_LNXVM_GATEWAY_NAME:-Ignition-ign-lnx-836}
       GW_PORT=${IGN_LNXVM_GATEWAY_PORT:-8088}
+      # the profile reads its token from IGNITION_TOKEN_AZURE_LNX; default it from the user's cache file
+      if [ -z "${IGNITION_TOKEN_AZURE_LNX:-}" ] && [ -r "$HOME/.cache/ign-lnxvm01/api-token" ]; then
+        IGNITION_TOKEN_AZURE_LNX=$(tr -d '[:space:]' < "$HOME/.cache/ign-lnxvm01/api-token")
+        export IGNITION_TOKEN_AZURE_LNX
+      fi
       BUDGET_SAVE=$BUDGET_LNX_SAVE
       BUDGET_RV=$BUDGET_LNX_RV
       ;;
