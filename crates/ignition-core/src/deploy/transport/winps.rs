@@ -36,7 +36,7 @@
 //!   path and name in `$p`: [`GIT_STATE`] (the fixed files in one pass),
 //!   [`GIT_SAVE`] and [`GIT_RESTORE`] (one host-local `robocopy` each, with the
 //!   manifest compare inside the script), [`GIT_MANIFEST`], [`GIT_SIZE`] (one
-//!   enumeration, no file read), [`GIT_DIGEST`], [`GIT_LOCK`] and
+//!   enumeration, no file read), [`GIT_DIGEST`], [`GIT_OBJECTS`] (the object files of a gateway `.git`, 27-11), [`GIT_LOCK`] and
 //!   [`GIT_REPLACE`] (the lock-and-rename write; the sftp client cannot create
 //!   a file exclusively), [`GIT_PROBE`], [`GIT_SAVE_RM`] and [`GIT_FREE`]. They
 //!   run under Windows PowerShell 5.1 (the deploy account's ssh session) and
@@ -190,10 +190,14 @@ pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b
 /// 261105-dl1), so a Windows read moves its files with one sftp `get`
 /// instead of one `get` per file (about 0.37 s each on this server).
 ///
-/// Parameters (`$p`): `x` the long path prefix, `b` the native
-/// `<data>\config\resources`, `l` the native list path, `z` the native
-/// archive path, `h` the lowercase hex SHA-256 of the list bytes, `f` the
-/// free bytes the archive's drive must have.
+/// Parameters (`$p`): `x` the long path prefix, `b` the native directory the
+/// listed names are below (`<data>\config\resources` for a resource read,
+/// `<data>\projects\<p>\.git` for the object read of 27-11), `l` the native
+/// list path, `z` the native archive path, `h` the lowercase hex SHA-256 of
+/// the list bytes, `f` the free bytes the archive's drive must have, and
+/// optionally `c`: `NoCompression` stores the entries (git objects and packs
+/// are compressed already); anything else, or no `c`, is `Optimal`, the level
+/// every resource read has always used.
 ///
 /// - Reads the list (`{size}` TAB `{collection}/{rel}` LF, see
 ///   `bundle::render_list`) and refuses it unless its SHA-256 is `h`
@@ -206,7 +210,7 @@ pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b
 ///   mode. Per line it opens the source below `b` with `FileShare`
 ///   `ReadWrite|Delete` (a gateway writing or replacing the file is not
 ///   blocked), makes an entry named `{collection}/{rel}` with Deflate
-///   (`Optimal`), copies, and compares the bytes copied with the listed size.
+///   (`Optimal`, or `NoCompression` when `c` says so), copies, and compares the bytes copied with the listed size.
 ///   Each read asks for at most the bytes still allowed, so the copy stops
 ///   one byte past the listed size: a file that keeps growing cannot grow
 ///   the archive (quick 261105-cr1). A missing source is
@@ -232,6 +236,7 @@ pub const ENUMERATE_CHILDREN: &str = "$o=@();for($i=0;$i -lt $p.r.Count;$i++){$b
 pub const BUNDLE: &str = concat!(
     "Add-Type -AssemblyName System.IO.Compression;",
     "$x=$p.x;$c=[IO.Path]::DirectorySeparatorChar;$r=$null;$s=$null;$a=$null;$k=$false;",
+    "$d=[IO.Compression.CompressionLevel]::Optimal;if($p.c -eq 'NoCompression'){$d=[IO.Compression.CompressionLevel]::NoCompression};",
     "try{$t=[IO.File]::ReadAllBytes($x+$p.l);",
     "$h=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($t)).Replace('-','').ToLowerInvariant();",
     "if($h -ne $p.h){$r=@{ok=0;err='list'}}else{",
@@ -245,7 +250,7 @@ pub const BUNDLE: &str = concat!(
     "$q=$x+$p.b+$c+$m.Replace('/',[string]$c);",
     "if(-not [IO.File]::Exists($q)){$r=@{ok=0;err='missing';i=$i};break};",
     "$g=[int64]0;$in=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');",
-    "try{$o=$a.CreateEntry($m,[IO.Compression.CompressionLevel]::Optimal).Open();",
+    "try{$o=$a.CreateEntry($m,$d).Open();",
     "try{while($g -le $n){$e=$n-$g+1;if($e -gt $u.Length){$e=$u.Length};$y=$in.Read($u,0,[int]$e);if($y -le 0){break};$o.Write($u,0,$y);$g+=$y}}finally{$o.Dispose()}}finally{$in.Dispose()};",
     "if($g -ne $n){$r=@{ok=0;err='changed';i=$i;n=$g};break}};",
     "$a.Dispose();$a=$null;$s.Dispose();$s=$null;",
@@ -432,6 +437,27 @@ pub const GIT_MANIFEST: &str = concat!(
 pub const GIT_SIZE: &str = concat!(
     git_ps_base!(),
     r##"K (Z $p.a)|Out-Null;$s=New-Object Collections.Stack;$s.Push([IO.DirectoryInfo]($p.x+$p.a));$n=0;$b=[long]0;while($s.Count){foreach($f in $s.Pop().EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};if($a -band 16){$s.Push($f)}else{$n++;$b+=$f.Length}}};E @{ok=1;files=$n;bytes=$b}"##,
+);
+
+/// The object files of a gateway's `.git` in one enumeration (Phase 27, 27-11,
+/// D-24): the Windows half of the POSIX `GIT_OBJECTS_SH`.
+///
+/// Parameters: `x` the long path prefix, `a` the native `.git`, `l` the most
+/// entries it may walk (`GIT_OBJECTS_LIST_MAX_ENTRIES`), `m` the most it may
+/// report (`GIT_OBJECTS_LOOSE_MAX + 2 * GIT_OBJECTS_PACKS_MAX + 1`). `.git` and
+/// `objects` must be real directories; the walk goes two levels below
+/// `objects` (`objects/<dir>/<file>`) and nothing else is opened. A reparse
+/// point at either level, or a name with a control character, a backslash or a
+/// colon, is a terminating error, and so is a walk past `l` entries. Only the
+/// files of the fixed shapes (`<2 hex>/<38 hex>`, `pack/pack-<40 hex>.pack` and
+/// `.idx`, lower case) are reported, as the lines `size SP objects/<name>` of
+/// one string `t`, so a large listing is one string for
+/// `ConvertTo-Json` and the walk appends to a list, never to an array. Answers
+/// `{ok:1,n:<lines>,more:<0|1>,t:<lines joined by LF>}`; `more` is 1 when the
+/// report stopped at `m` lines, and the caller refuses such a listing.
+pub const GIT_OBJECTS: &str = concat!(
+    git_ps_base!(),
+    r##"$g=$p.a;K (Z $g)|Out-Null;$o=$g+$c+'objects';K (Z $o)|Out-Null;$l=New-Object Collections.ArrayList;$k=0;$u=0;function V($f){if(([int]$f.Attributes -band 1024) -ne 0 -or $f.Name -match '[\x00-\x1f\\:]'){throw 'objects holds a link or a name that is not a plain name'};$global:k++;if($global:k -gt $p.l){throw 'objects holds more entries than a read may walk'}};foreach($f in ([IO.DirectoryInfo]($p.x+$o)).EnumerateFileSystemInfos()){V $f;if([int]$f.Attributes -band 16){foreach($h in $f.EnumerateFileSystemInfos()){V $h;if(([int]$h.Attributes -band 16) -eq 0){$n=$f.Name+'/'+$h.Name;if($n -cmatch '^([0-9a-f]{2}/[0-9a-f]{38}|pack/pack-[0-9a-f]{40}\.(pack|idx))$'){if($l.Count -ge $p.m){$u=1}else{[void]$l.Add([string]$h.Length+' objects/'+$n)}}}}}};E @{ok=1;n=$l.Count;more=$u;t=($l -join "`n")}"##,
 );
 
 /// The SHA-256 of one file below a `.git` (Phase 27, the read-back of an
@@ -659,17 +685,37 @@ impl WinScript {
         list_sha256: &str,
         need: u64,
     ) -> WinScript {
+        Self::bundle_level(prefix, resources, list, archive, list_sha256, need, None)
+    }
+
+    /// [`bundle`](Self::bundle) with the compression level of the entries:
+    /// `Some("NoCompression")` stores them, `None` sends no `c` and keeps the
+    /// `Optimal` of every existing read. `root` is the native directory the
+    /// listed names are below.
+    pub fn bundle_level(
+        prefix: &str,
+        root: &str,
+        list: &str,
+        archive: &str,
+        list_sha256: &str,
+        need: u64,
+        level: Option<&str>,
+    ) -> WinScript {
+        let mut params = serde_json::json!({
+            "x": prefix,
+            "b": root,
+            "l": list,
+            "z": archive,
+            "h": list_sha256,
+            "f": need,
+        });
+        if let (Some(level), Some(map)) = (level, params.as_object_mut()) {
+            map.insert("c".to_string(), Value::String(level.to_string()));
+        }
         WinScript {
             name: "bundle",
             body: BUNDLE,
-            params: serde_json::json!({
-                "x": prefix,
-                "b": resources,
-                "l": list,
-                "z": archive,
-                "h": list_sha256,
-                "f": need,
-            }),
+            params,
         }
     }
 
@@ -745,6 +791,19 @@ impl WinScript {
             name: "git_size",
             body: GIT_SIZE,
             params: serde_json::json!({ "x": prefix, "a": dir }),
+        }
+    }
+
+    /// The script that lists the object files of the native `.git` at `git`
+    /// ([`GIT_OBJECTS`]): `walk_max` is the most entries it may walk and
+    /// `report_max` the most it reports before it says `more`.
+    pub fn git_objects(prefix: &str, git: &str, walk_max: usize, report_max: usize) -> WinScript {
+        WinScript {
+            name: "git_objects",
+            body: GIT_OBJECTS,
+            params: serde_json::json!({
+                "x": prefix, "a": git, "l": walk_max, "m": report_max,
+            }),
         }
     }
 

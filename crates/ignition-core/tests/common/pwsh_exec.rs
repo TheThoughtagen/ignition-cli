@@ -115,8 +115,10 @@ pub fn run(script: &WinScript) -> Result<serde_json::Value, String> {
 
 /// The paths a script's parameters hold as native Windows spellings
 /// (`tmp\x\data`, from the sftp-style `/tmp/x/data`): rewritten to the local
-/// unix path before the script runs, and the long path prefix dropped.
-const PATH_KEYS: [&str; 5] = ["a", "b", "c", "d", "h"];
+/// unix path before the script runs, and the long path prefix dropped. `l` and
+/// `z` are BUNDLE's list and archive (27-11); in `GIT_OBJECTS` `l` is a number,
+/// which is left alone (only strings are mapped).
+const PATH_KEYS: [&str; 7] = ["a", "b", "c", "d", "h", "l", "z"];
 
 /// `rest` (the base64 of an `-EncodedCommand`) with its parameter blob mapped
 /// from native Windows spellings to this machine's unix paths.

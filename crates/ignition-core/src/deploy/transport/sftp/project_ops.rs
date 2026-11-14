@@ -103,7 +103,7 @@
 //! (a symlink or a non-regular journal refuses) and then removes the one
 //! file; an absent journal is a success.
 
-use super::{Budget, EntryKind, SftpTransport, windows_native_path};
+use super::{Budget, EntryKind, FoundFile, ReadBase, SftpTransport, windows_native_path};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
 use crate::deploy::git_advance::{GitWrite, GitWriteName};
@@ -117,7 +117,11 @@ use crate::deploy::ledger::{
 };
 use std::path::Path;
 
-use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
+use crate::deploy::git_objects::{
+    GIT_OBJECTS_FETCH_MAX_BYTES, GIT_OBJECTS_LIST_MAX_ENTRIES, GIT_OBJECTS_LOOSE_MAX,
+    GIT_OBJECTS_PACKS_MAX, GitObjectEntry, GitObjectEntryKind, GitObjectFile, GitObjectList,
+    check_object_rel,
+};
 use crate::deploy::project_run::{
     PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
 };
@@ -201,6 +205,44 @@ pub(super) const GIT_SIZE_SH: &str = concat!(
     "a=$(find -P . -type f -exec ls -ln {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
     "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; set -- $w; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s}\\n' \"$1\" \"$2\"",
+);
+
+/// The most object files a listing reports before it says `more` (a cut-off
+/// listing is refused, never read as the whole repo): one past the loose and
+/// pack caps together, so a repo over either cap is seen as over it.
+const GIT_OBJECTS_REPORT_MAX: usize = GIT_OBJECTS_LOOSE_MAX + 2 * GIT_OBJECTS_PACKS_MAX + 1;
+
+/// The object files of `<data>/projects/<p>/.git/objects` (27-11, D-24): one
+/// line of fixed text, `$1` the data directory, `$2` the path
+/// `projects/<p>/.git/objects` (every level a real directory), `$3` the most
+/// entries it may walk, `$4` the most it reports. A symlink or a name with a
+/// control character anywhere in the two levels below `objects/` refuses
+/// (exit 4); only the files of the fixed shapes are reported, as the lines
+/// `size objects/<name>` of one JSON string, `{"t":..,"n":..,"more":..}`.
+/// Nothing is opened but the sizes (`wc -c` on a regular file asks the file
+/// system), and no name is interpreted by a shell: the names are read from the
+/// output of `find` by `awk`.
+pub(super) const GIT_OBJECTS_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in find wc awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "wk \"$1\" \"$2\"; ",
+    "x=$(find -P . -maxdepth 2 \\( -type l -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { echo 'objects holds a symlink or a name with a control character' >&2; exit 4; }; ",
+    "a=$(find -P . -maxdepth 2 -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "j=$(printf '%s\\n' \"$a\" | awk -v lim=\"$3\" -v cap=\"$4\" '",
+    r#"BEGIN{printf "{\"t\":\""} "#,
+    r#"/ \.\// {i=index($0," ./"); s=substr($0,1,i-1)+0; p=substr($0,i+3); n++; "#,
+    r#"if(n>lim){print "objects holds more entries than a read may walk" > "/dev/stderr"; bad=4; exit} "#,
+    r#"if(p ~ /[\\:]/){print "an object file has a name that is not a plain name" > "/dev/stderr"; bad=4; exit} "#,
+    r#"if((length(p)==41 && p ~ /^[0-9a-f][0-9a-f]\/[0-9a-f]+$/) || ((length(p)==55 || length(p)==54) && p ~ /^pack\/pack-[0-9a-f]+\.(pack|idx)$/)) "#,
+    r#"{if(e>=cap){m=1}else{e++; printf "%.0f objects/%s\\n", s, p}}} "#,
+    r#"END{printf "\",\"n\":%d,\"more\":%d}\n", e, m; exit bad}"#,
+    "') || exit $?; ",
+    "printf 'IGN-RESULT:%s\\n' \"$j\"",
 );
 
 pub(super) const GIT_STATE_SH: &str = concat!(
@@ -1635,34 +1677,267 @@ impl GitHostRead for SftpTransport {
         }
     }
 
-    // The two object reads of the unpushed-HEAD dirty computation (27-10,
-    // D-24) have no remote implementation yet: both fail closed, naming the
-    // operation, and start no process, until 27-11 replaces them. The
-    // answer is never an empty list or a copy of nothing.
+    /// The object files of the project's `.git` (27-11, D-24): one script on a
+    /// POSIX host, one WinScript on a Windows host, never a listing per
+    /// directory. Both report only the fixed shapes below two levels of
+    /// `objects/` and refuse a symlink, so the same repo lists the same here as
+    /// on the local transport ([`GitObjectList::from_entries`] runs on the
+    /// answer either way).
     async fn list_git_objects(&self, project: &str) -> Result<GitObjectList, CoreError> {
+        const OP: &str = "list_git_objects";
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));
         }
-        Err(self.mirror_fail(
-            "list_git_objects",
-            "reading the gateway's git objects is not available on this host yet",
-        ))
+        let answer = if self.windows {
+            let script = WinScript::git_objects(
+                LONG_PATH_PREFIX,
+                &self.win_git(project),
+                GIT_OBJECTS_LIST_MAX_ENTRIES,
+                GIT_OBJECTS_REPORT_MAX,
+            );
+            self.git_win(OP, script, GIT_HEAVY_LIMIT).await?
+        } else {
+            let rel = format!("{}/objects", Self::git_rel(project));
+            let (walk, report) = (
+                GIT_OBJECTS_LIST_MAX_ENTRIES.to_string(),
+                GIT_OBJECTS_REPORT_MAX.to_string(),
+            );
+            self.git_run(
+                OP,
+                GIT_OBJECTS_SH,
+                &[&self.data_dir, &rel, &walk, &report],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?
+        };
+        self.git_objects_of(&answer)
     }
 
+    /// Copy exactly the listed object `files` into `dest/<rel>` (27-11, D-24).
+    ///
+    /// Every name is re-checked with [`check_object_rel`] and the count, the
+    /// total size and the destination are checked before the first byte moves.
+    /// The files arrive in a private download directory through the shared
+    /// machinery of the resource reads (one `get` per file in a fixed number
+    /// of sessions on a POSIX host, one archive on a Windows host, every file
+    /// exactly its listed size), and are then installed into `dest` with an
+    /// exclusive create: a file already there is never overwritten.
     async fn fetch_git_objects(
         &self,
         project: &str,
-        _files: &[GitObjectFile],
-        _dest: &Path,
+        files: &[GitObjectFile],
+        dest: &Path,
     ) -> Result<(), CoreError> {
+        const OP: &str = "fetch_git_objects";
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));
         }
-        Err(self.mirror_fail(
-            "fetch_git_objects",
-            "reading the gateway's git objects is not available on this host yet",
-        ))
+        if files.len() > GIT_OBJECTS_REPORT_MAX {
+            return Err(self.mirror_fail(
+                OP,
+                format!(
+                    "{} object files were asked for, over the {GIT_OBJECTS_REPORT_MAX} a read may fetch",
+                    files.len()
+                ),
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut total = 0u64;
+        let mut found: Vec<FoundFile> = Vec::with_capacity(files.len());
+        for file in files {
+            check_object_rel(&file.rel).map_err(|why| {
+                self.mirror_fail(OP, format!("{} is refused: {why}", file.rel.escape_debug()))
+            })?;
+            if !seen.insert(file.rel.as_str()) {
+                return Err(self.mirror_fail(
+                    OP,
+                    format!("{} is asked for twice", file.rel.escape_debug()),
+                ));
+            }
+            total = total.saturating_add(file.size);
+            // `check_object_rel` proved the `objects/` prefix and the shape
+            let below = file.rel.strip_prefix("objects/").unwrap_or_default();
+            found.push(FoundFile {
+                collection: "objects".to_string(),
+                rel: below.to_string(),
+                size: file.size,
+            });
+        }
+        if total > GIT_OBJECTS_FETCH_MAX_BYTES {
+            return Err(self.mirror_fail(
+                OP,
+                format!(
+                    "the object files asked for add up to {total} bytes, over the {GIT_OBJECTS_FETCH_MAX_BYTES} byte cap"
+                ),
+            ));
+        }
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.git_dest_problem(dest, files)
+            .map_err(|why| self.mirror_fail(OP, why))?;
+
+        let base = ReadBase::ProjectGit(project.to_string());
+        let tmp = self.download_dir(OP)?;
+        let refs: Vec<&FoundFile> = found.iter().collect();
+        if self.bundle_reads {
+            self.fetch_bundled(&base, &refs, tmp.path()).await?;
+        } else {
+            self.fetch_files(&base, &refs, tmp.path()).await?;
+        }
+        let (from, to, listed) = (tmp.path().to_path_buf(), dest.to_path_buf(), files.to_vec());
+        let installed =
+            tokio::task::spawn_blocking(move || install_object_files(&from, &to, &listed))
+                .await
+                .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?;
+        drop(tmp);
+        installed.map_err(|why| self.mirror_fail(OP, why))
     }
+}
+
+impl SftpTransport {
+    /// The [`GitObjectList`] of a `GIT_OBJECTS_SH` or `GIT_OBJECTS` answer:
+    /// `n` lines `size objects/<name>` in `t`, `more` 0. An answer that was cut off
+    /// (`more`), that does not add up or that holds a line it cannot read is
+    /// refused, and so is a listing [`GitObjectList::from_entries`] refuses.
+    fn git_objects_of(&self, answer: &serde_json::Value) -> Result<GitObjectList, CoreError> {
+        const OP: &str = "list_git_objects";
+        let more = answer.get("more").and_then(serde_json::Value::as_i64);
+        let count = answer.get("n").and_then(serde_json::Value::as_u64);
+        let text = answer.get("t").and_then(serde_json::Value::as_str);
+        let (Some(more), Some(count), Some(text)) = (more, count, text) else {
+            return Err(self.git_unusable(OP, "n, more or t is missing or malformed"));
+        };
+        if more != 0 {
+            return Err(self.mirror_fail(
+                OP,
+                format!(
+                    "the gateway repo holds more object files than a read may list (over {GIT_OBJECTS_REPORT_MAX})"
+                ),
+            ));
+        }
+        let mut entries: Vec<GitObjectEntry> = Vec::new();
+        for line in text.split('\n').filter(|line| !line.is_empty()) {
+            let parsed = line
+                .split_once(' ')
+                .filter(|(size, _)| !size.is_empty() && size.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|(size, name)| Some((size.parse::<u64>().ok()?, name)));
+            let Some((size, name)) = parsed else {
+                return Err(self.git_unusable(OP, "a listing line is not `size name`"));
+            };
+            if entries.len() >= GIT_OBJECTS_REPORT_MAX {
+                return Err(self.git_unusable(OP, "the listing is longer than it may be"));
+            }
+            entries.push(GitObjectEntry {
+                rel: name.to_string(),
+                size,
+                kind: GitObjectEntryKind::File,
+            });
+        }
+        if entries.len() as u64 != count {
+            return Err(self.git_unusable(OP, "the line count does not match n"));
+        }
+        GitObjectList::from_entries(&entries)
+            .map_err(|why| self.mirror_fail(OP, format!("the object listing is refused: {why}")))
+    }
+
+    /// Why `dest` cannot take `files`, or `None`: it must be a real directory
+    /// (a symlink is not followed) and none of the targets may exist yet.
+    fn git_dest_problem(&self, dest: &Path, files: &[GitObjectFile]) -> Result<(), String> {
+        match std::fs::symlink_metadata(dest) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Err("the destination is not a real directory".to_string()),
+            Err(e) => {
+                return Err(format!(
+                    "the destination cannot be inspected ({:?})",
+                    e.kind()
+                ));
+            }
+        }
+        for file in files {
+            let target = file
+                .rel
+                .split('/')
+                .fold(dest.to_path_buf(), |p, c| p.join(c));
+            match std::fs::symlink_metadata(&target) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "{} cannot be inspected at the destination ({:?})",
+                        file.rel,
+                        e.kind()
+                    ));
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "{} already exists at the destination; a file there is never overwritten",
+                        file.rel
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Make `path` a real directory: made when absent, accepted when it is one,
+/// refused when it is anything else (a symlink is never followed).
+fn ensure_real_dir(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} is not a real directory", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)
+            .map_err(|e| format!("a directory cannot be made ({:?})", e.kind())),
+        Err(e) => Err(format!("a directory cannot be inspected ({:?})", e.kind())),
+    }
+}
+
+/// Move the downloaded `files` from `from/<rel>` to `dest/<rel>`, creating each
+/// target exclusively and each directory on the way as a real directory. A
+/// hard link (fails when the target exists, copies nothing) is tried first; a
+/// host that cannot link across file systems falls back to an exclusive copy.
+/// Every target must end as a regular file of exactly its listed size.
+fn install_object_files(from: &Path, dest: &Path, files: &[GitObjectFile]) -> Result<(), String> {
+    for file in files {
+        let parts: Vec<&str> = file.rel.split('/').collect();
+        let (mut source, mut target) = (from.to_path_buf(), dest.to_path_buf());
+        for (at, part) in parts.iter().enumerate() {
+            source.push(part);
+            target.push(part);
+            if at + 1 < parts.len() {
+                ensure_real_dir(&target)?;
+            }
+        }
+        match std::fs::hard_link(&source, &target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "{} already exists at the destination; a file there is never overwritten",
+                    file.rel
+                ));
+            }
+            Err(_) => {
+                let mut input = std::fs::File::open(&source)
+                    .map_err(|e| format!("{} cannot be opened ({:?})", file.rel, e.kind()))?;
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .map_err(|e| format!("{} cannot be created ({:?})", file.rel, e.kind()))?;
+                std::io::copy(&mut input, &mut output)
+                    .map_err(|e| format!("{} cannot be copied ({:?})", file.rel, e.kind()))?;
+            }
+        }
+        let meta = std::fs::symlink_metadata(&target)
+            .map_err(|e| format!("{} cannot be inspected ({:?})", file.rel, e.kind()))?;
+        if !meta.file_type().is_file() || meta.len() != file.size {
+            return Err(format!(
+                "{} is not a regular file of the {} bytes it was listed as",
+                file.rel, file.size
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The suffix of the lock or temporary sibling a write is staged as: packs go
@@ -2525,7 +2800,8 @@ mod tests {
         }
     }
 
-    const ALL_GIT_SCRIPTS: [(&str, &str); 11] = [
+    const ALL_GIT_SCRIPTS: [(&str, &str); 12] = [
+        ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
         ("GIT_STATE_SH", GIT_STATE_SH),
         ("GIT_MANIFEST_SH", GIT_MANIFEST_SH),
         ("GIT_SIZE_SH", GIT_SIZE_SH),
@@ -2739,6 +3015,182 @@ mod tests {
         let (_, t) = win_host(vec![died]);
         let err = t.restore_git("gw", "CapApp", "r1").await.expect_err("died");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    fn objects_answer(lines: &[&str], n: usize, more: i32) -> ProcessOutput {
+        ok(&format!(
+            "IGN-RESULT:{{\"ok\":1,\"n\":{n},\"more\":{more},\"t\":\"{}\"}}\n",
+            lines.join("\\n")
+        ))
+    }
+
+    const LOOSE_A: &str = "ab/cdef0123456789abcdef0123456789abcdef01";
+    const PACK_A: &str = "pack/pack-0123456789abcdef0123456789abcdef01234567";
+
+    /// 27-11: the listing is one script whose answer is parsed strictly; the
+    /// arguments are the data directory, the path and the two caps, and
+    /// nothing of the project is in the script text.
+    #[tokio::test]
+    async fn sftp_git_objects_posix_arm_runs_one_script_and_parses_strictly() {
+        let pack = |ext: &str| format!("100 objects/{PACK_A}.{ext}");
+        let (runner, t) = host(
+            vec![objects_answer(
+                &[
+                    &format!("12 objects/{LOOSE_A}"),
+                    &pack("pack"),
+                    &format!("{} ", 7).replace(' ', ""),
+                ],
+                3,
+                0,
+            )],
+            false,
+        );
+        // a line that is not `size name` is unusable, never skipped
+        let err = t.list_git_objects("CapApp").await.expect_err("bad line");
+        assert!(detail(err).contains("unusable"), "bad line");
+        let argv = runner.argv.lock().expect("argv").clone();
+        assert_eq!(argv.len(), 1, "one exec, no sftp session");
+        let command = argv[0].last().expect("command").clone();
+        assert!(!command.chars().any(char::is_control), "one line");
+        assert!(command.contains("/gw/data"));
+        assert!(command.contains("projects/CapApp/.git/objects"));
+        assert!(command.contains(&GIT_OBJECTS_LIST_MAX_ENTRIES.to_string()));
+        assert!(command.contains(&GIT_OBJECTS_REPORT_MAX.to_string()));
+
+        let good = |lines: &[&str], n, more| host(vec![objects_answer(lines, n, more)], false).1;
+        let loose = format!("12 objects/{LOOSE_A}");
+        // the good answer builds the list
+        let list = good(&[&loose, &pack("pack"), &pack("idx")], 3, 0)
+            .list_git_objects("CapApp")
+            .await
+            .expect("list");
+        assert_eq!(list.loose.len(), 1);
+        assert_eq!(list.packs.len(), 1);
+        assert_eq!(list.packs[0].pack_size, 100);
+        // an answer cut off at the report cap is refused, never read as the repo
+        let err = good(&[&loose], 1, 1).list_git_objects("CapApp").await;
+        assert!(detail(err.expect_err("more")).contains("more object files"));
+        // a count that does not add up, a hostile name, a listed path twice
+        for (lines, n) in [
+            (vec![loose.clone()], 2usize),
+            (vec!["5 objects/../x".to_string()], 1),
+            (vec!["5 ../x".to_string(), "5 x".to_string()], 2),
+            (vec![loose.clone(), loose.clone()], 2),
+            (vec!["-5 objects/x".to_string()], 1),
+            (vec!["x objects/y".to_string()], 1),
+        ] {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let got = good(&refs, n, 0).list_git_objects("CapApp").await;
+            assert!(got.is_err(), "{lines:?}");
+        }
+        // an answer without its fields is unusable
+        let (_, t) = host(vec![ok("IGN-RESULT:{\"n\":0}\n")], false);
+        assert!(t.list_git_objects("CapApp").await.is_err());
+    }
+
+    /// 27-11: a Windows node lists through one WinScript whose parameters are
+    /// the native `.git`, the walk cap and the report cap, and nothing else.
+    #[tokio::test]
+    async fn sftp_git_objects_windows_arm_runs_one_script() {
+        let (runner, t) = win_host(vec![objects_answer(
+            &[&format!("12 objects/{LOOSE_A}")],
+            1,
+            0,
+        )]);
+        let list = t.list_git_objects("CapApp").await.expect("list");
+        assert_eq!(list.loose.len(), 1);
+        let argv = runner.argv.lock().expect("argv").clone();
+        assert_eq!(argv.len(), 1);
+        let p = win_params(&argv[0]);
+        assert_eq!(p["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
+        assert_eq!(p["x"], "\\\\?\\");
+        assert_eq!(p["l"], GIT_OBJECTS_LIST_MAX_ENTRIES);
+        assert_eq!(p["m"], GIT_OBJECTS_REPORT_MAX);
+        // `ok` must be 1 and the answer must be whole
+        for answer in [
+            "IGN-RESULT:{\"ok\":0}\n",
+            "IGN-RESULT:{\"ok\":1,\"n\":0}\n",
+            "IGN-RESULT:{\"ok\":1,\"n\":0,\"more\":0}\n",
+        ] {
+            let (_, t) = win_host(vec![ok(answer)]);
+            assert!(t.list_git_objects("CapApp").await.is_err(), "{answer}");
+        }
+        // an empty repo is an empty list, not an error
+        let (_, t) = win_host(vec![ok(
+            "IGN-RESULT:{\"ok\":1,\"n\":0,\"more\":0,\"t\":\"\"}\n",
+        )]);
+        let empty = t.list_git_objects("CapApp").await.expect("empty");
+        assert_eq!(empty, GitObjectList::default());
+        // a script that died is transport_failed
+        let died = ProcessOutput {
+            stdout: Vec::new(),
+            stderr: b"Exception: objects holds a link\n".to_vec(),
+            code: 1,
+            timed_out: false,
+        };
+        let (_, t) = win_host(vec![died]);
+        let err = t.list_git_objects("CapApp").await.expect_err("died");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    /// 27-11: a project name the host cannot hold, and every name of a fetch,
+    /// is refused before any process starts.
+    #[tokio::test]
+    async fn sftp_git_objects_names_are_checked_before_any_process() {
+        for windows in [false, true] {
+            let (runner, t) = host(Vec::new(), windows);
+            let dest = tempfile::tempdir().expect("dest");
+            let good = GitObjectFile {
+                rel: format!("objects/{LOOSE_A}"),
+                size: 1,
+            };
+            assert!(t.list_git_objects("..").await.is_err());
+            assert!(t.list_git_objects("a/b").await.is_err());
+            assert!(
+                t.fetch_git_objects("CapApp/..", std::slice::from_ref(&good), dest.path())
+                    .await
+                    .is_err()
+            );
+            for rel in [
+                "objects/../../config",
+                "config",
+                "hooks/pre-commit",
+                "objects/info/alternates",
+                "objects/pack/pack-xyz.pack",
+                "/etc/passwd",
+                "objects/ab/cd:ef",
+                "objects\\ab\\cdef",
+                "objects/ab/cdef\n",
+                "",
+            ] {
+                let bad = GitObjectFile {
+                    rel: rel.to_string(),
+                    size: 1,
+                };
+                let got = t
+                    .fetch_git_objects("CapApp", &[good.clone(), bad], dest.path())
+                    .await;
+                assert!(got.is_err(), "{rel:?}");
+            }
+            // the same rel twice, and a total over the cap
+            let got = t
+                .fetch_git_objects("CapApp", &[good.clone(), good.clone()], dest.path())
+                .await;
+            assert!(got.is_err());
+            let huge = GitObjectFile {
+                rel: format!("objects/{LOOSE_A}"),
+                size: GIT_OBJECTS_FETCH_MAX_BYTES + 1,
+            };
+            assert!(
+                t.fetch_git_objects("CapApp", &[huge], dest.path())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                runner.argv.lock().expect("argv").is_empty(),
+                "a refusal started a process (windows {windows})"
+            );
+        }
     }
 
     /// The names are checked on the Windows rules before any script runs.
@@ -3248,6 +3700,144 @@ mod tests {
                 &system_path(),
             );
             assert_eq!(out.code, 4, "{}", out.stderr);
+        }
+
+        /// The listing script reports only the fixed shapes, with their sizes,
+        /// as one JSON line, and refuses what a read must not trust.
+        #[test]
+        fn objects_script_lists_the_fixed_shapes_and_names_what_it_refuses() {
+            let rig = Rig::new();
+            let objects = rig.git().join("objects");
+            let loose = format!("{}/{}", "0a", "b".repeat(38));
+            let pack = |ext: &str| format!("pack/pack-{}.{ext}", "c".repeat(40));
+            std::fs::create_dir_all(objects.join("0a")).expect("fan");
+            std::fs::create_dir_all(objects.join("pack")).expect("pack dir");
+            std::fs::create_dir_all(objects.join("info")).expect("info");
+            std::fs::write(objects.join(&loose), vec![b'x'; 17]).expect("loose");
+            std::fs::write(objects.join(pack("pack")), vec![b'p'; 300]).expect("pack");
+            std::fs::write(objects.join(pack("idx")), vec![b'i'; 40]).expect("idx");
+            // not of the fixed shapes: never reported
+            std::fs::write(objects.join(pack("keep")), "").expect("keep");
+            std::fs::write(objects.join("info/packs"), "P x\n").expect("info");
+            std::fs::write(objects.join("ab/cdef"), "short name").expect("short");
+            std::fs::write(objects.join("0a/B"), "upper").expect("upper");
+            std::fs::write(objects.join("0a/with space"), "space").expect("space");
+            let args = [
+                rig.data(),
+                "projects/CapApp/.git/objects".to_string(),
+                "200000".to_string(),
+                "51025".to_string(),
+            ];
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = run(GIT_OBJECTS_SH, &args, &system_path());
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            let line = out
+                .stdout
+                .trim_end()
+                .strip_prefix("IGN-RESULT:")
+                .expect("sentinel");
+            let json: serde_json::Value = serde_json::from_str(line).expect("json");
+            assert_eq!(json["more"], 0);
+            assert_eq!(json["n"], 3);
+            let mut lines: Vec<&str> = json["t"].as_str().expect("t").split('\n').collect();
+            lines.retain(|l| !l.is_empty());
+            lines.sort_unstable();
+            let mut want = vec![
+                format!("17 objects/{loose}"),
+                format!("300 objects/{}", pack("pack")),
+                format!("40 objects/{}", pack("idx")),
+            ];
+            want.sort_unstable();
+            assert_eq!(lines, want);
+
+            // the report cap says `more` and the walk cap refuses
+            let capped = run(
+                GIT_OBJECTS_SH,
+                &[args[0], args[1], "200000", "2"],
+                &system_path(),
+            );
+            assert_eq!(capped.code, 0, "{}", capped.stderr);
+            let line = capped
+                .stdout
+                .trim_end()
+                .strip_prefix("IGN-RESULT:")
+                .expect("s");
+            let json: serde_json::Value = serde_json::from_str(line).expect("json");
+            assert_eq!(
+                (json["more"].clone(), json["n"].clone()),
+                (1.into(), 2.into())
+            );
+            let walked = run(
+                GIT_OBJECTS_SH,
+                &[args[0], args[1], "3", "51025"],
+                &system_path(),
+            );
+            assert_eq!(walked.code, 4, "{}", walked.stderr);
+            assert!(walked.stderr.contains("more entries"), "{}", walked.stderr);
+
+            // a symlink, a name with a control character, a name with a colon
+            // or a backslash, and a missing or linked objects directory refuse
+            std::os::unix::fs::symlink("/", objects.join("0a/link")).expect("link");
+            let out = run(GIT_OBJECTS_SH, &args, &system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert!(out.stderr.contains("symlink"), "{}", out.stderr);
+            std::fs::remove_file(objects.join("0a/link")).expect("rm");
+            std::fs::write(objects.join("0a/bad\u{7}"), "x").expect("bell");
+            assert_eq!(run(GIT_OBJECTS_SH, &args, &system_path()).code, 4);
+            std::fs::remove_file(objects.join("0a/bad\u{7}")).expect("rm");
+            for name in ["0a/a:b", "0a/a\\b"] {
+                std::fs::write(objects.join(name), "x").expect("name");
+                let out = run(GIT_OBJECTS_SH, &args, &system_path());
+                assert_eq!(out.code, 4, "{name}: {}", out.stderr);
+                std::fs::remove_file(objects.join(name)).expect("rm");
+            }
+            assert_eq!(run(GIT_OBJECTS_SH, &args, &system_path()).code, 0);
+            let out = run(
+                GIT_OBJECTS_SH,
+                &[args[0], "projects/Missing/.git/objects", "9", "9"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            let moved = rig.git().join("objects-real");
+            std::fs::rename(&objects, &moved).expect("move");
+            std::os::unix::fs::symlink(&moved, &objects).expect("link objects");
+            let out = run(GIT_OBJECTS_SH, &args, &system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert!(
+                out.stderr.contains("not a real directory"),
+                "{}",
+                out.stderr
+            );
+        }
+
+        /// A hostile value is data: a data directory or a path with quote,
+        /// `$`, backtick and space characters lists as it would otherwise.
+        #[test]
+        fn objects_script_keeps_hostile_path_text_inert() {
+            let root = tempfile::tempdir().expect("root");
+            let odd = "it's $(touch pwned) `x` \"q\"";
+            let data = root.path().join(odd);
+            std::fs::create_dir_all(data.join("projects/P/.git/objects/0a")).expect("dirs");
+            let name = "b".repeat(38);
+            std::fs::write(
+                data.join(format!("projects/P/.git/objects/0a/{name}")),
+                "xyz",
+            )
+            .expect("loose");
+            let data_s = data.display().to_string();
+            let out = run(
+                GIT_OBJECTS_SH,
+                &[&data_s, "projects/P/.git/objects", "99", "99"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(
+                out.stdout.contains(&format!("3 objects/0a/{name}")),
+                "{}",
+                out.stdout
+            );
+            assert!(!root.path().join("pwned").exists());
+            assert!(!std::path::Path::new("pwned").exists());
         }
     }
 }

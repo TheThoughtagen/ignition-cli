@@ -4635,6 +4635,241 @@ mod sftp_git {
         assert!(host.git().is_some());
     }
 
+    /// Every file the list names, as the fetch takes them.
+    fn all_files(
+        list: &ignition_core::deploy::git_objects::GitObjectList,
+    ) -> Vec<ignition_core::deploy::git_objects::GitObjectFile> {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let mut files = list.loose.clone();
+        for pack in &list.packs {
+            files.push(GitObjectFile {
+                rel: pack.idx_rel(),
+                size: pack.idx_size,
+            });
+            files.push(GitObjectFile {
+                rel: pack.pack_rel(),
+                size: pack.pack_size,
+            });
+        }
+        files
+    }
+
+    fn files_below(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).expect("ls") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path.strip_prefix(dir).expect("below").display().to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 27-11: the POSIX arm of the gateway-object read, over the local
+    /// sftp-server. The listing equals the local transport's for the same
+    /// repo (loose objects, packs and both at once), is one exec and no sftp
+    /// session, the fetch is a byte-identical round trip in a fixed number of
+    /// sessions whatever the object count, a bad name refuses before any
+    /// `get`, a size that differs from the listing refuses, and a target
+    /// already in the destination is never overwritten.
+    #[tokio::test]
+    async fn sftp_git_objects_posix() {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let fx = GitFixture::new();
+        // loose only first
+        let loose_only = fx.node().list_git_objects(PROJECT).await.expect("ref");
+        assert!(!loose_only.loose.is_empty() && loose_only.packs.is_empty());
+        let n = node(&fx.data_dir);
+        assert_eq!(
+            n.t.list_git_objects(PROJECT).await.expect("list"),
+            loose_only
+        );
+        assert_eq!((n.count.execs(), n.count.sftp()), (1, 0), "one script");
+
+        // packs and loose objects together
+        fx.gateway_gc();
+        fx.designer_commit(false);
+        let reference = fx.node().list_git_objects(PROJECT).await.expect("ref");
+        assert!(!reference.loose.is_empty() && !reference.packs.is_empty());
+        let n = node(&fx.data_dir);
+        let list = n.t.list_git_objects(PROJECT).await.expect("list");
+        assert_eq!(list, reference);
+        assert_eq!((n.count.execs(), n.count.sftp()), (1, 0));
+
+        // a byte-identical round trip of every listed file
+        let files = all_files(&list);
+        let dest = tempfile::tempdir().expect("dest");
+        let before = n.count.sftp();
+        n.t.fetch_git_objects(PROJECT, &files, dest.path())
+            .await
+            .expect("fetch");
+        let small_sessions = n.count.sftp() - before;
+        assert!(small_sessions >= 1, "the download ran");
+        let mut want: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        want.sort();
+        assert_eq!(files_below(dest.path()), want, "exactly the listed files");
+        for file in &files {
+            assert_eq!(
+                std::fs::read(dest.path().join(&file.rel)).expect("copy"),
+                std::fs::read(fx.git_dir().join(&file.rel)).expect("source"),
+                "{}",
+                file.rel
+            );
+        }
+
+        // the number of sessions does not depend on the object count
+        for i in 0..120u32 {
+            let fan = format!("{:02x}", i % 7);
+            let dir = fx.git_dir().join("objects").join(&fan);
+            std::fs::create_dir_all(&dir).expect("fan");
+            std::fs::write(dir.join(format!("{i:038x}")), vec![b'o'; 50 + i as usize])
+                .expect("object");
+        }
+        let n = node(&fx.data_dir);
+        let big = n.t.list_git_objects(PROJECT).await.expect("list");
+        assert!(big.loose.len() >= files.len() + 100, "{}", big.loose.len());
+        let more = all_files(&big);
+        let dest_big = tempfile::tempdir().expect("dest");
+        n.t.fetch_git_objects(PROJECT, &more, dest_big.path())
+            .await
+            .expect("fetch many");
+        assert_eq!(
+            n.count.sftp(),
+            small_sessions,
+            "{} files cost as many sessions as {}",
+            more.len(),
+            files.len()
+        );
+        assert_eq!(n.count.execs(), 1, "still one listing script");
+        assert_eq!(files_below(dest_big.path()).len(), more.len());
+
+        // a name outside the fixed shapes refuses before any `get`
+        let n = node(&fx.data_dir);
+        let empty = tempfile::tempdir().expect("dest");
+        for rel in [
+            "config",
+            "objects/info/alternates",
+            "hooks/pre-commit",
+            "objects/../config",
+            "objects/pack/pack-xyz.pack",
+            "/etc/passwd",
+        ] {
+            let bad = GitObjectFile {
+                rel: rel.to_string(),
+                size: 1,
+            };
+            let got =
+                n.t.fetch_git_objects(PROJECT, &[files[0].clone(), bad], empty.path())
+                    .await;
+            assert!(got.is_err(), "{rel}");
+        }
+        assert_eq!((n.count.execs(), n.count.sftp()), (0, 0), "no process ran");
+        assert!(files_below(empty.path()).is_empty());
+
+        // a size that is not the listed size refuses, and nothing is installed
+        let wrong = GitObjectFile {
+            rel: files[0].rel.clone(),
+            size: files[0].size + 1,
+        };
+        let err =
+            n.t.fetch_git_objects(PROJECT, &[wrong], empty.path())
+                .await
+                .expect_err("size");
+        assert!(detail(err).contains("listed as"), "names the mismatch");
+        assert!(files_below(empty.path()).is_empty(), "nothing installed");
+
+        // a target already in the destination is never overwritten
+        let taken = tempfile::tempdir().expect("dest");
+        let first = &files[0];
+        let target = taken.path().join(&first.rel);
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("dirs");
+        std::fs::write(&target, "mine").expect("mine");
+        let err =
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(first), taken.path())
+                .await
+                .expect_err("exists");
+        assert!(detail(err).contains("never overwritten"));
+        assert_eq!(std::fs::read(&target).expect("kept"), b"mine");
+
+        // a destination that is a symlink, or a directory on the way that is
+        // one, is not followed
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let linked = taken.path().join("link");
+        std::os::unix::fs::symlink(elsewhere.path(), &linked).expect("link");
+        assert!(
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(first), &linked)
+                .await
+                .is_err()
+        );
+        let trap = tempfile::tempdir().expect("trap");
+        std::os::unix::fs::symlink(elsewhere.path(), trap.path().join("objects")).expect("link");
+        assert!(
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(first), trap.path())
+                .await
+                .is_err()
+        );
+        assert!(
+            files_below(elsewhere.path()).is_empty(),
+            "nothing written through"
+        );
+
+        // a source that went away between the listing and the fetch
+        let gone = &files[1];
+        std::fs::remove_file(fx.git_dir().join(&gone.rel)).expect("rm");
+        let fresh = tempfile::tempdir().expect("dest");
+        assert!(
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(gone), fresh.path())
+                .await
+                .is_err()
+        );
+        assert!(files_below(fresh.path()).is_empty());
+    }
+
+    /// 27-11: the listing refuses a symlink and a repo whose `objects` is
+    /// missing or a link, never an empty list (the transport arm of the
+    /// refusals the script test pins).
+    #[tokio::test]
+    async fn sftp_git_objects_posix_refusals() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        std::os::unix::fs::symlink("/", fx.git_dir().join("objects/ab_link")).expect("link");
+        let err = n.t.list_git_objects(PROJECT).await.expect_err("symlink");
+        assert!(detail(err).contains("symlink"));
+        std::fs::remove_file(fx.git_dir().join("objects/ab_link")).expect("rm");
+        assert!(n.t.list_git_objects(PROJECT).await.is_ok());
+        let err = n.t.list_git_objects("Nope").await.expect_err("missing");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        std::fs::write(fx.git_dir().join("objects/0a_bad:name"), "x").expect("colon");
+        // an extra file of no fixed shape is ignored, a colon in a name refuses
+        let err = n.t.list_git_objects(PROJECT).await.expect_err("colon");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    /// 27-11: what is sent is fixed text of one line: no control character
+    /// reaches the host, and the project name is data after the script.
+    #[tokio::test]
+    async fn sftp_git_objects_sh_one_line() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        n.t.list_git_objects(PROJECT).await.expect("list");
+        let sent = n.count.execs.lock().expect("execs").clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            !sent[0].chars().any(char::is_control),
+            "no control character: {:?}",
+            sent[0]
+        );
+        assert!(sent[0].contains("IGN-RESULT"), "the answer sentinel");
+        assert!(!sent[0].contains("git "), "no git runs on the host");
+        assert!(!sent[0].contains("eval"), "nothing is evaluated");
+    }
+
     #[test]
     fn sftp_git_scripts_are_not_reachable_from_the_read_only_host() {
         // `ProjectHost::git` hands out the read half only; the writer trait is
@@ -4691,6 +4926,12 @@ mod winps_git {
             WinScript::git_restore(prefix, data, &project, home, &gateway, &run),
             WinScript::git_manifest(prefix, &git),
             WinScript::git_size(prefix, &git),
+            WinScript::git_objects(
+                prefix,
+                &git,
+                ignition_core::deploy::git_objects::GIT_OBJECTS_LIST_MAX_ENTRIES,
+                51_025,
+            ),
             WinScript::git_digest(
                 &git,
                 &format!("refs/remotes/{}/{}", "o".repeat(40), "b".repeat(80)),
@@ -4707,7 +4948,7 @@ mod winps_git {
     #[test]
     fn winps_git_scripts_fit_budget() {
         let scripts = maximal();
-        assert_eq!(scripts.len(), 12);
+        assert_eq!(scripts.len(), 13);
         for script in &scripts {
             let command = winps::encoded_command(script, COMMAND_BUDGET)
                 .unwrap_or_else(|why| panic!("{}: {why}", script.name));
@@ -4741,6 +4982,7 @@ mod winps_git {
             ("GIT_RESTORE", winps::GIT_RESTORE),
             ("GIT_MANIFEST", winps::GIT_MANIFEST),
             ("GIT_SIZE", winps::GIT_SIZE),
+            ("GIT_OBJECTS", winps::GIT_OBJECTS),
             ("GIT_DIGEST", winps::GIT_DIGEST),
             ("GIT_LOCK", winps::GIT_LOCK),
             ("GIT_REPLACE", winps::GIT_REPLACE),
@@ -4809,6 +5051,122 @@ mod winps_git {
         let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
         assert!(!command.as_str().contains("it's"));
         assert_eq!(script.params["j"], odd);
+    }
+
+    /// 27-11: the object listing fits the command budget with the longest
+    /// realistic parameters (a 100-character project below the Windows data
+    /// directory, the largest caps), with room to spare.
+    #[test]
+    fn winps_git_objects_fit_budget() {
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let git = format!("{data}\\projects\\{}\\.git", "P".repeat(100));
+        let script = WinScript::git_objects(winps::LONG_PATH_PREFIX, &git, usize::MAX, usize::MAX);
+        let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
+        let used = command.as_str().chars().count();
+        println!("winps_git_objects_fit_budget: {used} of {COMMAND_BUDGET}");
+        assert!(used < COMMAND_BUDGET - 1_000, "{used} leaves no margin");
+        // and a path that cannot fit is refused, never truncated
+        let long = format!("C:\\{}", "d\\".repeat(3_000));
+        let script = WinScript::git_objects("", &long, 1, 1);
+        assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_err());
+    }
+
+    /// 27-11: every value reaches the object listing as data in `$p`; the
+    /// text holds no path, no evaluation and no `Add-Type`, and a hostile
+    /// project is inside the encoding, not in the command text.
+    #[test]
+    fn winps_git_objects_params_only() {
+        let body = winps::GIT_OBJECTS;
+        assert!(!body.contains('\n'), "one line");
+        for drive in ["C:\\", "c:\\", "\\\\?\\", "/Users", "/home", "/tmp"] {
+            assert!(!body.contains(drive), "holds a path ({drive})");
+        }
+        for forbidden in [
+            "Invoke-Expression",
+            "iex ",
+            "Invoke-Command",
+            "Start-Process",
+            "-Command",
+            "cmd ",
+            "Add-Type",
+            "[scriptblock]::Create",
+            "FromBase64String",
+        ] {
+            assert!(!body.contains(forbidden), "holds {forbidden}");
+        }
+        // the parameters it reads are exactly the ones the constructor sends
+        let mut read: Vec<String> = body
+            .match_indices("$p.")
+            .map(|(at, _)| {
+                body[at + 3..]
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect()
+            })
+            .collect();
+        read.sort();
+        read.dedup();
+        assert_eq!(read, ["a", "l", "m", "x"]);
+        let odd = "it's$(x)`;y\"z";
+        let script = WinScript::git_objects("", &format!("C:\\gw\\{odd}\\.git"), 5, 6);
+        let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
+        assert!(!command.as_str().contains("it's"));
+        let keys: Vec<&String> = script.params.as_object().expect("object").keys().collect();
+        assert_eq!(keys, ["a", "l", "m", "x"]);
+        assert_eq!(script.params["l"], 5);
+        assert_eq!(script.params["m"], 6);
+    }
+
+    /// 27-11: the reads that existed before the object read keep their
+    /// parameters. `bundle` sends no compression level, so the script keeps
+    /// the `Optimal` of every resource read; the stored level is only ever
+    /// asked for by `bundle_level`, with exactly one more key, and the body
+    /// accepts nothing but that word.
+    #[test]
+    fn bundle_existing_reads_unchanged() {
+        let old = WinScript::bundle("\\\\?\\", "C:\\d\\config\\resources", "L", "Z", "abc", 7);
+        let keys: Vec<&String> = old.params.as_object().expect("object").keys().collect();
+        assert_eq!(keys, ["b", "f", "h", "l", "x", "z"], "no `c` parameter");
+        assert_eq!(
+            old.params,
+            serde_json::json!({
+                "x": "\\\\?\\", "b": "C:\\d\\config\\resources", "l": "L", "z": "Z",
+                "h": "abc", "f": 7,
+            })
+        );
+        let same = WinScript::bundle_level(
+            "\\\\?\\",
+            "C:\\d\\config\\resources",
+            "L",
+            "Z",
+            "abc",
+            7,
+            None,
+        );
+        assert_eq!(same.params, old.params);
+        let stored = WinScript::bundle_level(
+            "\\\\?\\",
+            "C:\\d\\git",
+            "L",
+            "Z",
+            "abc",
+            7,
+            Some("NoCompression"),
+        );
+        assert_eq!(stored.params["c"], "NoCompression");
+        assert_eq!(stored.params.as_object().expect("object").len(), 7);
+        assert_eq!(stored.body, old.body, "one script");
+        let body = winps::BUNDLE;
+        assert!(body.contains("CompressionLevel]::Optimal"), "the default");
+        assert!(
+            body.contains("$p.c -eq 'NoCompression'"),
+            "one word accepted"
+        );
+        // the object listing and the archive both fit with their parameters
+        for script in [&old, &stored] {
+            let command = winps::encoded_command(script, COMMAND_BUDGET).expect("fits");
+            assert!(command.as_str().chars().count() <= COMMAND_BUDGET);
+        }
     }
 
     /// The manifest answer as the host-independent value.
@@ -4952,6 +5310,104 @@ mod winps_git {
         std::fs::remove_file(fx.git_dir().join("link")).expect("rm");
         std::fs::write(fx.git_dir().join("bad\u{7}name"), "x").expect("bell");
         assert!(pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).is_err());
+    }
+
+    /// The listing of the object WinScript as the entries it reports.
+    fn objects_entries(answer: &Value) -> Vec<ignition_core::deploy::git_objects::GitObjectEntry> {
+        use ignition_core::deploy::git_objects::{GitObjectEntry, GitObjectEntryKind};
+        answer["t"]
+            .as_str()
+            .expect("t")
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (size, rel) = line.split_once(' ').expect("size name");
+                GitObjectEntry {
+                    rel: rel.to_string(),
+                    size: size.parse().expect("size"),
+                    kind: GitObjectEntryKind::File,
+                }
+            })
+            .collect()
+    }
+
+    /// 27-11: the object listing under the local `pwsh` reports what the
+    /// local transport lists (loose objects and packs together), stops at its
+    /// report cap with `more`, refuses at its walk cap, and refuses a link, a
+    /// name with a control character or a colon, and a missing or linked
+    /// `objects` directory.
+    #[tokio::test]
+    async fn pwsh_git_objects() {
+        use ignition_core::deploy::git_objects::GitObjectList;
+        if !pwsh_exec::gate("pwsh_git_objects") {
+            return;
+        }
+        let fx = GitFixture::new();
+        fx.gateway_gc();
+        fx.designer_commit(false);
+        let local = fx.node().list_git_objects(PROJECT).await.expect("local");
+        assert!(!local.loose.is_empty() && !local.packs.is_empty());
+        let list = |walk: usize, report: usize| {
+            pwsh_exec::run(&WinScript::git_objects("", &s(&fx.git_dir()), walk, report))
+        };
+        let answer = list(200_000, 51_025).expect("the listing");
+        assert_eq!(
+            (answer["ok"].clone(), answer["more"].clone()),
+            (1.into(), 0.into())
+        );
+        let entries = objects_entries(&answer);
+        assert_eq!(answer["n"].as_u64(), Some(entries.len() as u64));
+        let got = GitObjectList::from_entries(&entries).expect("from entries");
+        assert_eq!(got, local);
+
+        // a report cap stops with `more`; a walk cap refuses
+        let capped = list(200_000, 2).expect("capped");
+        assert_eq!(
+            (capped["more"].clone(), capped["n"].clone()),
+            (1.into(), 2.into())
+        );
+        let why = list(3, 51_025).expect_err("walk cap");
+        assert!(why.contains("more entries"), "{why}");
+
+        // names of no fixed shape are never reported, hostile ones refuse
+        let objects = fx.git_dir().join("objects");
+        std::fs::write(objects.join("pack").join("pack-x.keep"), "").expect("keep");
+        std::fs::write(objects.join("info").join("packs"), "x\n").expect("info");
+        std::fs::write(objects.join("0a_short"), "x").expect("short");
+        assert_eq!(
+            GitObjectList::from_entries(&objects_entries(&list(200_000, 51_025).expect("again")))
+                .expect("list"),
+            local
+        );
+        std::fs::write(objects.join("pack/a:b"), "x").expect("colon");
+        assert!(
+            list(200_000, 51_025)
+                .expect_err("colon")
+                .contains("plain name")
+        );
+        std::fs::remove_file(objects.join("pack/a:b")).expect("rm");
+        std::fs::write(objects.join("pack/bad\u{7}name"), "x").expect("bell");
+        assert!(list(200_000, 51_025).is_err());
+        std::fs::remove_file(objects.join("pack/bad\u{7}name")).expect("rm");
+        std::os::unix::fs::symlink("/", objects.join("pack/link")).expect("link");
+        assert!(list(200_000, 51_025).expect_err("link").contains("link"));
+        std::fs::remove_file(objects.join("pack/link")).expect("rm");
+        std::os::unix::fs::symlink("/", objects.join("lnk")).expect("dir link");
+        assert!(
+            list(200_000, 51_025)
+                .expect_err("dir link")
+                .contains("link")
+        );
+        std::fs::remove_file(objects.join("lnk")).expect("rm");
+        assert!(list(200_000, 51_025).is_ok());
+
+        // objects missing, or a link
+        let moved = fx.git_dir().join("objects-real");
+        std::fs::rename(&objects, &moved).expect("move");
+        assert!(list(200_000, 51_025).is_err(), "missing objects");
+        std::os::unix::fs::symlink(&moved, &objects).expect("link objects");
+        let why = list(200_000, 51_025).expect_err("linked objects");
+        assert!(why.contains("not a real directory"), "{why}");
     }
 
     #[tokio::test]

@@ -3142,6 +3142,12 @@ mod git_rows {
         /// The directory `ign-deploy/` lands in: the data dir for the local
         /// implementation, the account home for the POSIX one.
         pub ledger: PathBuf,
+        /// The Windows arm: a transport that believes it talks to a Windows
+        /// host. Its read staging needs a drive-lettered account home
+        /// (`/C:/...`), which a unix machine cannot have, so the archive
+        /// half of an object fetch is composed from the very scripts instead
+        /// ([`windows_script_fetch`]).
+        pub windows: bool,
         _home: Option<tempfile::TempDir>,
     }
 
@@ -3153,6 +3159,7 @@ mod git_rows {
                 read: Box::new(LocalFsTransport::new(fx.data_dir.clone(), "nodes.local")),
                 write: Box::new(LocalFsTransport::new(fx.data_dir.clone(), "nodes.local")),
                 ledger,
+                windows: false,
                 _home: None,
                 fx,
             }
@@ -3176,6 +3183,7 @@ mod git_rows {
                 read: Box::new(build()),
                 write: Box::new(build()),
                 ledger: home.path().to_path_buf(),
+                windows: false,
                 _home: Some(home),
                 fx,
             }
@@ -3200,6 +3208,7 @@ mod git_rows {
                 read: Box::new(build()),
                 write: Box::new(build()),
                 ledger: home.path().to_path_buf(),
+                windows: true,
                 _home: Some(home),
                 fx,
             }
@@ -3481,6 +3490,263 @@ mod git_rows {
         assert_eq!(err.code(), "deploy_run_invalid", "{err}");
     }
 
+    /// Every file a listing names, as a fetch takes them.
+    fn objects_files(
+        list: &ignition_core::deploy::git_objects::GitObjectList,
+    ) -> Vec<ignition_core::deploy::git_objects::GitObjectFile> {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let mut files = list.loose.clone();
+        for pack in &list.packs {
+            for (rel, size) in [
+                (pack.idx_rel(), pack.idx_size),
+                (pack.pack_rel(), pack.pack_size),
+            ] {
+                files.push(GitObjectFile { rel, size });
+            }
+        }
+        files
+    }
+
+    /// The files below `dir`, as `/`-separated paths, sorted.
+    fn objects_below(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).expect("ls") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(
+                        path.strip_prefix(dir)
+                            .expect("below")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// No staging directory of a read is left in `home`.
+    fn no_staging_left(home: &Path) {
+        let left: Vec<String> = std::fs::read_dir(home)
+            .expect("home")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ign-ctl"))
+            .collect();
+        assert!(left.is_empty(), "staging left behind: {left:?}");
+    }
+
+    /// The archive half of a Windows object fetch, from the scripts alone:
+    /// the list `bundle::render_list` writes, `BUNDLE` with `NoCompression`
+    /// under `pwsh`, then `bundle::extract` into `dest`. Returns the archive
+    /// bytes. (The transport's own orchestration of these steps is held to a
+    /// fake host by `windows_git_objects_fetch_is_one_archive`.)
+    fn windows_script_fetch(
+        c: &GitCtx,
+        files: &[ignition_core::deploy::git_objects::GitObjectFile],
+        dest: &Path,
+    ) -> u64 {
+        use ignition_core::deploy::transport::bundle::{self, BundleFile};
+        use ignition_core::deploy::transport::winps::WinScript;
+        let listed: Vec<BundleFile> = files
+            .iter()
+            .map(|f| BundleFile {
+                collection: "objects".to_string(),
+                rel: f
+                    .rel
+                    .strip_prefix("objects/")
+                    .expect("objects/")
+                    .to_string(),
+                size: f.size,
+            })
+            .collect();
+        let stage = tempfile::tempdir().expect("stage");
+        let list = bundle::render_list(&listed);
+        let list_path = stage.path().join(bundle::LIST_FILE);
+        std::fs::write(&list_path, &list).expect("list");
+        let archive = stage.path().join(bundle::ARCHIVE_FILE);
+        let script = WinScript::bundle_level(
+            "",
+            &c.fx.git_dir().display().to_string(),
+            &list_path.display().to_string(),
+            &archive.display().to_string(),
+            &ignition_core::deploy::tree::sha256_hex(&list),
+            bundle::archive_limit(&listed) + bundle::STAGING_FREE_MARGIN,
+            Some("NoCompression"),
+        );
+        let answer = common::pwsh_exec::run(&script).expect("BUNDLE");
+        assert_eq!(answer["ok"], 1, "{answer}");
+        assert_eq!(answer["n"].as_u64(), Some(listed.len() as u64));
+        let size = std::fs::metadata(&archive).expect("archive").len();
+        assert_eq!(answer["z"].as_u64(), Some(size));
+        bundle::extract(&archive, &listed, dest, 1024 * 1024).expect("extract");
+        assert!(!list_path.exists(), "BUNDLE removes its list");
+        size
+    }
+
+    /// 27-11: every host lists the object files of the same repo identically
+    /// (loose objects with packs), and refuses what a read must not trust: a
+    /// symlink anywhere in the two levels, a missing `objects` directory.
+    pub async fn git_objects_list_same(c: &GitCtx) {
+        c.fx.gateway_gc();
+        c.fx.designer_commit(false);
+        let want = c
+            .reference()
+            .list_git_objects(PROJECT)
+            .await
+            .expect("reference");
+        assert!(!want.loose.is_empty() && !want.packs.is_empty(), "{want:?}");
+        assert_eq!(c.read.list_git_objects(PROJECT).await.expect("host"), want);
+
+        // a symlink refuses the whole listing, on a fan-out directory or in it
+        let objects = c.fx.git_dir().join("objects");
+        for link in [objects.join("zz"), objects.join("pack/link")] {
+            std::os::unix::fs::symlink("/", &link).expect("symlink");
+            let err = c.read.list_git_objects(PROJECT).await.expect_err("symlink");
+            assert!(is_transport_failed(&err), "{err:?}");
+            std::fs::remove_file(&link).expect("rm");
+        }
+        assert_eq!(c.read.list_git_objects(PROJECT).await.expect("host"), want);
+
+        // names of no fixed shape are ignored, never listed
+        std::fs::write(objects.join("pack/pack-extra.keep"), "").expect("keep");
+        std::fs::write(objects.join("info/packs"), "x\n").expect("packs");
+        assert_eq!(c.read.list_git_objects(PROJECT).await.expect("host"), want);
+
+        // an absent repo, or one with no `objects`, is an error and never empty
+        std::fs::rename(&objects, c.fx.git_dir().join("objects-away")).expect("move");
+        let err = c
+            .read
+            .list_git_objects(PROJECT)
+            .await
+            .expect_err("no objects");
+        assert!(is_transport_failed(&err), "{err:?}");
+        std::fs::rename(c.fx.git_dir().join("objects-away"), &objects).expect("back");
+        let err = c
+            .read
+            .list_git_objects("Nope")
+            .await
+            .expect_err("no project");
+        assert!(is_transport_failed(&err), "{err:?}");
+    }
+
+    /// 27-11: the fetch is a byte-identical round trip of exactly the listed
+    /// files on every host, never overwrites a file already in the
+    /// destination, and leaves no staging directory behind.
+    pub async fn git_objects_fetch_round_trip(c: &GitCtx) {
+        c.fx.gateway_gc();
+        c.fx.designer_commit(false);
+        let list = c.read.list_git_objects(PROJECT).await.expect("list");
+        let files = objects_files(&list);
+        assert!(files.len() > 3, "{}", files.len());
+        let dest = tempfile::tempdir().expect("dest");
+        if c.windows {
+            windows_script_fetch(c, &files, dest.path());
+        } else {
+            c.read
+                .fetch_git_objects(PROJECT, &files, dest.path())
+                .await
+                .expect("fetch");
+        }
+        let mut want: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        want.sort();
+        assert_eq!(objects_below(dest.path()), want, "exactly the listed files");
+        for file in &files {
+            assert_eq!(
+                std::fs::read(dest.path().join(&file.rel)).expect("copy"),
+                std::fs::read(c.fx.git_dir().join(&file.rel)).expect("source"),
+                "{}",
+                file.rel
+            );
+        }
+        no_staging_left(&c.ledger);
+
+        // a second fetch into the same destination refuses: nothing is
+        // overwritten, and a copy that was not there before is not made
+        let first = files[0].clone();
+        let target = dest.path().join(&first.rel);
+        std::fs::write(&target, "mine").expect("mine");
+        let err = c
+            .read
+            .fetch_git_objects(PROJECT, std::slice::from_ref(&first), dest.path())
+            .await
+            .expect_err("exists");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert_eq!(std::fs::read(&target).expect("kept"), b"mine");
+        no_staging_left(&c.ledger);
+
+        // an empty request is a success that copies nothing
+        let empty = tempfile::tempdir().expect("empty");
+        c.read
+            .fetch_git_objects(PROJECT, &[], empty.path())
+            .await
+            .expect("nothing");
+        assert!(objects_below(empty.path()).is_empty());
+    }
+
+    /// 27-11: a name outside the fixed shapes, a size that is not the listed
+    /// size and a file that has gone refuse on every host, and nothing is
+    /// installed.
+    pub async fn git_objects_refuse_bad_name(c: &GitCtx) {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let list = c.read.list_git_objects(PROJECT).await.expect("list");
+        let good = list.loose[0].clone();
+        let dest = tempfile::tempdir().expect("dest");
+        for rel in [
+            "config",
+            "hooks/pre-commit",
+            "info/exclude",
+            "objects/info/alternates",
+            "objects/../config",
+            "objects/pack/pack-xyz.pack",
+            "objects/ab/cd:ef",
+            "/etc/passwd",
+            "",
+        ] {
+            let bad = GitObjectFile {
+                rel: rel.to_string(),
+                size: 1,
+            };
+            c.read
+                .fetch_git_objects(PROJECT, &[good.clone(), bad], dest.path())
+                .await
+                .expect_err(rel);
+            assert!(objects_below(dest.path()).is_empty(), "{rel:?} installed");
+        }
+        if c.windows {
+            // the size and vanished-file refusals are reached through the
+            // archive, whose staging needs a drive-lettered home: the fake
+            // host of `windows_git_objects_fetch_*` holds them
+            return;
+        }
+        // a size that is not the listed size
+        let wrong = GitObjectFile {
+            rel: good.rel.clone(),
+            size: good.size + 1,
+        };
+        assert!(
+            c.read
+                .fetch_git_objects(PROJECT, &[wrong], dest.path())
+                .await
+                .is_err()
+        );
+        assert!(objects_below(dest.path()).is_empty());
+        // a file that went away after the listing
+        std::fs::remove_file(c.fx.git_dir().join(&good.rel)).expect("rm");
+        assert!(
+            c.read
+                .fetch_git_objects(PROJECT, std::slice::from_ref(&good), dest.path())
+                .await
+                .is_err()
+        );
+        assert!(objects_below(dest.path()).is_empty());
+        no_staging_left(&c.ledger);
+    }
+
     macro_rules! git_row_tests {
         ($($name:ident, $ctor:path, $row:ident;)*) => {
             $(
@@ -3501,6 +3767,9 @@ mod git_rows {
         conformance_git_local_git_probe_denied_names_path, GitCtx::local, git_probe_denied_names_path;
         conformance_git_local_git_save_rm_refuses_foreign_path, GitCtx::local, git_save_rm_refuses_foreign_path;
         conformance_git_local_git_size_matches_manifest, GitCtx::local, git_size_matches_manifest;
+        conformance_git_local_git_objects_list_same, GitCtx::local, git_objects_list_same;
+        conformance_git_local_git_objects_fetch_round_trip, GitCtx::local, git_objects_fetch_round_trip;
+        conformance_git_local_git_objects_refuse_bad_name, GitCtx::local, git_objects_refuse_bad_name;
     }
 
     git_row_tests! {
@@ -3511,6 +3780,9 @@ mod git_rows {
         conformance_git_sh_git_probe_denied_names_path, GitCtx::posix, git_probe_denied_names_path;
         conformance_git_sh_git_save_rm_refuses_foreign_path, GitCtx::posix, git_save_rm_refuses_foreign_path;
         conformance_git_sh_git_size_matches_manifest, GitCtx::posix, git_size_matches_manifest;
+        conformance_git_sh_git_objects_list_same, GitCtx::posix, git_objects_list_same;
+        conformance_git_sh_git_objects_fetch_round_trip, GitCtx::posix, git_objects_fetch_round_trip;
+        conformance_git_sh_git_objects_refuse_bad_name, GitCtx::posix, git_objects_refuse_bad_name;
     }
 
     macro_rules! git_pwsh_row_tests {
@@ -3536,6 +3808,9 @@ mod git_rows {
         conformance_git_pwsh_git_probe_denied_names_path, git_probe_denied_names_path;
         conformance_git_pwsh_git_save_rm_refuses_foreign_path, git_save_rm_refuses_foreign_path;
         conformance_git_pwsh_git_size_matches_manifest, git_size_matches_manifest;
+        conformance_git_pwsh_git_objects_list_same, git_objects_list_same;
+        conformance_git_pwsh_git_objects_fetch_round_trip, git_objects_fetch_round_trip;
+        conformance_git_pwsh_git_objects_refuse_bad_name, git_objects_refuse_bad_name;
     }
 
     /// Every row has a test for each host, so a row added without wiring fails
@@ -3551,6 +3826,9 @@ mod git_rows {
             "git_probe_denied_names_path",
             "git_save_rm_refuses_foreign_path",
             "git_size_matches_manifest",
+            "git_objects_list_same",
+            "git_objects_fetch_round_trip",
+            "git_objects_refuse_bad_name",
         ] {
             for host in ["local", "sh"] {
                 let wired = format!("conformance_git_{host}_{row}, GitCtx::");

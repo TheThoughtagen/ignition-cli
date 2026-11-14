@@ -123,6 +123,87 @@ const DOWNLOAD_SLACK_BYTES: u64 = 1024 * 1024;
 /// How often the download dir is measured while sftp runs.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Where the files of one download live on the host, and the limits that go
+/// with them. Every file is named `{collection}/{rel}` below the base's remote
+/// directory. The tag and resource reads use [`ReadBase::Resources`], whose
+/// directory, caps and wording are those they always had; the gateway-object
+/// read of Phase 27 (27-11) uses [`ReadBase::ProjectGit`], whose files are
+/// `objects/<...>` below `<data>/projects/<project>/.git`.
+#[derive(Debug, Clone)]
+enum ReadBase {
+    /// `<data>/config/resources`, the collections of a gateway's resources.
+    Resources,
+    /// `<data>/projects/<project>/.git`, read for the fixed object shapes only
+    /// (the project name passed the component gates before this is built).
+    ProjectGit(String),
+}
+
+impl ReadBase {
+    /// The remote directory (sftp spelling) the files live below.
+    fn remote_root(&self, data_dir: &str) -> String {
+        match self {
+            ReadBase::Resources => format!("{data_dir}/config/resources"),
+            ReadBase::ProjectGit(project) => format!("{data_dir}/projects/{project}/.git"),
+        }
+    }
+
+    /// How a host path below the base is shown in a message.
+    fn shown(&self, name: &str) -> String {
+        match self {
+            ReadBase::Resources => format!("config/resources/{name}"),
+            ReadBase::ProjectGit(project) => format!("projects/{project}/.git/{name}"),
+        }
+    }
+
+    /// The most bytes one read may fetch in total.
+    fn max_total(&self) -> u64 {
+        match self {
+            ReadBase::Resources => READ_MAX_TOTAL_BYTES,
+            ReadBase::ProjectGit(_) => crate::deploy::git_objects::GIT_OBJECTS_FETCH_MAX_BYTES,
+        }
+    }
+
+    /// The most bytes one file may have.
+    fn max_file(&self) -> u64 {
+        match self {
+            ReadBase::Resources => READ_MAX_FILE_BYTES,
+            ReadBase::ProjectGit(_) => crate::deploy::git_objects::GIT_OBJECTS_FETCH_MAX_BYTES,
+        }
+    }
+
+    /// The compression level BUNDLE is asked for. `None` keeps the level the
+    /// resource reads always used; git objects and packs are zlib data
+    /// already, so deflating them again only costs time.
+    fn bundle_level(&self) -> Option<&'static str> {
+        match self {
+            ReadBase::Resources => None,
+            ReadBase::ProjectGit(_) => Some("NoCompression"),
+        }
+    }
+
+    /// An archive-extraction message (`bundle::extract` names every file under
+    /// `config/resources/`) with the host path of this base instead.
+    fn rename_extract_error(&self, why: &str) -> String {
+        match self {
+            ReadBase::Resources => why.to_string(),
+            ReadBase::ProjectGit(_) => why.replace("config/resources/", &self.shown("")),
+        }
+    }
+
+    /// The over-the-total message of a read, naming the file that crossed it.
+    fn over_total(&self, shown_file: &str) -> String {
+        match self {
+            ReadBase::Resources => format!(
+                "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at {shown_file})"
+            ),
+            ReadBase::ProjectGit(project) => format!(
+                "the object files of projects/{project}/.git exceed {} bytes in total (at {shown_file})",
+                self.max_total()
+            ),
+        }
+    }
+}
+
 /// What kind of filesystem object a listing line describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -636,6 +717,13 @@ struct FoundFile {
     /// Collection-relative path.
     rel: String,
     size: u64,
+}
+
+impl FoundFile {
+    /// `{collection}/{rel}`, the name BUNDLE and the archive use.
+    fn name(&self) -> String {
+        format!("{}/{}", self.collection, self.rel)
+    }
 }
 
 /// What discovery found.
@@ -1680,7 +1768,12 @@ impl SftpTransport {
     /// Before each chunk the running total (actual bytes already on disk plus
     /// the chunk's listed bytes) must fit [`READ_MAX_TOTAL_BYTES`]; after each
     /// chunk every delivered file must be exactly its listed size.
-    async fn fetch_files(&self, files: &[&FoundFile], tmp: &Path) -> Result<(), CoreError> {
+    async fn fetch_files(
+        &self,
+        base: &ReadBase,
+        files: &[&FoundFile],
+        tmp: &Path,
+    ) -> Result<(), CoreError> {
         let mut downloaded = 0u64;
         let mut next = 0usize;
         while next < files.len() {
@@ -1692,11 +1785,8 @@ impl SftpTransport {
                 if !ops.is_empty() && chunk_listed + file.size > DOWNLOAD_CHUNK_BYTES {
                     break;
                 }
-                if downloaded + chunk_listed + file.size > READ_MAX_TOTAL_BYTES {
-                    return Err(self.fail(format!(
-                        "the files under config/resources exceed {READ_MAX_TOTAL_BYTES} bytes in total (at config/resources/{}/{})",
-                        file.collection, file.rel
-                    )));
+                if downloaded + chunk_listed + file.size > base.max_total() {
+                    return Err(self.fail(base.over_total(&base.shown(&file.name()))));
                 }
                 let local = file
                     .rel
@@ -1709,8 +1799,10 @@ impl SftpTransport {
                 }
                 ops.push(SftpOp::Get {
                     remote: format!(
-                        "{}/config/resources/{}/{}",
-                        self.data_dir, file.collection, file.rel
+                        "{}/{}/{}",
+                        base.remote_root(&self.data_dir),
+                        file.collection,
+                        file.rel
                     ),
                     local,
                 });
@@ -1719,7 +1811,7 @@ impl SftpTransport {
             }
             let limit = downloaded + chunk_listed + DOWNLOAD_SLACK_BYTES;
             self.run_download("read", &ops, tmp, limit).await?;
-            downloaded += self.check_chunk(&files[start..next], tmp)?;
+            downloaded += self.check_chunk(base, &files[start..next], tmp)?;
         }
         Ok(())
     }
@@ -1744,7 +1836,12 @@ impl SftpTransport {
     /// Any failure once step 2 began is followed by one best-effort
     /// [`winps::BUNDLE_CLEAN`] call; when that fails too, its reason is
     /// appended to the original error. An empty `files` costs nothing.
-    async fn fetch_bundled(&self, files: &[&FoundFile], tmp: &Path) -> Result<(), CoreError> {
+    async fn fetch_bundled(
+        &self,
+        base: &ReadBase,
+        files: &[&FoundFile],
+        tmp: &Path,
+    ) -> Result<(), CoreError> {
         if files.is_empty() {
             return Ok(());
         }
@@ -1772,7 +1869,7 @@ impl SftpTransport {
             return Err(self.fail(format!("the read staging directory is unsafe: {why}")));
         }
         let ctl_native = windows_native_path(&ctl);
-        let ran = self.bundle_into(&ctl, &listed, tmp).await;
+        let ran = self.bundle_into(base, &ctl, &listed, tmp).await;
         let Err(err) = ran else {
             return Ok(());
         };
@@ -1810,6 +1907,7 @@ impl SftpTransport {
     /// dir `ctl` (sftp spelling).
     async fn bundle_into(
         &self,
+        base: &ReadBase,
         ctl: &str,
         listed: &[BundleFile],
         tmp: &Path,
@@ -1838,13 +1936,14 @@ impl SftpTransport {
 
         let limit = bundle::archive_limit(listed);
         let need = limit.saturating_add(bundle::STAGING_FREE_MARGIN);
-        let script = winps::WinScript::bundle(
+        let script = winps::WinScript::bundle_level(
             LONG_PATH_PREFIX,
-            &windows_native_path(&format!("{}/config/resources", self.data_dir)),
+            &windows_native_path(&base.remote_root(&self.data_dir)),
             &windows_native_path(&remote_list),
             &windows_native_path(&remote_zip),
             &list_sha,
             need,
+            base.bundle_level(),
         );
         let value = self.read_powershell(&script).await.map_err(|e| match e {
             CoreError::TransportFailed { detail, .. } => self.fail(format!(
@@ -1852,7 +1951,7 @@ impl SftpTransport {
             )),
             other => other,
         })?;
-        let z = self.bundle_result(&value, listed, need)?;
+        let z = self.bundle_result(base, &value, listed, need)?;
         if z > limit {
             return Err(self.fail(format!(
                 "the read archive is {z} bytes, more than the {limit} bytes the listed files can take; it was not downloaded"
@@ -1892,7 +1991,7 @@ impl SftpTransport {
         })
         .await
         .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?
-        .map_err(|why| self.fail(why))?;
+        .map_err(|why| self.fail(base.rename_extract_error(&why)))?;
         drop(archive_dir);
         Ok(())
     }
@@ -1901,6 +2000,7 @@ impl SftpTransport {
     /// error for any other answer.
     fn bundle_result(
         &self,
+        base: &ReadBase,
         value: &serde_json::Value,
         listed: &[BundleFile],
         need: u64,
@@ -1929,8 +2029,8 @@ impl SftpTransport {
                 },
                 Some("missing") => match file_at("i") {
                     Some(file) => self.fail(format!(
-                        "config/resources/{} is not on the host any more; it changed while it was read",
-                        file.name()
+                        "{} is not on the host any more; it changed while it was read",
+                        base.shown(&file.name())
                     )),
                     None => malformed(),
                 },
@@ -1938,13 +2038,13 @@ impl SftpTransport {
                     // BUNDLE stops one byte past the listed size, so a
                     // larger `n` is a lower bound, not the file's size
                     (Some(file), Some(n)) if n > file.size => self.fail(format!(
-                        "config/resources/{} is more than the {} bytes it was listed as; it changed while it was read",
-                        file.name(),
+                        "{} is more than the {} bytes it was listed as; it changed while it was read",
+                        base.shown(&file.name()),
                         file.size
                     )),
                     (Some(file), Some(n)) => self.fail(format!(
-                        "config/resources/{} is {n} bytes but was listed as {}; it changed while it was read",
-                        file.name(),
+                        "{} is {n} bytes but was listed as {}; it changed while it was read",
+                        base.shown(&file.name()),
                         file.size
                     )),
                     _ => malformed(),
@@ -1957,14 +2057,19 @@ impl SftpTransport {
 
     /// The delivered size of each file of a finished chunk must be exactly
     /// the listed size (and within the per-file cap); returns the bytes.
-    fn check_chunk(&self, chunk: &[&FoundFile], tmp: &Path) -> Result<u64, CoreError> {
+    fn check_chunk(
+        &self,
+        base: &ReadBase,
+        chunk: &[&FoundFile],
+        tmp: &Path,
+    ) -> Result<u64, CoreError> {
         let mut bytes = 0u64;
         for file in chunk {
             let local = file
                 .rel
                 .split('/')
                 .fold(tmp.join(&file.collection), |p, c| p.join(c));
-            let shown = format!("config/resources/{}/{}", file.collection, file.rel);
+            let shown = base.shown(&file.name());
             let meta = match std::fs::symlink_metadata(&local) {
                 Ok(meta) => meta,
                 // reported with the other missing files by the final check
@@ -1975,9 +2080,10 @@ impl SftpTransport {
                 return Err(self.fail(format!("{shown} was downloaded as a non-regular file")));
             }
             let len = meta.len();
-            if len > READ_MAX_FILE_BYTES {
+            if len > base.max_file() {
                 return Err(self.fail(format!(
-                    "{shown} is {len} bytes, over the {READ_MAX_FILE_BYTES} byte file cap"
+                    "{shown} is {len} bytes, over the {} byte file cap",
+                    base.max_file()
                 )));
             }
             if len != file.size {
@@ -2271,9 +2377,11 @@ impl SftpTransport {
                 .filter(|f| f.collection != LOCAL_COLLECTION)
                 .collect();
             if self.bundle_reads {
-                self.fetch_bundled(&fetch, tmp.path()).await?;
+                self.fetch_bundled(&ReadBase::Resources, &fetch, tmp.path())
+                    .await?;
             } else {
-                self.fetch_files(&fetch, tmp.path()).await?;
+                self.fetch_files(&ReadBase::Resources, &fetch, tmp.path())
+                    .await?;
             }
 
             let label = self.label.clone();
@@ -4107,6 +4215,8 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         clean_fail: bool,
         /// The bytes of every list BUNDLE read, in call order.
         bundle_lists: Vec<Vec<u8>>,
+        /// The parameters of every BUNDLE call, in call order.
+        bundle_params: Vec<serde_json::Value>,
         /// How many times BUNDLE_CLEAN ran.
         clean_calls: usize,
     }
@@ -4456,6 +4566,7 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             let list_path = fake_path(&text("l"));
             let zip_path = fake_path(&text("z"));
             let need = params["f"].as_u64().expect("free bytes needed");
+            self.knobs().bundle_params.push(params.clone());
             if let Some(code) = self.knobs().bundle_fail {
                 // killed mid-build: the list and a partial archive stay
                 self.put(&zip_path, Node::File(b"PK\x03".to_vec()));
@@ -9337,6 +9448,138 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             "{:?}",
             whole.elapsed()
         );
+    }
+
+    /// 27-11: a Windows node fetches the object files of a gateway `.git` as
+    /// one archive: one `get`, a fixed number of connections whatever the
+    /// count, entries stored (`c = NoCompression`), the host base named in
+    /// `b`, the staging dir gone, every file byte-identical in the
+    /// destination.
+    #[tokio::test]
+    async fn windows_git_objects_fetch_is_one_archive() {
+        use crate::deploy::git_objects::GitObjectFile;
+        use crate::deploy::transport::projects::GitHostRead;
+        let git = format!("{WDATA}/projects/CapApp/.git");
+        let mut counts = Vec::new();
+        for count in [3u32, 60] {
+            let fake = windows_fake();
+            let mut files = Vec::new();
+            for i in 0..count {
+                let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
+                let body = format!("object {i}");
+                fake.file(&format!("{git}/{rel}"), &body);
+                files.push(GitObjectFile {
+                    rel,
+                    size: body.len() as u64,
+                });
+            }
+            let pack = format!("objects/pack/pack-{}.pack", "c".repeat(40));
+            fake.file(&format!("{git}/{pack}"), "PACKDATA");
+            files.push(GitObjectFile { rel: pack, size: 8 });
+            let t = windows_transport(&fake);
+            let dest = tempfile::tempdir().expect("dest");
+            t.fetch_git_objects("CapApp", &files, dest.path())
+                .await
+                .expect("fetch");
+            for file in &files {
+                let got = std::fs::read(dest.path().join(&file.rel)).expect("copy");
+                assert_eq!(got.len() as u64, file.size, "{}", file.rel);
+            }
+            assert_eq!(
+                std::fs::read(dest.path().join(&files[0].rel)).expect("first"),
+                b"object 0"
+            );
+            assert_eq!(
+                get_lines(&fake).len(),
+                1,
+                "one `get` for {} files",
+                files.len()
+            );
+            let n = connections(&fake);
+            assert!(n <= 8, "{n} connections");
+            assert_eq!(t.sessions(), n);
+            assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
+            assert_writes_below_home(&fake);
+            let params = fake.knobs().bundle_params.clone();
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0]["c"], "NoCompression", "objects are stored");
+            assert_eq!(params[0]["b"], "C:\\gw\\data\\projects\\CapApp\\.git");
+            counts.push(n);
+        }
+        assert_eq!(counts[0], counts[1], "O(1) in the object count");
+
+        // the resource reads still ask for no level at all
+        let fake = windows_fake();
+        windows_tree(&fake);
+        windows_transport(&fake).read(&scope()).await.expect("read");
+        let params = fake.knobs().bundle_params.clone();
+        assert!(!params.is_empty());
+        for p in &params {
+            assert!(p.get("c").is_none(), "no level sent: {p}");
+            assert_eq!(p["b"], "C:\\gw\\data\\config\\resources");
+        }
+    }
+
+    /// 27-11: the archive of a Windows object read is hostile data: a size
+    /// the archive declares that is not the listed one, an entry nobody
+    /// asked for and a name outside the fixed shapes refuse before anything
+    /// is installed, naming the host path of the git read (never
+    /// `config/resources`), and the staging dir goes.
+    #[tokio::test]
+    async fn windows_git_objects_fetch_refuses_a_hostile_archive() {
+        use crate::deploy::git_objects::GitObjectFile;
+        use crate::deploy::transport::projects::GitHostRead;
+        let git = format!("{WDATA}/projects/CapApp/.git");
+        let rel = format!("objects/ab/{}", "1".repeat(38));
+        let other = format!("objects/cd/{}", "2".repeat(38));
+        let file = GitObjectFile {
+            rel: rel.clone(),
+            size: 4,
+        };
+        for (entries, want) in [
+            (vec![(rel.clone(), b"12345".to_vec())], "but was listed as"),
+            (
+                vec![(rel.clone(), b"1234".to_vec()), (other, b"x".to_vec())],
+                "which was not listed",
+            ),
+            (vec![(format!("../{rel}"), b"1234".to_vec())], "`..`"),
+            (
+                vec![(rel.replace('/', "\\"), b"1234".to_vec())],
+                "backslash",
+            ),
+        ] {
+            let fake = windows_fake();
+            fake.file(&format!("{git}/{rel}"), "1234");
+            fake.knobs().bundle_archive = Some(zip_of(&entries));
+            let t = windows_transport(&fake);
+            let dest = tempfile::tempdir().expect("dest");
+            let err = t
+                .fetch_git_objects("CapApp", std::slice::from_ref(&file), dest.path())
+                .await
+                .expect_err("hostile archive");
+            let why = detail(err);
+            assert!(why.contains(want), "{want}: {why}");
+            assert!(
+                !why.contains("config/resources"),
+                "names the git read, not the resources: {why}"
+            );
+            assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
+            assert_eq!(
+                std::fs::read_dir(dest.path()).expect("ls").count(),
+                0,
+                "nothing installed"
+            );
+        }
+        // the declared-size refusal names the host path of the git read
+        let fake = windows_fake();
+        fake.file(&format!("{git}/{rel}"), "1234");
+        fake.knobs().bundle_archive = Some(zip_of(&[(rel.clone(), b"12345".to_vec())]));
+        let dest = tempfile::tempdir().expect("dest");
+        let err = windows_transport(&fake)
+            .fetch_git_objects("CapApp", std::slice::from_ref(&file), dest.path())
+            .await
+            .expect_err("size");
+        assert!(detail(err).contains(&format!("projects/CapApp/.git/{rel}")));
     }
 
     /// T-dl1-01: entry names the host controls. Each is refused by its name
