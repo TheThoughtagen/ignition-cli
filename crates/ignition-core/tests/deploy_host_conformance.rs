@@ -3097,8 +3097,11 @@ fn every_row_runs_against_the_local_host() {
 // `GitHostRead` / `GitStateWriter` run the same rows through the local
 // filesystem implementation and through the POSIX scripts of `SftpTransport`
 // (the local `sftp-server` and `sh`), so the two answer identically for the
-// same `.git`. 27-09 adds the Windows arm where the table runs the Windows
-// bodies under `pwsh`.
+// same `.git`. 27-09 adds the Windows arm: a `SftpTransport` that believes it
+// talks to a Windows host runs the Windows scripts (`winps::GIT_*`) under the
+// local `pwsh`, with the parameters mapped from native Windows spellings to
+// this machine's paths (`common::pwsh_exec::PwshRunner`). The rows print
+// `PWSH-RAN <row>` or `PWSH-SKIPPED <row> (no pwsh)`.
 
 #[cfg(unix)]
 mod git_rows {
@@ -3168,6 +3171,30 @@ mod git_rows {
                 let data = posix_root(&fx.data_dir.display().to_string()).expect("posix root");
                 let home_root = posix_root(&home.path().display().to_string()).expect("home");
                 SftpTransport::new(shell, data, "nodes.sh").with_home(&home_root)
+            };
+            GitCtx {
+                read: Box::new(build()),
+                write: Box::new(build()),
+                ledger: home.path().to_path_buf(),
+                _home: Some(home),
+                fx,
+            }
+        }
+
+        /// The Windows arm: the Windows scripts under the local `pwsh`.
+        pub fn pwsh() -> GitCtx {
+            let fx = GitFixture::new();
+            let home = tempfile::tempdir().expect("home");
+            let build = || {
+                let shell = RemoteShell::local_sftp_server(
+                    &common::sftp_server::sftp_server_path(),
+                    Arc::new(common::pwsh_exec::PwshRunner),
+                    std::time::Duration::from_secs(120),
+                )
+                .local_exec();
+                let data = posix_root(&fx.data_dir.display().to_string()).expect("posix root");
+                let home_root = posix_root(&home.path().display().to_string()).expect("home");
+                SftpTransport::new_windows(shell, data, "nodes.pwsh").with_home(&home_root)
             };
             GitCtx {
                 read: Box::new(build()),
@@ -3486,6 +3513,31 @@ mod git_rows {
         conformance_git_sh_git_size_matches_manifest, GitCtx::posix, git_size_matches_manifest;
     }
 
+    macro_rules! git_pwsh_row_tests {
+        ($($name:ident, $row:ident;)*) => {
+            $(
+                #[tokio::test]
+                async fn $name() {
+                    if !common::pwsh_exec::gate(stringify!($row)) {
+                        return;
+                    }
+                    let ctx = GitCtx::pwsh();
+                    $row(&ctx).await;
+                }
+            )*
+        };
+    }
+
+    git_pwsh_row_tests! {
+        conformance_git_pwsh_git_state_reads_same, git_state_reads_same;
+        conformance_git_pwsh_git_save_restore_round_trip, git_save_restore_round_trip;
+        conformance_git_pwsh_git_restore_refuses_present, git_restore_refuses_present;
+        conformance_git_pwsh_git_write_lock_refuses, git_write_lock_refuses;
+        conformance_git_pwsh_git_probe_denied_names_path, git_probe_denied_names_path;
+        conformance_git_pwsh_git_save_rm_refuses_foreign_path, git_save_rm_refuses_foreign_path;
+        conformance_git_pwsh_git_size_matches_manifest, git_size_matches_manifest;
+    }
+
     /// Every row has a test for each host, so a row added without wiring fails
     /// here.
     #[test]
@@ -3504,6 +3556,8 @@ mod git_rows {
                 let wired = format!("conformance_git_{host}_{row}, GitCtx::");
                 assert!(source.contains(&wired), "row {row} is not run on {host}");
             }
+            let wired = format!("conformance_git_pwsh_{row}, {row};");
+            assert!(source.contains(&wired), "row {row} is not run on pwsh");
         }
     }
 }

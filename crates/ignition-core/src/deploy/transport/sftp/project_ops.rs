@@ -127,7 +127,7 @@ use crate::deploy::transport::projects::{
     git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
-use crate::deploy::transport::winps::{WinScript, windows_component_problem};
+use crate::deploy::transport::winps::{LONG_PATH_PREFIX, WinScript, windows_component_problem};
 use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
 
@@ -1190,9 +1190,11 @@ impl SftpTransport {
 // match, 6 for the gateway-account ACL step. Every non-zero exit is
 // `transport_failed` naming the operation, with the script's stderr tail.
 //
-// The Windows arm of every method below fails closed until 27-09 replaces it:
-// `transport_failed` naming the operation, never an absent `.git` and never an
-// empty answer.
+// The Windows arm of every method is a WinScript (27-09), one per operation,
+// built from native paths and base64 JSON parameters only. The script answers
+// `ok: 1` and the fields of its doc; anything else (a missing field, `ok: 0`)
+// is `transport_failed` naming the operation, never an absent `.git` and never
+// an empty answer.
 
 /// The `$0` the git scripts run under.
 const GIT_SCRIPT_NAME: &str = "ign-git";
@@ -1201,17 +1203,38 @@ const GIT_SCRIPT_NAME: &str = "ign-git";
 /// whole `.git`) may run.
 const GIT_HEAVY_LIMIT: std::time::Duration = std::time::Duration::from_secs(900);
 
-/// What a `.git` operation on a Windows node says until 27-09.
-const WINDOWS_GIT_PENDING: &str = "the git host operations are not available on a Windows ssh node yet; the request was refused, not answered empty";
-
 /// The state files' caps the scripts ask for (one byte past each cap, so the
 /// caller's cap check names a file that is over).
 const STATE_SMALL_READ: usize = crate::deploy::git_state::GIT_SMALL_FILE_MAX + 1;
 
 impl SftpTransport {
-    /// A refused Windows call (27-09 replaces every use).
-    fn git_windows_pending(&self, op: &str) -> CoreError {
-        self.mirror_fail(op, format!("{op}: {WINDOWS_GIT_PENDING}"))
+    /// Run one git WinScript and require `ok == 1` in its answer.
+    async fn git_win(
+        &self,
+        op: &str,
+        script: WinScript,
+        limit: std::time::Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        let answer = self.shell.exec_powershell_within(&script, limit).await?;
+        if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
+            return Err(self.git_unusable(op, "ok is not 1"));
+        }
+        Ok(answer)
+    }
+
+    /// The native spelling of the data directory of a Windows node.
+    fn win_data(&self) -> String {
+        windows_native_path(&self.data_dir)
+    }
+
+    /// The native `.git` of `project` on a Windows node.
+    fn win_git(&self, project: &str) -> String {
+        format!("{}\\projects\\{project}\\.git", self.win_data())
+    }
+
+    /// The native account home of a Windows node.
+    async fn win_home(&self) -> Result<String, CoreError> {
+        Ok(windows_native_path(&self.account_home().await?))
     }
 
     /// The names gateway, project and run id as safe components on this host's
@@ -1226,6 +1249,13 @@ impl SftpTransport {
             return Some(format!(
                 "{location}: the run id is not 1 to 128 characters of [A-Za-z0-9._-]"
             ));
+        }
+        // the run id is a directory name too: `CON` or a trailing dot is not
+        // a name Windows keeps
+        if self.windows
+            && let Some(why) = windows_component_problem(run_id)
+        {
+            return Some(format!("{location}: the run id: {why}"));
         }
         None
     }
@@ -1292,6 +1322,22 @@ impl SftpTransport {
                 })
             }
             _ => Err(self.git_unusable(op, "files, bytes or digest is missing or malformed")),
+        }
+    }
+
+    /// The digest of a `git_file_digest` answer: `null` or 64 lowercase hex.
+    fn git_digest_of(&self, answer: &serde_json::Value) -> Result<Option<String>, CoreError> {
+        match answer.get("digest") {
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(hex))
+                if hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                Ok(Some(hex.clone()))
+            }
+            _ => Err(self.git_unusable("git_file_digest", "the digest")),
         }
     }
 
@@ -1388,7 +1434,7 @@ impl SftpTransport {
     }
 
     /// `git.yaml` in the data directory, one capped `get`.
-    async fn read_git_yaml_posix(&self) -> Result<Option<Vec<u8>>, CoreError> {
+    async fn read_git_yaml_file(&self) -> Result<Option<Vec<u8>>, CoreError> {
         let bad = |problem: String| CoreError::DeployRunInvalid {
             run_id: "unknown".to_string(),
             problem: format!("git.yaml: {problem}"),
@@ -1418,7 +1464,15 @@ impl GitHostRead for SftpTransport {
             return Err(self.fail(why));
         }
         if self.windows {
-            return Err(self.git_windows_pending("read_git_state"));
+            let kind = self.git_entry_windows(project).await?;
+            if kind != GitEntry::Directory {
+                return Ok(GitFiles::without_contents(kind));
+            }
+            let script = WinScript::git_state(&self.win_git(project), GIT_MARKERS);
+            let answer = self
+                .git_win("read_git_state", script, self.shell.op_timeout())
+                .await?;
+            return self.git_files_of("read_git_state", &answer);
         }
         let kind = self.git_entry_posix(project).await?;
         if kind != GitEntry::Directory {
@@ -1443,7 +1497,11 @@ impl GitHostRead for SftpTransport {
             return Err(self.fail(why));
         }
         if self.windows {
-            return Err(self.git_windows_pending("git_manifest"));
+            let script = WinScript::git_manifest(LONG_PATH_PREFIX, &self.win_git(project));
+            let answer = self
+                .git_win("git_manifest", script, GIT_HEAVY_LIMIT)
+                .await?;
+            return self.git_manifest_of("git_manifest", &answer);
         }
         let rel = Self::git_rel(project);
         let answer = self
@@ -1465,7 +1523,13 @@ impl GitHostRead for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("save_manifest", gateway, project, run_id)?;
         if self.windows {
-            return Err(self.git_windows_pending("save_manifest"));
+            let home = self.win_home().await?;
+            let repo = git_save_rel(gateway, project, run_id).replace('/', "\\");
+            let script = WinScript::git_manifest(LONG_PATH_PREFIX, &format!("{home}\\{repo}"));
+            let answer = self
+                .git_win("save_manifest", script, GIT_HEAVY_LIMIT)
+                .await?;
+            return self.git_manifest_of("save_manifest", &answer);
         }
         let home = self.account_home().await?;
         let rel = git_save_rel(gateway, project, run_id);
@@ -1491,7 +1555,11 @@ impl GitHostRead for SftpTransport {
         name.check_shape()
             .map_err(|why| self.fail(format!("a .git file name is refused: {why}")))?;
         if self.windows {
-            return Err(self.git_windows_pending("git_file_digest"));
+            let script = WinScript::git_digest(&self.win_git(project), &name.rel());
+            let answer = self
+                .git_win("git_file_digest", script, self.shell.op_timeout())
+                .await?;
+            return self.git_digest_of(&answer);
         }
         let (rel, file) = (Self::git_rel(project), name.rel());
         let answer = self
@@ -1502,35 +1570,28 @@ impl GitHostRead for SftpTransport {
                 self.shell.op_timeout(),
             )
             .await?;
-        match answer.get("digest") {
-            Some(serde_json::Value::Null) => Ok(None),
-            Some(serde_json::Value::String(hex))
-                if hex.len() == 64
-                    && hex
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
-            {
-                Ok(Some(hex.clone()))
-            }
-            _ => Err(self.git_unusable("git_file_digest", "the digest")),
-        }
+        self.git_digest_of(&answer)
     }
 
     async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
-        if self.windows {
-            return Err(self.git_windows_pending("read_git_yaml"));
-        }
-        self.read_git_yaml_posix().await
+        self.read_git_yaml_file().await
     }
 
     async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
         self.git_names_check("free_bytes", gateway, project, "free")?;
-        if self.windows {
-            return Err(self.git_windows_pending("free_bytes"));
-        }
-        let home = self.account_home().await?;
         let repo = git_save_rel(gateway, project, "free");
         let dir = repo.strip_suffix("/free/repo").unwrap_or(&repo).to_string();
+        if self.windows {
+            let script = WinScript::git_free(&self.win_home().await?, &dir);
+            let answer = self
+                .git_win("free_bytes", script, self.shell.op_timeout())
+                .await?;
+            return answer
+                .get("free")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| self.git_unusable("free_bytes", "the free byte count"));
+        }
+        let home = self.account_home().await?;
         let answer = self
             .git_run(
                 "free_bytes",
@@ -1549,24 +1610,39 @@ impl GitHostRead for SftpTransport {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));
         }
-        if self.windows {
-            return Err(self.git_windows_pending("git_size"));
-        }
-        let rel = Self::git_rel(project);
-        let answer = self
-            .git_run(
+        let answer = if self.windows {
+            let script = WinScript::git_size(LONG_PATH_PREFIX, &self.win_git(project));
+            self.git_win("git_size", script, self.shell.op_timeout())
+                .await?
+        } else {
+            let rel = Self::git_rel(project);
+            self.git_run(
                 "git_size",
                 GIT_SIZE_SH,
                 &[&self.data_dir, &rel],
                 self.shell.op_timeout(),
             )
-            .await?;
+            .await?
+        };
         let files = answer.get("files").and_then(serde_json::Value::as_u64);
         let bytes = answer.get("bytes").and_then(serde_json::Value::as_u64);
         match (files.map(usize::try_from), bytes) {
             (Some(Ok(files)), Some(bytes)) => Ok(GitSize { files, bytes }),
             _ => Err(self.git_unusable("git_size", "the count or the size")),
         }
+    }
+}
+
+/// The suffix of the lock or temporary sibling a write is staged as: packs go
+/// through `.ign-tmp`, every other file through `.lock`. [`winps::GIT_LOCK`]
+/// derives the same name from the same rule (anything below `objects/pack/`),
+/// and `git_lock_suffix_matches_the_script_rule` pins the two together.
+///
+/// [`winps::GIT_LOCK`]: crate::deploy::transport::winps::GIT_LOCK
+pub(super) fn git_lock_suffix(name: &GitWriteName) -> &'static str {
+    match name {
+        GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => ".ign-tmp",
+        _ => ".lock",
     }
 }
 
@@ -1589,7 +1665,16 @@ impl GitStateWriter for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
         if self.windows {
-            return Err(self.git_windows_pending("save_git"));
+            let script = WinScript::git_save(
+                LONG_PATH_PREFIX,
+                &self.win_data(),
+                project,
+                &self.win_home().await?,
+                gateway,
+                run_id,
+            );
+            let answer = self.git_win("save_git", script, GIT_HEAVY_LIMIT).await?;
+            return self.git_manifest_of("save_git", &answer);
         }
         let home = self.account_home().await?;
         let (rel, dir) = (
@@ -1615,7 +1700,16 @@ impl GitStateWriter for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
         if self.windows {
-            return Err(self.git_windows_pending("restore_git"));
+            let script = WinScript::git_restore(
+                LONG_PATH_PREFIX,
+                &self.win_data(),
+                project,
+                &self.win_home().await?,
+                gateway,
+                run_id,
+            );
+            let answer = self.git_win("restore_git", script, GIT_HEAVY_LIMIT).await?;
+            return self.git_manifest_of("restore_git", &answer);
         }
         let home = self.account_home().await?;
         let (project_rel, dir) = (
@@ -1646,11 +1740,17 @@ impl GitStateWriter for SftpTransport {
                 self.mirror_fail("write", format!("a .git write is refused: {why}"))
             })?;
             let rel = write.name.rel();
-            let suffix = match write.name {
-                GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => ".ign-tmp",
-                _ => ".lock",
-            };
-            let lock = format!("{rel}{suffix}");
+            if self.windows {
+                for component in rel.split('/') {
+                    if let Some(why) = windows_component_problem(component) {
+                        return Err(self.mirror_fail(
+                            "write",
+                            format!("{rel} cannot be a Windows path: {why}"),
+                        ));
+                    }
+                }
+            }
+            let lock = format!("{rel}{}", git_lock_suffix(&write.name));
             safe_remote_path(&format!("{git}/{lock}")).map_err(|why| {
                 self.mirror_fail(
                     "write",
@@ -1659,27 +1759,30 @@ impl GitStateWriter for SftpTransport {
             })?;
             plan.push((rel, lock, write));
         }
-        if self.windows {
-            return Err(self.git_windows_pending("write_git_files"));
-        }
         if plan.is_empty() {
             return Ok(());
         }
         let rel = Self::git_rel(project);
         let limit = self.shell.op_timeout();
-        let mut lock_args = vec![self.data_dir.as_str(), rel.as_str(), "lock"];
-        for (target, lock, _) in &plan {
-            lock_args.push(target);
-            lock_args.push(lock);
-        }
         // 1. Every lock exclusively (a lock that exists refuses, nothing is
         //    written), creating the missing parent directories.
-        self.git_run("write_git_files", GIT_LOCK_SH, &lock_args, limit)
-            .await?;
+        if self.windows {
+            let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
+            let script = WinScript::git_lock(&self.win_git(project), false, &targets);
+            self.git_win("write_git_files", script, limit).await?;
+        } else {
+            let mut lock_args = vec![self.data_dir.as_str(), rel.as_str(), "lock"];
+            for (target, lock, _) in &plan {
+                lock_args.push(target);
+                lock_args.push(lock);
+            }
+            self.git_run("write_git_files", GIT_LOCK_SH, &lock_args, limit)
+                .await?;
+        }
         // 2. The bytes over sftp into the locks.
         let staged = match self.stage_git_writes(&plan) {
             Ok(staged) => staged,
-            Err(err) => return Err(self.unlock_git_writes(err, &rel, &plan).await),
+            Err(err) => return Err(self.unlock_git_writes(err, project, &rel, &plan).await),
         };
         let ops: Vec<SftpOp> = staged
             .1
@@ -1690,21 +1793,33 @@ impl GitStateWriter for SftpTransport {
             })
             .collect();
         if let Err(err) = self.run_batch("write", ops).await {
-            return Err(self.unlock_git_writes(err, &rel, &plan).await);
+            return Err(self.unlock_git_writes(err, project, &rel, &plan).await);
         }
         // 3. Each lock over its file, after a size check.
-        let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
-        let mut replace_args = vec![self.data_dir.as_str(), rel.as_str()];
-        for (s, size) in staged.1.iter().zip(&sizes) {
-            replace_args.push(&s.target);
-            replace_args.push(&s.lock);
-            replace_args.push(size);
-        }
-        if let Err(err) = self
-            .git_run("write_git_files", GIT_REPLACE_SH, &replace_args, limit)
-            .await
-        {
-            return Err(self.unlock_git_writes(err, &rel, &plan).await);
+        let replaced = if self.windows {
+            let writes: Vec<(String, u64)> = staged
+                .1
+                .iter()
+                .map(|s| (s.target.clone(), s.size as u64))
+                .collect();
+            let script = WinScript::git_replace(&self.win_git(project), &writes, RENAME_RETRIES);
+            self.git_win("write_git_files", script, limit)
+                .await
+                .map(|_| ())
+        } else {
+            let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
+            let mut replace_args = vec![self.data_dir.as_str(), rel.as_str()];
+            for (s, size) in staged.1.iter().zip(&sizes) {
+                replace_args.push(&s.target);
+                replace_args.push(&s.lock);
+                replace_args.push(size);
+            }
+            self.git_run("write_git_files", GIT_REPLACE_SH, &replace_args, limit)
+                .await
+                .map(|_| ())
+        };
+        if let Err(err) = replaced {
+            return Err(self.unlock_git_writes(err, project, &rel, &plan).await);
         }
         drop(staged);
         Ok(())
@@ -1717,19 +1832,22 @@ impl GitStateWriter for SftpTransport {
         run_id: &str,
     ) -> Result<(), CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
-        if self.windows {
-            return Err(self.git_windows_pending("remove_git_save"));
-        }
-        let home = self.account_home().await?;
         let rel = git_save_rel(gateway, project, run_id);
-        let answer = self
-            .git_run(
+        let answer = if self.windows {
+            let script =
+                WinScript::git_save_rm(LONG_PATH_PREFIX, &self.win_home().await?, &rel, run_id);
+            self.git_win("remove_git_save", script, GIT_HEAVY_LIMIT)
+                .await?
+        } else {
+            let home = self.account_home().await?;
+            self.git_run(
                 "remove_git_save",
                 GIT_SAVE_RM_SH,
                 &[&home, &rel, run_id],
                 GIT_HEAVY_LIMIT,
             )
-            .await?;
+            .await?
+        };
         match answer.get("removed").and_then(serde_json::Value::as_u64) {
             Some(0 | 1) => Ok(()),
             _ => Err(self.git_unusable("remove_git_save", "the removal count")),
@@ -1746,10 +1864,21 @@ impl GitStateWriter for SftpTransport {
                 "the run id is not 1 to 128 characters of [A-Za-z0-9._-]",
             ));
         }
-        if self.windows {
-            return Err(self.git_windows_pending("probe_write"));
+        if self.windows
+            && let Some(why) = windows_component_problem(run_id)
+        {
+            return Err(self.mirror_fail("write", format!("the run id: {why}")));
         }
         let (project_rel, probe) = (format!("projects/{project}"), git_probe_name(run_id));
+        if self.windows {
+            self.git_win(
+                "probe_write",
+                WinScript::git_probe(&self.win_data(), project, &probe),
+                self.shell.op_timeout(),
+            )
+            .await?;
+            return Ok(());
+        }
         self.git_run(
             "probe_write",
             GIT_PROBE_W_SH,
@@ -1807,9 +1936,18 @@ impl SftpTransport {
     async fn unlock_git_writes(
         &self,
         err: CoreError,
+        project: &str,
         rel: &str,
         plan: &[(String, String, &GitWrite)],
     ) -> CoreError {
+        if self.windows {
+            let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
+            let script = WinScript::git_lock(&self.win_git(project), true, &targets);
+            let _ = self
+                .git_win("write_git_files", script, self.shell.op_timeout())
+                .await;
+            return err;
+        }
         let mut args = vec![self.data_dir.as_str(), rel, "unlock"];
         for (target, lock, _) in plan {
             args.push(target);
@@ -2369,56 +2507,327 @@ mod tests {
         ("GIT_FREE_SH", GIT_FREE_SH),
     ];
 
-    /// 27-08: until 27-09 every Windows arm fails closed with
-    /// `transport_failed` naming the operation, and starts no process.
+    /// The parameters a Windows git script was sent with: the base64 JSON blob
+    /// inside the UTF-16LE `-EncodedCommand` of one recorded ssh argv.
+    fn win_params(argv: &[String]) -> serde_json::Value {
+        use base64::Engine as _;
+        let command = argv.last().expect("a command");
+        let encoded = command
+            .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+            .unwrap_or_else(|| panic!("not an encoded command: {command}"));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16(&units).expect("utf16");
+        let from = text.find("FromBase64String('").expect("params") + "FromBase64String('".len();
+        let blob = &text[from..from + text[from..].find('\'').expect("end")];
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .expect("blob");
+        serde_json::from_slice(&json).expect("json")
+    }
+
+    const WIN_MANIFEST: &str = "IGN-RESULT:{\"ok\":1,\"files\":3,\"bytes\":42,\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n";
+
+    fn win_host(outs: Vec<ProcessOutput>) -> (Arc<Scripted>, SftpTransport) {
+        let (runner, t) = host(outs, true);
+        (runner, t.with_home("/C:/Users/svc"))
+    }
+
+    /// 27-09: every Windows arm is one script over the encoded PowerShell
+    /// route, with native paths and the names as data, and nothing of the
+    /// sftp spelling left.
     #[tokio::test]
-    async fn sftp_git_windows_arms_fail_closed() {
-        let (runner, t) = host(Vec::new(), true);
+    async fn sftp_git_windows_arms_run_one_script_each() {
+        let name = GitWriteName::Head;
+        // (what ran, its answer, the parameters it must carry)
+        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        let m = t.git_manifest("CapApp").await.expect("manifest");
+        assert_eq!((m.files, m.bytes), (3, 42));
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(p["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
+        assert_eq!(p["x"], "\\\\?\\");
+
+        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        t.save_manifest("gw", "CapApp", "r1")
+            .await
+            .expect("save manifest");
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(
+            p["a"],
+            "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\git-save\\r1\\repo"
+        );
+
+        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        t.save_git("gw", "CapApp", "r1").await.expect("save");
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        for (key, want) in [
+            ("d", "C:\\gw\\data"),
+            ("j", "CapApp"),
+            ("h", "C:\\Users\\svc"),
+            ("g", "gw"),
+            ("i", "r1"),
+        ] {
+            assert_eq!(p[key], want, "{key}");
+        }
+
+        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        t.restore_git("gw", "CapApp", "r1").await.expect("restore");
+        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
+
+        let (runner, t) = win_host(vec![ok(
+            "IGN-RESULT:{\"ok\":1,\"digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}\n",
+        )]);
+        let digest = t.git_file_digest("CapApp", &name).await.expect("digest");
+        assert_eq!(digest.as_deref().map(str::len), Some(64));
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(p["f"], "HEAD");
+        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"digest\":null}\n")]);
+        assert_eq!(
+            t.git_file_digest("CapApp", &name).await.expect("none"),
+            None
+        );
+
+        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"files\":7,\"bytes\":9}\n")]);
+        let size = t.git_size("CapApp").await.expect("size");
+        assert_eq!((size.files, size.bytes), (7, 9));
+
+        let (runner, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"free\":123}\n")]);
+        assert_eq!(t.free_bytes("gw", "CapApp").await.expect("free"), 123);
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(p["s"], "ign-deploy/gw/projects/CapApp/git-save");
+
+        let (runner, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"removed\":1}\n")]);
+        t.remove_git_save("gw", "CapApp", "r1")
+            .await
+            .expect("remove");
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(p["r"], "ign-deploy/gw/projects/CapApp/git-save/r1/repo");
+        assert_eq!(p["i"], "r1");
+
+        let (runner, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1}\n")]);
+        t.probe_write("CapApp", "r1").await.expect("probe");
+        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(p["d"], "C:\\gw\\data");
+        assert_eq!(p["j"], "CapApp");
+        assert_eq!(p["n"], ".ign-probe-r1");
+
+        // state: the probe, then one script, with the marker names as data
+        let state = "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":3,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[\"shallow\"],\"refs\":[]}\n";
+        let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), ok(state)]);
+        let files = t.read_git_state("CapApp").await.expect("state");
+        assert!(files.index_present);
+        assert_eq!(files.markers, ["shallow"]);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 2);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
+        assert_eq!(p["m"].as_array().map(Vec::len), Some(GIT_MARKERS.len()));
+        // a `.git` that is not a directory is answered by kind, never read
+        let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "file", 0, 0))]);
+        let files = t.read_git_state("CapApp").await.expect("file");
+        assert_eq!(files, GitFiles::without_contents(GitEntry::File));
+        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
+    }
+
+    /// Every Windows arm refuses an answer that does not say `ok: 1` with the
+    /// fields it needs, and a failed script is `transport_failed`.
+    #[tokio::test]
+    async fn sftp_git_windows_answers_are_checked_strictly() {
         let write = [GitWrite {
             name: GitWriteName::Head,
             bytes: vec![1],
         }];
         let name = GitWriteName::Head;
-        let results = [
-            (
-                "read_git_state",
-                t.read_git_state("CapApp").await.map(|_| ()),
-            ),
-            ("git_manifest", t.git_manifest("CapApp").await.map(|_| ())),
-            (
-                "save_manifest",
-                t.save_manifest("gw", "CapApp", "r1").await.map(|_| ()),
-            ),
-            (
-                "git_file_digest",
-                t.git_file_digest("CapApp", &name).await.map(|_| ()),
-            ),
-            ("read_git_yaml", t.read_git_yaml().await.map(|_| ())),
-            ("free_bytes", t.free_bytes("gw", "CapApp").await.map(|_| ())),
-            ("git_size", t.git_size("CapApp").await.map(|_| ())),
-            (
-                "save_git",
-                t.save_git("gw", "CapApp", "r1").await.map(|_| ()),
-            ),
-            (
-                "restore_git",
-                t.restore_git("gw", "CapApp", "r1").await.map(|_| ()),
-            ),
-            ("write_git_files", t.write_git_files("CapApp", &write).await),
-            (
-                "remove_git_save",
-                t.remove_git_save("gw", "CapApp", "r1").await,
-            ),
-            ("probe_write", t.probe_write("CapApp", "r1").await),
+        let bad_answers = [
+            "IGN-RESULT:{\"ok\":0}\n",
+            "IGN-RESULT:{}\n",
+            "IGN-RESULT:{\"ok\":1}\n",
+            "IGN-RESULT:{\"ok\":1,\"files\":3,\"bytes\":42}\n",
+            "IGN-RESULT:{\"ok\":1,\"files\":3,\"bytes\":42,\"digest\":\"short\"}\n",
+            "IGN-RESULT:{\"ok\":1,\"digest\":\"nothex\"}\n",
+            "IGN-RESULT:{\"ok\":1,\"free\":\"a lot\"}\n",
+            "no result\n",
         ];
-        for (op, result) in results {
-            let why = detail(result.expect_err(op));
-            assert!(why.contains(op), "{op}: {why}");
+        for answer in bad_answers {
+            let (_, t) = win_host(vec![ok(answer)]);
+            assert!(t.git_manifest("CapApp").await.is_err(), "manifest {answer}");
+            if !answer.contains("\"files\":3") {
+                // (an answer with a count and a size is a good size answer)
+                let (_, t) = win_host(vec![ok(answer)]);
+                assert!(t.git_size("CapApp").await.is_err(), "size {answer}");
+            }
+            let (_, t) = win_host(vec![ok(answer)]);
+            assert!(
+                t.save_git("gw", "CapApp", "r1").await.is_err(),
+                "save {answer}"
+            );
+            let (_, t) = win_host(vec![ok(answer)]);
+            assert!(
+                t.restore_git("gw", "CapApp", "r1").await.is_err(),
+                "restore {answer}"
+            );
+            let (_, t) = win_host(vec![ok(answer)]);
+            assert!(
+                t.git_file_digest("CapApp", &name).await.is_err(),
+                "digest {answer}"
+            );
+            let (_, t) = win_host(vec![ok(answer)]);
+            assert!(t.free_bytes("gw", "CapApp").await.is_err(), "free {answer}");
         }
-        assert!(
-            runner.argv.lock().expect("argv").is_empty(),
-            "a refused Windows call starts no process"
-        );
+        for answer in ["IGN-RESULT:{\"ok\":0}\n", "IGN-RESULT:{\"ok\":1}\n", "x\n"] {
+            // `removed` must be 0 or 1; the probe and the lock need ok == 1
+            let (_, t) = win_host(vec![ok(answer)]);
+            let removed = t.remove_git_save("gw", "CapApp", "r1").await;
+            assert!(removed.is_err(), "remove {answer}");
+        }
+        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":0}\n")]);
+        assert!(t.probe_write("CapApp", "r1").await.is_err());
+        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":0}\n")]);
+        assert!(t.write_git_files("CapApp", &write).await.is_err());
+        // a state answer with a marker the host may not report, or no index
+        let bad_state = [
+            "IGN-RESULT:{\"ok\":1,\"head\":null,\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[\"evil\"],\"refs\":[]}\n",
+            "IGN-RESULT:{\"ok\":1,\"head\":null,\"config\":null,\"packed\":null,\"log\":null,\"markers\":[],\"refs\":[]}\n",
+            "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":9,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[],\"refs\":[]}\n",
+        ];
+        for answer in bad_state {
+            let (_, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), ok(answer)]);
+            assert!(t.read_git_state("CapApp").await.is_err(), "state {answer}");
+        }
+        // a script that died is transport_failed
+        let died = ProcessOutput {
+            stdout: Vec::new(),
+            stderr: b"Exception: the project already has a .git\n".to_vec(),
+            code: 1,
+            timed_out: false,
+        };
+        let (_, t) = win_host(vec![died]);
+        let err = t.restore_git("gw", "CapApp", "r1").await.expect_err("died");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    /// The names are checked on the Windows rules before any script runs.
+    #[tokio::test]
+    async fn sftp_git_windows_names_are_checked_before_any_script() {
+        for hostile in ["CON", "a:b", "trail.", "a<b", "a/b", ".."] {
+            let (runner, t) = win_host(Vec::new());
+            let write = [GitWrite {
+                name: GitWriteName::Head,
+                bytes: vec![1],
+            }];
+            assert!(t.git_manifest(hostile).await.is_err(), "{hostile}");
+            assert!(t.git_size(hostile).await.is_err(), "{hostile}");
+            assert!(t.read_git_state(hostile).await.is_err(), "{hostile}");
+            assert!(t.save_git("gw", hostile, "r1").await.is_err(), "{hostile}");
+            assert!(
+                t.save_git(hostile, "CapApp", "r1").await.is_err(),
+                "{hostile}"
+            );
+            assert!(
+                t.save_git("gw", "CapApp", hostile).await.is_err(),
+                "{hostile}"
+            );
+            assert!(
+                t.restore_git("gw", hostile, "r1").await.is_err(),
+                "{hostile}"
+            );
+            assert!(
+                t.remove_git_save("gw", "CapApp", hostile).await.is_err(),
+                "{hostile}"
+            );
+            assert!(t.probe_write(hostile, "r1").await.is_err(), "{hostile}");
+            assert!(
+                t.write_git_files(hostile, &write).await.is_err(),
+                "{hostile}"
+            );
+            assert!(
+                runner.argv.lock().expect("argv").is_empty(),
+                "{hostile:?} started a process"
+            );
+        }
+        // a ref name Windows cannot hold is refused before any lock is made
+        let (runner, t) = win_host(Vec::new());
+        let write = [GitWrite {
+            name: GitWriteName::BranchRef("con".to_string()),
+            bytes: vec![1],
+        }];
+        let err = t.write_git_files("CapApp", &write).await.expect_err("con");
+        assert!(detail(err).contains("Windows"), "names the Windows rule");
+        assert!(runner.argv.lock().expect("argv").is_empty());
+    }
+
+    /// The lock name Rust uploads to is the name the script locks: packs
+    /// through `.ign-tmp`, everything else through `.lock`, decided by the
+    /// `objects/pack/` prefix on both sides.
+    #[test]
+    fn git_lock_suffix_matches_the_script_rule() {
+        use crate::deploy::transport::winps::{GIT_LOCK, GIT_REPLACE};
+        let hash = "a".repeat(40);
+        let packs = [
+            GitWriteName::PackFile(hash.clone()),
+            GitWriteName::PackIndex(hash),
+        ];
+        let others = [
+            GitWriteName::Head,
+            GitWriteName::Config,
+            GitWriteName::Index,
+            GitWriteName::BranchRef("feature/x".to_string()),
+            GitWriteName::RemoteRef {
+                remote: "origin".to_string(),
+                branch: "main".to_string(),
+            },
+        ];
+        for name in &packs {
+            assert_eq!(git_lock_suffix(name), ".ign-tmp");
+            assert!(name.rel().starts_with("objects/pack/"));
+        }
+        for name in &others {
+            assert_eq!(git_lock_suffix(name), ".lock");
+            assert!(!name.rel().starts_with("objects/pack/"));
+        }
+        for script in [GIT_LOCK, GIT_REPLACE] {
+            assert!(
+                script.contains("if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'}"),
+                "the script derives the lock name by the same rule"
+            );
+        }
+    }
+
+    /// A Windows write is the lock script, one sftp batch and the replace
+    /// script (the sftp client cannot create a file exclusively), and a failed
+    /// replace takes the locks away again.
+    #[tokio::test]
+    async fn sftp_git_windows_write_is_lock_put_replace() {
+        let write = [GitWrite {
+            name: GitWriteName::BranchRef("production".to_string()),
+            bytes: b"0123\n".to_vec(),
+        }];
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
+        let (runner, t) = win_host(vec![ok_answer(), ok(""), ok_answer()]);
+        t.write_git_files("CapApp", &write).await.expect("write");
+        let argv = runner.argv.lock().expect("argv").clone();
+        assert_eq!(argv.len(), 3, "lock, put, replace");
+        let lock = win_params(&argv[0]);
+        assert_eq!(lock["m"], "lock");
+        assert_eq!(lock["w"][0], "refs/heads/production");
+        let replace = win_params(&argv[2]);
+        assert_eq!(replace["w"][0], "refs/heads/production:5");
+        assert_eq!(replace["q"], RENAME_RETRIES);
+
+        // a replace that fails unlocks: lock, put, replace (fails), unlock
+        let (runner, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            ok("IGN-RESULT:{\"ok\":0}\n"),
+            ok_answer(),
+        ]);
+        assert!(t.write_git_files("CapApp", &write).await.is_err());
+        let argv = runner.argv.lock().expect("argv").clone();
+        assert_eq!(argv.len(), 4);
+        assert_eq!(win_params(&argv[3])["m"], "unlock");
     }
 
     /// The git scripts run under the local `sh`, with shims standing in for

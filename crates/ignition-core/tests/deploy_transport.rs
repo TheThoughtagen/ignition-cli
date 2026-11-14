@@ -4648,3 +4648,583 @@ mod sftp_git {
         );
     }
 }
+
+/// The Windows git scripts of 27-09 (`winps::GIT_*`): their size against the
+/// command budget, their parameter discipline, and their behaviour under the
+/// local `pwsh` against the same fixture the POSIX and local implementations
+/// are held to.
+mod winps_git {
+    use super::*;
+    use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
+    use common::pwsh_exec;
+    use ignition_core::deploy::git_state::{GIT_MARKERS, GitFiles};
+    use ignition_core::deploy::transport::projects::{GitHostRead, GitManifest};
+    use ignition_core::deploy::transport::winps::{self, COMMAND_BUDGET, WinScript};
+    use ignition_core::deploy::tree::sha256_hex;
+    use serde_json::Value;
+
+    const RUN: &str = "20261114T101500Z-ab12";
+
+    fn s(path: &Path) -> String {
+        path.display().to_string()
+    }
+
+    /// Every constructor, with maximal realistic parameters: the Windows
+    /// install's data directory, a 100-character project, 48-character gateway
+    /// and run names, a long `.git` path.
+    fn maximal() -> Vec<WinScript> {
+        let prefix = winps::LONG_PATH_PREFIX;
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let home = "C:\\Users\\svc-ignition-deploy";
+        let project = "P".repeat(100);
+        let (gateway, run) = ("G".repeat(48), "R".repeat(48));
+        let git = format!("{data}\\projects\\{project}\\.git");
+        let save_rel = format!("ign-deploy/{gateway}/projects/{project}/git-save/{run}");
+        // twelve files named like SHA-1 packs: more than any advance writes
+        // (one pack and its index, two refs, HEAD, index)
+        let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
+        let writes: Vec<String> = (0..12).map(|_| pack.clone()).collect();
+        let sized: Vec<(String, u64)> = writes.iter().map(|w| (w.clone(), 123_456_789)).collect();
+        vec![
+            WinScript::git_state(&git, GIT_MARKERS),
+            WinScript::git_save(prefix, data, &project, home, &gateway, &run),
+            WinScript::git_restore(prefix, data, &project, home, &gateway, &run),
+            WinScript::git_manifest(prefix, &git),
+            WinScript::git_size(prefix, &git),
+            WinScript::git_digest(
+                &git,
+                &format!("refs/remotes/{}/{}", "o".repeat(40), "b".repeat(80)),
+            ),
+            WinScript::git_lock(&git, false, &writes),
+            WinScript::git_lock(&git, true, &writes),
+            WinScript::git_replace(&git, &sized, 3),
+            WinScript::git_probe(data, &project, &format!(".ign-probe-{}", "R".repeat(128))),
+            WinScript::git_save_rm(prefix, home, &format!("{save_rel}/repo"), &run),
+            WinScript::git_free(home, &save_rel),
+        ]
+    }
+
+    #[test]
+    fn winps_git_scripts_fit_budget() {
+        let scripts = maximal();
+        assert_eq!(scripts.len(), 12);
+        for script in &scripts {
+            let command = winps::encoded_command(script, COMMAND_BUDGET)
+                .unwrap_or_else(|why| panic!("{}: {why}", script.name));
+            let used = command.as_str().chars().count();
+            println!(
+                "winps_git_scripts_fit_budget {}: {used} of {COMMAND_BUDGET}",
+                script.name
+            );
+            assert!(used <= COMMAND_BUDGET, "{}", script.name);
+        }
+        // eight SHA-256 pack names fit too
+        let sha256: Vec<String> = (0..8)
+            .map(|i| format!("objects/pack/pack-{}{i}.pack", "b".repeat(63)))
+            .collect();
+        let script = WinScript::git_lock("C:\\gw\\data\\projects\\CapApp\\.git", false, &sha256);
+        assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_ok());
+        // a lock list that cannot fit is refused before anything is sent,
+        // never truncated
+        let many: Vec<String> = (0..60)
+            .map(|i| format!("objects/pack/pack-{}-{i}.pack", "a".repeat(40)))
+            .collect();
+        let script = WinScript::git_lock("C:\\gw\\data\\projects\\CapApp\\.git", false, &many);
+        assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_err());
+    }
+
+    #[test]
+    fn winps_git_params_only() {
+        let bodies = [
+            ("GIT_STATE", winps::GIT_STATE),
+            ("GIT_SAVE", winps::GIT_SAVE),
+            ("GIT_RESTORE", winps::GIT_RESTORE),
+            ("GIT_MANIFEST", winps::GIT_MANIFEST),
+            ("GIT_SIZE", winps::GIT_SIZE),
+            ("GIT_DIGEST", winps::GIT_DIGEST),
+            ("GIT_LOCK", winps::GIT_LOCK),
+            ("GIT_REPLACE", winps::GIT_REPLACE),
+            ("GIT_PROBE", winps::GIT_PROBE),
+            ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
+            ("GIT_FREE", winps::GIT_FREE),
+        ];
+        for (name, body) in bodies {
+            assert!(!body.contains('\n'), "{name}: one line");
+            // no host path or drive in the text: paths exist only as `$p.*`
+            for drive in ["C:\\", "c:\\", "\\\\?\\", "/Users", "/home", "/tmp"] {
+                assert!(!body.contains(drive), "{name} holds a path ({drive})");
+            }
+            // nothing that evaluates or re-parses text
+            for forbidden in [
+                "Invoke-Expression",
+                "iex ",
+                "Invoke-Command",
+                "Start-Process",
+                "-Command",
+                "cmd ",
+                "Add-Type",
+                "[scriptblock]::Create",
+            ] {
+                assert!(!body.contains(forbidden), "{name} holds {forbidden}");
+            }
+            // a double-quoted string never carries a parameter: a parameter
+            // value inside quotes would be parsed as script
+            let mut quoted = false;
+            let mut at = 0;
+            let bytes: Vec<char> = body.chars().collect();
+            let mut text = String::new();
+            while at < bytes.len() {
+                let c = bytes[at];
+                if c == '\'' && !quoted {
+                    // skip a single-quoted literal
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != '\'' {
+                        at += 1;
+                    }
+                } else if c == '"' {
+                    if quoted {
+                        assert!(
+                            !text.contains("$p."),
+                            "{name}: a parameter inside a double-quoted string: {text}"
+                        );
+                        text.clear();
+                    }
+                    quoted = !quoted;
+                } else if quoted {
+                    text.push(c);
+                }
+                at += 1;
+            }
+            assert!(!quoted, "{name}: balanced quotes");
+            // the parameters are decoded from the base64 blob, never spliced
+            assert!(
+                !body.contains("FromBase64String"),
+                "{name}: the blob is the command's"
+            );
+        }
+        // a hostile value is data: it is inside the encoding and not in the
+        // text of the command
+        let odd = "it's$(x)`;y\"z";
+        let script = WinScript::git_probe("C:\\gw\\data", odd, ".ign-probe-r1");
+        let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
+        assert!(!command.as_str().contains("it's"));
+        assert_eq!(script.params["j"], odd);
+    }
+
+    /// The manifest answer as the host-independent value.
+    fn manifest_of(answer: &Value) -> GitManifest {
+        GitManifest {
+            files: answer["files"].as_u64().expect("files") as usize,
+            bytes: answer["bytes"].as_u64().expect("bytes"),
+            digest: answer["digest"].as_str().expect("digest").to_string(),
+        }
+    }
+
+    fn b64(text: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .expect("base64")
+    }
+
+    fn file_of(value: &Value) -> Option<Vec<u8>> {
+        if value.is_null() {
+            None
+        } else {
+            Some(b64(value["b"].as_str().expect("bytes")))
+        }
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_state() {
+        if !pwsh_exec::gate("pwsh_git_state") {
+            return;
+        }
+        let fx = GitFixture::new();
+        std::fs::write(fx.git_dir().join("index.lock"), "").expect("lock");
+        std::fs::write(fx.git_dir().join("MERGE_HEAD"), "x\n").expect("merge");
+        fx.git_in_project(&["branch", "feature/x"]);
+        fx.git_in_project(&["branch", "feature-y"]);
+        fx.git_in_project(&["pack-refs", "--all"]);
+        fx.git_in_project(&["branch", "late"]);
+        let local: GitFiles = fx.node().read_git_state(PROJECT).await.expect("local");
+        let markers: Vec<&str> = GIT_MARKERS.to_vec();
+        let answer = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
+            .expect("the state script");
+        assert_eq!(answer["ok"], 1);
+        assert_eq!(file_of(&answer["head"]), local.head);
+        assert_eq!(file_of(&answer["config"]), local.config);
+        assert_eq!(file_of(&answer["packed"]), local.packed_refs);
+        assert_eq!(file_of(&answer["log"]), local.head_log_tail);
+        assert_eq!(answer["index"], local.index_present);
+        let mut marks: Vec<String> = answer["markers"]
+            .as_array()
+            .expect("markers")
+            .iter()
+            .map(|m| m.as_str().expect("marker").to_string())
+            .collect();
+        let mut want = local.markers.clone();
+        marks.sort();
+        want.sort();
+        assert_eq!(marks, want);
+        let mut refs: Vec<(String, Vec<u8>)> = answer["refs"]
+            .as_array()
+            .expect("refs")
+            .iter()
+            .map(|r| {
+                (
+                    String::from_utf8(b64(r["p"].as_str().expect("name"))).expect("utf8"),
+                    file_of(r).expect("bytes"),
+                )
+            })
+            .collect();
+        let mut want = local.loose_refs.clone();
+        refs.sort();
+        want.sort();
+        assert_eq!(refs, want);
+        assert!(
+            refs.iter().any(|(name, _)| name == "refs/heads/late"),
+            "a loose ref after the pack: {refs:?}"
+        );
+        // a missing file is null, never an empty string
+        std::fs::remove_file(fx.git_dir().join("packed-refs")).expect("rm");
+        let again =
+            pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers)).expect("run");
+        assert!(again["packed"].is_null());
+        // a link in the way is a refusal, not an absent file
+        let head = fx.git_dir().join("HEAD");
+        std::fs::rename(&head, fx.git_dir().join("HEAD.real")).expect("rename");
+        std::os::unix::fs::symlink("HEAD.real", &head).expect("symlink");
+        let why = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
+            .expect_err("a linked HEAD");
+        assert!(why.contains("not a regular file"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_size() {
+        if !pwsh_exec::gate("pwsh_git_size") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let local = fx.node().git_size(PROJECT).await.expect("local size");
+        let manifest = fx.node().git_manifest(PROJECT).await.expect("manifest");
+        let answer = pwsh_exec::run(&WinScript::git_size("", &s(&fx.git_dir()))).expect("size");
+        assert_eq!(answer["ok"], 1);
+        assert_eq!(answer["files"].as_u64(), Some(local.files as u64));
+        assert_eq!(answer["bytes"].as_u64(), Some(local.bytes));
+        assert_eq!(local.files, manifest.files);
+        assert_eq!(local.bytes, manifest.bytes);
+        // a link anywhere inside refuses
+        std::os::unix::fs::symlink(fx.data_dir.clone(), fx.git_dir().join("refs/loop"))
+            .expect("link");
+        let why = pwsh_exec::run(&WinScript::git_size("", &s(&fx.git_dir()))).expect_err("link");
+        assert!(why.contains("link"), "{why}");
+    }
+
+    /// The manifest of a Windows script is the one the local walk computes,
+    /// for names that sort differently by walk and by whole path.
+    #[tokio::test]
+    async fn pwsh_git_manifest_equals_local() {
+        if !pwsh_exec::gate("pwsh_git_manifest_equals_local") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let heads = fx.git_dir().join("refs/heads");
+        std::fs::create_dir_all(heads.join("a")).expect("dir");
+        std::fs::write(heads.join("a/b"), "1\n").expect("a/b");
+        std::fs::write(heads.join("a-b"), "2\n").expect("a-b");
+        std::fs::write(heads.join("caf\u{e9}"), "3\n").expect("accent");
+        std::fs::write(heads.join("empty"), "").expect("empty");
+        std::fs::write(fx.git_dir().join("objects/zero"), "").expect("zero");
+        let local = fx.node().git_manifest(PROJECT).await.expect("local");
+        let answer =
+            pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).expect("manifest");
+        assert_eq!(manifest_of(&answer), local);
+        // an empty directory has the digest of nothing, like the other hosts
+        let empty = fx.data_dir.join("empty-tree");
+        std::fs::create_dir_all(&empty).expect("empty");
+        let answer = pwsh_exec::run(&WinScript::git_manifest("", &s(&empty))).expect("empty");
+        assert_eq!(answer["files"], 0);
+        assert_eq!(answer["digest"], sha256_hex(b""));
+        // a link or a name with a control character refuses
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("link")).expect("link");
+        assert!(pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).is_err());
+        std::fs::remove_file(fx.git_dir().join("link")).expect("rm");
+        std::fs::write(fx.git_dir().join("bad\u{7}name"), "x").expect("bell");
+        assert!(pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).is_err());
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_save_restore() {
+        if !pwsh_exec::gate("pwsh_git_save_restore") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        let local = fx.node().git_manifest(PROJECT).await.expect("local");
+        let save = || WinScript::git_save("", &data, PROJECT, &home_s, GATEWAY, RUN);
+        let restore = || WinScript::git_restore("", &data, PROJECT, &home_s, GATEWAY, RUN);
+
+        let saved = pwsh_exec::run(&save()).expect("save");
+        assert_eq!(manifest_of(&saved), local, "the save equals the source");
+        let repo = home
+            .path()
+            .join("ign-deploy")
+            .join(GATEWAY)
+            .join("projects")
+            .join(PROJECT)
+            .join("git-save")
+            .join(RUN)
+            .join("repo");
+        assert!(repo.join("HEAD").is_file());
+        // a save is never overwritten
+        let why = pwsh_exec::run(&save()).expect_err("second save");
+        assert!(why.contains("already exists"), "{why}");
+        // and the failed second save left the first alone
+        assert_eq!(
+            manifest_of(&pwsh_exec::run(&WinScript::git_manifest("", &s(&repo))).expect("m")),
+            local
+        );
+
+        // restore refuses while `.git` exists
+        let why = pwsh_exec::run(&restore()).expect_err("restore over .git");
+        assert!(why.contains("never replaced"), "{why}");
+        assert_eq!(
+            fx.node().git_manifest(PROJECT).await.expect("intact"),
+            local
+        );
+
+        // the import deletes `.git`; the restore brings it back, equal
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let back = pwsh_exec::run(&restore()).expect("restore");
+        assert_eq!(manifest_of(&back), local, "the restore equals the save");
+        assert_eq!(fx.node().git_manifest(PROJECT).await.expect("after"), local);
+        let stage = fx.project_dir().join(format!(".ign-restore-{RUN}"));
+        assert!(!stage.exists(), "no stage is left behind");
+
+        // a planted stage (a link) is refused and its target is left alone
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let target = fx.data_dir.join("elsewhere");
+        std::fs::create_dir_all(&target).expect("target");
+        std::os::unix::fs::symlink(&target, &stage).expect("plant");
+        let why = pwsh_exec::run(&restore()).expect_err("planted stage");
+        assert!(why.contains("already exists"), "{why}");
+        assert_eq!(
+            std::fs::read_dir(&target).expect("ls").count(),
+            0,
+            "nothing written through"
+        );
+        assert!(!fx.git_dir().exists(), "nothing was restored");
+        std::fs::remove_file(&stage).expect("unplant");
+
+        // a restore proves the copy: a save changed behind the script's back
+        // after the manifest cannot be seen from here, but a save that is not
+        // a real directory is refused
+        let moved = repo.with_file_name("repo-real");
+        std::fs::rename(&repo, &moved).expect("move");
+        std::os::unix::fs::symlink(&moved, &repo).expect("link repo");
+        assert!(
+            pwsh_exec::run(&restore()).is_err(),
+            "a linked repo is refused"
+        );
+        assert!(!fx.git_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_refuses_links_and_foreign_paths() {
+        if !pwsh_exec::gate("pwsh_git_refuses_links_and_foreign_paths") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        // a link inside `.git` refuses the save and leaves no `repo`
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("link")).expect("link");
+        let why = pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect_err("save with a link");
+        assert!(why.contains("link"), "{why}");
+        let run_dir = home.path().join(format!(
+            "ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}"
+        ));
+        assert!(!run_dir.join("repo").exists(), "no partial save");
+        std::fs::remove_file(fx.git_dir().join("link")).expect("rm link");
+
+        // a link on the way into the save path refuses
+        std::fs::create_dir_all(home.path().join("ign-deploy")).expect("dir");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        std::os::unix::fs::symlink(
+            elsewhere.path(),
+            home.path().join("ign-deploy").join(GATEWAY),
+        )
+        .expect("link");
+        let why = pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect_err("save through a link");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert_eq!(std::fs::read_dir(elsewhere.path()).expect("ls").count(), 0);
+        std::fs::remove_file(home.path().join("ign-deploy").join(GATEWAY)).expect("unlink");
+
+        // remove_git_save: a foreign path is refused before anything is touched
+        let saved = pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect("save");
+        assert_eq!(saved["ok"], 1);
+        let rel = format!("ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}");
+        for foreign in [
+            format!("{rel}/other"),
+            format!("{rel}/repo/objects"),
+            "ign-deploy/x/projects/y/git-save/other-run/repo".to_string(),
+            format!("../{rel}/repo"),
+            "repo".to_string(),
+        ] {
+            let why = pwsh_exec::run(&WinScript::git_save_rm("", &home_s, &foreign, RUN))
+                .expect_err(&foreign);
+            assert!(why.contains("refusing"), "{foreign}: {why}");
+        }
+        assert!(
+            run_dir.join("repo").is_dir(),
+            "the refusals removed nothing"
+        );
+        let removed = pwsh_exec::run(&WinScript::git_save_rm(
+            "",
+            &home_s,
+            &format!("{rel}/repo"),
+            RUN,
+        ))
+        .expect("remove");
+        assert_eq!(removed["removed"], 1);
+        assert!(!run_dir.exists(), "the empty run directory goes too");
+        let again = pwsh_exec::run(&WinScript::git_save_rm(
+            "",
+            &home_s,
+            &format!("{rel}/repo"),
+            RUN,
+        ))
+        .expect("absent");
+        assert_eq!(again["removed"], 0, "an absent save is a success");
+
+        // the probe: one file in each directory, removed; an existing one is
+        // refused and left
+        let probe = ".ign-probe-r1";
+        let ok = pwsh_exec::run(&WinScript::git_probe(&data, PROJECT, probe)).expect("probe");
+        assert_eq!(ok["ok"], 1);
+        assert!(!fx.project_dir().join(probe).exists());
+        assert!(!fx.git_dir().join(probe).exists());
+        std::fs::write(fx.git_dir().join(probe), "mine").expect("planted");
+        let why = pwsh_exec::run(&WinScript::git_probe(&data, PROJECT, probe))
+            .expect_err("planted probe");
+        assert!(
+            why.contains(".git"),
+            "names the directory that refused: {why}"
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join(probe)).expect("kept"),
+            b"mine"
+        );
+
+        // free space of a save root that does not exist yet
+        let free =
+            pwsh_exec::run(&WinScript::git_free(&home_s, &format!("{rel}/free"))).expect("free");
+        assert!(free["free"].as_u64().expect("free") > 0);
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_write_lock_replace_digest() {
+        if !pwsh_exec::gate("pwsh_git_write_lock_replace_digest") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let git = s(&fx.git_dir());
+        let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
+        let targets = vec![
+            "refs/heads/feature/new".to_string(),
+            "HEAD".to_string(),
+            pack.clone(),
+        ];
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+        let lock = pwsh_exec::run(&WinScript::git_lock(&git, false, &targets)).expect("lock");
+        assert_eq!(lock["ok"], 1);
+        for lock in [
+            "refs/heads/feature/new.lock",
+            "HEAD.lock",
+            &format!("{pack}.ign-tmp"),
+        ] {
+            assert!(fx.git_dir().join(lock).is_file(), "{lock}");
+        }
+        // a second writer is refused and the first one's locks stay
+        let why = pwsh_exec::run(&WinScript::git_lock(&git, false, &targets)).expect_err("held");
+        assert!(why.contains("already exists"), "{why}");
+        assert!(fx.git_dir().join("HEAD.lock").is_file());
+        // a lock call that fails halfway takes back what it made this call
+        std::fs::write(fx.git_dir().join("config.lock"), "").expect("foreign lock");
+        let both = vec!["refs/heads/other".to_string(), "config".to_string()];
+        assert!(pwsh_exec::run(&WinScript::git_lock(&git, false, &both)).is_err());
+        assert!(!fx.git_dir().join("refs/heads/other.lock").exists());
+        assert!(
+            fx.git_dir().join("config.lock").is_file(),
+            "a foreign lock is left"
+        );
+        std::fs::remove_file(fx.git_dir().join("config.lock")).expect("rm");
+
+        // the upload (here a plain write), then the replace
+        let new_head = b"ref: refs/heads/feature/new\n";
+        let new_ref = b"0123456789abcdef0123456789abcdef01234567\n";
+        let new_pack = vec![b'P'; 4096];
+        std::fs::write(fx.git_dir().join("HEAD.lock"), new_head).expect("head lock");
+        std::fs::write(fx.git_dir().join("refs/heads/feature/new.lock"), new_ref)
+            .expect("ref lock");
+        std::fs::write(fx.git_dir().join(format!("{pack}.ign-tmp")), &new_pack).expect("pack");
+        // a size that is not the size sent is refused
+        let wrong = vec![("HEAD".to_string(), new_head.len() as u64 + 1)];
+        let why = pwsh_exec::run(&WinScript::git_replace(&git, &wrong, 0)).expect_err("size");
+        assert!(why.contains("size"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before
+        );
+        let writes = vec![
+            ("refs/heads/feature/new".to_string(), new_ref.len() as u64),
+            ("HEAD".to_string(), new_head.len() as u64),
+            (pack.clone(), new_pack.len() as u64),
+        ];
+        let done = pwsh_exec::run(&WinScript::git_replace(&git, &writes, 2)).expect("replace");
+        assert_eq!(done["ok"], 1);
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            new_head
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("refs/heads/feature/new")).expect("ref"),
+            new_ref
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join(&pack)).expect("pack"),
+            new_pack
+        );
+        for gone in ["HEAD.lock", "refs/heads/feature/new.lock"] {
+            assert!(!fx.git_dir().join(gone).exists(), "{gone}");
+        }
+        // the read-back digest is the sha256 of what was written
+        let digest = pwsh_exec::run(&WinScript::git_digest(&git, "HEAD")).expect("digest");
+        assert_eq!(digest["digest"], sha256_hex(new_head));
+        let absent =
+            pwsh_exec::run(&WinScript::git_digest(&git, "refs/heads/none")).expect("absent");
+        assert!(absent["digest"].is_null());
+        let nodir = pwsh_exec::run(&WinScript::git_digest(&git, "no/dir/file")).expect("nodir");
+        assert!(nodir["digest"].is_null());
+        // unlock removes only locks that are regular files
+        let one = vec!["refs/heads/again".to_string()];
+        pwsh_exec::run(&WinScript::git_lock(&git, false, &one)).expect("lock");
+        pwsh_exec::run(&WinScript::git_lock(&git, true, &one)).expect("unlock");
+        assert!(!fx.git_dir().join("refs/heads/again.lock").exists());
+        // a link as a lock target is refused
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("refs/heads/linked")).expect("link");
+        let linked = vec!["refs/heads/linked".to_string()];
+        assert!(pwsh_exec::run(&WinScript::git_lock(&git, false, &linked)).is_err());
+    }
+}

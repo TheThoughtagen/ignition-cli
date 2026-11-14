@@ -3289,3 +3289,107 @@ fn git_prodshape_posix_size() {
         prodshape_within("git_prodshape_posix_size", took, HOST_LINUX_PREFLIGHT);
     });
 }
+
+/// The Windows git scripts (`winps::GIT_*`) under the local `pwsh` over the
+/// production-shape `.git`: size, save, and restore plus the manifest of the
+/// result, against the Windows host budgets. A runner without `pwsh` prints
+/// `PWSH-SKIPPED git_prodshape_pwsh_save_restore (no pwsh)`.
+///
+/// What the time means: the walk, the hashing, the manifest compare and the
+/// stage logic are the scripts' own and run here under PowerShell 7; the copy
+/// itself is the stand-in `robocopy` of `common::pwsh_exec` (a local `cp -R`),
+/// not robocopy. This row complements the Windows VM run
+/// (`wincap_git_scripts`), which times the real tool under PowerShell 5.1, and
+/// never replaces it.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_pwsh_save_restore() {
+    use common::pwsh_exec;
+    use ignition_core::deploy::transport::winps::WinScript;
+    use shape_git::{HOST_WINDOWS_PREFLIGHT, HOST_WINDOWS_RESTORE_VERIFY, HOST_WINDOWS_SAVE};
+    if !pwsh_exec::gate("git_prodshape_pwsh_save_restore") {
+        return;
+    }
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (data, home_s) = (
+            f.data_dir.display().to_string(),
+            home.path().display().to_string(),
+        );
+        let git = f.git_dir().display().to_string();
+        let reference = f.node().git_manifest(PROJECT).await.expect("reference");
+        let manifest_of = |answer: &serde_json::Value| {
+            (
+                answer["files"].as_u64().expect("files") as usize,
+                answer["bytes"].as_u64().expect("bytes"),
+                answer["digest"].as_str().expect("digest").to_string(),
+            )
+        };
+        let want = (reference.files, reference.bytes, reference.digest.clone());
+
+        // the preflight: one enumeration, no file read
+        let started = Instant::now();
+        let size = pwsh_exec::run(&WinScript::git_size("", &git)).expect("size");
+        let size_took = started.elapsed();
+        assert_eq!(size["files"].as_u64(), Some(reference.files as u64));
+        assert_eq!(size["bytes"].as_u64(), Some(reference.bytes));
+        prodshape_within("git_prodshape_pwsh_size", size_took, HOST_WINDOWS_PREFLIGHT);
+
+        let live = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("live manifest");
+        assert_eq!(
+            manifest_of(&live),
+            want,
+            "the Windows digest equals the local one"
+        );
+
+        let started = Instant::now();
+        let saved = pwsh_exec::run(&WinScript::git_save(
+            "",
+            &data,
+            PROJECT,
+            &home_s,
+            GATEWAY,
+            GIT_PRODSHAPE_RUN,
+        ))
+        .expect("save");
+        let save_took = started.elapsed();
+        assert_eq!(
+            manifest_of(&saved),
+            want,
+            "the save equals the gateway .git"
+        );
+        prodshape_within("git_prodshape_pwsh_save", save_took, HOST_WINDOWS_SAVE);
+
+        // the import deletes `.git`; restore plus the manifest of the result
+        std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
+        let started = Instant::now();
+        let back = pwsh_exec::run(&WinScript::git_restore(
+            "",
+            &data,
+            PROJECT,
+            &home_s,
+            GATEWAY,
+            GIT_PRODSHAPE_RUN,
+        ))
+        .expect("restore");
+        let after = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("manifest after");
+        let restore_took = started.elapsed();
+        assert_eq!(manifest_of(&back), want);
+        assert_eq!(manifest_of(&after), want);
+        prodshape_within(
+            "git_prodshape_pwsh_restore_verify",
+            restore_took,
+            HOST_WINDOWS_RESTORE_VERIFY,
+        );
+        eprintln!(
+            "git_prodshape_pwsh_save_restore: {} files, size {} ms, save {} ms, restore plus manifest {} ms",
+            reference.files,
+            size_took.as_millis(),
+            save_took.as_millis(),
+            restore_took.as_millis()
+        );
+    });
+}

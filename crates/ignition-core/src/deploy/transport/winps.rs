@@ -32,6 +32,20 @@
 //! - [`GIT_ENTRY`]: the `.git` probe of `deploy projects` (25-08, K9), one
 //!   `Get-Item -Force` per level, so a Hidden entry is seen and a denied one is
 //!   an error rather than "absent".
+//! - The git host channel (Phase 27, 27-09), one script per operation, every
+//!   path and name in `$p`: [`GIT_STATE`] (the fixed files in one pass),
+//!   [`GIT_SAVE`] and [`GIT_RESTORE`] (one host-local `robocopy` each, with the
+//!   manifest compare inside the script), [`GIT_MANIFEST`], [`GIT_SIZE`] (one
+//!   enumeration, no file read), [`GIT_DIGEST`], [`GIT_LOCK`] and
+//!   [`GIT_REPLACE`] (the lock-and-rename write; the sftp client cannot create
+//!   a file exclusively), [`GIT_PROBE`], [`GIT_SAVE_RM`] and [`GIT_FREE`]. They
+//!   run under Windows PowerShell 5.1 (the deploy account's ssh session) and
+//!   PowerShell 7 (the local tests), so they use neither `??` nor the ternary
+//!   operator. Each is built from shared pieces by `macro_rules!` so the text a
+//!   test runs is the text a host receives, and each must fit
+//!   [`COMMAND_BUDGET`] with realistic maximal parameters (the encoded command
+//!   is about 2.7 times the script text: one script is about 2,400 characters
+//!   at most); `winps_git_scripts_fit_budget` pins that.
 //!
 //! ## How a command is built
 //!
@@ -295,6 +309,204 @@ pub const GIT_ENTRY: &str = concat!(
     "E @{ok=1;projects=(W $a);project=(W $b);kind=$c.k;hidden=$c.h;reparse=$c.r}"
 );
 
+// Phase 27 (27-09): the Windows half of the git host channel. Each script is
+// one `const` built from shared pieces so the text a test runs is the text a
+// host receives; every path travels in `$p`.
+
+// ---- generated pieces (see the GIT_* docs) ----
+macro_rules! git_ps_base {
+    () => {
+        r##"$c=[IO.Path]::DirectorySeparatorChar;function Z($x){try{Get-Item -LiteralPath $x -Force}catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){throw}}};function K($i){if(!$i -or !$i.PSIsContainer -or (([int]$i.Attributes -band 1024) -ne 0)){throw 'a path is not a real directory'};$i};"##
+    };
+}
+macro_rules! git_ps_yc {
+    () => {
+        r##"function Yc($s,$d){& robocopy $s $d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ|Out-Null;if($LASTEXITCODE -ge 8){throw "robocopy failed with exit code $LASTEXITCODE"}};"##
+    };
+}
+macro_rules! git_ps_x {
+    () => {
+        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};"##
+    };
+}
+macro_rules! git_ps_m {
+    () => {
+        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function M($d){$d=$p.x+$d;$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=[long]0;$l=@();$s=New-Object Collections.Stack;$s.Push(@((New-Object IO.DirectoryInfo $d),''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()}};$l+=$r+"`0"+$v}}};$z=$l;[Array]::Sort($z,[StringComparer]::Ordinal);@{files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($(if($z.Length){($z-join"`n")+"`n"}else{''}))))}}"##
+    };
+}
+macro_rules! git_ps_l {
+    () => {
+        r##"function L($t){$g+$c+($t+$(if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'})).Replace('/',$c)};"##
+    };
+}
+
+/// The fixed files of a gateway's `.git` in one pass (Phase 27, 27-09), the
+/// Windows half of the POSIX `GIT_STATE_SH`: `HEAD`, `config`, `packed-refs`,
+/// the tail of `logs/HEAD`, whether `index` exists, the markers of
+/// [`GIT_MARKERS`](crate::deploy::git_state::GIT_MARKERS) that are present and
+/// every loose ref below `refs/heads` and `refs/remotes`.
+///
+/// Parameters (`$p`): `a` the native `.git` path, `m` the marker names. Each
+/// file is read with `FileShare.ReadWrite|Delete` (a running gateway is not
+/// blocked) and answered as `{n:size,b:base64}` or `null` when absent; a file
+/// is read up to one byte past its cap, so the caller's cap check names an
+/// oversized one. A reparse point, a directory where a file belongs or a name
+/// with a control character is a terminating error, never an absent file:
+/// presence is decided by `Get-Item -Force`, which throws unless the error is
+/// `ObjectNotFound` (the 25-03 captures). Loose refs stop at 4097 entries.
+pub const GIT_STATE: &str = concat!(
+    git_ps_base!(),
+    r##"$g=$p.a;K (Z $g)|Out-Null;function F($f,$k,$t){$q=$g+$c+$f.Replace('/',$c);$y=Z $q;if(!$y){return $null};if($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$f is not a regular file"};$n=$y.Length;$e=[int][Math]::Min([long]$n,[long]$k);$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{if($t -and $n -gt $e){[void]$s.Seek($n-$e,0)};$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};@{n=$n;b=[Convert]::ToBase64String($u,0,$o)}};$k=@();foreach($m in @($p.m)){if(Z ($g+$c+$m.Replace('/',$c))){$k+=$m}};$u=@();$z=0;foreach($d in 'refs/heads','refs/remotes'){$y=Z ($g+$c+$d.Replace('/',$c));if($y){K $y|Out-Null;$s=New-Object Collections.Stack;$s.Push(@($y,$d));while($s.Count -and $z -le 4097){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'refs holds a link or a name with a control character'};$r=$q[1]+'/'+$f.Name;if($a -band 16){$s.Push(@($f,$r))}else{$z++;if($z -le 4097){$v=F $r 65537 $false;$v.p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r));$u+=,$v}}}}}};E @{ok=1;head=(F 'HEAD' 65537 $false);config=(F 'config' 65537 $false);packed=(F 'packed-refs' 8388609 $false);log=(F 'logs/HEAD' 65536 $true);index=[bool](Z ($g+$c+'index'));markers=$k;refs=$u}"##,
+);
+
+/// Save a project's `.git` below the account home with ONE host-local copy
+/// (Phase 27, D-06): `robocopy /E /COPY:DAT /R:1 /W:1 /XJ`, the tool G4
+/// measured at 1.4 s for the production-shape `.git` (the same files as
+/// `Copy-Item` in a third of the restore time, and it carries attributes).
+///
+/// Parameters: `x` the long path prefix, `d` the native data directory, `j` the
+/// project, `h` the account home, `g` the gateway, `i` the run id; the paths
+/// are built in the script from those components so a long project name costs
+/// the command budget once. The script takes the manifest of the source first
+/// (it refuses a link or a name with a control character anywhere in the
+/// tree), walks `ign-deploy\<g>\projects\<j>\git-save\<i>` below the home
+/// (a reparse point on the way is refused, missing levels are created), makes
+/// `repo` with `New-Item`, which fails when anything is there (a save is never
+/// overwritten and a planted link is never written through), copies, carries
+/// the source's Hidden attribute to `repo` (robocopy copies the contents of a
+/// directory, not the directory's own attributes) and compares the manifest of
+/// the copy with the source's. A failure removes the partial `repo`
+/// (`Directory.Delete`, which does not follow a reparse point). The answer is
+/// the copy's manifest.
+pub const GIT_SAVE: &str = concat!(
+    git_ps_base!(),
+    git_ps_yc!(),
+    git_ps_m!(),
+    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){K $y|Out-Null}else{[IO.Directory]::CreateDirectory($q)|Out-Null}};$r=$q+$c+'repo';New-Item -ItemType Directory -Path $r|Out-Null;try{Yc $a $r;if(([int]$i.Attributes -band 2) -ne 0){[IO.File]::SetAttributes($r,[IO.File]::GetAttributes($r) -bor 2)};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{[IO.Directory]::Delete($p.x+$r,$true);throw};E @{ok=1;files=$n.files;bytes=$n.bytes;digest=$n.digest}"##,
+);
+
+/// Restore the save of a run as the project's `.git` (Phase 27, D-06):
+/// the staged copy, the manifest compare and one rename.
+///
+/// Parameters as [`GIT_SAVE`] (`d` is the data directory, `j` the project). It
+/// refuses when `.git` exists (it is never replaced), checks the project
+/// directory and every level of the save path are real directories, takes the
+/// manifest of the save, creates the stage `<project>\.ign-restore-<run>` with
+/// `New-Item` (which fails when anything is there), copies the save into it
+/// with robocopy, re-applies the Hidden attribute the save recorded (G8: the
+/// module's `.git` is Hidden; the stage is a new directory and robocopy would
+/// otherwise leave it visible), proves the stage equals the save and renames it
+/// to `.git` with `Directory.Move`, which fails when the target exists. The
+/// stage inherits the project directory's ACL, so the LocalSystem gateway
+/// account holds the FullControl G1 found. The answer is the manifest of the
+/// restored `.git`; a failure removes the stage.
+pub const GIT_RESTORE: &str = concat!(
+    git_ps_base!(),
+    git_ps_yc!(),
+    git_ps_m!(),
+    r##"$a=$p.d+$c+'projects'+$c+$p.j;K (Z $a)|Out-Null;$g=$a+$c+'.git';if(Z $g){throw 'the project already has a .git; it is never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;K (Z $q)|Out-Null};$r=$q+$c+'repo';$i=K (Z $r);$m=M $r;$t=$a+$c+'.ign-restore-'+$p.i;New-Item -ItemType Directory -Path $t|Out-Null;try{Yc $r $t;if(([int]$i.Attributes -band 2) -ne 0){[IO.File]::SetAttributes($t,[IO.File]::GetAttributes($t) -bor 2)};$n=M $t;if($n.digest -ne $m.digest){throw 'the restored copy does not match the save; nothing was restored'};[IO.Directory]::Move($t,$g)}catch{if([IO.Directory]::Exists($p.x+$t)){[IO.Directory]::Delete($p.x+$t,$true)};throw};$f=M $g;E @{ok=1;files=$f.files;bytes=$f.bytes;digest=$f.digest}"##,
+);
+
+/// The manifest of a tree: file count, total bytes and one digest (Phase 27).
+///
+/// Parameters: `x` the long path prefix, `a` the native directory (a project's
+/// `.git` or a save's `repo`). The digest is the SHA-256 over the lines `path
+/// NUL size LF` for every file below `objects/` and `path NUL sha256 LF` for
+/// every other file, sorted by the ordinal order of the whole path (the order
+/// `LC_ALL=C sort` and the local walk give for the ASCII names a `.git` holds),
+/// with `/` separators, so the three host families compute one value. The
+/// relative path is built from entry names during the walk (as in
+/// [`ENUMERATE`]); a reparse point or a name with a control character
+/// anywhere in the tree is a terminating error and nothing is followed. Files
+/// are hashed through a `FileShare.ReadWrite|Delete` stream.
+pub const GIT_MANIFEST: &str = concat!(
+    git_ps_base!(),
+    git_ps_m!(),
+    r##"$m=M $p.a;E @{ok=1;files=$m.files;bytes=$m.bytes;digest=$m.digest}"##,
+);
+
+/// How big a `.git` is, from one enumeration (Phase 27, checker W-5):
+/// file count and the sum of the file lengths. Parameters: `x`, `a` as
+/// [`GIT_MANIFEST`]. The directory listing carries each length, so no file is
+/// opened; a reparse point or a name with a control character is refused.
+pub const GIT_SIZE: &str = concat!(
+    git_ps_base!(),
+    r##"K (Z $p.a)|Out-Null;$s=New-Object Collections.Stack;$s.Push([IO.DirectoryInfo]($p.x+$p.a));$n=0;$b=[long]0;while($s.Count){foreach($f in $s.Pop().EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};if($a -band 16){$s.Push($f)}else{$n++;$b+=$f.Length}}};E @{ok=1;files=$n;bytes=$b}"##,
+);
+
+/// The SHA-256 of one file below a `.git` (Phase 27, the read-back of an
+/// advance's writes). Parameters: `a` the native `.git`, `f` the `/`-separated
+/// path below it. Every directory on the way must be a real directory; a
+/// missing level or file answers `digest:null`; a link or a directory in the
+/// file's place is refused.
+pub const GIT_DIGEST: &str = concat!(
+    git_ps_base!(),
+    git_ps_x!(),
+    r##"K (Z $p.a)|Out-Null;$q=$p.a;$o=0;$u=$p.f.Split('/');for($k=0;$k -lt $u.Length;$k++){$q+=$c+$u[$k];$y=Z $q;if(!$y){$o=1;break};if($k -lt $u.Length-1){K $y|Out-Null}elseif($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw 'the file is not a regular file'}};if($o){E @{ok=1;digest=$null}}else{$m=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{$d=X ([Security.Cryptography.SHA256]::Create().ComputeHash($m))}finally{$m.Dispose()};E @{ok=1;digest=$d}}"##,
+);
+
+/// Take (or give back) the `.lock` files of a `.git` write (Phase 27): the
+/// sftp client cannot create a file exclusively, so a script does it.
+///
+/// Parameters: `a` the native `.git`, `m` `lock` or `unlock`, `w` the paths
+/// below `.git` of the files to be written (the lock of a path below
+/// `objects/pack/` is `<path>.ign-tmp`, any other `<path>.lock`). `lock` makes
+/// every missing parent directory (a link on the way is refused), refuses a
+/// target that is not a regular file and creates each lock with
+/// `FileMode.CreateNew`, so a lock that exists (another writer) fails the call
+/// and the locks made so far are removed again. `unlock` removes the locks of
+/// `w` that are regular files.
+pub const GIT_LOCK: &str = concat!(
+    git_ps_base!(),
+    git_ps_l!(),
+    r##"$g=$p.a;K (Z $g)|Out-Null;if($p.m -eq 'unlock'){foreach($t in @($p.w)){$l=L $t;$y=Z $l;if($y -and !$y.PSIsContainer -and (([int]$y.Attributes -band 1024) -eq 0)){[IO.File]::Delete($l)}}}else{$made=@();try{foreach($t in @($p.w)){$u=$t.Split('/');$q=$g;for($k=0;$k -lt $u.Length-1;$k++){$q+=$c+$u[$k];$y=Z $q;if($y){K $y|Out-Null}else{[IO.Directory]::CreateDirectory($q)|Out-Null}};$y=Z ($g+$c+$t.Replace('/',$c));if($y -and ($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0))){throw "$t is not a regular file; it is left alone"};$l=L $t;$s=[IO.File]::Open($l,'CreateNew','Write','None');$s.Dispose();$made+=$l}}catch{foreach($l in $made){[IO.File]::Delete($l)};throw}};E @{ok=1}"##,
+);
+
+/// Put each uploaded lock over its target (Phase 27), after the sftp upload
+/// of [`GIT_LOCK`]'s files. Parameters: `a` the native `.git`, `w` entries
+/// `<path>:<size>`, `q` the retries. The lock must be a regular file of exactly
+/// the size that was sent; the target must be a regular file or absent. An
+/// existing target is replaced with `File.Replace` (atomic for readers), a new
+/// one is moved in; a sharing violation is retried `q` times a second apart
+/// and then fails, leaving the previous file in place. Not an `Add-Type`
+/// P/Invoke: nothing is compiled.
+pub const GIT_REPLACE: &str = concat!(
+    git_ps_base!(),
+    git_ps_l!(),
+    r##"$g=$p.a;K (Z $g)|Out-Null;foreach($e in @($p.w)){$k=$e.LastIndexOf(':');$t=$e.Substring(0,$k);$z=[long]$e.Substring($k+1);$l=L $t;$d=$g+$c+$t.Replace('/',$c);$y=Z $l;if(!$y -or $y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$t.lock is not a regular file"};if($y.Length -ne $z){throw "$t.lock is not the size that was sent"};$y=Z $d;if($y -and ($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0))){throw "$t is not a regular file; it is left alone"};for($n=0;;$n++){try{if($y){[IO.File]::Replace($l,$d,[NullString]::Value)}else{[IO.File]::Move($l,$d)};break}catch{if($n -ge $p.q){throw};Start-Sleep 1}}};E @{ok=1}"##,
+);
+
+/// Prove the grant before any other write (Phase 27): create exclusively and
+/// delete one probe file in the project directory and in its `.git`. Parameters:
+/// `d` the native data directory, `j` the project, `n` the probe file name. The
+/// error names which of the two directories refused (`projects/<j>` or
+/// `projects/<j>/.git`, as the POSIX script does); a probe file that already
+/// exists is refused and left alone.
+pub const GIT_PROBE: &str = concat!(
+    git_ps_base!(),
+    r##"function W($d,$t){K (Z $d)|Out-Null;$f=$d+$c+$p.n;try{$s=[IO.File]::Open($f,'CreateNew','Write','None');$s.Dispose()}catch{throw "a probe file cannot be created in $t"};[IO.File]::Delete($f)};$a=$p.d+$c+'projects'+$c+$p.j;W $a ('projects/'+$p.j);W ($a+$c+'.git') ('projects/'+$p.j+'/.git');E @{ok=1}"##,
+);
+
+/// Remove the `repo` tree of one save (Phase 27). Parameters: `x`, `h` the
+/// account home, `r` the path below it (`/`-separated), `i` the run id. A path
+/// that is not exactly `ign-deploy/<g>/projects/<p>/git-save/<i>/repo` is
+/// refused before anything is touched; every level must be a real directory (a
+/// missing level answers `removed:0`); `Directory.Delete(recursive)` does not
+/// follow a reparse point inside the tree. The empty run directory is then
+/// removed.
+pub const GIT_SAVE_RM: &str = concat!(
+    git_ps_base!(),
+    r##"$u=$p.r.Split('/');$n=$u.Length;if($n -lt 4 -or $u[0] -ne 'ign-deploy' -or $u[$n-1] -ne 'repo' -or $u[$n-2] -ne $p.i -or $u[$n-3] -ne 'git-save'){throw 'refusing a path that does not end in git-save/<run-id>/repo'};$q=$p.h;K (Z $q)|Out-Null;$o=1;foreach($e in $u){if($e -in '','.','..'){throw 'refusing an empty, . or .. component'};$q+=$c+$e;$y=Z $q;if(!$y){$o=0;break};K $y|Out-Null};if($o){[IO.Directory]::Delete($p.x+$q,$true);$v=[IO.Path]::GetDirectoryName($q);if(!@([IO.Directory]::EnumerateFileSystemEntries($v)).Count){[IO.Directory]::Delete($v)}};E @{ok=1;removed=$o}"##,
+);
+
+/// Free bytes on the volume that will hold a save (Phase 27). Parameters: `h`
+/// the account home, `s` the save directory below it (`/`-separated). The
+/// nearest existing ancestor decides the drive.
+pub const GIT_FREE: &str = concat!(
+    git_ps_base!(),
+    r##"$q=$p.h+$c+$p.s.Replace('/',$c);while($q -and !(Z $q)){$q=[IO.Path]::GetDirectoryName($q)};E @{ok=1;free=(New-Object IO.DriveInfo([IO.Path]::GetPathRoot($q))).AvailableFreeSpace}"##,
+);
+
 /// Why `name` cannot be ONE component of a path on a Windows host, or `None`.
 ///
 /// This is the Windows half of the path gate. It refuses everything the POSIX
@@ -470,6 +682,154 @@ impl WinScript {
             params: serde_json::json!({ "x": prefix, "d": dir, "f": names }),
         }
     }
+
+    /// The script that reads the fixed files of the `.git` at `git` (native),
+    /// asking for the presence of `markers` ([`GIT_STATE`]).
+    pub fn git_state(git: &str, markers: &[&str]) -> WinScript {
+        WinScript {
+            name: "git_state",
+            body: GIT_STATE,
+            params: serde_json::json!({ "a": git, "m": markers }),
+        }
+    }
+
+    /// The script that saves a project's `.git` ([`GIT_SAVE`]): `prefix` is
+    /// [`LONG_PATH_PREFIX`], `data` the native data directory, `home` the
+    /// native account home.
+    pub fn git_save(
+        prefix: &str,
+        data: &str,
+        project: &str,
+        home: &str,
+        gateway: &str,
+        run_id: &str,
+    ) -> WinScript {
+        WinScript {
+            name: "git_save",
+            body: GIT_SAVE,
+            params: git_run_params(prefix, data, project, home, gateway, run_id),
+        }
+    }
+
+    /// The script that restores the save of a run ([`GIT_RESTORE`]); the
+    /// parameters are [`git_save`](Self::git_save)'s.
+    pub fn git_restore(
+        prefix: &str,
+        data: &str,
+        project: &str,
+        home: &str,
+        gateway: &str,
+        run_id: &str,
+    ) -> WinScript {
+        WinScript {
+            name: "git_restore",
+            body: GIT_RESTORE,
+            params: git_run_params(prefix, data, project, home, gateway, run_id),
+        }
+    }
+
+    /// The script that takes the manifest of the native directory `dir`
+    /// ([`GIT_MANIFEST`]).
+    pub fn git_manifest(prefix: &str, dir: &str) -> WinScript {
+        WinScript {
+            name: "git_manifest",
+            body: GIT_MANIFEST,
+            params: serde_json::json!({ "x": prefix, "a": dir }),
+        }
+    }
+
+    /// The script that sizes the native directory `dir` from one enumeration
+    /// ([`GIT_SIZE`]).
+    pub fn git_size(prefix: &str, dir: &str) -> WinScript {
+        WinScript {
+            name: "git_size",
+            body: GIT_SIZE,
+            params: serde_json::json!({ "x": prefix, "a": dir }),
+        }
+    }
+
+    /// The script that hashes `file` (a `/`-separated path) below the native
+    /// `.git` ([`GIT_DIGEST`]).
+    pub fn git_digest(git: &str, file: &str) -> WinScript {
+        WinScript {
+            name: "git_digest",
+            body: GIT_DIGEST,
+            params: serde_json::json!({ "a": git, "f": file }),
+        }
+    }
+
+    /// The script that creates (`unlock` false) or removes (`unlock` true) the
+    /// locks of `targets`, paths below the native `.git` ([`GIT_LOCK`]).
+    pub fn git_lock(git: &str, unlock: bool, targets: &[String]) -> WinScript {
+        WinScript {
+            name: "git_lock",
+            body: GIT_LOCK,
+            params: serde_json::json!({
+                "a": git,
+                "m": if unlock { "unlock" } else { "lock" },
+                "w": targets,
+            }),
+        }
+    }
+
+    /// The script that puts each lock over its target ([`GIT_REPLACE`]):
+    /// `writes` are `(path below .git, size sent)`.
+    pub fn git_replace(git: &str, writes: &[(String, u64)], retries: u32) -> WinScript {
+        let entries: Vec<String> = writes
+            .iter()
+            .map(|(path, size)| format!("{path}:{size}"))
+            .collect();
+        WinScript {
+            name: "git_replace",
+            body: GIT_REPLACE,
+            params: serde_json::json!({ "a": git, "w": entries, "q": retries }),
+        }
+    }
+
+    /// The script that probes write access in a project directory (below the
+    /// native `data` directory) and its `.git` with the file `name`
+    /// ([`GIT_PROBE`]).
+    pub fn git_probe(data: &str, project: &str, name: &str) -> WinScript {
+        WinScript {
+            name: "git_probe",
+            body: GIT_PROBE,
+            params: serde_json::json!({ "d": data, "j": project, "n": name }),
+        }
+    }
+
+    /// The script that removes the save at `rel` (`/`-separated, below the
+    /// native account `home`) of run `run_id` ([`GIT_SAVE_RM`]).
+    pub fn git_save_rm(prefix: &str, home: &str, rel: &str, run_id: &str) -> WinScript {
+        WinScript {
+            name: "git_save_rm",
+            body: GIT_SAVE_RM,
+            params: serde_json::json!({ "x": prefix, "h": home, "r": rel, "i": run_id }),
+        }
+    }
+
+    /// The script that reports the free bytes on the volume of the save
+    /// directory `rel` below the native account `home` ([`GIT_FREE`]).
+    pub fn git_free(home: &str, rel: &str) -> WinScript {
+        WinScript {
+            name: "git_free",
+            body: GIT_FREE,
+            params: serde_json::json!({ "h": home, "s": rel }),
+        }
+    }
+}
+
+/// The parameters of [`GIT_SAVE`] and [`GIT_RESTORE`].
+fn git_run_params(
+    prefix: &str,
+    data: &str,
+    project: &str,
+    home: &str,
+    gateway: &str,
+    run_id: &str,
+) -> Value {
+    serde_json::json!({
+        "x": prefix, "d": data, "j": project, "h": home, "g": gateway, "i": run_id,
+    })
 }
 
 /// The remote command for `script`, or why it cannot be sent: the parameters
