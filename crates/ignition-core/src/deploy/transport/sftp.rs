@@ -122,6 +122,14 @@ const DOWNLOAD_CHUNK_FILES: usize = 10_000;
 const DOWNLOAD_SLACK_BYTES: u64 = 1024 * 1024;
 /// How often the download dir is measured while sftp runs.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// A Windows object read splits its archive into parts fetched at the same
+/// time, one part per this many listed bytes, because one `get` of a large
+/// file is limited by one TCP flow (measured on the Windows test VM: four
+/// sessions moved packs 2.7 times as fast as one, 27-11). The resource reads
+/// are never split.
+const PART_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+/// The most parts (hence concurrent ssh sessions) one read uses.
+const PARTS_MAX: usize = 4;
 
 /// Where the files of one download live on the host, and the limits that go
 /// with them. Every file is named `{collection}/{rel}` below the base's remote
@@ -187,6 +195,14 @@ impl ReadBase {
         match self {
             ReadBase::Resources => why.to_string(),
             ReadBase::ProjectGit(_) => why.replace("config/resources/", &self.shown("")),
+        }
+    }
+
+    /// The most archive parts one read may fetch at the same time.
+    fn max_parts(&self) -> usize {
+        match self {
+            ReadBase::Resources => 1,
+            ReadBase::ProjectGit(_) => PARTS_MAX,
         }
     }
 
@@ -726,6 +742,44 @@ impl FoundFile {
     }
 }
 
+/// The list or archive name of part `k` of a split read.
+fn part_file(k: usize, ext: &str) -> String {
+    format!("read-{k}.{ext}")
+}
+
+/// Split `files` into at most `max_parts` parts of about `target` listed bytes
+/// each, balanced by size (the largest file first into the lightest part; ties
+/// to the lowest part), every file in exactly one part, each part in the
+/// original order, and no part empty. A read of fewer bytes than two targets, or
+/// of one file, stays whole.
+fn split_into_parts(files: &[BundleFile], max_parts: usize, target: u64) -> Vec<Vec<BundleFile>> {
+    let total: u64 = files.iter().map(|f| f.size).sum();
+    let wanted = usize::try_from(total / target.max(1)).unwrap_or(usize::MAX);
+    let count = wanted.clamp(1, max_parts.max(1)).min(files.len().max(1));
+    if count <= 1 {
+        return vec![files.to_vec()];
+    }
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|a, b| files[*b].size.cmp(&files[*a].size).then(a.cmp(b)));
+    let mut load = vec![0u64; count];
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for index in order {
+        let lightest = (0..count)
+            .min_by_key(|part| (load[*part], *part))
+            .unwrap_or(0);
+        load[lightest] += files[index].size;
+        members[lightest].push(index);
+    }
+    members
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|mut part| {
+            part.sort_unstable();
+            part.into_iter().map(|index| files[index].clone()).collect()
+        })
+        .collect()
+}
+
 /// What discovery found.
 struct Found {
     /// Scoped directories that exist (chains below `data_dir`).
@@ -775,6 +829,8 @@ pub struct SftpTransport {
     /// quick 261105-dl1) instead of one `get` per file: true on a Windows
     /// host, where each `get` costs about 0.37 s.
     bundle_reads: bool,
+    /// Listed bytes per archive part of a split read ([`PART_TARGET_BYTES`]).
+    part_target_bytes: u64,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -803,6 +859,7 @@ impl SftpTransport {
             lists: Mutex::new(BTreeMap::new()),
             ctl_seq: AtomicUsize::new(0),
             bundle_reads: false,
+            part_target_bytes: PART_TARGET_BYTES,
         }
     }
 
@@ -822,6 +879,13 @@ impl SftpTransport {
         transport.windows = true;
         transport.bundle_reads = true;
         transport
+    }
+
+    /// Test only: split a read into parts of about `bytes` listed bytes.
+    #[cfg(test)]
+    fn with_part_target_bytes(mut self, bytes: u64) -> Self {
+        self.part_target_bytes = bytes;
+        self
     }
 
     /// Test only: a Windows reader that fetches with one `get` per file, as
@@ -1869,11 +1933,25 @@ impl SftpTransport {
             return Err(self.fail(format!("the read staging directory is unsafe: {why}")));
         }
         let ctl_native = windows_native_path(&ctl);
-        let ran = self.bundle_into(base, &ctl, &listed, tmp).await;
+        let parts = split_into_parts(&listed, base.max_parts(), self.part_target_bytes);
+        let (ran, names) = if parts.len() == 1 {
+            (
+                self.bundle_into(base, &ctl, &listed, tmp).await,
+                vec![
+                    bundle::LIST_FILE.to_string(),
+                    bundle::ARCHIVE_FILE.to_string(),
+                ],
+            )
+        } else {
+            let names = (0..parts.len())
+                .flat_map(|k| [part_file(k, "tsv"), part_file(k, "zip")])
+                .collect();
+            (self.bundle_parts(base, &ctl, &parts, tmp).await, names)
+        };
         let Err(err) = ran else {
             return Ok(());
         };
-        let names = [bundle::LIST_FILE, bundle::ARCHIVE_FILE];
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let clean = winps::WinScript::bundle_clean(LONG_PATH_PREFIX, &ctl_native, &names);
         let why = match self.read_powershell(&clean).await {
             Ok(value) if value.get("ok").and_then(serde_json::Value::as_i64) == Some(1) => {
@@ -1985,6 +2063,132 @@ impl SftpTransport {
             )));
         }
         let files = listed.to_vec();
+        let dest = tmp.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            bundle::extract(&archive, &files, &dest, DOWNLOAD_SLACK_BYTES)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?
+        .map_err(|why| self.fail(base.rename_extract_error(&why)))?;
+        drop(archive_dir);
+        Ok(())
+    }
+
+    /// Steps 2 to 5 of [`fetch_bundled`](Self::fetch_bundled) for a read split
+    /// into `parts` (27-11): one session makes the staging dir and uploads
+    /// every part's list, then every part runs its own BUNDLE, download and
+    /// extraction at the same time (each its own ssh connection, its own list
+    /// and archive `read-<k>.tsv` / `read-<k>.zip`), and one session removes the
+    /// staging dir. Each part is held to its own list, size and
+    /// hostile-archive checks exactly as a single archive is; the parts are
+    /// disjoint and together are the whole read. The connection count is
+    /// `2 * parts + 2`, whatever the file count.
+    async fn bundle_parts(
+        &self,
+        base: &ReadBase,
+        ctl: &str,
+        parts: &[Vec<BundleFile>],
+        tmp: &Path,
+    ) -> Result<(), CoreError> {
+        let local = self.download_dir("read")?;
+        let mut ops = vec![SftpOp::Mkdir {
+            path: ctl.to_string(),
+        }];
+        let mut shas = Vec::with_capacity(parts.len());
+        for (k, part) in parts.iter().enumerate() {
+            let list = bundle::render_list(part);
+            shas.push(sha256_hex(&list));
+            let local_list = local.path().join(part_file(k, "tsv"));
+            std::fs::write(&local_list, &list)
+                .map_err(|e| self.fail(format!("cannot stage the read list ({:?})", e.kind())))?;
+            ops.push(SftpOp::Put {
+                local: local_list,
+                remote: format!("{ctl}/{}", part_file(k, "tsv")),
+            });
+        }
+        self.run_batch("read", ops).await?;
+
+        // every part needs room for all of them: they are written together
+        let all: Vec<BundleFile> = parts.iter().flatten().cloned().collect();
+        let need = bundle::archive_limit(&all).saturating_add(bundle::STAGING_FREE_MARGIN);
+        let runs = parts
+            .iter()
+            .enumerate()
+            .map(|(k, part)| self.bundle_part(base, ctl, k, part, &shas[k], need, tmp));
+        futures_util::future::try_join_all(runs).await?;
+        drop(local);
+
+        self.run_batch(
+            "read",
+            vec![SftpOp::Rmdir {
+                path: ctl.to_string(),
+            }],
+        )
+        .await
+    }
+
+    /// One part of [`bundle_parts`](Self::bundle_parts): BUNDLE its list, check
+    /// the reported size, download and remove the archive, check its size and
+    /// extract it into `tmp`.
+    #[allow(clippy::too_many_arguments)]
+    async fn bundle_part(
+        &self,
+        base: &ReadBase,
+        ctl: &str,
+        k: usize,
+        part: &[BundleFile],
+        list_sha: &str,
+        need: u64,
+        tmp: &Path,
+    ) -> Result<(), CoreError> {
+        let remote_list = format!("{ctl}/{}", part_file(k, "tsv"));
+        let remote_zip = format!("{ctl}/{}", part_file(k, "zip"));
+        let limit = bundle::archive_limit(part);
+        let script = winps::WinScript::bundle_level(
+            LONG_PATH_PREFIX,
+            &windows_native_path(&base.remote_root(&self.data_dir)),
+            &windows_native_path(&remote_list),
+            &windows_native_path(&remote_zip),
+            list_sha,
+            need,
+            base.bundle_level(),
+        );
+        let value = self.read_powershell(&script).await.map_err(|e| match e {
+            CoreError::TransportFailed { detail, .. } => self.fail(format!(
+                "cannot bundle the listed files on the host: {detail}"
+            )),
+            other => other,
+        })?;
+        let z = self.bundle_result(base, &value, part, need)?;
+        if z > limit {
+            return Err(self.fail(format!(
+                "the read archive is {z} bytes, more than the {limit} bytes the listed files can take; it was not downloaded"
+            )));
+        }
+        let archive_dir = self.download_dir("read")?;
+        let archive = archive_dir.path().join(part_file(k, "zip"));
+        self.run_download(
+            "read",
+            &[
+                SftpOp::Get {
+                    remote: remote_zip.clone(),
+                    local: archive.clone(),
+                },
+                SftpOp::Rm { path: remote_zip },
+            ],
+            archive_dir.path(),
+            z.saturating_add(DOWNLOAD_SLACK_BYTES),
+        )
+        .await?;
+        let arrived = std::fs::symlink_metadata(&archive)
+            .map_err(|e| self.fail(format!("the read archive did not arrive ({:?})", e.kind())))?;
+        if !arrived.file_type().is_file() || arrived.len() != z {
+            return Err(self.fail(format!(
+                "the read archive arrived as {} bytes but was reported as {z}",
+                arrived.len()
+            )));
+        }
+        let files = part.to_vec();
         let dest = tmp.to_path_buf();
         tokio::task::spawn_blocking(move || {
             bundle::extract(&archive, &files, &dest, DOWNLOAD_SLACK_BYTES)
@@ -9518,6 +9722,187 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             assert!(p.get("c").is_none(), "no level sent: {p}");
             assert_eq!(p["b"], "C:\\gw\\data\\config\\resources");
         }
+    }
+
+    /// 27-11: a large object read is split into parts of about the target
+    /// size, each file in exactly one part, in its original order, balanced by
+    /// size; the resource reads and small reads are never split.
+    #[test]
+    fn large_reads_split_into_balanced_disjoint_parts() {
+        let file = |name: &str, size: u64| BundleFile {
+            collection: "objects".to_string(),
+            rel: name.to_string(),
+            size,
+        };
+        let mib = 1024 * 1024;
+        let files: Vec<BundleFile> = (0..47)
+            .map(|i| file(&format!("pack/p{i:02}"), (8 + (i % 5)) * mib))
+            .collect();
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        let parts = split_into_parts(&files, PARTS_MAX, PART_TARGET_BYTES);
+        assert_eq!(parts.len(), PARTS_MAX);
+        // every file once, nothing else
+        let mut seen: Vec<&str> = parts.iter().flatten().map(|f| f.rel.as_str()).collect();
+        seen.sort_unstable();
+        let mut want: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        want.sort_unstable();
+        assert_eq!(seen, want);
+        // each part keeps the original order and none is empty
+        for part in &parts {
+            assert!(!part.is_empty());
+            let at: Vec<usize> = part
+                .iter()
+                .map(|f| files.iter().position(|g| g == f).expect("listed"))
+                .collect();
+            assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
+        }
+        // balanced: no part carries more than a file's size past the mean
+        let mean = total / parts.len() as u64;
+        for part in &parts {
+            let bytes: u64 = part.iter().map(|f| f.size).sum();
+            assert!(bytes.abs_diff(mean) <= 12 * mib, "{bytes} vs {mean}");
+        }
+        // below two targets, one file, or a base that never splits: whole
+        let small = vec![file("a", 10 * mib), file("b", 10 * mib)];
+        assert_eq!(
+            split_into_parts(&small, PARTS_MAX, PART_TARGET_BYTES).len(),
+            1
+        );
+        let one = vec![file("big", 900 * mib)];
+        assert_eq!(
+            split_into_parts(&one, PARTS_MAX, PART_TARGET_BYTES).len(),
+            1
+        );
+        assert_eq!(split_into_parts(&files, 1, PART_TARGET_BYTES).len(), 1);
+        assert_eq!(split_into_parts(&[], PARTS_MAX, PART_TARGET_BYTES).len(), 1);
+        assert_eq!(ReadBase::Resources.max_parts(), 1);
+        assert_eq!(ReadBase::ProjectGit("P".to_string()).max_parts(), PARTS_MAX);
+        // two files of 70 MiB make two parts, never an empty third
+        let two = vec![file("a", 70 * mib), file("b", 70 * mib), file("c", mib)];
+        let parts = split_into_parts(&two, PARTS_MAX, PART_TARGET_BYTES);
+        assert_eq!(parts.len(), 2);
+    }
+
+    /// 27-11: a Windows object read of enough bytes is fetched as parts at the
+    /// same time: one archive per part (`read-<k>.zip`, its own list), a
+    /// connection count of `2 * parts + 2` however many files, the staging dir
+    /// gone, every file byte-identical. A hostile archive in any part fails
+    /// the read and the staging dir is cleaned of every part's files.
+    #[tokio::test]
+    async fn windows_git_objects_fetch_splits_a_large_read() {
+        use crate::deploy::git_objects::GitObjectFile;
+        use crate::deploy::transport::projects::GitHostRead;
+        let git = format!("{WDATA}/projects/CapApp/.git");
+        let mut files = Vec::new();
+        let fake = windows_fake();
+        for i in 0..24u32 {
+            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
+            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
+            fake.file(&format!("{git}/{rel}"), &body);
+            files.push(GitObjectFile {
+                rel,
+                size: body.len() as u64,
+            });
+        }
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        let t = windows_transport(&fake).with_part_target_bytes(total / 4);
+        let dest = tempfile::tempdir().expect("dest");
+        t.fetch_git_objects("CapApp", &files, dest.path())
+            .await
+            .expect("fetch");
+        for file in &files {
+            let got = std::fs::read(dest.path().join(&file.rel)).expect("copy");
+            let want = match fake
+                .fs
+                .lock()
+                .expect("fs")
+                .get(&format!("{git}/{}", file.rel))
+            {
+                Some(Node::File(bytes)) => bytes.clone(),
+                _ => panic!("{} is not on the fake host", file.rel),
+            };
+            assert_eq!(got, want, "{}", file.rel);
+        }
+        assert_eq!(get_lines(&fake).len(), 4, "one `get` per part");
+        let n = connections(&fake);
+        assert!(n <= 2 * 4 + 2 + 1, "{n} connections");
+        assert_eq!(t.sessions(), n);
+        assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
+        assert_writes_below_home(&fake);
+        let params = fake.knobs().bundle_params.clone();
+        assert_eq!(params.len(), 4);
+        let mut lists: Vec<String> = params
+            .iter()
+            .map(|p| {
+                p["l"]
+                    .as_str()
+                    .expect("list")
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        lists.sort();
+        assert_eq!(
+            lists,
+            ["read-0.tsv", "read-1.tsv", "read-2.tsv", "read-3.tsv"]
+        );
+        for p in &params {
+            assert_eq!(p["c"], "NoCompression");
+        }
+        // the parts are disjoint and together the whole read
+        let mut named: Vec<String> = fake
+            .knobs()
+            .bundle_lists
+            .iter()
+            .flat_map(|l| {
+                String::from_utf8_lossy(l)
+                    .lines()
+                    .filter_map(|line| line.split_once('\t').map(|(_, n)| n.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        named.sort();
+        let mut want: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        want.sort();
+        assert_eq!(named, want, "each file in exactly one list");
+
+        // a hostile archive in the parts fails the read, and every part's
+        // staging files go
+        let hostile = windows_fake();
+        for file in &files {
+            hostile.file(&format!("{git}/{}", file.rel), "short");
+        }
+        let one = files[0].rel.clone();
+        hostile.knobs().bundle_archive = Some(zip_of(&[(one, b"nope".to_vec())]));
+        let sized: Vec<GitObjectFile> = files
+            .iter()
+            .map(|f| GitObjectFile {
+                rel: f.rel.clone(),
+                size: 5,
+            })
+            .collect();
+        let t = windows_transport(&hostile).with_part_target_bytes(30);
+        let err = t
+            .fetch_git_objects("CapApp", &sized, dest.path().join("two").as_path())
+            .await;
+        assert!(err.is_err());
+        let again = tempfile::tempdir().expect("dest");
+        let err = t
+            .fetch_git_objects("CapApp", &sized, again.path())
+            .await
+            .expect_err("hostile");
+        assert!(
+            detail(err).contains("projects/CapApp/.git/"),
+            "names the git read"
+        );
+        assert!(
+            staged_left(&hostile).is_empty(),
+            "{:?}",
+            staged_left(&hostile)
+        );
+        assert_eq!(std::fs::read_dir(again.path()).expect("ls").count(), 0);
     }
 
     /// 27-11: the archive of a Windows object read is hostile data: a size
