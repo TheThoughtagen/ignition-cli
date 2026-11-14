@@ -2901,6 +2901,7 @@ fn write_half_unreachable() {
         "ProjectRunWriter",
         "project_run_writer_for_node",
         "GitStateWriter",
+        "git_state_writer_for_node",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
@@ -4055,6 +4056,595 @@ fn project_run_writer_is_confined() {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),
             "{expected} does not name the project run writer: the walk is not looking where it should; saw {naming:?}"
+        );
+    }
+}
+
+/// 27-08: the git host channel over the sftp transport on a POSIX node, against
+/// the in-repo local `sftp-server` and the local `sh` (the exec seam). The
+/// scripts under test are the very text a Linux host would run, so each result
+/// is also compared with the local-filesystem implementation on the same
+/// `.git`.
+#[cfg(unix)]
+mod sftp_git {
+    use super::*;
+    use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use ignition_core::deploy::git_state::GitFiles;
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, GitHostRead, GitStateWriter, ProjectHost,
+    };
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use ignition_core::deploy::tree::sha256_hex;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const RUN: &str = "20261114T101500Z-ab12";
+
+    /// Counts the exec calls (`sh -c`) and the sftp sessions a transport makes
+    /// and keeps the exec command texts.
+    #[derive(Default)]
+    struct Count {
+        execs: Mutex<Vec<String>>,
+        sftp: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Count {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program == "sh" {
+                let command = args
+                    .last()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.execs.lock().expect("execs").push(command);
+            } else {
+                self.sftp.fetch_add(1, Ordering::Relaxed);
+            }
+            let (program, args) = common::posix_exec::shimmed(program, args);
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    impl Count {
+        fn execs(&self) -> usize {
+            self.execs.lock().expect("execs").len()
+        }
+        fn sftp(&self) -> usize {
+            self.sftp.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The sftp transport over `data_dir`, with a fresh account home.
+    struct Node {
+        t: SftpTransport,
+        home: tempfile::TempDir,
+        count: Arc<Count>,
+    }
+
+    fn node(data_dir: &Path) -> Node {
+        let count = Arc::new(Count::default());
+        let shell =
+            RemoteShell::local_sftp_server(&sftp_server(), count.clone(), Duration::from_secs(60))
+                .local_exec();
+        let home = tempfile::tempdir().expect("home");
+        let data = posix_root(&data_dir.display().to_string()).expect("posix root");
+        let home_root = posix_root(&home.path().display().to_string()).expect("home root");
+        let t = SftpTransport::new(shell, data, "nodes.master").with_home(&home_root);
+        Node { t, home, count }
+    }
+
+    /// Whether this process ignores mode bits (root), so denial cases cannot run.
+    fn ignores_modes(dir: &Path) -> bool {
+        let probe = dir.join(".mode-probe");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let ignored = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::remove_dir(&probe).expect("rm probe");
+        ignored
+    }
+
+    fn detail(err: CoreError) -> String {
+        match err {
+            CoreError::TransportFailed { detail, .. } => detail,
+            other => panic!("expected transport_failed, got {other:?}"),
+        }
+    }
+
+    fn save_dir(n: &Node) -> PathBuf {
+        n.home
+            .path()
+            .join("ign-deploy")
+            .join(GATEWAY)
+            .join("projects")
+            .join(PROJECT)
+            .join("git-save")
+            .join(RUN)
+    }
+
+    #[tokio::test]
+    async fn sftp_git_state_posix_managed() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        // markers the host may report, and a loose ref in a nested directory
+        std::fs::write(fx.git_dir().join("index.lock"), "").expect("lock");
+        std::fs::write(fx.git_dir().join("MERGE_HEAD"), "x\n").expect("merge");
+        fx.git_in_project(&["branch", "feature/x"]);
+        fx.git_in_project(&["branch", "feature-y"]);
+
+        let local: GitFiles = fx.node().read_git_state(PROJECT).await.expect("local");
+        let posix: GitFiles = n.t.read_git_state(PROJECT).await.expect("posix");
+        assert_eq!(posix, local, "the two implementations read the same state");
+        assert_eq!(posix.kind, GitEntry::Directory);
+        assert!(posix.index_present);
+        assert!(
+            posix.markers.contains(&"index.lock".to_string()),
+            "{posix:?}"
+        );
+        assert!(
+            posix.markers.contains(&"MERGE_HEAD".to_string()),
+            "{posix:?}"
+        );
+        assert!(
+            posix
+                .loose_refs
+                .iter()
+                .any(|(name, _)| name == "refs/heads/feature/x"),
+            "{posix:?}"
+        );
+        // a probe and a state call: two exec calls, no sftp session
+        assert_eq!(n.count.execs(), 2);
+        assert_eq!(n.count.sftp(), 0);
+
+        // not a directory, and no project: answered by kind, never read
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let absent = n.t.read_git_state(PROJECT).await.expect("absent");
+        assert_eq!(absent, GitFiles::without_contents(GitEntry::Absent));
+        std::fs::write(fx.git_dir(), "gitdir: elsewhere\n").expect("git file");
+        let file = n.t.read_git_state(PROJECT).await.expect("file");
+        assert_eq!(file, GitFiles::without_contents(GitEntry::File));
+    }
+
+    #[tokio::test]
+    async fn sftp_git_state_posix_failure_not_absent() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        if ignores_modes(&fx.data_dir) {
+            println!("running with privileges that ignore mode bits; denial cases skipped");
+            return;
+        }
+        // a config the account cannot read is a failure, never an absent file
+        let config = fx.git_dir().join("config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let why = detail(
+            n.t.read_git_state(PROJECT)
+                .await
+                .expect_err("denied config"),
+        );
+        assert!(why.contains("config"), "{why}");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // a refs directory it cannot list is a failure too
+        let heads = fx.git_dir().join("refs/heads");
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let err = n.t.read_git_state(PROJECT).await.expect_err("denied refs");
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+
+        // a symlinked HEAD is refused
+        let head = fx.git_dir().join("HEAD");
+        std::fs::rename(&head, fx.git_dir().join("HEAD.real")).expect("rename");
+        std::os::unix::fs::symlink("HEAD.real", &head).expect("symlink");
+        let why = detail(n.t.read_git_state(PROJECT).await.expect_err("symlink"));
+        assert!(why.contains("symlink"), "{why}");
+        std::fs::remove_file(&head).expect("rm link");
+        std::fs::rename(fx.git_dir().join("HEAD.real"), &head).expect("rename back");
+        n.t.read_git_state(PROJECT).await.expect("readable again");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_save_restore_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let local_manifest = fx
+            .node()
+            .git_manifest(PROJECT)
+            .await
+            .expect("local manifest");
+        let before = n.t.git_manifest(PROJECT).await.expect("manifest");
+        assert_eq!(before, local_manifest, "both implementations digest alike");
+
+        let saved = n.t.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        assert_eq!(saved, before, "the save equals the gateway .git");
+        assert_eq!(
+            n.t.save_manifest(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("save manifest"),
+            before
+        );
+        let run_mode = std::fs::metadata(save_dir(&n))
+            .expect("run dir")
+            .permissions()
+            .mode();
+        assert_eq!(run_mode & 0o077, 0, "the save is private: {run_mode:o}");
+        // a save is never overwritten
+        let why = detail(
+            n.t.save_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("again"),
+        );
+        assert!(why.contains("never overwritten"), "{why}");
+
+        // restore refuses while `.git` exists
+        let why = detail(
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("present"),
+        );
+        assert!(why.contains("never replaced"), "{why}");
+        assert_eq!(n.t.git_manifest(PROJECT).await.expect("untouched"), before);
+
+        // the import deletes `.git`; the restore puts it back byte for byte
+        let config_mode = std::fs::metadata(fx.git_dir().join("config"))
+            .expect("config")
+            .permissions()
+            .mode();
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let back =
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("restore");
+        assert_eq!(back, before);
+        assert_eq!(n.t.git_manifest(PROJECT).await.expect("live"), before);
+        let restored_mode = std::fs::metadata(fx.git_dir().join("config"))
+            .expect("config")
+            .permissions()
+            .mode();
+        assert_eq!(
+            restored_mode, config_mode,
+            "the modes survive the round trip"
+        );
+        assert!(
+            !fx.project_dir()
+                .join(".ign-restore-20261114T101500Z-ab12")
+                .exists(),
+            "no staging directory is left"
+        );
+
+        // removing the save takes the repo tree and its run directory
+        n.t.remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("remove");
+        assert!(!save_dir(&n).exists());
+        n.t.remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("absent is fine");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_save_refuses_a_symlink_and_leaves_no_save() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        std::os::unix::fs::symlink("/etc", fx.git_dir().join("hooks-link")).expect("symlink");
+        let why = detail(
+            n.t.save_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("symlink"),
+        );
+        assert!(why.contains("symlink"), "{why}");
+        assert!(!save_dir(&n).join("repo").exists(), "no half save");
+        // the manifest refuses it as well
+        let err = n.t.git_manifest(PROJECT).await.expect_err("symlink");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // and a symlinked project directory is never walked through
+        std::fs::remove_file(fx.git_dir().join("hooks-link")).expect("rm link");
+        let real = fx.data_dir.join("projects").join("Real");
+        std::fs::rename(fx.project_dir(), &real).expect("rename");
+        std::os::unix::fs::symlink(&real, fx.project_dir()).expect("project link");
+        let err =
+            n.t.save_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("linked project");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_write_lock_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let pack = "ab".repeat(20);
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::BranchRef("feature/new".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+            GitWrite {
+                name: GitWriteName::PackFile(pack.clone()),
+                bytes: vec![7u8; 5000],
+            },
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/feature/new\n".to_vec(),
+            },
+        ];
+        n.t.write_git_files(PROJECT, &writes).await.expect("write");
+        for write in &writes {
+            let path = fx.git_dir().join(write.name.rel());
+            assert_eq!(std::fs::read(&path).expect("read back"), write.bytes);
+            let digest =
+                n.t.git_file_digest(PROJECT, &write.name)
+                    .await
+                    .expect("digest");
+            assert_eq!(digest, Some(sha256_hex(&write.bytes)), "{:?}", write.name);
+        }
+        let leftovers: Vec<String> = walk(&fx.git_dir())
+            .into_iter()
+            .filter(|p| p.ends_with(".lock") || p.ends_with(".ign-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // the ref file is a regular readable file, not private to the writer
+        let mode = std::fs::metadata(fx.git_dir().join("refs/heads/feature/new"))
+            .expect("ref")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o044, 0o044, "{mode:o}");
+        // an absent file has no digest
+        assert_eq!(
+            n.t.git_file_digest(PROJECT, &GitWriteName::BranchRef("nope".to_string()))
+                .await
+                .expect("absent"),
+            None
+        );
+
+        // an existing lock refuses and nothing is written, no lock of this
+        // call is left behind
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+        std::fs::write(fx.git_dir().join("config.lock"), "held").expect("lock");
+        let again = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Config,
+                bytes: b"[core]\n".to_vec(),
+            },
+        ];
+        let why = detail(
+            n.t.write_git_files(PROJECT, &again)
+                .await
+                .expect_err("held"),
+        );
+        assert!(why.contains("config.lock"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before
+        );
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "no lock of the refused call"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.git_dir().join("config.lock")).expect("lock"),
+            "held",
+            "the other writer's lock is left alone"
+        );
+        // a pack name that is not a hex digest never reaches the host
+        let calls = n.count.execs();
+        let bad = vec![GitWrite {
+            name: GitWriteName::PackFile("../x".to_string()),
+            bytes: vec![1],
+        }];
+        n.t.write_git_files(PROJECT, &bad)
+            .await
+            .expect_err("bad shape");
+        assert_eq!(n.count.execs(), calls, "refused before any remote call");
+    }
+
+    /// Every file below `dir`, `/`-separated and relative.
+    fn walk(dir: &Path) -> Vec<String> {
+        fn go(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                if entry.file_type().expect("type").is_dir() {
+                    go(base, &path, out);
+                } else {
+                    out.push(
+                        path.strip_prefix(base)
+                            .expect("prefix")
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(dir, dir, &mut out);
+        out
+    }
+
+    #[tokio::test]
+    async fn sftp_git_probe_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        n.t.probe_write(PROJECT, RUN).await.expect("probe");
+        let probe = format!(".ign-probe-{RUN}");
+        assert!(!fx.project_dir().join(&probe).exists());
+        assert!(!fx.git_dir().join(&probe).exists());
+        if ignores_modes(&fx.data_dir) {
+            println!("running with privileges that ignore mode bits; denial cases skipped");
+            return;
+        }
+        // a read-only project directory refuses, naming it
+        std::fs::set_permissions(fx.project_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let why = detail(
+            n.t.probe_write(PROJECT, RUN)
+                .await
+                .expect_err("read-only project"),
+        );
+        std::fs::set_permissions(fx.project_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(why.contains("projects/CapApp"), "{why}");
+        assert!(!why.contains("projects/CapApp/.git"), "{why}");
+        // a read-only `.git` refuses, naming it
+        std::fs::set_permissions(fx.git_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let why = detail(
+            n.t.probe_write(PROJECT, RUN)
+                .await
+                .expect_err("read-only .git"),
+        );
+        std::fs::set_permissions(fx.git_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(why.contains("projects/CapApp/.git"), "{why}");
+        // a probe file that is already there is refused and left alone
+        std::fs::write(fx.git_dir().join(&probe), "mine").expect("existing");
+        let why = detail(n.t.probe_write(PROJECT, RUN).await.expect_err("existing"));
+        assert!(why.contains("already exists"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(fx.git_dir().join(&probe)).expect("kept"),
+            "mine"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_git_yaml_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        assert_eq!(n.t.read_git_yaml().await.expect("absent"), None);
+        let yaml = fx.data_dir.join("git.yaml");
+        std::fs::write(&yaml, "repos: {}\n").expect("yaml");
+        assert_eq!(
+            n.t.read_git_yaml().await.expect("present"),
+            Some(b"repos: {}\n".to_vec())
+        );
+        // a symlink refuses, naming git.yaml
+        std::fs::rename(&yaml, fx.data_dir.join("real.yaml")).expect("rename");
+        std::os::unix::fs::symlink("real.yaml", &yaml).expect("symlink");
+        let err = n.t.read_git_yaml().await.expect_err("symlink");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        assert!(err.to_string().contains("git.yaml"), "{err}");
+        std::fs::remove_file(&yaml).expect("rm link");
+        // over the YAML cap refuses
+        std::fs::write(&yaml, vec![b'a'; 1_048_577]).expect("big");
+        let err = n.t.read_git_yaml().await.expect_err("oversize");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        // a directory is not a yaml file
+        std::fs::remove_file(&yaml).expect("rm");
+        std::fs::create_dir(&yaml).expect("dir");
+        let err = n.t.read_git_yaml().await.expect_err("directory");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_size_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let manifest = fx.node().git_manifest(PROJECT).await.expect("manifest");
+        let size = n.t.git_size(PROJECT).await.expect("size");
+        assert_eq!(size.files, manifest.files);
+        assert_eq!(size.bytes, manifest.bytes);
+        // one exec call, no sftp session, and nothing was hashed or read
+        assert_eq!(n.count.execs(), 1);
+        assert_eq!(n.count.sftp(), 0);
+        let command = n.count.execs.lock().expect("execs")[0].clone();
+        for reader in [
+            "sha256", "shasum", "cat ", "base64", "head ", "tail ", "wc ",
+        ] {
+            assert!(!command.contains(reader), "{reader} in the size script");
+        }
+        if !ignores_modes(&fx.data_dir) {
+            // a file nobody may read still counts: its size comes from the listing
+            let config = fx.git_dir().join("config");
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            let after = n.t.git_size(PROJECT).await;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert_eq!(after.expect("size without reading"), size);
+        }
+        // a symlink inside refuses
+        std::os::unix::fs::symlink("/etc", fx.git_dir().join("l")).expect("symlink");
+        let err = n.t.git_size(PROJECT).await.expect_err("symlink");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // a missing `.git` is a failure, not an empty size
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let err = n.t.git_size(PROJECT).await.expect_err("absent .git");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_free_bytes_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let free = n.t.free_bytes(GATEWAY, PROJECT).await.expect("free");
+        assert!(free > 0);
+        let local = fx
+            .node()
+            .free_bytes(GATEWAY, PROJECT)
+            .await
+            .expect("local free");
+        assert!(local > 0);
+    }
+
+    #[tokio::test]
+    async fn sftp_git_names_checked_first() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let hostile = [
+            "", ".", "..", "../x", "a/b", ".x", "a\nb", "a\u{7}b", "a\\b",
+        ];
+        for name in hostile {
+            let write = vec![GitWrite {
+                name: GitWriteName::Head,
+                bytes: vec![1],
+            }];
+            let results = [
+                n.t.read_git_state(name).await.map(|_| ()),
+                n.t.git_manifest(name).await.map(|_| ()),
+                n.t.git_size(name).await.map(|_| ()),
+                n.t.save_git(GATEWAY, name, RUN).await.map(|_| ()),
+                n.t.restore_git(GATEWAY, name, RUN).await.map(|_| ()),
+                n.t.remove_git_save(GATEWAY, name, RUN).await,
+                n.t.probe_write(name, RUN).await,
+                n.t.write_git_files(name, &write).await,
+                n.t.free_bytes(GATEWAY, name).await.map(|_| ()),
+                n.t.save_manifest(GATEWAY, name, RUN).await.map(|_| ()),
+                n.t.save_git(name, PROJECT, RUN).await.map(|_| ()),
+                n.t.save_git(GATEWAY, PROJECT, name).await.map(|_| ()),
+            ];
+            for (index, result) in results.iter().enumerate() {
+                assert!(result.is_err(), "{name:?} call {index} was accepted");
+            }
+        }
+        assert_eq!(n.count.execs(), 0, "no remote command ran");
+        assert_eq!(n.count.sftp(), 0, "no sftp session opened");
+        // the host trait reaches the same reader
+        let host: &dyn ProjectHost = &n.t;
+        assert!(host.git().is_some());
+    }
+
+    #[test]
+    fn sftp_git_scripts_are_not_reachable_from_the_read_only_host() {
+        // `ProjectHost::git` hands out the read half only; the writer trait is
+        // a different trait object that this accessor cannot produce.
+        let source = include_str!("../src/deploy/transport/projects.rs");
+        let trait_start = source.find("pub trait ProjectHost").expect("trait");
+        let trait_end = source[trait_start..].find("\n}\n").expect("end") + trait_start;
+        assert!(
+            !source[trait_start..trait_end].contains("GitStateWriter"),
+            "ProjectHost must not name the writer"
         );
     }
 }

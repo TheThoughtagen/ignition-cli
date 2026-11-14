@@ -2562,7 +2562,23 @@ impl SftpTransport {
         names: [(&str, &str); 2],
         bad: &(dyn Fn(String) -> CoreError + Sync),
     ) -> Result<Option<Vec<u8>>, CoreError> {
-        for (kind, value) in names {
+        self.read_file_below(None, rel, cap, what, &names, bad)
+            .await
+    }
+
+    /// [`read_home_file`](Self::read_home_file) below `base` (`None`: the
+    /// account home). `git.yaml` in the data directory (Phase 27) reads
+    /// through here with the data directory as `base`.
+    async fn read_file_below(
+        &self,
+        base: Option<&str>,
+        rel: &str,
+        cap: usize,
+        what: &str,
+        names: &[(&str, &str)],
+        bad: &(dyn Fn(String) -> CoreError + Sync),
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        for (kind, value) in names.iter().copied() {
             if let Some(why) = component_problem(value) {
                 return Err(bad(format!("the {kind} {why}")));
             }
@@ -2577,7 +2593,10 @@ impl SftpTransport {
         let parts: Vec<&str> = rel.split('/').collect();
         // An unreadable host is not an absent file: the home must answer
         // `pwd` and list.
-        let home = self.account_home().await?;
+        let home = match base {
+            Some(base) => base.to_string(),
+            None => self.account_home().await?,
+        };
         // Only the fixed names of the path are looked up in the home, so
         // names in it that cannot ride a batch line (a Windows profile holds
         // `NTUSER.DAT{<guid>}.TM.blf`) are skipped, not refused.

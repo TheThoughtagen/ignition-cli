@@ -52,10 +52,11 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind};
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitManifest, GitStateWriter, ProjectHost, ProjectRunWriter,
+    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ProjectHost, ProjectRunWriter,
     ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_entry_location,
-    project_run_names_problem_on, tag_record_names_problem_on,
+    git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
+use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
 
 impl LocalFsTransport {
@@ -502,6 +503,10 @@ impl ProjectRunWriter for LocalFsTransport {
 
 #[async_trait::async_trait]
 impl ProjectHost for LocalFsTransport {
+    fn git(&self) -> Option<&dyn GitHostRead> {
+        Some(self)
+    }
+
     async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
         let this = self.clone();
         let project = project.to_string();
@@ -884,7 +889,11 @@ impl LocalFsTransport {
         let mut files = 0usize;
         let mut bytes = 0u64;
         let mut digest = Sha256::new();
-        for entry in entries.iter().filter(|e| !e.is_dir) {
+        // The byte order of the whole path, the order `LC_ALL=C sort` gives on
+        // a POSIX host, so every transport computes the same digest.
+        let mut sorted: Vec<&WalkEntry> = entries.iter().filter(|e| !e.is_dir).collect();
+        sorted.sort_by(|a, b| a.rel.as_bytes().cmp(b.rel.as_bytes()));
+        for entry in sorted {
             files += 1;
             bytes += entry.size;
             digest.update(entry.rel.as_bytes());
@@ -1542,6 +1551,150 @@ impl LocalFsTransport {
             .map_err(|e| self.fail(format!("logs/HEAD cannot be read ({})", e.kind())))?;
         Ok(Some(bytes))
     }
+
+    /// `<data_dir>/git.yaml`, capped; `None` only when it does not exist.
+    fn read_git_yaml_blocking(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        let invalid = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("git.yaml: {problem}"),
+        };
+        self.require_data_dir()?;
+        let path = self.data_dir.join("git.yaml");
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(self.fail(format!("git.yaml cannot be inspected ({})", e.kind()))),
+            Ok(m) if !m.file_type().is_file() => Err(invalid(
+                "is not a regular file (symlinks are refused)".to_string(),
+            )),
+            Ok(m) if m.len() > YAML_MAX_BYTES as u64 => Err(invalid(format!(
+                "is {} bytes, over the {YAML_MAX_BYTES} byte cap",
+                m.len()
+            ))),
+            Ok(_) => {
+                let file = std::fs::File::open(&path)
+                    .map_err(|e| self.fail(format!("git.yaml cannot be read ({})", e.kind())))?;
+                let mut bytes = Vec::new();
+                file.take(YAML_MAX_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| self.fail(format!("git.yaml cannot be read ({})", e.kind())))?;
+                if bytes.len() > YAML_MAX_BYTES {
+                    return Err(invalid(format!(
+                        "grew past the {YAML_MAX_BYTES} byte cap while it was read"
+                    )));
+                }
+                Ok(Some(bytes))
+            }
+        }
+    }
+
+    /// Free bytes on the file system holding the save root of `project`.
+    fn free_bytes_blocking(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+        // Any valid run id: only the directory chain is used.
+        self.git_save_names(gateway, project, "free")?;
+        self.require_data_dir()?;
+        let mut path = self.data_dir.clone();
+        for part in git_save_rel(gateway, project, "free")
+            .split('/')
+            .take_while(|part| *part != "free")
+        {
+            path.push(part);
+        }
+        // The nearest ancestor that exists: the save root may not yet.
+        while std::fs::symlink_metadata(&path).is_err() {
+            if !path.pop() {
+                return Err(self.fail("no ancestor of the save root can be inspected"));
+            }
+        }
+        free_bytes_of(&path).map_err(|why| self.fail(format!("free space cannot be read ({why})")))
+    }
+
+    /// The count and total size of the project's live `.git` from the walk's
+    /// metadata alone (no file is opened).
+    fn git_size_blocking(&self, project: &str) -> Result<GitSize, CoreError> {
+        let git = self.live_git_dir("read", project)?;
+        let entries = self.walk_git("read", &git)?;
+        let mut size = GitSize { files: 0, bytes: 0 };
+        for entry in entries.iter().filter(|e| !e.is_dir) {
+            size.files += 1;
+            size.bytes += entry.size;
+        }
+        Ok(size)
+    }
+
+    /// Create then remove `.ign-probe-<run id>` in the project directory and
+    /// in its `.git`.
+    fn probe_write_blocking(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+        const OP: &str = "write";
+        if let Some(why) = component_problem(project) {
+            return Err(self.git_fail(OP, format!("the project name {why}")));
+        }
+        if RunId::parse(run_id).is_err() {
+            return Err(run_invalid(
+                &git_entry_location(project),
+                "the run id is not 1 to 128 characters of [A-Za-z0-9._-]",
+            ));
+        }
+        let git = self.live_git_dir(OP, project)?;
+        let name = git_probe_name(run_id);
+        let places = [
+            (
+                self.data_dir.join("projects").join(project),
+                format!("projects/{project}"),
+            ),
+            (git, format!("projects/{project}/.git")),
+        ];
+        for (dir, shown) in places {
+            let probe = dir.join(&name);
+            create_new_file(&probe, 0o600).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("a probe file cannot be created in {shown} ({})", e.kind()),
+                )
+            })?;
+            std::fs::remove_file(&probe).map_err(|e| {
+                self.git_fail(
+                    OP,
+                    format!("the probe file in {shown} cannot be removed ({})", e.kind()),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// Free bytes (available to this account) on the file system holding `path`.
+#[cfg(unix)]
+fn free_bytes_of(path: &Path) -> Result<u64, String> {
+    let stat = rustix::fs::statvfs(path).map_err(|e| e.to_string())?;
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// Free bytes on the drive holding `path`, read with one `powershell`
+/// subprocess (the precedent of `deploy/owner_acl.rs`).
+#[cfg(windows)]
+fn free_bytes_of(path: &Path) -> Result<u64, String> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($args[0])).AvailableFreeSpace",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| e.kind().to_string())?;
+    if !out.status.success() {
+        return Err("the drive query failed".to_string());
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "the drive query answered something that is not a number".to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn free_bytes_of(_path: &Path) -> Result<u64, String> {
+    Err("this platform has no free-space query".to_string())
 }
 
 /// A prefix as a message names it (`the repo` for the root).
@@ -1638,6 +1791,29 @@ impl GitHostRead for LocalFsTransport {
         .await
         .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
+
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.read_git_yaml_blocking())
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+        let this = self.clone();
+        let (gateway, project) = (gateway.to_string(), project.to_string());
+        tokio::task::spawn_blocking(move || this.free_bytes_blocking(&gateway, &project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn git_size(&self, project: &str) -> Result<GitSize, CoreError> {
+        let this = self.clone();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || this.git_size_blocking(&project))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
 }
 
 #[async_trait::async_trait]
@@ -1692,6 +1868,14 @@ impl GitStateWriter for LocalFsTransport {
         })
         .await
         .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
+    }
+
+    async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+        let this = self.clone();
+        let (project, run_id) = (project.to_string(), run_id.to_string());
+        tokio::task::spawn_blocking(move || this.probe_write_blocking(&project, &run_id))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local write task failed: {e}")))?
     }
 }
 
@@ -1871,6 +2055,146 @@ mod tests {
         for rel in ["HEAD", "config", "private/secret", "objects/ab/cdef"] {
             assert_eq!(mode(&git.join(rel)), 0o600, "{rel} without a record");
         }
+    }
+
+    /// A data dir whose `projects/Plain` holds a `.git` of three files.
+    fn data_with_git() -> tempfile::TempDir {
+        let dir = data_with_projects();
+        let git = dir.path().join("projects/Plain/.git");
+        std::fs::create_dir_all(git.join("objects/ab")).expect("dirs");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        std::fs::write(git.join("config"), "[core]\n").expect("config");
+        std::fs::write(git.join("objects/ab/cdef"), "object").expect("object");
+        dir
+    }
+
+    #[tokio::test]
+    async fn local_git_size_counts_files_and_bytes_without_hashing() {
+        let dir = data_with_git();
+        let t = host(dir.path());
+        let size = t.git_size("Plain").await.expect("size");
+        assert_eq!(
+            size,
+            GitSize {
+                files: 3,
+                bytes: 21 + 7 + 6
+            }
+        );
+        let manifest = t.git_manifest("Plain").await.expect("manifest");
+        assert_eq!((size.files, size.bytes), (manifest.files, manifest.bytes));
+        // a missing `.git` and a symlink inside both refuse
+        let err = t.git_size("Nope").await.expect_err("missing project");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("HEAD", dir.path().join("projects/Plain/.git/l"))
+                .expect("symlink");
+            let err = t.git_size("Plain").await.expect_err("symlink");
+            assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_git_manifest_digest_is_in_path_byte_order() {
+        // `objects-x` sorts before `objects/` bytewise ('-' < '/') although a
+        // depth-first walk visits the `objects` directory first; the digest
+        // must follow the whole-path order a POSIX `sort` gives.
+        let dir = data_with_git();
+        let git = dir.path().join("projects/Plain/.git");
+        std::fs::write(git.join("objects-x"), "x").expect("file");
+        let t = host(dir.path());
+        let manifest = t.git_manifest("Plain").await.expect("manifest");
+        let mut lines: Vec<(String, String)> = vec![
+            ("HEAD".to_string(), sha256_text("ref: refs/heads/main\n")),
+            ("config".to_string(), sha256_text("[core]\n")),
+            ("objects-x".to_string(), sha256_text("x")),
+            ("objects/ab/cdef".to_string(), "6".to_string()),
+        ];
+        lines.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        let mut digest = Sha256::new();
+        for (path, value) in &lines {
+            digest.update(path.as_bytes());
+            digest.update([0u8]);
+            digest.update(value.as_bytes());
+            digest.update([b'\n']);
+        }
+        assert_eq!(manifest.digest, format!("{:x}", digest.finalize()));
+    }
+
+    fn sha256_text(text: &str) -> String {
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn local_git_yaml_reads_capped_and_refuses_odd_entries() {
+        let dir = data_with_projects();
+        let t = host(dir.path());
+        assert_eq!(t.read_git_yaml().await.expect("absent"), None);
+        let yaml = dir.path().join("git.yaml");
+        std::fs::write(&yaml, "repos: {}\n").expect("yaml");
+        assert_eq!(
+            t.read_git_yaml().await.expect("present"),
+            Some(b"repos: {}\n".to_vec())
+        );
+        std::fs::write(&yaml, vec![b'a'; YAML_MAX_BYTES + 1]).expect("big");
+        let err = t.read_git_yaml().await.expect_err("over the cap");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        assert!(err.to_string().contains("git.yaml"), "{err}");
+        std::fs::remove_file(&yaml).expect("rm");
+        std::fs::create_dir(&yaml).expect("dir");
+        let err = t.read_git_yaml().await.expect_err("directory");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&yaml).expect("rm dir");
+            std::fs::write(dir.path().join("real.yaml"), "a: 1\n").expect("real");
+            std::os::unix::fs::symlink("real.yaml", &yaml).expect("symlink");
+            let err = t.read_git_yaml().await.expect_err("symlink");
+            assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_git_probe_leaves_nothing_and_refuses_an_existing_probe() {
+        let dir = data_with_git();
+        let t = host(dir.path());
+        t.probe_write("Plain", "20261114T101500Z-ab12")
+            .await
+            .expect("probe");
+        let name = ".ign-probe-20261114T101500Z-ab12";
+        assert!(!dir.path().join("projects/Plain").join(name).exists());
+        assert!(!dir.path().join("projects/Plain/.git").join(name).exists());
+        // an existing probe file is refused and left alone
+        std::fs::write(dir.path().join("projects/Plain/.git").join(name), "mine").expect("probe");
+        let err = t
+            .probe_write("Plain", "20261114T101500Z-ab12")
+            .await
+            .expect_err("existing probe");
+        assert!(err.to_string().contains("projects/Plain/.git"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("projects/Plain/.git").join(name))
+                .expect("kept"),
+            "mine"
+        );
+        // names are checked first
+        for bad in ["", "..", "a/b"] {
+            assert!(
+                t.probe_write(bad, "20261114T101500Z-ab12").await.is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(t.probe_write("Plain", "../x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn local_free_bytes_reads_the_file_system_of_the_save_root() {
+        let dir = data_with_projects();
+        let t = host(dir.path());
+        // the save root does not exist yet: the nearest ancestor answers
+        let free = t.free_bytes("gw-a", "Plain").await.expect("free");
+        assert!(free > 0);
+        assert!(t.free_bytes("..", "Plain").await.is_err());
+        assert!(t.free_bytes("gw-a", "a/b").await.is_err());
     }
 
     fn write_record(data: &Path, gateway: &str, project: &str, bytes: &[u8]) {

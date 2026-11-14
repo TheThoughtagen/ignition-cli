@@ -167,6 +167,17 @@ pub trait ProjectHost: Send + Sync {
         project: &str,
         name: &str,
     ) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// The read-only git surface of this host (Phase 27), when it has one.
+    ///
+    /// The one `ProjectHost` method Phase 27 adds, with a default body so
+    /// every existing implementation (and test fake) compiles unchanged and
+    /// answers `None`. A caller that finds a `.git` on a host that answers
+    /// `None` must treat the state as unreadable (`transport_failed`), never
+    /// as absent. The write half is never reachable from here.
+    fn git(&self) -> Option<&dyn GitHostRead> {
+        None
+    }
 }
 
 /// The host writes of a tag-owning `deploy projects` run besides its records
@@ -216,9 +227,11 @@ pub trait ProjectRunWriter: Send + Sync {
 
 /// What a copy of a gateway `.git` holds, as one comparable value (Phase 27).
 ///
-/// `digest` is the sha256 over the sorted lines `path NUL size LF` for every
-/// file below `objects/` and `path NUL sha256 LF` for every other file, so a
-/// save and its restore are proven equal without hashing every object.
+/// `digest` is the sha256 over the lines `path NUL size LF` for every file
+/// below `objects/` and `path NUL sha256 LF` for every other file, in the byte
+/// order of the whole path (the order `LC_ALL=C sort` gives, so every host
+/// family computes the same value), so a save and its restore are proven
+/// equal without hashing every object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitManifest {
     /// Regular files in the tree.
@@ -227,6 +240,17 @@ pub struct GitManifest {
     pub bytes: u64,
     /// Lowercase hex sha256, as described above.
     pub digest: String,
+}
+
+/// How big a gateway `.git` is, from file sizes alone (Phase 27, checker
+/// W-5): nothing is read or hashed, so the free-space preflight stays cheap at
+/// production shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GitSize {
+    /// Regular files in the tree.
+    pub files: usize,
+    /// Their total size in bytes.
+    pub bytes: u64,
 }
 
 /// The read-only host surface for the gateway's `.git` (Phase 27).
@@ -265,6 +289,25 @@ pub trait GitHostRead: Send + Sync {
         project: &str,
         name: &GitWriteName,
     ) -> Result<Option<String>, CoreError>;
+
+    /// The bytes of `<data_dir>/git.yaml`, the git module's settings file.
+    /// `None` only when it does not exist; a symlink, a non-regular file or
+    /// more than [`YAML_MAX_BYTES`](crate::deploy::yamlio::YAML_MAX_BYTES)
+    /// bytes is [`CoreError::DeployRunInvalid`] naming `git.yaml`, an
+    /// unreadable host is [`CoreError::TransportFailed`]. The bytes may hold a
+    /// credential: they are held in memory only and never logged or stored.
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// Free bytes on the file system that holds the save root of `gateway`'s
+    /// `project` (the nearest existing ancestor of
+    /// [`git_save_rel`](crate::deploy::ledger::git_save_rel)'s directory).
+    async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError>;
+
+    /// The [`GitSize`] of the project's live `.git`, from a listing alone:
+    /// no file is opened for reading and nothing is hashed, unlike
+    /// [`git_manifest`](Self::git_manifest). A symlink anywhere inside
+    /// refuses.
+    async fn git_size(&self, project: &str) -> Result<GitSize, CoreError>;
 }
 
 /// The writes `deploy projects` makes to a project's `.git` and to its
@@ -290,6 +333,9 @@ pub trait GitHostRead: Send + Sync {
 ///   refuses the write and nothing is written.
 /// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
 ///   of one run and nothing else; no save directory is named `.git`.
+/// - [`probe_write`](Self::probe_write) creates and removes one probe file in
+///   the project directory and in its `.git`, to prove the grant before any
+///   other write.
 ///
 /// Every name passes [`component_problem`] before a path is built.
 #[async_trait::async_trait]
@@ -323,6 +369,18 @@ pub trait GitStateWriter: Send + Sync {
         project: &str,
         run_id: &str,
     ) -> Result<(), CoreError>;
+
+    /// Create exclusively, then remove, `.ign-probe-<run-id>` in
+    /// `projects/<project>` and in `projects/<project>/.git`. A denial is
+    /// [`CoreError::TransportFailed`] naming which of the two paths refused.
+    /// Nothing is left behind on success; a probe file that already exists is
+    /// refused and left alone.
+    async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError>;
+}
+
+/// The name of the probe file [`GitStateWriter::probe_write`] creates.
+pub fn git_probe_name(run_id: &str) -> String {
+    format!(".ign-probe-{run_id}")
 }
 
 /// Why `gateway`, `project` or the pre-image file `name` cannot be used for
@@ -562,6 +620,45 @@ pub fn tag_record_writer_for_node(
     }
 }
 
+/// The read-only git surface for `node`, built from its target block exactly
+/// as [`project_host_for_node`] builds the project host (Phase 27). No
+/// connection is opened until a method is called.
+pub fn git_host_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn GitHostRead>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
+}
+
+/// The git state writer for `node`, from its target block, built exactly as
+/// [`git_host_for_node`] builds the reader. The source scan
+/// `git_state_writer_is_confined` lets only `deploy/transport/`,
+/// `deploy/git_handover.rs` and the project deploy action name it.
+pub fn git_state_writer_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn GitStateWriter>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
+}
+
 /// The release-record writer for `node`, from its target block.
 ///
 /// The `local` arm writes below the runner's own data directory. The `ssh` arm
@@ -655,6 +752,61 @@ mod tests {
         release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
             .map(|_| ())
             .expect("an ssh node has a writer");
+    }
+
+    /// 27-08: the git reader and the git writer are built for a local and an
+    /// ssh node the way the release writer is, without a connection, and an
+    /// ssh node whose `known_hosts` is missing is refused before anything is
+    /// read or written.
+    #[test]
+    fn git_factories_build_local_and_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: '{}'\n",
+            dir.path().display()
+        );
+        let local = crate::deploy::target::Target::parse("targets/dev.yaml", local_yaml.as_bytes())
+            .expect("local target")
+            .nodes
+            .master;
+        git_host_for_node(dir.path(), "targets/dev.yaml", "nodes.master", &local)
+            .map(|_| ())
+            .expect("a local node has a git reader");
+        git_state_writer_for_node(dir.path(), "targets/dev.yaml", "nodes.master", &local)
+            .map(|_| ())
+            .expect("a local node has a git writer");
+
+        let ssh = ssh_target("hosts/lnx.known_hosts").expect("target parses");
+        let err = git_host_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("no known_hosts under this base");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        let err = git_state_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("no known_hosts under this base");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+
+        std::fs::create_dir_all(dir.path().join("hosts")).expect("hosts dir");
+        std::fs::write(
+            dir.path().join("hosts/lnx.known_hosts"),
+            "lnx.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTheUnitTestOnly0000000\n",
+        )
+        .expect("known_hosts");
+        git_host_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect("an ssh node has a git reader");
+        git_state_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect("an ssh node has a git writer");
+    }
+
+    /// The probe file name is fixed by the run id.
+    #[test]
+    fn git_probe_name_is_fixed() {
+        assert_eq!(
+            git_probe_name("20261114T101500Z-ab12"),
+            ".ign-probe-20261114T101500Z-ab12"
+        );
     }
 
     /// 26-06: the tag record writer is built for a local and an ssh node the

@@ -104,11 +104,16 @@
 //! file; an absent journal is a success.
 
 use super::{Budget, EntryKind, SftpTransport, windows_native_path};
+use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
+use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_state::{
+    GIT_LOG_TAIL_MAX, GIT_LOOSE_REFS_MAX, GIT_MARKERS, GIT_PACKED_REFS_MAX, GitFiles,
+};
 use crate::deploy::ledger::{
-    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, pre_image_location, pre_image_rel,
-    project_journal_location, project_journal_rel, release_record_location, release_record_rel,
-    tag_record_location, tag_record_rel,
+    LedgerRoot, RELEASE_RECORD_FILE, RELEASE_RECORD_MAX_BYTES, git_save_location, git_save_rel,
+    pre_image_location, pre_image_rel, project_journal_location, project_journal_rel,
+    release_record_location, release_record_rel, tag_record_location, tag_record_rel,
 };
 use crate::deploy::project_run::{
     PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
@@ -117,12 +122,13 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
-    GitEntry, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
-    check_pre_image_write, git_entry_location, project_run_names_problem_on,
-    tag_record_names_problem_on,
+    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ProjectHost, ProjectRunWriter,
+    ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_entry_location,
+    git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
-use crate::deploy::transport::remote::{RemoteCommand, SftpOp};
+use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
 use crate::deploy::transport::winps::{WinScript, windows_component_problem};
+use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
 
 /// The fixed `sh -c` text of the POSIX probe, one line (a remote command
@@ -145,6 +151,284 @@ pub(super) const GIT_PROBE_SH: &str = concat!(
 
 /// The `$0` the probe runs under, so a `stat` message names the script.
 const GIT_PROBE_NAME: &str = "ign-git-probe";
+
+// The git handover scripts (Phase 27, 27-08). Each is one line of fixed text;
+// every path and name travels as a positional argument. Generated from one
+// reviewed source and kept here as `concat!` lines so a test can run the very
+// same text under the local `sh`.
+
+pub(super) const GIT_MANIFEST_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in find wc awk sort tr ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
+    "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "ml() { while IFS= read -r l; do case $l in *' ./'*) s=${l%% ./*}; p=${l#*' ./'}; s=$((s)); ",
+    "case $p in objects/*) printf '%s\\001%s\\n' \"$p\" \"$s\";; ",
+    "*) h=$($H -- \"./$p\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; }; ",
+    "mf() { cd -- \"$1\" || exit 3; ",
+    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
+    "a=$(find -P . -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "w=$(printf '%s\\n' \"$a\" | awk '/ \\.\\// {n++; s=$0; sub(/^ */,\"\",s); b+=s+0} END {printf \"%d %.0f\", n, b}') || exit 3; ",
+    "q=$(printf '%s\\n' \"$a\" | ml) || exit 3; ",
+    "if [ -n \"$q\" ]; then d=$(printf '%s\\n' \"$q\" | sort | tr '\\001' '\\000' | $H) || exit 3; else d=$(: | $H) || exit 3; fi; ",
+    "printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
+    "wk \"$1\" \"$2\"; m=$(mf \"$PWD\") || exit $?; set -- $m; ",
+    "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
+);
+
+pub(super) const GIT_SIZE_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in find ls awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "wk \"$1\" \"$2\"; ",
+    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
+    "a=$(find -P . -type f -exec ls -ln {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; set -- $w; ",
+    "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s}\\n' \"$1\" \"$2\"",
+);
+
+pub(super) const GIT_STATE_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in find wc head tail base64 tr ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "wk \"$1\" \"$2\"; shift 2; set -f; NL=$(printf '\\nx'); NL=${NL%x}; ",
+    "rd() { if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
+    "if pr \"$1\"; then [ -f \"$1\" ] || { printf '%s is not a regular file\\n' \"$1\" >&2; exit 4; }; ",
+    "[ -r \"$1\" ] || { printf '%s cannot be read\\n' \"$1\" >&2; exit 3; }; ",
+    "z=$(wc -c < \"$1\") || exit 3; z=$((z)); ",
+    "b=$($3 -c \"$2\" < \"$1\" | base64 | tr -d '\\n'); printf '{\"n\":%s,\"b\":\"%s\"}' \"$z\" \"$b\"; ",
+    "else printf null; fi; }; ",
+    "printf 'IGN-RESULT:{\"head\":'; rd HEAD 65537 head; ",
+    "printf ',\"config\":'; rd config 65537 head; ",
+    "printf ',\"packed\":'; rd packed-refs 8388609 head; ",
+    "printf ',\"log\":'; rd logs/HEAD 65536 tail; ",
+    "printf ',\"index\":'; if pr index; then printf true; else printf false; fi; ",
+    "printf ',\"markers\":['; s=''; for m in \"$@\"; do if pr \"$m\"; then printf '%s\"%s\"' \"$s\" \"$m\"; s=,; fi; done; printf ']'; ",
+    "printf ',\"refs\":['; s=''; c=0; ",
+    "for d in refs/heads refs/remotes; do if pr \"$d\"; then ",
+    "[ -d \"$d\" ] && [ ! -L \"$d\" ] || { printf '%s is not a real directory\\n' \"$d\" >&2; exit 4; }; ",
+    "x=$(find -P \"$d\" \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { printf '%s holds a symlink, a special file or a name with a control character\\n' \"$d\" >&2; exit 4; }; ",
+    "L=$(find -P \"$d\" -type f 2>&1) || { printf '%s\\n' \"$L\" >&2; exit 3; }; ",
+    "IFS=$NL; for r in $L; do c=$((c+1)); [ \"$c\" -le 4097 ] || break; ",
+    "[ -r \"$r\" ] || { printf '%s cannot be read\\n' \"$r\" >&2; exit 3; }; ",
+    "z=$(wc -c < \"$r\") || exit 3; z=$((z)); ",
+    "b=$(head -c 65537 < \"$r\" | base64 | tr -d '\\n'); p=$(printf '%s' \"$r\" | base64 | tr -d '\\n'); ",
+    "printf '%s{\"p\":\"%s\",\"n\":%s,\"b\":\"%s\"}' \"$s\" \"$p\" \"$z\" \"$b\"; s=,; done; unset IFS; ",
+    "fi; done; printf ']}\\n'",
+);
+
+pub(super) const GIT_DIGEST_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
+    "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "wk \"$1\" \"$2\"; f=$3; ",
+    "if [ -L \"$f\" ]; then printf '%s is a symlink\\n' \"$f\" >&2; exit 4; fi; ",
+    "if pr \"$f\"; then [ -f \"$f\" ] || { printf '%s is not a regular file\\n' \"$f\" >&2; exit 4; }; ",
+    "h=$($H -- \"./$f\") || exit 3; printf 'IGN-RESULT:{\"digest\":\"%s\"}\\n' \"${h%% *}\"; ",
+    "else printf 'IGN-RESULT:{\"digest\":null}\\n'; fi",
+);
+
+pub(super) const GIT_SAVE_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in find wc awk sort tr ls cp rm mkdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
+    "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "mk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do if [ -L \"$c\" ]; then printf '%s is a symlink\\n' \"$c\" >&2; exit 4; ",
+    "elif [ -d \"$c\" ]; then :; ",
+    "elif pr \"$c\"; then printf '%s is not a directory\\n' \"$c\" >&2; exit 4; ",
+    "else mkdir -- \"$c\" || exit 3; fi; cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "ml() { while IFS= read -r l; do case $l in *' ./'*) s=${l%% ./*}; p=${l#*' ./'}; s=$((s)); ",
+    "case $p in objects/*) printf '%s\\001%s\\n' \"$p\" \"$s\";; ",
+    "*) h=$($H -- \"./$p\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; }; ",
+    "mf() { cd -- \"$1\" || exit 3; ",
+    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
+    "a=$(find -P . -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "w=$(printf '%s\\n' \"$a\" | awk '/ \\.\\// {n++; s=$0; sub(/^ */,\"\",s); b+=s+0} END {printf \"%d %.0f\", n, b}') || exit 3; ",
+    "q=$(printf '%s\\n' \"$a\" | ml) || exit 3; ",
+    "if [ -n \"$q\" ]; then d=$(printf '%s\\n' \"$q\" | sort | tr '\\001' '\\000' | $H) || exit 3; else d=$(: | $H) || exit 3; fi; ",
+    "printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
+    "umask 077; wk \"$1\" \"$2\"; src=$PWD; before=$(mf \"$src\") || exit $?; ",
+    "mk \"$3\" \"$4\"; if pr repo; then echo 'the save already exists; a save is never overwritten' >&2; exit 4; fi; ",
+    "cp -a -- \"$src\" repo || { rm -rf -- repo; exit 3; }; ",
+    "after=$(mf repo) || { r=$?; rm -rf -- repo; exit $r; }; ",
+    "[ \"$before\" = \"$after\" ] || { rm -rf -- repo; echo 'the saved copy does not match the .git it was taken from' >&2; exit 5; }; ",
+    "set -- $after; ",
+    "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
+);
+
+pub(super) const GIT_RESTORE_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in find wc awk sort tr ls cp mv rm id; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
+    "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "ml() { while IFS= read -r l; do case $l in *' ./'*) s=${l%% ./*}; p=${l#*' ./'}; s=$((s)); ",
+    "case $p in objects/*) printf '%s\\001%s\\n' \"$p\" \"$s\";; ",
+    "*) h=$($H -- \"./$p\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; }; ",
+    "mf() { cd -- \"$1\" || exit 3; ",
+    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
+    "a=$(find -P . -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "w=$(printf '%s\\n' \"$a\" | awk '/ \\.\\// {n++; s=$0; sub(/^ */,\"\",s); b+=s+0} END {printf \"%d %.0f\", n, b}') || exit 3; ",
+    "q=$(printf '%s\\n' \"$a\" | ml) || exit 3; ",
+    "if [ -n \"$q\" ]; then d=$(printf '%s\\n' \"$q\" | sort | tr '\\001' '\\000' | $H) || exit 3; else d=$(: | $H) || exit 3; fi; ",
+    "printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
+    "wk \"$1\" \"$2\"; proj=$PWD; ",
+    "if pr \"$proj/.git\"; then printf '%s/.git exists; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
+    "wk \"$3\" \"$4\"; [ -d repo ] && [ ! -L repo ] || { echo 'the save has no repo directory' >&2; exit 4; }; ",
+    "saved=$(mf repo) || exit $?; stage=$proj/.ign-restore-$5; ",
+    "if pr \"$stage\"; then printf '%s exists; it is left alone\\n' \"$stage\" >&2; exit 4; fi; ",
+    "cp -a -- repo \"$stage\" || { rm -rf -- \"$stage\"; exit 3; }; ",
+    "gu=$(ls -ldn -- \"$proj\" | awk '{print $3}'); me=$(id -u); ",
+    "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then ",
+    "if ! command -v setfacl >/dev/null 2>&1; then rm -rf -- \"$stage\"; echo 'the gateway account needs write access to the restored .git and the host has no setfacl' >&2; exit 6; fi; ",
+    "setfacl -R -m \"u:$gu:rwX\" \"$stage\" && find \"$stage\" -type d -exec setfacl -d -m \"u:$gu:rwX\" {} + || { rm -rf -- \"$stage\"; echo 'setfacl failed on the restored .git' >&2; exit 6; }; ",
+    "if command -v getfacl >/dev/null 2>&1; then e=$(getfacl -p -- \"$stage/config\" 2>/dev/null | grep \"^user:$gu:\"); ",
+    "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) rm -rf -- \"$stage\"; echo 'the gateway account has no effective write access on the restored .git' >&2; exit 6;; esac;; ",
+    "*) rm -rf -- \"$stage\"; echo 'the gateway account has no ACL entry on the restored .git' >&2; exit 6;; esac; fi; fi; ",
+    "staged=$(mf \"$stage\") || { r=$?; rm -rf -- \"$stage\"; exit $r; }; ",
+    "[ \"$staged\" = \"$saved\" ] || { rm -rf -- \"$stage\"; echo 'the restored copy does not match the save; nothing was restored' >&2; exit 5; }; ",
+    "if pr \"$proj/.git\"; then rm -rf -- \"$stage\"; printf '%s/.git appeared; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
+    "mv -- \"$stage\" \"$proj/.git\" || { rm -rf -- \"$stage\"; exit 3; }; ",
+    "final=$(mf \"$proj/.git\") || exit $?; set -- $final; ",
+    "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
+);
+
+pub(super) const GIT_PROBE_W_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in ls rm; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "pw() { [ -d \"$1\" ] && [ ! -L \"$1\" ] || { printf '%s is not a real directory\\n' \"$2\" >&2; exit 4; }; ",
+    "if pr \"$1/$3\"; then printf 'a probe file already exists in %s\\n' \"$2\" >&2; exit 4; fi; ",
+    "( set -C; : > \"$1/$3\" ) 2>/dev/null || { printf 'a probe file cannot be created in %s\\n' \"$2\" >&2; exit 3; }; ",
+    "rm -f -- \"$1/$3\" || { printf 'the probe file in %s cannot be removed\\n' \"$2\" >&2; exit 3; }; }; ",
+    "[ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "pw \"$1/$2\" \"$2\" \"$3\"; pw \"$1/$2/.git\" \"$2/.git\" \"$3\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
+);
+
+pub(super) const GIT_LOCK_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in ls mkdir rm; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "umask 022; wk \"$1\" \"$2\"; mode=$3; shift 3; set -f; NL=$(printf '\\nx'); NL=${NL%x}; ",
+    "if [ \"$mode\" = unlock ]; then while [ $# -ge 2 ]; do l=$2; shift 2; ",
+    "if [ -f \"$l\" ] && [ ! -L \"$l\" ]; then rm -f -- \"$l\" || exit 3; fi; done; printf 'IGN-RESULT:{\"ok\":1}\\n'; exit 0; fi; ",
+    "ck() { p=''; OI=$IFS; IFS=/; for c in $1; do p=${p:+$p/}$c; ",
+    "if [ -L \"$p\" ]; then printf '%s is a symlink\\n' \"$p\" >&2; exit 4; ",
+    "elif [ -d \"$p\" ]; then :; ",
+    "elif pr \"$p\"; then printf '%s is not a directory\\n' \"$p\" >&2; exit 4; ",
+    "elif [ \"$2\" = m ]; then mkdir -- \"$p\" || exit 3; else break; fi; done; IFS=$OI; }; ",
+    "n=$#; k=0; while [ $k -lt $n ]; do t=$1; l=$2; shift 2; set -- \"$@\" \"$t\" \"$l\"; k=$((k+2)); ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; ck \"$par\" c; ",
+    "if pr \"$t\"; then [ -f \"$t\" ] && [ ! -L \"$t\" ] || { printf '%s is not a regular file; it is left alone\\n' \"$t\" >&2; exit 4; }; fi; ",
+    "if pr \"$l\"; then printf '%s exists; another writer holds it, nothing was written\\n' \"$l\" >&2; exit 4; fi; done; ",
+    "made=''; k=0; while [ $k -lt $n ]; do t=$1; l=$2; shift 2; set -- \"$@\" \"$t\" \"$l\"; k=$((k+2)); ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; ck \"$par\" m; ",
+    "if ( set -C; : > \"$l\" ) 2>/dev/null; then made=\"$made$l$NL\"; ",
+    "else IFS=$NL; for f in $made; do rm -f -- \"$f\"; done; unset IFS; printf '%s exists or cannot be created; nothing was written\\n' \"$l\" >&2; exit 4; fi; done; ",
+    "printf 'IGN-RESULT:{\"ok\":1}\\n'",
+);
+
+pub(super) const GIT_REPLACE_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in ls mv wc; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    "wk \"$1\" \"$2\"; shift 2; ",
+    "while [ $# -ge 3 ]; do t=$1; l=$2; z=$3; shift 3; ",
+    "[ -f \"$l\" ] && [ ! -L \"$l\" ] || { printf '%s is not a regular file\\n' \"$l\" >&2; exit 4; }; ",
+    "[ $(( $(wc -c < \"$l\") )) -eq \"$z\" ] || { printf '%s is not the size that was sent\\n' \"$l\" >&2; exit 5; }; ",
+    "if pr \"$t\"; then [ -f \"$t\" ] && [ ! -L \"$t\" ] || { printf '%s is not a regular file; it is left alone\\n' \"$t\" >&2; exit 4; }; fi; ",
+    "mv -f -- \"$l\" \"$t\" || { printf '%s cannot be put in place\\n' \"$t\" >&2; exit 3; }; done; ",
+    "printf 'IGN-RESULT:{\"ok\":1}\\n'",
+);
+
+pub(super) const GIT_SAVE_RM_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in ls rm rmdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "case $2 in ign-deploy/*/git-save/\"$3\"/repo) ;; *) printf 'refusing %s: it does not end in git-save/%s/repo\\n' \"$2\" \"$3\" >&2; exit 4;; esac; ",
+    "[ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; set -f; OI=$IFS; IFS=/; for c in $2; do ",
+    "case $c in ''|.|..) echo 'refusing an empty, . or .. component' >&2; exit 4;; esac; ",
+    "if [ -L \"$c\" ]; then printf '%s is a symlink\\n' \"$c\" >&2; exit 4; ",
+    "elif [ -d \"$c\" ]; then :; ",
+    "elif pr \"$c\"; then printf '%s is not a directory\\n' \"$c\" >&2; exit 4; ",
+    "else printf 'IGN-RESULT:{\"removed\":0}\\n'; exit 0; fi; ",
+    "if [ \"$c\" = repo ]; then break; fi; cd -- \"$c\" || exit 3; done; IFS=$OI; ",
+    "rm -rf -- repo || { echo 'the save cannot be removed' >&2; exit 3; }; ",
+    "cd .. || exit 3; rmdir -- \"$3\" 2>/dev/null; printf 'IGN-RESULT:{\"removed\":1}\\n'",
+);
+
+pub(super) const GIT_FREE_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in df awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "d=$1/$2; while [ ! -d \"$d\" ]; do case $d in */*) d=${d%/*}; [ -n \"$d\" ] || d=/;; *) exit 3;; esac; done; ",
+    "f=$(df -P -k -- \"$d\" | awk 'NR==2 {printf \"%.0f\", $4*1024}') || exit 3; [ -n \"$f\" ] || exit 3; ",
+    "printf 'IGN-RESULT:{\"free\":%s}\\n' \"$f\"",
+);
 
 /// The note `RemoteShell::require_success` puts in the detail of an sftp
 /// failure that answered "not found" (`remote.rs`).
@@ -313,6 +597,10 @@ fn windows_git_entry(answer: &serde_json::Value, project: &str) -> Result<GitEnt
 
 #[async_trait::async_trait]
 impl ProjectHost for SftpTransport {
+    fn git(&self) -> Option<&dyn GitHostRead> {
+        Some(self)
+    }
+
     async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));
@@ -867,6 +1155,675 @@ impl SftpTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The git host channel (Phase 27, 27-08): POSIX nodes
+// ---------------------------------------------------------------------------
+//
+// One fixed `sh -c` script per operation over the hardened exec channel, so a
+// save, a restore, a manifest or a size is a fixed number of ssh connections
+// whatever the file count (D-06; a per-file sftp loop costs about 0.8 s per
+// folder on a production Windows host and is never used). The scripts take
+// every path and name as a positional argument, hold no control character
+// (one line each) and print one `IGN-RESULT:` JSON line. They need only POSIX
+// `sh` and the usual utilities, so the same text runs on the Linux hosts and
+// under the local `sh` in the tests.
+//
+// | script | does |
+// |---|---|
+// | `GIT_STATE_SH` | reads the files `classify` needs: HEAD, config, packed-refs, logs/HEAD tail, loose refs, markers, index |
+// | `GIT_MANIFEST_SH` | `GitManifest` of a directory: sizes below `objects/`, sha256 elsewhere |
+// | `GIT_SIZE_SH` | file count and total size from `ls -ln`, nothing opened |
+// | `GIT_DIGEST_SH` | sha256 of one file below `.git` |
+// | `GIT_SAVE_SH` | `cp -a` of `.git` into the private save, then both manifests compared |
+// | `GIT_RESTORE_SH` | `cp -a` of the save beside `.git`, the D-G1 ACL step, manifest compare, `mv` into place |
+// | `GIT_PROBE_W_SH` | exclusive create then remove of a probe file in the project directory and its `.git` |
+// | `GIT_LOCK_SH` | `<rel>.lock` (or `.ign-tmp`) created exclusively; the sftp CLI cannot open `O_EXCL` |
+// | `GIT_REPLACE_SH` | size check, then `mv -f` of each lock over its file |
+// | `GIT_SAVE_RM_SH` | removes `git-save/<run-id>/repo` and nothing else |
+// | `GIT_FREE_SH` | free bytes of the file system under the save root |
+//
+// A script exits 3 for a failure of the host or a denial, 4 for a refusal
+// (a symlink, an existing target, a foreign path), 5 for a copy that does not
+// match, 6 for the gateway-account ACL step. Every non-zero exit is
+// `transport_failed` naming the operation, with the script's stderr tail.
+//
+// The Windows arm of every method below fails closed until 27-09 replaces it:
+// `transport_failed` naming the operation, never an absent `.git` and never an
+// empty answer.
+
+/// The `$0` the git scripts run under.
+const GIT_SCRIPT_NAME: &str = "ign-git";
+
+/// Longest a heavy git script (a save, restore, manifest or removal of a
+/// whole `.git`) may run.
+const GIT_HEAVY_LIMIT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// What a `.git` operation on a Windows node says until 27-09.
+const WINDOWS_GIT_PENDING: &str = "the git host operations are not available on a Windows ssh node yet; the request was refused, not answered empty";
+
+/// The state files' caps the scripts ask for (one byte past each cap, so the
+/// caller's cap check names a file that is over).
+const STATE_SMALL_READ: usize = crate::deploy::git_state::GIT_SMALL_FILE_MAX + 1;
+
+impl SftpTransport {
+    /// A refused Windows call (27-09 replaces every use).
+    fn git_windows_pending(&self, op: &str) -> CoreError {
+        self.mirror_fail(op, format!("{op}: {WINDOWS_GIT_PENDING}"))
+    }
+
+    /// The names gateway, project and run id as safe components on this host's
+    /// family, before any path is built (T-27-22).
+    fn git_names_problem(&self, gateway: &str, project: &str, run_id: &str) -> Option<String> {
+        let location = git_save_location(LedgerRoot::AccountHome, gateway, project, "<run-id>");
+        if let Some(why) = project_run_names_problem_on(gateway, project, None, Some(self.windows))
+        {
+            return Some(format!("{location}: {why}"));
+        }
+        if RunId::parse(run_id).is_err() {
+            return Some(format!(
+                "{location}: the run id is not 1 to 128 characters of [A-Za-z0-9._-]"
+            ));
+        }
+        None
+    }
+
+    fn git_names_check(
+        &self,
+        op: &str,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError> {
+        match self.git_names_problem(gateway, project, run_id) {
+            Some(why) => Err(self.mirror_fail(op, why)),
+            None => Ok(()),
+        }
+    }
+
+    /// Run one git script with `args` (paths and names only as arguments).
+    async fn git_run(
+        &self,
+        op: &str,
+        script: &'static str,
+        args: &[&str],
+        limit: std::time::Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        let mut argv = vec!["sh", "-c", script, GIT_SCRIPT_NAME];
+        argv.extend_from_slice(args);
+        let command = RemoteCommand::posix(&argv).map_err(|why| {
+            self.mirror_fail(op, format!("the {op} command cannot be built: {why}"))
+        })?;
+        self.shell.exec_posix_within(op, &command, limit).await
+    }
+
+    /// The `.git` of `project` as a path below the data directory.
+    fn git_rel(project: &str) -> String {
+        format!("projects/{project}/.git")
+    }
+
+    fn git_unusable(&self, op: &str, what: &str) -> CoreError {
+        self.mirror_fail(op, format!("{op}: the host's answer is unusable ({what})"))
+    }
+
+    /// A [`GitManifest`] from a script answer.
+    fn git_manifest_of(
+        &self,
+        op: &str,
+        answer: &serde_json::Value,
+    ) -> Result<GitManifest, CoreError> {
+        let files = answer.get("files").and_then(serde_json::Value::as_u64);
+        let bytes = answer.get("bytes").and_then(serde_json::Value::as_u64);
+        let digest = answer.get("digest").and_then(serde_json::Value::as_str);
+        match (files, bytes, digest) {
+            (Some(files), Some(bytes), Some(digest))
+                if digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                Ok(GitManifest {
+                    files: usize::try_from(files)
+                        .map_err(|_| self.git_unusable(op, "the file count"))?,
+                    bytes,
+                    digest: digest.to_string(),
+                })
+            }
+            _ => Err(self.git_unusable(op, "files, bytes or digest is missing or malformed")),
+        }
+    }
+
+    /// The bytes of one `{"n":size,"b":base64}` file answer (or `null`),
+    /// checked against the size the host reported: `want` bytes were asked
+    /// for, so a short read (a failed `head` the shell could not see) is an
+    /// error here and never silently empty content.
+    fn git_file_bytes(
+        &self,
+        op: &str,
+        what: &str,
+        value: Option<&serde_json::Value>,
+        asked: usize,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let Some(value) = value else {
+            return Err(self.git_unusable(op, &format!("{what} is missing")));
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let size = value.get("n").and_then(serde_json::Value::as_u64);
+        let text = value.get("b").and_then(serde_json::Value::as_str);
+        let (Some(size), Some(text)) = (size, text) else {
+            return Err(self.git_unusable(op, &format!("{what} has no size or no bytes")));
+        };
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text)
+            .map_err(|_| self.git_unusable(op, &format!("{what} is not base64")))?;
+        let want = size.min(asked as u64);
+        if bytes.len() as u64 != want {
+            return Err(self.git_unusable(
+                op,
+                &format!(
+                    "{what} came back as {} bytes where {want} were expected; a read was cut short",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(Some(bytes))
+    }
+
+    /// The [`GitFiles`] of a `GIT_STATE_SH` answer.
+    fn git_files_of(&self, op: &str, answer: &serde_json::Value) -> Result<GitFiles, CoreError> {
+        let mut files = GitFiles::without_contents(GitEntry::Directory);
+        files.head = self.git_file_bytes(op, "HEAD", answer.get("head"), STATE_SMALL_READ)?;
+        files.config = self.git_file_bytes(op, "config", answer.get("config"), STATE_SMALL_READ)?;
+        files.packed_refs = self.git_file_bytes(
+            op,
+            "packed-refs",
+            answer.get("packed"),
+            GIT_PACKED_REFS_MAX + 1,
+        )?;
+        files.head_log_tail =
+            self.git_file_bytes(op, "logs/HEAD", answer.get("log"), GIT_LOG_TAIL_MAX)?;
+        files.index_present = answer
+            .get("index")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| self.git_unusable(op, "index is missing"))?;
+        let markers = answer
+            .get("markers")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| self.git_unusable(op, "markers is missing"))?;
+        for marker in markers {
+            let name = marker
+                .as_str()
+                .filter(|name| GIT_MARKERS.contains(name))
+                .ok_or_else(|| self.git_unusable(op, "a marker the host may not report"))?;
+            files.markers.push(name.to_string());
+        }
+        let refs = answer
+            .get("refs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| self.git_unusable(op, "refs is missing"))?;
+        for entry in refs {
+            let name = entry
+                .get("p")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).ok()
+                })
+                .and_then(|raw| String::from_utf8(raw).ok())
+                .filter(|name| name.starts_with("refs/heads/") || name.starts_with("refs/remotes/"))
+                .ok_or_else(|| self.git_unusable(op, "a loose ref name"))?;
+            let bytes = self
+                .git_file_bytes(op, "a loose ref", Some(entry), STATE_SMALL_READ)?
+                .unwrap_or_default();
+            files.loose_refs.push((name, bytes));
+        }
+        // Depth-first in name order, as the local walk lists them.
+        files
+            .loose_refs
+            .sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')));
+        files.loose_refs.truncate(GIT_LOOSE_REFS_MAX + 1);
+        Ok(files)
+    }
+
+    /// `git.yaml` in the data directory, one capped `get`.
+    async fn read_git_yaml_posix(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        let bad = |problem: String| CoreError::DeployRunInvalid {
+            run_id: "unknown".to_string(),
+            problem: format!("git.yaml: {problem}"),
+        };
+        self.read_file_below(
+            Some(&self.data_dir),
+            "git.yaml",
+            YAML_MAX_BYTES,
+            "git.yaml",
+            &[],
+            &bad,
+        )
+        .await
+    }
+
+    /// The `ign-deploy/.../git-save/<run>` directory below the account home.
+    fn git_save_dir_rel(gateway: &str, project: &str, run_id: &str) -> String {
+        let repo = git_save_rel(gateway, project, run_id);
+        repo.strip_suffix("/repo").unwrap_or(&repo).to_string()
+    }
+}
+
+#[async_trait::async_trait]
+impl GitHostRead for SftpTransport {
+    async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        if self.windows {
+            return Err(self.git_windows_pending("read_git_state"));
+        }
+        let kind = self.git_entry_posix(project).await?;
+        if kind != GitEntry::Directory {
+            return Ok(GitFiles::without_contents(kind));
+        }
+        let rel = Self::git_rel(project);
+        let mut args = vec![self.data_dir.as_str(), rel.as_str()];
+        args.extend(GIT_MARKERS.iter().copied());
+        let answer = self
+            .git_run(
+                "read_git_state",
+                GIT_STATE_SH,
+                &args,
+                self.shell.op_timeout(),
+            )
+            .await?;
+        self.git_files_of("read_git_state", &answer)
+    }
+
+    async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        if self.windows {
+            return Err(self.git_windows_pending("git_manifest"));
+        }
+        let rel = Self::git_rel(project);
+        let answer = self
+            .git_run(
+                "git_manifest",
+                GIT_MANIFEST_SH,
+                &[&self.data_dir, &rel],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        self.git_manifest_of("git_manifest", &answer)
+    }
+
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        self.git_names_check("save_manifest", gateway, project, run_id)?;
+        if self.windows {
+            return Err(self.git_windows_pending("save_manifest"));
+        }
+        let home = self.account_home().await?;
+        let rel = git_save_rel(gateway, project, run_id);
+        let answer = self
+            .git_run(
+                "save_manifest",
+                GIT_MANIFEST_SH,
+                &[&home, &rel],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        self.git_manifest_of("save_manifest", &answer)
+    }
+
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &GitWriteName,
+    ) -> Result<Option<String>, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        name.check_shape()
+            .map_err(|why| self.fail(format!("a .git file name is refused: {why}")))?;
+        if self.windows {
+            return Err(self.git_windows_pending("git_file_digest"));
+        }
+        let (rel, file) = (Self::git_rel(project), name.rel());
+        let answer = self
+            .git_run(
+                "git_file_digest",
+                GIT_DIGEST_SH,
+                &[&self.data_dir, &rel, &file],
+                self.shell.op_timeout(),
+            )
+            .await?;
+        match answer.get("digest") {
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(hex))
+                if hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                Ok(Some(hex.clone()))
+            }
+            _ => Err(self.git_unusable("git_file_digest", "the digest")),
+        }
+    }
+
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        if self.windows {
+            return Err(self.git_windows_pending("read_git_yaml"));
+        }
+        self.read_git_yaml_posix().await
+    }
+
+    async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+        self.git_names_check("free_bytes", gateway, project, "free")?;
+        if self.windows {
+            return Err(self.git_windows_pending("free_bytes"));
+        }
+        let home = self.account_home().await?;
+        let repo = git_save_rel(gateway, project, "free");
+        let dir = repo.strip_suffix("/free/repo").unwrap_or(&repo).to_string();
+        let answer = self
+            .git_run(
+                "free_bytes",
+                GIT_FREE_SH,
+                &[&home, &dir],
+                self.shell.op_timeout(),
+            )
+            .await?;
+        answer
+            .get("free")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| self.git_unusable("free_bytes", "the free byte count"))
+    }
+
+    async fn git_size(&self, project: &str) -> Result<GitSize, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        if self.windows {
+            return Err(self.git_windows_pending("git_size"));
+        }
+        let rel = Self::git_rel(project);
+        let answer = self
+            .git_run(
+                "git_size",
+                GIT_SIZE_SH,
+                &[&self.data_dir, &rel],
+                self.shell.op_timeout(),
+            )
+            .await?;
+        let files = answer.get("files").and_then(serde_json::Value::as_u64);
+        let bytes = answer.get("bytes").and_then(serde_json::Value::as_u64);
+        match (files.map(usize::try_from), bytes) {
+            (Some(Ok(files)), Some(bytes)) => Ok(GitSize { files, bytes }),
+            _ => Err(self.git_unusable("git_size", "the count or the size")),
+        }
+    }
+}
+
+/// One staged file of a `.git` write: the target, the lock or temporary
+/// sibling it is written to, and the bytes.
+struct StagedWrite {
+    target: String,
+    lock: String,
+    local: std::path::PathBuf,
+    size: usize,
+}
+
+#[async_trait::async_trait]
+impl GitStateWriter for SftpTransport {
+    async fn save_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        self.git_names_check("write", gateway, project, run_id)?;
+        if self.windows {
+            return Err(self.git_windows_pending("save_git"));
+        }
+        let home = self.account_home().await?;
+        let (rel, dir) = (
+            Self::git_rel(project),
+            Self::git_save_dir_rel(gateway, project, run_id),
+        );
+        let answer = self
+            .git_run(
+                "save_git",
+                GIT_SAVE_SH,
+                &[&self.data_dir, &rel, &home, &dir],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        self.git_manifest_of("save_git", &answer)
+    }
+
+    async fn restore_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        self.git_names_check("write", gateway, project, run_id)?;
+        if self.windows {
+            return Err(self.git_windows_pending("restore_git"));
+        }
+        let home = self.account_home().await?;
+        let (project_rel, dir) = (
+            format!("projects/{project}"),
+            Self::git_save_dir_rel(gateway, project, run_id),
+        );
+        let answer = self
+            .git_run(
+                "restore_git",
+                GIT_RESTORE_SH,
+                &[&self.data_dir, &project_rel, &home, &dir, run_id],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        self.git_manifest_of("restore_git", &answer)
+    }
+
+    async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.mirror_fail("write", why));
+        }
+        // Every shape, and every path as an sftp batch line, is checked before
+        // the first remote call.
+        let git = format!("{}/{}", self.data_dir, Self::git_rel(project));
+        let mut plan: Vec<(String, String, &GitWrite)> = Vec::new();
+        for write in writes {
+            write.name.check_shape().map_err(|why| {
+                self.mirror_fail("write", format!("a .git write is refused: {why}"))
+            })?;
+            let rel = write.name.rel();
+            let suffix = match write.name {
+                GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => ".ign-tmp",
+                _ => ".lock",
+            };
+            let lock = format!("{rel}{suffix}");
+            safe_remote_path(&format!("{git}/{lock}")).map_err(|why| {
+                self.mirror_fail(
+                    "write",
+                    format!("{rel} cannot ride an sftp batch line ({why})"),
+                )
+            })?;
+            plan.push((rel, lock, write));
+        }
+        if self.windows {
+            return Err(self.git_windows_pending("write_git_files"));
+        }
+        if plan.is_empty() {
+            return Ok(());
+        }
+        let rel = Self::git_rel(project);
+        let limit = self.shell.op_timeout();
+        let mut lock_args = vec![self.data_dir.as_str(), rel.as_str(), "lock"];
+        for (target, lock, _) in &plan {
+            lock_args.push(target);
+            lock_args.push(lock);
+        }
+        // 1. Every lock exclusively (a lock that exists refuses, nothing is
+        //    written), creating the missing parent directories.
+        self.git_run("write_git_files", GIT_LOCK_SH, &lock_args, limit)
+            .await?;
+        // 2. The bytes over sftp into the locks.
+        let staged = match self.stage_git_writes(&plan) {
+            Ok(staged) => staged,
+            Err(err) => return Err(self.unlock_git_writes(err, &rel, &plan).await),
+        };
+        let ops: Vec<SftpOp> = staged
+            .1
+            .iter()
+            .map(|s| SftpOp::Put {
+                local: s.local.clone(),
+                remote: format!("{git}/{}", s.lock),
+            })
+            .collect();
+        if let Err(err) = self.run_batch("write", ops).await {
+            return Err(self.unlock_git_writes(err, &rel, &plan).await);
+        }
+        // 3. Each lock over its file, after a size check.
+        let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
+        let mut replace_args = vec![self.data_dir.as_str(), rel.as_str()];
+        for (s, size) in staged.1.iter().zip(&sizes) {
+            replace_args.push(&s.target);
+            replace_args.push(&s.lock);
+            replace_args.push(size);
+        }
+        if let Err(err) = self
+            .git_run("write_git_files", GIT_REPLACE_SH, &replace_args, limit)
+            .await
+        {
+            return Err(self.unlock_git_writes(err, &rel, &plan).await);
+        }
+        drop(staged);
+        Ok(())
+    }
+
+    async fn remove_git_save(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError> {
+        self.git_names_check("write", gateway, project, run_id)?;
+        if self.windows {
+            return Err(self.git_windows_pending("remove_git_save"));
+        }
+        let home = self.account_home().await?;
+        let rel = git_save_rel(gateway, project, run_id);
+        let answer = self
+            .git_run(
+                "remove_git_save",
+                GIT_SAVE_RM_SH,
+                &[&home, &rel, run_id],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        match answer.get("removed").and_then(serde_json::Value::as_u64) {
+            Some(0 | 1) => Ok(()),
+            _ => Err(self.git_unusable("remove_git_save", "the removal count")),
+        }
+    }
+
+    async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.mirror_fail("write", why));
+        }
+        if RunId::parse(run_id).is_err() {
+            return Err(self.mirror_fail(
+                "write",
+                "the run id is not 1 to 128 characters of [A-Za-z0-9._-]",
+            ));
+        }
+        if self.windows {
+            return Err(self.git_windows_pending("probe_write"));
+        }
+        let (project_rel, probe) = (format!("projects/{project}"), git_probe_name(run_id));
+        self.git_run(
+            "probe_write",
+            GIT_PROBE_W_SH,
+            &[&self.data_dir, &project_rel, &probe],
+            self.shell.op_timeout(),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+impl SftpTransport {
+    /// Write each write's bytes to a private local file, ready for `put`.
+    fn stage_git_writes(
+        &self,
+        plan: &[(String, String, &GitWrite)],
+    ) -> Result<(tempfile::TempDir, Vec<StagedWrite>), CoreError> {
+        let dir = self.download_dir("write")?;
+        let mut staged = Vec::with_capacity(plan.len());
+        for (index, (target, lock, write)) in plan.iter().enumerate() {
+            let local = dir.path().join(format!("w{index}"));
+            {
+                use std::io::Write;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                options
+                    .open(&local)
+                    .and_then(|mut file| file.write_all(&write.bytes).and_then(|()| file.flush()))
+                    .map_err(|e| {
+                        self.mirror_fail(
+                            "write",
+                            format!("{target} cannot be staged locally ({:?})", e.kind()),
+                        )
+                    })?;
+            }
+            staged.push(StagedWrite {
+                target: target.clone(),
+                lock: lock.clone(),
+                local,
+                size: write.bytes.len(),
+            });
+        }
+        Ok((dir, staged))
+    }
+}
+
+impl SftpTransport {
+    /// Take the locks of a failed write away again (they are this call's: the
+    /// lock script created each one exclusively) and return `err`.
+    async fn unlock_git_writes(
+        &self,
+        err: CoreError,
+        rel: &str,
+        plan: &[(String, String, &GitWrite)],
+    ) -> CoreError {
+        let mut args = vec![self.data_dir.as_str(), rel, "unlock"];
+        for (target, lock, _) in plan {
+            args.push(target);
+            args.push(lock);
+        }
+        let _ = self
+            .git_run(
+                "write_git_files",
+                GIT_LOCK_SH,
+                &args,
+                self.shell.op_timeout(),
+            )
+            .await;
+        err
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1374,6 +2331,435 @@ mod tests {
                 words(&run(tmp.path(), "CapApp")),
                 serde_json::json!({"projects":"none","project":"skip","git":"skip"})
             );
+        }
+    }
+
+    /// Every git script is one fixed line: a remote command argument may hold
+    /// no control character, and a script that held one could never be sent.
+    #[test]
+    fn git_scripts_are_one_fixed_line() {
+        for (name, script) in ALL_GIT_SCRIPTS {
+            assert!(
+                !script.chars().any(char::is_control),
+                "{name} holds a control character"
+            );
+            assert!(script.starts_with("LC_ALL=C; export LC_ALL;"), "{name}");
+            assert!(!script.contains("eval "), "{name} must not eval");
+            assert!(
+                !script.contains("$(cat") && !script.contains("`"),
+                "{name} must not interpolate a file or use backticks"
+            );
+        }
+    }
+
+    const ALL_GIT_SCRIPTS: [(&str, &str); 11] = [
+        ("GIT_STATE_SH", GIT_STATE_SH),
+        ("GIT_MANIFEST_SH", GIT_MANIFEST_SH),
+        ("GIT_SIZE_SH", GIT_SIZE_SH),
+        ("GIT_DIGEST_SH", GIT_DIGEST_SH),
+        ("GIT_SAVE_SH", GIT_SAVE_SH),
+        ("GIT_RESTORE_SH", GIT_RESTORE_SH),
+        ("GIT_PROBE_W_SH", GIT_PROBE_W_SH),
+        ("GIT_LOCK_SH", GIT_LOCK_SH),
+        ("GIT_REPLACE_SH", GIT_REPLACE_SH),
+        ("GIT_SAVE_RM_SH", GIT_SAVE_RM_SH),
+        ("GIT_FREE_SH", GIT_FREE_SH),
+    ];
+
+    /// 27-08: until 27-09 every Windows arm fails closed with
+    /// `transport_failed` naming the operation, and starts no process.
+    #[tokio::test]
+    async fn sftp_git_windows_arms_fail_closed() {
+        let (runner, t) = host(Vec::new(), true);
+        let write = [GitWrite {
+            name: GitWriteName::Head,
+            bytes: vec![1],
+        }];
+        let name = GitWriteName::Head;
+        let results = [
+            (
+                "read_git_state",
+                t.read_git_state("CapApp").await.map(|_| ()),
+            ),
+            ("git_manifest", t.git_manifest("CapApp").await.map(|_| ())),
+            (
+                "save_manifest",
+                t.save_manifest("gw", "CapApp", "r1").await.map(|_| ()),
+            ),
+            (
+                "git_file_digest",
+                t.git_file_digest("CapApp", &name).await.map(|_| ()),
+            ),
+            ("read_git_yaml", t.read_git_yaml().await.map(|_| ())),
+            ("free_bytes", t.free_bytes("gw", "CapApp").await.map(|_| ())),
+            ("git_size", t.git_size("CapApp").await.map(|_| ())),
+            (
+                "save_git",
+                t.save_git("gw", "CapApp", "r1").await.map(|_| ()),
+            ),
+            (
+                "restore_git",
+                t.restore_git("gw", "CapApp", "r1").await.map(|_| ()),
+            ),
+            ("write_git_files", t.write_git_files("CapApp", &write).await),
+            (
+                "remove_git_save",
+                t.remove_git_save("gw", "CapApp", "r1").await,
+            ),
+            ("probe_write", t.probe_write("CapApp", "r1").await),
+        ];
+        for (op, result) in results {
+            let why = detail(result.expect_err(op));
+            assert!(why.contains(op), "{op}: {why}");
+        }
+        assert!(
+            runner.argv.lock().expect("argv").is_empty(),
+            "a refused Windows call starts no process"
+        );
+    }
+
+    /// The git scripts run under the local `sh`, with shims standing in for
+    /// the tools a Linux host has (`id`, `setfacl`, `getfacl`) so the
+    /// gateway-account ACL step of D-G1 is exercised on any unix host.
+    #[cfg(unix)]
+    mod git_scripts {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        struct Out {
+            code: i32,
+            stdout: String,
+            stderr: String,
+        }
+
+        fn run(script: &str, args: &[&str], path: &str) -> Out {
+            let out = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("ign-git")
+                .args(args)
+                .env("PATH", path)
+                .output()
+                .expect("sh");
+            Out {
+                code: out.status.code().expect("exit code"),
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            }
+        }
+
+        fn system_path() -> String {
+            std::env::var("PATH").unwrap_or_default()
+        }
+
+        fn shim(dir: &Path, name: &str, body: &str) {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("shim");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        fn my_uid() -> String {
+            let out = Command::new("id").arg("-u").output().expect("id");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// A data dir with a project holding a small `.git`, a save of it,
+        /// and `.git` removed (the state after an import).
+        struct Rig {
+            root: tempfile::TempDir,
+        }
+
+        impl Rig {
+            fn new() -> Rig {
+                let root = tempfile::tempdir().expect("root");
+                let git = root.path().join("data/projects/CapApp/.git");
+                std::fs::create_dir_all(git.join("objects/ab")).expect("dirs");
+                std::fs::create_dir_all(git.join("refs/heads")).expect("dirs");
+                std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+                std::fs::write(git.join("config"), "[core]\n").expect("config");
+                std::fs::write(git.join("objects/ab/cdef"), "object bytes").expect("object");
+                std::fs::write(
+                    git.join("refs/heads/main"),
+                    "0123456789012345678901234567890123456789\n",
+                )
+                .expect("ref");
+                std::fs::create_dir_all(root.path().join("home")).expect("home");
+                Rig { root }
+            }
+
+            fn data(&self) -> String {
+                self.root.path().join("data").display().to_string()
+            }
+
+            fn home(&self) -> String {
+                self.root.path().join("home").display().to_string()
+            }
+
+            fn git(&self) -> PathBuf {
+                self.root.path().join("data/projects/CapApp/.git")
+            }
+
+            fn save(&self) -> Out {
+                run(
+                    GIT_SAVE_SH,
+                    &[
+                        &self.data(),
+                        "projects/CapApp/.git",
+                        &self.home(),
+                        "ign-deploy/gw/projects/CapApp/git-save/r1",
+                    ],
+                    &system_path(),
+                )
+            }
+
+            fn restore(&self, path: &str) -> Out {
+                run(
+                    GIT_RESTORE_SH,
+                    &[
+                        &self.data(),
+                        "projects/CapApp",
+                        &self.home(),
+                        "ign-deploy/gw/projects/CapApp/git-save/r1",
+                        "r1",
+                    ],
+                    path,
+                )
+            }
+
+            fn import_deletes_git(&self) {
+                std::fs::remove_dir_all(self.git()).expect("rm .git");
+            }
+        }
+
+        #[test]
+        fn restore_without_a_foreign_gateway_account_makes_no_acl_call() {
+            let rig = Rig::new();
+            assert_eq!(rig.save().code, 0);
+            rig.import_deletes_git();
+            let bin = tempfile::tempdir().expect("bin");
+            let calls = bin.path().join("calls");
+            // The project directory belongs to this account, which is the
+            // account that runs the script: no ACL step.
+            shim(
+                bin.path(),
+                "setfacl",
+                &format!("echo \"$*\" >> {}", calls.display()),
+            );
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = rig.restore(&path);
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.contains("IGN-RESULT:"), "{}", out.stdout);
+            assert!(rig.git().join("config").is_file());
+            assert!(
+                !calls.exists(),
+                "no setfacl call for the deploy account itself"
+            );
+        }
+
+        #[test]
+        fn restore_gives_a_non_root_gateway_account_an_explicit_acl() {
+            if my_uid() == "0" {
+                println!("running as root; the gateway-account branch cannot be set up");
+                return;
+            }
+            let rig = Rig::new();
+            assert_eq!(rig.save().code, 0);
+            rig.import_deletes_git();
+            let bin = tempfile::tempdir().expect("bin");
+            let calls = bin.path().join("calls");
+            let uid = my_uid();
+            // The script runs as "uid 424242"; the project directory belongs
+            // to the real account, which therefore plays the gateway account.
+            shim(bin.path(), "id", "echo 424242");
+            shim(
+                bin.path(),
+                "setfacl",
+                &format!("echo \"$*\" >> {}", calls.display()),
+            );
+            shim(
+                bin.path(),
+                "getfacl",
+                &format!("echo 'user::rw-'; echo 'user:{uid}:rw-'; echo 'mask::rw-'"),
+            );
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = rig.restore(&path);
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(rig.git().join("config").is_file());
+            let log = std::fs::read_to_string(&calls).expect("setfacl calls");
+            let lines: Vec<&str> = log.lines().collect();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("-R -m u:{uid}:rwX "))),
+                "the recursive access entry: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("-d -m u:{uid}:rwX "))),
+                "the default entry on directories: {lines:?}"
+            );
+            // the ACL is applied to the copy before it is put in place
+            assert!(
+                lines.iter().all(|l| l.contains(".ign-restore-r1")),
+                "{lines:?}"
+            );
+        }
+
+        #[test]
+        fn restore_refuses_when_the_gateway_account_would_only_read() {
+            if my_uid() == "0" {
+                return;
+            }
+            let rig = Rig::new();
+            assert_eq!(rig.save().code, 0);
+            rig.import_deletes_git();
+            let bin = tempfile::tempdir().expect("bin");
+            let uid = my_uid();
+            shim(bin.path(), "id", "echo 424242");
+            shim(bin.path(), "setfacl", "exit 0");
+            shim(
+                bin.path(),
+                "getfacl",
+                &format!("echo 'user:{uid}:rw- #effective:r--'"),
+            );
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = rig.restore(&path);
+            assert_eq!(out.code, 6, "{}", out.stderr);
+            assert!(out.stderr.contains("effective"), "{}", out.stderr);
+            assert!(!rig.git().exists(), "nothing is put in place");
+            assert!(
+                !rig.root
+                    .path()
+                    .join("data/projects/CapApp/.ign-restore-r1")
+                    .exists(),
+                "no staging directory is left"
+            );
+        }
+
+        #[test]
+        fn restore_refuses_without_setfacl_for_a_foreign_gateway_account() {
+            if my_uid() == "0" {
+                return;
+            }
+            let rig = Rig::new();
+            assert_eq!(rig.save().code, 0);
+            rig.import_deletes_git();
+            // A tools directory of symlinks with everything the script needs
+            // except `setfacl`, and an `id` that is not the project owner.
+            let bin = tempfile::tempdir().expect("bin");
+            for tool in [
+                "find",
+                "wc",
+                "awk",
+                "sort",
+                "tr",
+                "ls",
+                "cp",
+                "mv",
+                "rm",
+                "grep",
+                "sha256sum",
+                "shasum",
+                "mkdir",
+                "cat",
+                "sed",
+                "head",
+                "tail",
+                "base64",
+                "dirname",
+                "env",
+            ] {
+                let found = Command::new("sh")
+                    .args(["-c", &format!("command -v {tool}")])
+                    .output()
+                    .expect("sh");
+                let target = String::from_utf8_lossy(&found.stdout).trim().to_string();
+                if found.status.success() && target.starts_with('/') {
+                    std::os::unix::fs::symlink(&target, bin.path().join(tool)).expect("link");
+                }
+            }
+            shim(bin.path(), "id", "echo 424242");
+            let out = rig.restore(&bin.path().display().to_string());
+            assert_eq!(out.code, 6, "{}", out.stderr);
+            assert!(out.stderr.contains("setfacl"), "{}", out.stderr);
+            assert!(!rig.git().exists());
+        }
+
+        #[test]
+        fn save_rm_script_refuses_foreign_paths() {
+            let rig = Rig::new();
+            assert_eq!(rig.save().code, 0);
+            let home = rig.home();
+            let repo = "ign-deploy/gw/projects/CapApp/git-save/r1/repo";
+            for foreign in [
+                "ign-deploy/gw/projects/CapApp/git-save/r1",
+                "projects/CapApp/.git",
+                "ign-deploy/gw/projects/CapApp/git-save/r2/repo",
+                "../x/git-save/r1/repo",
+                "ign-deploy/gw/projects/CapApp/git-save/r1/repo/objects",
+            ] {
+                let out = run(GIT_SAVE_RM_SH, &[&home, foreign, "r1"], &system_path());
+                assert_eq!(out.code, 4, "{foreign}: {}", out.stderr);
+            }
+            assert!(rig.root.path().join("home").join(repo).is_dir());
+            // a symlink on the way is refused and nothing is removed
+            let real = rig.root.path().join("home/ign-deploy/gw/projects/CapApp");
+            std::fs::rename(real.join("git-save"), real.join("kept")).expect("rename");
+            std::os::unix::fs::symlink("kept", real.join("git-save")).expect("link");
+            let out = run(GIT_SAVE_RM_SH, &[&home, repo, "r1"], &system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert!(real.join("kept/r1/repo").is_dir());
+        }
+
+        #[test]
+        fn replace_script_refuses_a_lock_of_the_wrong_size() {
+            let rig = Rig::new();
+            std::fs::write(rig.git().join("config.lock"), "12345").expect("lock");
+            let out = run(
+                GIT_REPLACE_SH,
+                &[
+                    &rig.data(),
+                    "projects/CapApp/.git",
+                    "config",
+                    "config.lock",
+                    "99",
+                ],
+                &system_path(),
+            );
+            assert_eq!(out.code, 5, "{}", out.stderr);
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                "[core]\n",
+                "the file is untouched"
+            );
+        }
+
+        #[test]
+        fn manifest_script_names_what_it_refuses() {
+            let rig = Rig::new();
+            let args = [rig.data(), "projects/CapApp/.git".to_string()];
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let ok = run(GIT_MANIFEST_SH, &args, &system_path());
+            assert_eq!(ok.code, 0, "{}", ok.stderr);
+            // a symlink, then a name with a control character, then a missing dir
+            std::os::unix::fs::symlink("HEAD", rig.git().join("link")).expect("link");
+            let out = run(GIT_MANIFEST_SH, &args, &system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert!(out.stderr.contains("symlink"), "{}", out.stderr);
+            std::fs::remove_file(rig.git().join("link")).expect("rm");
+            std::fs::write(rig.git().join("bad\u{1}name"), "x").expect("control name");
+            let out = run(GIT_MANIFEST_SH, &args, &system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            std::fs::remove_file(rig.git().join("bad\u{1}name")).expect("rm");
+            let out = run(
+                GIT_MANIFEST_SH,
+                &[&rig.data(), "projects/Missing/.git"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 4, "{}", out.stderr);
         }
     }
 }
