@@ -1385,10 +1385,20 @@ impl HostGit {
             .map_err(|_| host_failure("git rev-list --count answered something unexpected"))
     }
 
-    /// Write every file of `commit`'s tree under `dir` (created if needed),
-    /// through a temp `GIT_INDEX_FILE` and an empty private work tree, so the
-    /// repository's own HEAD, index and work tree are untouched. Line-ending
-    /// conversion and sparse checkout are off: the bytes are the blobs.
+    /// Write every entry of `commit`'s tree under `dir` (created if needed)
+    /// from the raw blob bytes, so the repository's own HEAD, index and work
+    /// tree are untouched.
+    ///
+    /// The tree is listed with `ls-tree -r -z` and the blobs are read with
+    /// `cat-file --batch`, then written by this function. Nothing here is a
+    /// checkout: gitattributes (`text`, `eol`, `ident`, `working-tree-encoding`,
+    /// `filter`) from the commit's own `.gitattributes`, and any filter an
+    /// operator's git config defines, never apply, so no filter process runs
+    /// and the bytes are what the gateway itself would write. Regular files
+    /// keep the exec bit, a symlink is written as a symlink (never followed:
+    /// the canonical digest refuses it), a gitlink is an empty directory, and
+    /// a path that is absolute, holds `..`, `.` or a `.git` component, or
+    /// meets anything already on disk is refused before it is written.
     pub async fn materialize(
         &self,
         repo: &GitDir,
@@ -1398,57 +1408,264 @@ impl HostGit {
         require_object_id(commit)?;
         let dir = std::path::absolute(dir)
             .map_err(|e| host_failure(format!("the target path could not be resolved: {e}")))?;
+        let mut list_args = repo.prefix();
+        list_args.extend(["ls-tree", "-r", "-z", "--full-tree", commit].map(OsString::from));
+        let listed = self.run_ok("ls-tree", Call::new(list_args)).await?;
+        let entries = parse_tree_entries(&listed.stdout)?;
+        let mut want = Vec::new();
+        for entry in &entries {
+            if entry.kind.has_blob() {
+                want.push(entry.oid.as_str());
+            }
+        }
+        let mut blobs = if want.is_empty() {
+            Vec::new().into_iter()
+        } else {
+            let mut input = Vec::new();
+            for oid in &want {
+                input.extend_from_slice(oid.as_bytes());
+                input.push(b'\n');
+            }
+            let mut read_args = repo.prefix();
+            read_args.extend(["cat-file", "--batch"].map(OsString::from));
+            let done = self
+                .run_ok(
+                    "cat-file --batch",
+                    Call::new(read_args)
+                        .stdin(input)
+                        .max_output(LARGE_OUTPUT_MAX),
+                )
+                .await?;
+            split_batch(&done.stdout, &want)?.into_iter()
+        };
         std::fs::create_dir_all(&dir)
             .map_err(|e| host_failure(format!("the target dir could not be made: {e}")))?;
-        let scratch = scratch_dir()?;
-        let index = scratch.path().join("index");
-        let work = scratch.path().join("empty-work-tree");
-        std::fs::create_dir(&work)
-            .map_err(|e| host_failure(format!("a private temp dir could not be made: {e}")))?;
-        let call = |tail: Vec<OsString>| {
-            let mut args: Vec<OsString> = [
-                "-c",
-                "core.autocrlf=false",
-                "-c",
-                "core.eol=lf",
-                "-c",
-                "core.sparseCheckout=false",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.splitIndex=false",
-                "-c",
-                "index.version=2",
-            ]
-            .iter()
-            .map(OsString::from)
-            .collect();
-            args.extend(repo.prefix());
-            let mut work_arg = OsString::from("--work-tree=");
-            work_arg.push(work.as_os_str());
-            args.push(work_arg);
-            args.extend(tail);
-            Call::new(args).env("GIT_INDEX_FILE", &index)
-        };
-        self.run_ok(
-            "read-tree",
-            call(vec![OsString::from("read-tree"), OsString::from(commit)]),
-        )
-        .await?;
-        let mut prefix = OsString::from("--prefix=");
-        prefix.push(dir.as_os_str());
-        prefix.push("/");
-        self.run_ok(
-            "checkout-index",
-            call(vec![
-                OsString::from("checkout-index"),
-                OsString::from("-a"),
-                OsString::from("-f"),
-                prefix,
-            ]),
-        )
-        .await?;
+        for entry in &entries {
+            let bytes = if entry.kind.has_blob() {
+                blobs.next()
+            } else {
+                None
+            };
+            write_tree_entry(&dir, entry, bytes.as_deref())?;
+        }
         Ok(())
+    }
+}
+
+/// What a tree entry is, from its mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    File,
+    Executable,
+    Symlink,
+    Gitlink,
+}
+
+impl EntryKind {
+    fn has_blob(self) -> bool {
+        !matches!(self, EntryKind::Gitlink)
+    }
+}
+
+/// One line of `ls-tree -r -z`.
+#[derive(Debug)]
+struct TreeEntry {
+    kind: EntryKind,
+    oid: String,
+    path: PathBuf,
+}
+
+fn tree_failure() -> CoreError {
+    host_failure("git ls-tree answered something unexpected")
+}
+
+/// Parse `ls-tree -r -z` output (`<mode> SP <type> SP <oid> TAB <path> NUL`).
+/// A mode or type outside blob 100644 / 100755 / 120000 and commit 160000,
+/// or an unsafe path, is an error.
+fn parse_tree_entries(out: &[u8]) -> Result<Vec<TreeEntry>, CoreError> {
+    let mut entries = Vec::new();
+    for record in out.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let tab = record
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or_else(tree_failure)?;
+        let meta = std::str::from_utf8(&record[..tab]).map_err(|_| tree_failure())?;
+        let mut fields = meta.split(' ');
+        let (Some(mode), Some(kind), Some(oid), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(tree_failure());
+        };
+        let kind = match (mode, kind) {
+            ("100644", "blob") => EntryKind::File,
+            ("100755", "blob") => EntryKind::Executable,
+            ("120000", "blob") => EntryKind::Symlink,
+            ("160000", "commit") => EntryKind::Gitlink,
+            _ => {
+                return Err(host_failure(format!(
+                    "the tree holds an entry of mode {} that cannot be written",
+                    mode.escape_debug()
+                )));
+            }
+        };
+        if !is_object_id(oid) {
+            return Err(tree_failure());
+        }
+        entries.push(TreeEntry {
+            kind,
+            oid: oid.to_string(),
+            path: tree_entry_path(&record[tab + 1..])?,
+        });
+    }
+    Ok(entries)
+}
+
+/// `raw` as a relative path of plain components. Absolute paths, empty
+/// components, `.`, `..` and any `.git` component (any case, and the 8.3 name
+/// `git~1`) are refused; NUL cannot appear in a `-z` record, but is refused
+/// all the same.
+fn tree_entry_path(raw: &[u8]) -> Result<PathBuf, CoreError> {
+    let unsafe_path = || {
+        host_failure(format!(
+            "the tree holds an unsafe path (`{}`)",
+            String::from_utf8_lossy(raw).escape_debug()
+        ))
+    };
+    if raw.is_empty() || raw.contains(&0) {
+        return Err(unsafe_path());
+    }
+    let mut path = PathBuf::new();
+    for part in raw.split(|b| *b == b'/') {
+        if part.is_empty()
+            || part == b"."
+            || part == b".."
+            || part.eq_ignore_ascii_case(b".git")
+            || part.eq_ignore_ascii_case(b"git~1")
+        {
+            return Err(unsafe_path());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            path.push(OsStr::from_bytes(part));
+        }
+        #[cfg(not(unix))]
+        {
+            let part = std::str::from_utf8(part).map_err(|_| unsafe_path())?;
+            if part.contains(['\\', ':']) {
+                return Err(unsafe_path());
+            }
+            path.push(part);
+        }
+    }
+    Ok(path)
+}
+
+/// Cut `cat-file --batch` output (`<oid> blob <size> LF <bytes> LF` per
+/// requested id, in order) into one byte vector per id.
+fn split_batch(out: &[u8], oids: &[&str]) -> Result<Vec<Vec<u8>>, CoreError> {
+    let bad = || host_failure("git cat-file --batch answered something unexpected");
+    let mut pos = 0usize;
+    let mut blobs = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let eol = out[pos..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or_else(bad)?;
+        let header = String::from_utf8_lossy(&out[pos..pos + eol]).into_owned();
+        pos += eol + 1;
+        let mut fields = header.split(' ');
+        let (Some(id), Some("blob"), Some(size), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(bad());
+        };
+        if id != *oid {
+            return Err(bad());
+        }
+        let size: usize = size.parse().map_err(|_| bad())?;
+        let end = pos.checked_add(size).ok_or_else(bad)?;
+        if end >= out.len() || out[end] != b'\n' {
+            return Err(bad());
+        }
+        blobs.push(out[pos..end].to_vec());
+        pos = end + 1;
+    }
+    Ok(blobs)
+}
+
+/// Make the directories above `entry` under `root`, one component at a time,
+/// refusing to step through anything that is not a plain directory (a
+/// symlink in particular).
+fn make_parents(root: &Path, entry: &Path) -> Result<PathBuf, CoreError> {
+    let mut at = root.to_path_buf();
+    let parent = entry.parent().unwrap_or(Path::new(""));
+    for part in parent.components() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(host_failure(
+                    "a tree path runs through something that is not a directory",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&at).map_err(|e| {
+                    host_failure(format!("a tree directory could not be made: {e}"))
+                })?;
+            }
+            Err(e) => return Err(host_failure(format!("a tree path could not be read: {e}"))),
+        }
+    }
+    Ok(at.join(
+        entry
+            .file_name()
+            .ok_or_else(|| host_failure("a tree path is empty"))?,
+    ))
+}
+
+/// Write one entry as a new file, symlink or directory; anything already at
+/// the path is refused.
+fn write_tree_entry(root: &Path, entry: &TreeEntry, bytes: Option<&[u8]>) -> Result<(), CoreError> {
+    let target = make_parents(root, &entry.path)?;
+    let failed =
+        |e: std::io::Error| host_failure(format!("a tree entry could not be written: {e}"));
+    match entry.kind {
+        EntryKind::Gitlink => std::fs::create_dir(&target).map_err(failed),
+        EntryKind::Symlink => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let link = OsStr::from_bytes(bytes.unwrap_or_default());
+                std::os::unix::fs::symlink(link, &target).map_err(failed)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = bytes;
+                Err(host_failure("a symlink in the tree cannot be written here"))
+            }
+        }
+        EntryKind::File | EntryKind::Executable => {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(failed)?;
+            file.write_all(bytes.unwrap_or_default()).map_err(failed)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if entry.kind == EntryKind::Executable {
+                    0o755
+                } else {
+                    0o644
+                };
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .map_err(failed)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1943,5 +2160,257 @@ mod tests {
             .expect("objects");
         assert_eq!(full.name.len(), 40);
         assert_eq!(&full.idx[..4], &[0xff, b't', b'O', b'c']);
+    }
+
+    /// The raw bytes of `path` at `commit`, as git stores them.
+    fn blob_bytes(repo: &Path, commit: &str, path: &str) -> Vec<u8> {
+        let out = Command::new("git")
+            .args(["cat-file", "blob", &format!("{commit}:{path}")])
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "cat-file {path} failed");
+        out.stdout
+    }
+
+    /// A `git` that runs with `config` as its global config, as an operator's
+    /// own configuration would apply.
+    #[cfg(unix)]
+    fn git_with_global(stubs: &Path, config: &Path) -> HostGit {
+        let program = stub(
+            stubs,
+            "git-with-global",
+            &format!("GIT_CONFIG_GLOBAL='{}' exec git \"$@\"", config.display()),
+        );
+        HostGit::with_program(program)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_is_raw_blobs_whatever_the_attributes_and_filters_say() {
+        let marker_dir = tempfile::tempdir().expect("tempdir");
+        let marker = marker_dir.path().join("filter-ran");
+        let smudge = stub(
+            marker_dir.path(),
+            "smudge.sh",
+            &format!("touch '{}'\ncat", marker.display()),
+        );
+        let config = marker_dir.path().join("operator-gitconfig");
+        std::fs::write(
+            &config,
+            format!("[filter \"evil\"]\n\tsmudge = {}\n", smudge.display()),
+        )
+        .expect("write config");
+        let attributes = "*.py text eol=crlf\n*.txt ident\n*.bin filter=evil\n\
+                          *.enc working-tree-encoding=UTF-16LE\n";
+        let files = [
+            ("code.py", "x = 1\ny = 2\n"),
+            ("sub/deep.py", "z = 3\n"),
+            ("id.txt", "$Id$\nsecond line\n"),
+            ("payload.bin", "payload\n"),
+            ("text.enc", "plain ascii\n"),
+        ];
+        // The blobs go in before the attributes exist, so they are stored
+        // exactly as written; the second commit adds the attributes.
+        let (repo, _) = repo_with(&files);
+        std::fs::write(repo.path().join(".gitattributes"), attributes).expect("attributes");
+        git(repo.path(), &["add", ".gitattributes"]);
+        git(
+            repo.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "attrs"],
+        );
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let host = git_with_global(marker_dir.path(), &config);
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let bare = scratch.path().join("bare.git");
+        git(
+            scratch.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                &repo.path().display().to_string(),
+                &bare.display().to_string(),
+            ],
+        );
+        for (n, source) in [
+            GitDir::Checkout(repo.path().to_path_buf()),
+            GitDir::Bare(bare),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let out = scratch.path().join(format!("tree-{n}"));
+            host.materialize(&source, &commit, &out)
+                .await
+                .expect("materialize");
+            for path in files
+                .iter()
+                .map(|(path, _)| *path)
+                .chain([".gitattributes"])
+            {
+                assert_eq!(
+                    std::fs::read(out.join(path)).expect("read written file"),
+                    blob_bytes(repo.path(), &commit, path),
+                    "{path} is not the blob's bytes"
+                );
+            }
+        }
+        assert!(
+            !marker.exists(),
+            "a configured filter ran during materialize"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn materialize_keeps_modes_symlinks_and_gitlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-q", "-b", "production"]);
+        std::fs::write(dir.path().join("plain.txt"), "plain\n").expect("write");
+        std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(
+            dir.path().join("run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+        std::os::unix::fs::symlink("plain.txt", dir.path().join("link")).expect("symlink");
+        git(dir.path(), &["add", "-A"]);
+        let module = "1".repeat(40);
+        git(
+            dir.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{module},vendor/module"),
+            ],
+        );
+        git(
+            dir.path(),
+            &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "modes"],
+        );
+        let commit = git(dir.path(), &["rev-parse", "HEAD"]);
+        let out = tempfile::tempdir().expect("tempdir");
+        let target = out.path().join("tree");
+        HostGit::new()
+            .materialize(
+                &GitDir::Checkout(dir.path().to_path_buf()),
+                &commit,
+                &target,
+            )
+            .await
+            .expect("materialize");
+        let mode = |name: &str| {
+            std::fs::symlink_metadata(target.join(name))
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("run.sh"), 0o755);
+        assert_eq!(mode("plain.txt"), 0o644);
+        assert_eq!(
+            std::fs::read_link(target.join("link")).expect("a symlink, not its target"),
+            Path::new("plain.txt")
+        );
+        let gitlink = target.join("vendor/module");
+        assert!(gitlink.is_dir(), "a gitlink is an empty directory");
+        assert_eq!(std::fs::read_dir(gitlink).expect("read").count(), 0);
+    }
+
+    /// The id of the tree `entries` (`mode type oid\tname` lines) names, built
+    /// with plumbing because porcelain refuses these names.
+    fn tree_of(repo: &Path, entries: &str) -> String {
+        use std::io::Write;
+        let mut mktree = Command::new("git")
+            .arg("mktree")
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("mktree starts");
+        mktree
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(entries.as_bytes())
+            .expect("write entries");
+        let out = mktree.wait_with_output().expect("mktree finishes");
+        assert!(out.status.success(), "mktree failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn materialize_refuses_paths_that_leave_the_target() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        git(repo.path(), &["init", "-q", "-b", "production"]);
+        std::fs::write(repo.path().join("seed"), "escaped\n").expect("write");
+        let blob = git(repo.path(), &["hash-object", "-w", "seed"]);
+        let sub = tree_of(repo.path(), &format!("100644 blob {blob}\tx\n"));
+        for name in ["..", ".git", ".GIT"] {
+            let root = tree_of(repo.path(), &format!("040000 tree {sub}\t{name}\n"));
+            let commit = git(repo.path(), &["commit-tree", &root, "-m", "hostile"]);
+            let out = tempfile::tempdir().expect("tempdir");
+            let target = out.path().join("inner");
+            let err = HostGit::new()
+                .materialize(
+                    &GitDir::Checkout(repo.path().to_path_buf()),
+                    &commit,
+                    &target,
+                )
+                .await
+                .expect_err(name);
+            assert_eq!(failed_check(&err), "git_host", "{name}");
+            assert!(!out.path().join("x").exists(), "{name} escaped the target");
+            assert!(!target.join("x").exists(), "{name}");
+        }
+    }
+
+    #[test]
+    fn tree_paths_are_plain_relative_components() {
+        for good in ["a", "a/b.txt", ".gitattributes", "a/.gitignore", "gitx/y"] {
+            let path = tree_entry_path(good.as_bytes()).expect(good);
+            assert!(path.is_relative(), "{good}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "a//b",
+            "a/",
+            ".",
+            "./a",
+            "..",
+            "a/../b",
+            "../a",
+            ".git",
+            ".GiT/config",
+            "a/.git/hooks/x",
+            "GIT~1/x",
+            "a\0b",
+        ] {
+            assert!(tree_entry_path(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn tree_listing_refuses_modes_it_cannot_write() {
+        let oid = "a".repeat(40);
+        let ok = format!("100644 blob {oid}\tf\0160000 commit {oid}\tg/h\0");
+        assert_eq!(parse_tree_entries(ok.as_bytes()).expect("parse").len(), 2);
+        for bad in [
+            format!("100664 blob {oid}\tf\0"),
+            format!("040000 tree {oid}\tf\0"),
+            format!("100644 blob {oid} \tf\0"),
+            format!("100644 blob {}\tf\0", "A".repeat(40)),
+            format!("100644 blob {oid}\0"),
+        ] {
+            assert!(parse_tree_entries(bad.as_bytes()).is_err(), "{bad:?}");
+        }
     }
 }
