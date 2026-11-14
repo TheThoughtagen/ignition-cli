@@ -7197,3 +7197,410 @@ async fn wincap_prod_shape_restore() {
     timed("wincap_prod_shape_restore total", started, ());
     eprintln!("PASS wincap_prod_shape_restore: manifest hash and counts equal");
 }
+
+// ---- the git host scripts of 27-09 (checker W14) ------------------------------
+//
+// Every WinScript of the Windows git host channel (`winps::GIT_*`), run through
+// `SftpTransport` as the deploy account on the production-shape `.git` that
+// 27-07 uploaded (`ign-live-scratch\git27\src.git`, kept for 27-11), before the
+// 27-12 contract checkpoint. The gateway's own data directory is never touched:
+// everything happens below the scratch data root `ign-live-scratch\data27`
+// (project `CapApp27`) and the saves below `ign-deploy\live-scratch27` of the
+// account home; both are removed at the start and at the end.
+//
+// ```text
+// source ~/.config/ign-azure-win/env
+// IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST=$IGN_WINVM_HOST IGN_WINCAP_KEY=$IGN_WINVM_KEY \
+//   IGN_WINCAP_PROFILE=$IGN_WINVM_PROFILE \
+//   cargo test -p ignition-core --test live_transport_wincap wincap_git_scripts -- --ignored --nocapture --test-threads=1
+// ```
+
+/// The gateway name the saves of the git gate use, so its `ign-deploy` tree is
+/// its own and its cleanup never touches another gate's.
+const GIT_GATEWAY: &str = "live-scratch27";
+const GIT_PROJECT: &str = "CapApp27";
+const GIT_RUN: &str = "20261114T101500Z-w27a";
+/// The 27-06 Windows host budgets (`HOST_WINDOWS_*` in `common/prod_shape_git.rs`;
+/// `wincap_git_budgets_are_the_27_06_ones` keeps the copies honest).
+const GIT_SAVE_BUDGET: Duration = Duration::from_secs(120);
+const GIT_RESTORE_VERIFY_BUDGET: Duration = Duration::from_secs(120);
+const GIT_PREFLIGHT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Copy a tree host-locally with the tool G4 chose.
+const GIT_HOST_COPY: &str = "& robocopy $p.s $p.d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP|Out-Null;if($LASTEXITCODE -ge 8){throw ('robocopy failed with exit code '+$LASTEXITCODE)};E @{ok=1}";
+/// Mark a directory Hidden, as the module's `.git` is (G8).
+const GIT_HOST_HIDE: &str =
+    "$d=$p.path;[IO.File]::SetAttributes($d,[IO.File]::GetAttributes($d) -bor 2);E @{ok=1}";
+/// The attribute bits of one entry.
+const GIT_HOST_ATTR: &str = "E @{ok=1;a=[int][IO.File]::GetAttributes($p.path)}";
+/// Create an empty file (a held lock a second writer would leave).
+const GIT_HOST_TOUCH: &str = "[IO.File]::WriteAllBytes($p.path,[byte[]]@());E @{ok=1}";
+const GIT_HOST_UNTOUCH: &str =
+    "if([IO.File]::Exists($p.path)){[IO.File]::Delete($p.path)};E @{ok=1}";
+const GIT_HOST_FACTS: &str = "E @{ok=1;e=[string]$PSVersionTable.PSEdition;v=[string]$PSVersionTable.PSVersion;c=$env:COMPUTERNAME}";
+
+fn git_step(name: &str, took: Duration, budget: Option<Duration>) {
+    match budget {
+        Some(budget) => {
+            println!(
+                "wincap_git_scripts {name}: measured {} ms budget {} ms",
+                took.as_millis(),
+                budget.as_millis()
+            );
+            assert!(
+                took <= budget,
+                "{name}: measured {} ms is over the budget of {} ms",
+                took.as_millis(),
+                budget.as_millis()
+            );
+        }
+        None => println!("wincap_git_scripts {name}: ok in {} ms", took.as_millis()),
+    }
+}
+
+#[test]
+fn wincap_git_budgets_are_the_27_06_ones() {
+    let source = include_str!("common/prod_shape_git.rs");
+    for (name, budget) in [
+        ("HOST_WINDOWS_SAVE", GIT_SAVE_BUDGET),
+        ("HOST_WINDOWS_RESTORE_VERIFY", GIT_RESTORE_VERIFY_BUDGET),
+        ("HOST_WINDOWS_PREFLIGHT", GIT_PREFLIGHT_BUDGET),
+    ] {
+        let line = format!(
+            "pub const {name}: Duration = Duration::from_secs({});",
+            budget.as_secs()
+        );
+        assert!(source.contains(&line), "{line}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and ign-live-scratch\\git27\\src.git from capture27-vm.sh upload"]
+async fn wincap_git_scripts() {
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, GitHostRead, GitStateWriter, ProjectHost,
+    };
+
+    let Some(live) = live() else { return };
+    let host_repo = repo(&live, "git27-home", &live.data_dir, None);
+    let host_shell = shell_of(host_repo.path(), "git27-home");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let data27 = format!("{home_native}\\{SCRATCH}\\data27");
+    let src_git = format!("{home_native}\\{SCRATCH}\\git27\\src.git");
+    let saves = format!("{home_native}\\ign-deploy\\{GIT_GATEWAY}");
+    let project_dir = format!("{data27}\\projects\\{GIT_PROJECT}");
+    let git_dir = format!("{project_dir}\\.git");
+    // the scratch root is the account's own, never the gateway's data directory
+    assert!(!data27.to_ascii_lowercase().contains("program files"));
+    assert!(data27.contains(SCRATCH));
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    println!(
+        "wincap_git_scripts host: PSEdition {} PSVersion {} computer {}",
+        facts["e"], facts["v"], facts["c"]
+    );
+    assert_eq!(
+        facts["e"], "Desktop",
+        "the deploy account's ssh runs Windows PowerShell"
+    );
+
+    // leftovers of an earlier run, then the source must exist
+    remove_tree(&host_shell, &data27).await;
+    remove_tree(&host_shell, &saves).await;
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "{src_git} is missing: run capture27-vm.sh upload first"
+    );
+
+    let repo_dir = repo(&live, "git27", &data27, None);
+    let shell = shell_of(repo_dir.path(), "git27");
+    let (_, ssh, _) = ssh_of(repo_dir.path(), "git27");
+    let node = SftpTransport::new_windows(
+        shell,
+        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
+        "nodes.master",
+    );
+
+    // the production-shape `.git` goes in with the host copy tool, Hidden as
+    // the module's is
+    let copy = script(
+        "git_host_copy",
+        GIT_HOST_COPY,
+        serde_json::json!({ "s": src_git, "d": git_dir }),
+    );
+    host_shell
+        .exec_powershell(&copy)
+        .await
+        .expect("copy src.git in");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_hide",
+            GIT_HOST_HIDE,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("hide");
+
+    // 1. read_git_state: the entry probe and one GIT_STATE call
+    let started = Instant::now();
+    let state = node.read_git_state(GIT_PROJECT).await.expect("state");
+    git_step("read_git_state", started.elapsed(), None);
+    assert_eq!(state.kind, GitEntry::Directory);
+    assert!(state.head.is_some(), "HEAD is read");
+    assert!(state.config.is_some(), "config is read");
+
+    // 2. read_git_yaml: absent
+    assert_eq!(node.read_git_yaml().await.expect("yaml"), None);
+    git_step("read_git_yaml", Duration::ZERO, None);
+
+    // 3. free_bytes
+    let free = node
+        .free_bytes(GIT_GATEWAY, GIT_PROJECT)
+        .await
+        .expect("free");
+    assert!(free > 0);
+    println!("wincap_git_scripts free_bytes: {free} bytes free");
+
+    // 4. git_size from one enumeration, against the manifest
+    let started = Instant::now();
+    let size = node.git_size(GIT_PROJECT).await.expect("size");
+    git_step("git_size", started.elapsed(), Some(GIT_PREFLIGHT_BUDGET));
+    let started = Instant::now();
+    let manifest = node.git_manifest(GIT_PROJECT).await.expect("manifest");
+    git_step("git_manifest", started.elapsed(), None);
+    assert_eq!((size.files, size.bytes), (manifest.files, manifest.bytes));
+    println!(
+        "wincap_git_scripts shape: {} files, {} bytes",
+        manifest.files, manifest.bytes
+    );
+
+    // 5. probe_write
+    node.probe_write(GIT_PROJECT, GIT_RUN).await.expect("probe");
+    git_step("probe_write", Duration::ZERO, None);
+
+    // 6. save_git
+    let started = Instant::now();
+    let saved = node
+        .save_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("save");
+    git_step("save_git", started.elapsed(), Some(GIT_SAVE_BUDGET));
+    assert_eq!(saved, manifest, "the save equals the gateway .git");
+    assert_eq!(
+        node.save_manifest(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+            .await
+            .expect("save manifest"),
+        manifest
+    );
+    // a save is never overwritten
+    assert!(
+        node.save_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+            .await
+            .is_err()
+    );
+
+    // 7. the import deletes `.git`; restore plus the manifest of the result
+    assert!(remove_tree(&host_shell, &git_dir).await);
+    assert_eq!(
+        node.read_git_state(GIT_PROJECT).await.expect("gone").kind,
+        GitEntry::Absent
+    );
+    let started = Instant::now();
+    let back = node
+        .restore_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("restore");
+    let after = node.git_manifest(GIT_PROJECT).await.expect("after");
+    git_step(
+        "restore_git_and_manifest",
+        started.elapsed(),
+        Some(GIT_RESTORE_VERIFY_BUDGET),
+    );
+    assert_eq!(back, manifest);
+    assert_eq!(after, manifest, "the manifests are equal");
+    // the module's `.git` is Hidden; so is the restored one (G8)
+    let attrs = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("attributes");
+    let attrs = attrs["a"].as_i64().expect("attributes");
+    println!("wincap_git_scripts restored .git attributes: {attrs}");
+    assert_ne!(attrs & 2, 0, "the restored .git is Hidden again");
+    assert_eq!(
+        node.read_git_state(GIT_PROJECT).await.expect("state").kind,
+        GitEntry::Directory
+    );
+    let stage = format!("{project_dir}\\.ign-restore-{GIT_RUN}");
+    assert!(
+        enumerate(&host_shell, &stage).await.is_none(),
+        "no restore stage is left behind"
+    );
+
+    // 8. a restore over a present `.git` is refused
+    let why = node
+        .restore_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect_err("present");
+    assert!(why.to_string().contains("never replaced"), "{why}");
+    assert_eq!(
+        node.git_manifest(GIT_PROJECT).await.expect("intact"),
+        manifest
+    );
+    println!("wincap_git_scripts restore over a present .git: refused");
+
+    // 9. write_git_files through the lock-and-replace path, read back equal
+    let hash = "ab".repeat(20);
+    let writes = vec![
+        GitWrite {
+            name: GitWriteName::PackFile(hash.clone()),
+            bytes: vec![b'P'; 70_000],
+        },
+        GitWrite {
+            name: GitWriteName::PackIndex(hash),
+            bytes: vec![b'I'; 1_200],
+        },
+        GitWrite {
+            name: GitWriteName::BranchRef("production".to_string()),
+            bytes: b"0123456789abcdef0123456789abcdef01234567\n".to_vec(),
+        },
+        GitWrite {
+            name: GitWriteName::Head,
+            bytes: b"ref: refs/heads/production\n".to_vec(),
+        },
+    ];
+    let started = Instant::now();
+    node.write_git_files(GIT_PROJECT, &writes)
+        .await
+        .expect("write");
+    git_step("write_git_files", started.elapsed(), None);
+    for write in &writes {
+        let digest = node
+            .git_file_digest(GIT_PROJECT, &write.name)
+            .await
+            .expect("digest");
+        assert_eq!(digest, Some(sha256_hex(&write.bytes)), "{:?}", write.name);
+    }
+    let leftovers: Vec<String> = enumerate(&host_shell, &git_dir)
+        .await
+        .expect("git dir")
+        .into_iter()
+        .map(|(rel, _, _)| rel)
+        .filter(|rel| rel.ends_with(".lock") || rel.ends_with(".ign-tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no lock is left behind: {leftovers:?}"
+    );
+    // a lock another writer holds refuses the write and leaves the file alone
+    let held = format!("{git_dir}\\refs\\heads\\production.lock");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_touch",
+            GIT_HOST_TOUCH,
+            serde_json::json!({ "path": held }),
+        ))
+        .await
+        .expect("plant a lock");
+    let again = vec![GitWrite {
+        name: GitWriteName::BranchRef("production".to_string()),
+        bytes: b"fedcba9876543210fedcba9876543210fedcba98\n".to_vec(),
+    }];
+    assert!(node.write_git_files(GIT_PROJECT, &again).await.is_err());
+    let kept = node
+        .git_file_digest(
+            GIT_PROJECT,
+            &GitWriteName::BranchRef("production".to_string()),
+        )
+        .await
+        .expect("digest");
+    assert_eq!(
+        kept,
+        Some(sha256_hex(&writes[2].bytes)),
+        "the ref is unchanged"
+    );
+    host_shell
+        .exec_powershell(&script(
+            "git_host_untouch",
+            GIT_HOST_UNTOUCH,
+            serde_json::json!({ "path": held }),
+        ))
+        .await
+        .expect("remove the planted lock");
+    println!("wincap_git_scripts write over a held lock: refused, ref unchanged");
+
+    // 10. remove_git_save: a path that is not the save's is refused before
+    //     anything is touched, then the real one is removed
+    let home_sftp_path = home_sftp(&host_shell).await;
+    let _ = home_sftp_path;
+    let rel = format!("ign-deploy/{GIT_GATEWAY}/projects/{GIT_PROJECT}/git-save/{GIT_RUN}");
+    for foreign in [
+        format!("{rel}/other"),
+        format!("{rel}/repo/objects"),
+        format!("ign-deploy/{GIT_GATEWAY}/projects/{GIT_PROJECT}/git-save/x/repo"),
+    ] {
+        let refused = host_shell
+            .exec_powershell(&WinScript::git_save_rm(
+                LONG_PATH_PREFIX,
+                &home_native,
+                &foreign,
+                GIT_RUN,
+            ))
+            .await;
+        assert!(refused.is_err(), "{foreign} was accepted");
+    }
+    assert_eq!(
+        node.save_manifest(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+            .await
+            .expect("the save survived the refusals"),
+        manifest
+    );
+    node.remove_git_save(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("remove");
+    assert!(
+        enumerate(
+            &host_shell,
+            &format!("{saves}\\projects\\{GIT_PROJECT}\\git-save\\{GIT_RUN}")
+        )
+        .await
+        .is_none(),
+        "the run directory is gone"
+    );
+    node.remove_git_save(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("absent is a success");
+    println!("wincap_git_scripts remove_git_save: foreign paths refused, the save removed");
+
+    // the entry probe of the project host still answers
+    assert_eq!(
+        node.git_entry(GIT_PROJECT).await.expect("entry"),
+        GitEntry::Directory
+    );
+
+    // cleanup: the scratch root and the saves, both quoted
+    let data_gone = remove_tree(&host_shell, &data27).await;
+    let saves_gone = remove_tree(&host_shell, &saves).await;
+    host_shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    println!("wincap_git_scripts cleanup: data27 gone {data_gone}, saves gone {saves_gone}");
+    assert!(data_gone && saves_gone);
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "the 27-07 source is kept for 27-11"
+    );
+    println!("LIVE-RAN wincap_git_scripts");
+}
