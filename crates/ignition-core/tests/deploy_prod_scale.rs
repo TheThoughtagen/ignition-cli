@@ -3457,17 +3457,26 @@ fn git_prodshape_pwsh_gateway_objects() {
         &read,
         HOST_WINDOWS_GATEWAY_OBJECTS,
     );
-    // listing + (loose, indexes, packs of each round) archives of three
-    // connections each: not one per object or per pack
+    // The listing, then one fetch each for the loose objects and the indexes
+    // (three or four connections), then one fetch per round of packs. A fetch of
+    // 64 MiB or more is split into up to four parts of two connections each
+    // plus two for the staging directory (`2 * parts + 2`, `PARTS_MAX` is 4), so a
+    // round costs at most 10 whatever the object or pack count. Three rounds are
+    // far more than the worst case needs (it takes two).
     let connections = node.sessions();
     eprintln!(
         "git_prodshape_pwsh_gateway_objects: {connections} ssh connections for {} loose objects, {} packs",
         stats.loose, stats.packs
     );
-    assert!(connections <= 25, "{connections} connections");
+    let bound = 1 + 4 + 4 + 3 * (2 * 4 + 2 + 1);
     assert!(
-        stats.packs > 6 || connections <= 25,
-        "connections must not follow the pack count"
+        connections <= bound,
+        "{connections} connections, bound {bound}"
+    );
+    assert!(
+        stats.packs > 6,
+        "the packs ({}) outnumber what a connection bound could hide",
+        stats.packs
     );
 }
 
