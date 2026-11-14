@@ -289,8 +289,10 @@ pub(super) const GIT_SAVE_SH: &str = concat!(
     "printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
     "umask 077; wk \"$1\" \"$2\"; src=$PWD; before=$(mf \"$src\") || exit $?; ",
     "mk \"$3\" \"$4\"; if pr repo; then echo 'the save already exists; a save is never overwritten' >&2; exit 4; fi; ",
-    "cp -a -- \"$src\" repo || { rm -rf -- repo; exit 3; }; ",
-    "after=$(mf repo) || { r=$?; rm -rf -- repo; exit $r; }; ",
+    "mkdir -m 700 -- repo || { echo 'the save already exists; a save is never overwritten' >&2; exit 4; }; ",
+    "sg() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || { printf '%s is not a real directory\\n' \"$1\" >&2; exit 4; }; }; ",
+    "sg repo; cp -a -- \"$src\"/. repo/ || { rm -rf -- repo; exit 3; }; ",
+    "sg repo; after=$(mf repo) || { r=$?; rm -rf -- repo; exit $r; }; ",
     "[ \"$before\" = \"$after\" ] || { rm -rf -- repo; echo 'the saved copy does not match the .git it was taken from' >&2; exit 5; }; ",
     "set -- $after; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
@@ -298,7 +300,7 @@ pub(super) const GIT_SAVE_SH: &str = concat!(
 
 pub(super) const GIT_RESTORE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in find wc awk sort tr ls cp mv rm id; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in find wc awk sort tr ls cp mv rm id mkdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
     "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
     "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
@@ -324,19 +326,20 @@ pub(super) const GIT_RESTORE_SH: &str = concat!(
     "if pr \"$proj/.git\"; then printf '%s/.git exists; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
     "wk \"$3\" \"$4\"; [ -d repo ] && [ ! -L repo ] || { echo 'the save has no repo directory' >&2; exit 4; }; ",
     "saved=$(mf repo) || exit $?; stage=$proj/.ign-restore-$5; ",
-    "if pr \"$stage\"; then printf '%s exists; it is left alone\\n' \"$stage\" >&2; exit 4; fi; ",
-    "cp -a -- repo \"$stage\" || { rm -rf -- \"$stage\"; exit 3; }; ",
+    "sg() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || { printf '%s is not a real directory\\n' \"$1\" >&2; exit 4; }; }; ",
+    "mkdir -m 700 -- \"$stage\" || { printf '%s exists or cannot be created; it is left alone\\n' \"$stage\" >&2; exit 4; }; ",
+    "sg \"$stage\"; cp -a -- repo/. \"$stage\"/ || { rm -rf -- \"$stage\"; exit 3; }; ",
     "gu=$(ls -ldn -- \"$proj\" | awk '{print $3}'); me=$(id -u); ",
     "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then ",
     "if ! command -v setfacl >/dev/null 2>&1; then rm -rf -- \"$stage\"; echo 'the gateway account needs write access to the restored .git and the host has no setfacl' >&2; exit 6; fi; ",
-    "setfacl -R -m \"u:$gu:rwX\" \"$stage\" && find \"$stage\" -type d -exec setfacl -d -m \"u:$gu:rwX\" {} + || { rm -rf -- \"$stage\"; echo 'setfacl failed on the restored .git' >&2; exit 6; }; ",
+    "sg \"$stage\"; setfacl -R -P -m \"u:$gu:rwX\" \"$stage\" && sg \"$stage\" && find -P \"$stage\" -type d -exec setfacl -d -m \"u:$gu:rwX\" {} + || { rm -rf -- \"$stage\"; echo 'setfacl failed on the restored .git' >&2; exit 6; }; ",
     "if command -v getfacl >/dev/null 2>&1; then e=$(getfacl -p -- \"$stage/config\" 2>/dev/null | grep \"^user:$gu:\"); ",
     "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) rm -rf -- \"$stage\"; echo 'the gateway account has no effective write access on the restored .git' >&2; exit 6;; esac;; ",
     "*) rm -rf -- \"$stage\"; echo 'the gateway account has no ACL entry on the restored .git' >&2; exit 6;; esac; fi; fi; ",
-    "staged=$(mf \"$stage\") || { r=$?; rm -rf -- \"$stage\"; exit $r; }; ",
+    "sg \"$stage\"; staged=$(mf \"$stage\") || { r=$?; rm -rf -- \"$stage\"; exit $r; }; ",
     "[ \"$staged\" = \"$saved\" ] || { rm -rf -- \"$stage\"; echo 'the restored copy does not match the save; nothing was restored' >&2; exit 5; }; ",
     "if pr \"$proj/.git\"; then rm -rf -- \"$stage\"; printf '%s/.git appeared; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
-    "mv -- \"$stage\" \"$proj/.git\" || { rm -rf -- \"$stage\"; exit 3; }; ",
+    "sg \"$stage\"; mv -- \"$stage\" \"$proj/.git\" || { rm -rf -- \"$stage\"; exit 3; }; ",
     "final=$(mf \"$proj/.git\") || exit $?; set -- $final; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
 );
@@ -2592,7 +2595,7 @@ mod tests {
             assert!(
                 lines
                     .iter()
-                    .any(|l| l.starts_with(&format!("-R -m u:{uid}:rwX "))),
+                    .any(|l| l.starts_with(&format!("-R -P -m u:{uid}:rwX "))),
                 "the recursive access entry: {lines:?}"
             );
             assert!(
@@ -2686,6 +2689,50 @@ mod tests {
             assert_eq!(out.code, 6, "{}", out.stderr);
             assert!(out.stderr.contains("setfacl"), "{}", out.stderr);
             assert!(!rig.git().exists());
+        }
+
+        #[test]
+        fn restore_refuses_a_symlink_planted_at_the_stage_path() {
+            let rig = Rig::new();
+            assert_eq!(rig.save().code, 0);
+            rig.import_deletes_git();
+            // Someone with write access to the project directory plants the
+            // stage name as a link to a directory elsewhere.
+            let outside = rig.root.path().join("outside");
+            std::fs::create_dir_all(&outside).expect("outside");
+            let stage = rig.root.path().join("data/projects/CapApp/.ign-restore-r1");
+            std::os::unix::fs::symlink(&outside, &stage).expect("plant");
+            let out = rig.restore(&system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert_eq!(
+                std::fs::read_dir(&outside).expect("outside").count(),
+                0,
+                "nothing was copied through the link"
+            );
+            assert!(!rig.git().exists(), "no .git was put in place");
+            assert!(
+                std::fs::symlink_metadata(&stage)
+                    .expect("link")
+                    .file_type()
+                    .is_symlink(),
+                "the planted entry is left alone"
+            );
+        }
+
+        #[test]
+        fn save_refuses_a_symlink_planted_at_the_repo_path() {
+            let rig = Rig::new();
+            let outside = rig.root.path().join("outside");
+            std::fs::create_dir_all(&outside).expect("outside");
+            let run = rig
+                .root
+                .path()
+                .join("home/ign-deploy/gw/projects/CapApp/git-save/r1");
+            std::fs::create_dir_all(&run).expect("run dir");
+            std::os::unix::fs::symlink(&outside, run.join("repo")).expect("plant");
+            let out = rig.save();
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert_eq!(std::fs::read_dir(&outside).expect("outside").count(), 0);
         }
 
         #[test]
