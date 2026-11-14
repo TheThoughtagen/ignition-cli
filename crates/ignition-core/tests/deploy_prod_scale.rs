@@ -2674,3 +2674,161 @@ fn project_tags_real_corpus() {
         }
     }
 }
+
+// ---- the module-style `.git` handover at scale (plan 27-06, D-18) ------------
+//
+// `common::prod_shape_git` builds a remote, a release checkout and a gateway
+// data dir from a `GitShape`. CI runs the neutral defaults; a production-scale
+// run sets `IGN_PROD_SHAPE_FILE` to a private TOML file outside this
+// repository. Every row below prints `measured <ms> budget <ms>` and fails over
+// budget with both numbers. Rows take `GIT_PRODSHAPE_SERIAL` so two rows never
+// time each other's disk and CPU, and each generates its own fixture outside
+// the timed span.
+
+use common::git_fixture::git as run_git;
+use common::prod_shape_git::{self as shape_git, GitShape, ProdShapeGit};
+
+static GIT_PRODSHAPE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One git-shape row at a time.
+fn prodshape_serial() -> std::sync::MutexGuard<'static, ()> {
+    GIT_PRODSHAPE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The shape this run uses, and a generated fixture of it in `dir`.
+fn prodshape_fixture(dir: &std::path::Path) -> (GitShape, ProdShapeGit) {
+    let shape = GitShape::from_env();
+    let started = Instant::now();
+    let fixture = ProdShapeGit::generate(dir, &shape);
+    eprintln!(
+        "git_prodshape: generated in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    (shape, fixture)
+}
+
+/// `got` is within 5% of `want`.
+fn prodshape_near(what: &str, got: u64, want: u64) {
+    eprintln!("git_prodshape_shape: {what}: measured {got}, parameter {want}");
+    assert!(
+        got.abs_diff(want) * 20 <= want,
+        "{what}: measured {got} is not within 5% of the parameter {want}"
+    );
+}
+
+#[test]
+fn git_prodshape_shape() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+
+    let measured = shape_git::measure_git_dir(&f.git_dir());
+    prodshape_near("gateway .git bytes", measured.bytes, shape.git_bytes);
+    prodshape_near(
+        "gateway .git files",
+        measured.files as u64,
+        shape.git_files as u64,
+    );
+    prodshape_near("packs", measured.packs as u64, shape.packs as u64);
+    prodshape_near(
+        "loose objects",
+        measured.loose as u64,
+        shape.loose_objects as u64,
+    );
+    prodshape_near("commits", f.gateway_commits() as u64, shape.commits as u64);
+    let (in_scope, out_of_scope) = f.tree_scope_counts();
+    prodshape_near(
+        "tracked",
+        (in_scope + out_of_scope) as u64,
+        shape.tracked as u64,
+    );
+    prodshape_near("in scope", in_scope as u64, shape.in_scope as u64);
+    prodshape_near(
+        "out of scope",
+        out_of_scope as u64,
+        shape.out_of_scope as u64,
+    );
+    prodshape_near(
+        "advance commits",
+        f.advance_count() as u64,
+        shape.advance_commits as u64,
+    );
+
+    // The artifact carries every in-scope path, and the remote holds the tag.
+    assert_eq!(f.artifact_members().len(), shape.in_scope);
+    assert_eq!(
+        run_git(
+            &f.checkout,
+            &["rev-parse", &format!("{}^{{commit}}", f.release_tag)]
+        ),
+        f.release_head
+    );
+    assert_eq!(
+        run_git(
+            &f.remote,
+            &["rev-parse", &format!("{}^{{commit}}", f.release_tag)]
+        ),
+        f.release_head
+    );
+    // The in-scope files are on disk; the gateway's HEAD is not the release.
+    assert!(f.project.join("project.json").is_file());
+    assert_ne!(f.gateway_head, f.release_head);
+}
+
+#[test]
+fn git_prodshape_emit() {
+    let Some(out) = std::env::var_os("PRODSHAPE_GIT_OUT").filter(|v| !v.is_empty()) else {
+        return;
+    };
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let written = f.emit_to(std::path::Path::new(&out));
+    eprintln!(
+        "git_prodshape_emit: remote {}/capapp.git, gateway data {}/data, release tag {}, gateway head {}, release {}",
+        written.display(),
+        written.display(),
+        f.release_tag,
+        f.gateway_head,
+        f.release_head
+    );
+}
+
+#[test]
+fn git_prodshape_refuses_a_path_inside_the_repository() {
+    let root = repository_root();
+    assert!(shape_git::outside_repository(&root).is_err());
+    assert!(shape_git::outside_repository(&root.join("crates")).is_err());
+    assert!(shape_git::outside_repository(&root.join("not-there-yet/sub")).is_err());
+    assert!(shape_git::outside_repository(&root.join("crates/../crates")).is_err());
+    let outside = tempfile::tempdir().expect("tempdir");
+    assert!(shape_git::outside_repository(outside.path()).is_ok());
+    assert!(shape_git::outside_repository(&outside.path().join("later/dir")).is_ok());
+}
+
+#[test]
+fn git_prodshape_shape_file_refuses_unknown_keys_and_bad_relations() {
+    let neutral = GitShape::neutral();
+    let text = |extra: &str, tracked: usize| {
+        format!(
+            "git_bytes = {}\ngit_files = {}\npacks = {}\nloose_objects = {}\ncommits = {}\n\
+             tracked = {tracked}\nin_scope = {}\nout_of_scope = {}\nadvance_commits = {}\n{extra}",
+            neutral.git_bytes,
+            neutral.git_files,
+            neutral.packs,
+            neutral.loose_objects,
+            neutral.commits,
+            neutral.in_scope,
+            neutral.out_of_scope,
+            neutral.advance_commits,
+        )
+    };
+    assert_eq!(
+        GitShape::from_toml(&text("", neutral.tracked)).expect("parses"),
+        neutral
+    );
+    assert!(GitShape::from_toml(&text("surprise = 1\n", neutral.tracked)).is_err());
+    assert!(GitShape::from_toml(&text("", neutral.tracked + 1)).is_err());
+}

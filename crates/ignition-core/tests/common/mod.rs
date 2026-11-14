@@ -24,6 +24,7 @@ pub mod git_fixture;
 pub mod native_shape;
 pub mod plan_fixture;
 pub mod prod_shape;
+pub mod prod_shape_git;
 pub mod sftp_server;
 
 /// Wraps a [`wiremock::MockServer`] with Ignition-shaped fixture builders.
