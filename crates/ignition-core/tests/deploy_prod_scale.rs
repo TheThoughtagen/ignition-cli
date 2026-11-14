@@ -2685,8 +2685,12 @@ fn project_tags_real_corpus() {
 // time each other's disk and CPU, and each generates its own fixture outside
 // the timed span.
 
-use common::git_fixture::git as run_git;
+use common::git_fixture::{BRANCH, GATEWAY, PROJECT, git as run_git, in_scope};
 use common::prod_shape_git::{self as shape_git, GitShape, ProdShapeGit};
+use ignition_core::deploy::git_advance::{GitWrite, GitWriteName, pack_bases, predict_drift};
+use ignition_core::deploy::git_handover::{restore_and_advance, save};
+use ignition_core::deploy::git_remote::HostGit;
+use ignition_core::deploy::transport::projects::{GitHostRead, GitStateWriter};
 
 static GIT_PRODSHAPE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2695,6 +2699,16 @@ fn prodshape_serial() -> std::sync::MutexGuard<'static, ()> {
     GIT_PRODSHAPE_SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Drive `future` on a private runtime, so the row's lock is held by a
+/// synchronous function and never across an await.
+fn prodshape_block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(future)
 }
 
 /// The shape this run uses, and a generated fixture of it in `dir`.
@@ -2707,6 +2721,21 @@ fn prodshape_fixture(dir: &std::path::Path) -> (GitShape, ProdShapeGit) {
         started.elapsed().as_secs_f64()
     );
     (shape, fixture)
+}
+
+/// Print a row's time beside its budget and fail over it.
+fn prodshape_within(row: &str, measured: Duration, budget: Duration) {
+    eprintln!(
+        "{row}: measured {} ms budget {} ms",
+        measured.as_millis(),
+        budget.as_millis()
+    );
+    assert!(
+        measured <= budget,
+        "{row}: measured {} ms is over the budget of {} ms",
+        measured.as_millis(),
+        budget.as_millis()
+    );
 }
 
 /// `got` is within 5% of `want`.
@@ -2831,4 +2860,271 @@ fn git_prodshape_shape_file_refuses_unknown_keys_and_bad_relations() {
     );
     assert!(GitShape::from_toml(&text("surprise = 1\n", neutral.tracked)).is_err());
     assert!(GitShape::from_toml(&text("", neutral.tracked + 1)).is_err());
+}
+
+/// The run id every save in these rows uses.
+const GIT_PRODSHAPE_RUN: &str = "20261113T101500Z-ab12";
+
+#[test]
+fn git_prodshape_read_state() {
+    use shape_git::OFFLINE_READ_STATE;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let node = f.node();
+        let host = HostGit::new();
+        let started = Instant::now();
+        let files = node.read_git_state(PROJECT).await.expect("host read");
+        files.check_caps().expect("caps");
+        let config = host
+            .parse_config(files.config.as_deref().expect("config"))
+            .await
+            .expect("config");
+        let refs = host
+            .parse_refs(&files)
+            .await
+            .expect("refs")
+            .expect("some refs");
+        let took = started.elapsed();
+        assert_eq!(config.remotes.len(), 1);
+        assert_eq!(refs.head.commit(), Some(f.gateway_head.as_str()));
+        prodshape_within("git_prodshape_read_state", took, OFFLINE_READ_STATE);
+    });
+}
+
+#[test]
+fn git_prodshape_save() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let node = f.node();
+        let before = node.git_manifest(PROJECT).await.expect("manifest");
+        let started = Instant::now();
+        let report = save(&node, &node, GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("save");
+        let took = started.elapsed();
+        assert_eq!(report.manifest, before, "the save equals the gateway .git");
+        assert!(f.data_dir.join(&report.path).is_dir());
+        prodshape_within("git_prodshape_save", took, shape_git::OFFLINE_SAVE);
+    });
+}
+
+#[test]
+fn git_prodshape_restore_verify() {
+    use shape_git::OFFLINE_RESTORE_VERIFY;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let node = f.node();
+        let saved = save(&node, &node, GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("save");
+        // The import deletes `.git` (R-3).
+        std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
+        let started = Instant::now();
+        let back = node
+            .restore_git(GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("restore");
+        let live = node.git_manifest(PROJECT).await.expect("manifest");
+        let took = started.elapsed();
+        assert_eq!(back, saved.manifest);
+        assert_eq!(live, saved.manifest);
+        prodshape_within("git_prodshape_restore_verify", took, OFFLINE_RESTORE_VERIFY);
+    });
+}
+
+#[test]
+fn git_prodshape_pack() {
+    use shape_git::OFFLINE_PACK;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let (_state, refs) = f.gateway_state(&host).await;
+        let bases = pack_bases(&host, &f.checkout, &refs).await.expect("bases");
+        assert!(bases.contains(&f.gateway_head), "{bases:?}");
+        let started = Instant::now();
+        let pack = host
+            .build_pack(&f.checkout, &f.release_head, &bases)
+            .await
+            .expect("pack")
+            .expect("the release has objects the gateway lacks");
+        let took = started.elapsed();
+        prodshape_within("git_prodshape_pack", took, OFFLINE_PACK);
+        eprintln!(
+            "git_prodshape_pack: {} advance commits, {} pack bytes",
+            shape.advance_commits,
+            pack.pack.len()
+        );
+
+        // The pack holds every object the gateway lacked: with it and the new
+        // branch ref the gateway repo is connected.
+        let node = f.node();
+        node.write_git_files(
+            PROJECT,
+            &[
+                GitWrite {
+                    name: GitWriteName::PackFile(pack.name.clone()),
+                    bytes: pack.pack.clone(),
+                },
+                GitWrite {
+                    name: GitWriteName::PackIndex(pack.name.clone()),
+                    bytes: pack.idx.clone(),
+                },
+                GitWrite {
+                    name: GitWriteName::BranchRef(BRANCH.to_string()),
+                    bytes: format!("{}\n", f.release_head).into_bytes(),
+                },
+            ],
+        )
+        .await
+        .expect("write the advance");
+        run_git(&f.project, &["fsck", "--connectivity-only"]);
+        assert_eq!(
+            run_git(&f.project, &["rev-parse", &format!("refs/heads/{BRANCH}")]),
+            f.release_head
+        );
+    });
+}
+
+#[test]
+fn git_prodshape_index() {
+    use shape_git::OFFLINE_INDEX;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let tree = host
+            .tree_paths(&f.checkout, &f.release_head)
+            .await
+            .expect("tree");
+        let assume: Vec<String> = tree.iter().filter(|p| !in_scope(p)).cloned().collect();
+        assert_eq!(assume.len(), shape.out_of_scope);
+        let started = Instant::now();
+        let index = host
+            .build_index(&f.checkout, &f.release_head, &assume)
+            .await
+            .expect("index");
+        let took = started.elapsed();
+        prodshape_within("git_prodshape_index", took, OFFLINE_INDEX);
+        assert_eq!(&index[..4], b"DIRC");
+        let entries = u32::from_be_bytes([index[8], index[9], index[10], index[11]]);
+        assert_eq!(entries as usize, shape.tracked);
+    });
+}
+
+#[test]
+fn git_prodshape_drift() {
+    use shape_git::OFFLINE_DRIFT;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let (_state, prep) = f.prepare(&host).await;
+        let targets = f.gateway_form_targets();
+        f.simulate_import(true, &targets);
+        let export = f.export_members();
+        assert_eq!(export.len(), shape.in_scope);
+        let started = Instant::now();
+        let prediction = predict_drift(&prep, &export);
+        let took = started.elapsed();
+        prodshape_within("git_prodshape_drift", took, OFFLINE_DRIFT);
+        let mut want = targets.clone();
+        want.sort();
+        assert_eq!(prediction.modified, want);
+        assert!(
+            prediction.untracked.is_empty(),
+            "{:?}",
+            prediction.untracked
+        );
+        assert!(prediction.unexpected.is_empty());
+        assert!(prediction.dropped.is_empty());
+    });
+}
+
+#[test]
+fn git_prodshape_handover() {
+    use shape_git::{
+        OFFLINE_DRIFT, OFFLINE_INDEX, OFFLINE_PACK, OFFLINE_READ_STATE, OFFLINE_RESTORE_VERIFY,
+        OFFLINE_SAVE,
+    };
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let node = f.node();
+        let targets = f.gateway_form_targets();
+
+        let started = Instant::now();
+        let (state, prep) = f.prepare(&host).await;
+        let prepared = started.elapsed();
+
+        let started = Instant::now();
+        let saved = save(&node, &node, GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("save");
+        let save_took = started.elapsed();
+
+        f.simulate_import(false, &targets);
+        let export = f.export_zip();
+
+        let started = Instant::now();
+        let report = restore_and_advance(
+            &node,
+            &node,
+            &host,
+            &f.checkout,
+            &state,
+            &saved,
+            &prep,
+            &export,
+        )
+        .await
+        .expect("restore and advance");
+        let restore_took = started.elapsed();
+
+        eprintln!(
+            "git_prodshape_handover: prepare (read, pack, blobs) {} ms, save {} ms, restore and advance (index, status, restore, write, verify) {} ms",
+            prepared.as_millis(),
+            save_took.as_millis(),
+            restore_took.as_millis()
+        );
+        prodshape_within(
+            "git_prodshape_handover",
+            prepared + save_took + restore_took,
+            OFFLINE_READ_STATE
+                + OFFLINE_PACK
+                + OFFLINE_SAVE
+                + OFFLINE_INDEX
+                + OFFLINE_DRIFT
+                + OFFLINE_RESTORE_VERIFY,
+        );
+
+        assert!(report.restored && report.advanced && report.verified);
+        let mut want = targets.clone();
+        want.sort();
+        assert_eq!(report.expected_drift, want);
+        assert!(report.dropped.is_empty());
+        assert_eq!(run_git(&f.project, &["rev-parse", "HEAD"]), f.release_head);
+        let status = run_git(
+            &f.project,
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        let mut paths: Vec<String> = status
+            .lines()
+            .filter_map(|l| l.trim_start().split_once(' '))
+            .map(|(_, path)| path.to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, want);
+    });
 }
