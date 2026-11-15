@@ -6274,16 +6274,39 @@ const READ_ATTEMPTS: usize = 3;
 const READ_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Whether `err` is worth another try of a read: the gateway's own error
-/// (`internal`, which an HTTP 5xx is), a restart (503) or a timeout.
+/// (`internal`, which an HTTP 5xx is), a restart (503), a timeout, or a pooled
+/// connection the gateway closed under the request (27-24).
 fn read_transient(err: &CoreError) -> bool {
     match err {
         CoreError::Internal(_) | CoreError::GatewayRestarting { .. } => true,
         CoreError::Network {
             source: Some(source),
             ..
-        } => source.is_timeout(),
+        } => source.is_timeout() || connection_closed_early(source),
         _ => false,
     }
+}
+
+/// The request went out on a pooled connection that the gateway had already
+/// closed, so the answer ended before it began (hyper's `IncompleteMessage`,
+/// "connection closed before message completed"). The gateway closes the
+/// socket after it answers a large import (observed live in 27-24: the
+/// read-back that follows a multi-megabyte import failed about half the time
+/// with `network_error` and the run ended `imported_unverified`). A read has no
+/// effect on the gateway, so the retry that opens a fresh connection is safe.
+fn connection_closed_early(err: &reqwest::Error) -> bool {
+    use std::error::Error as _;
+    let mut cause = err.source();
+    while let Some(inner) = cause {
+        if inner
+            .to_string()
+            .contains("connection closed before message completed")
+        {
+            return true;
+        }
+        cause = inner.source();
+    }
+    false
 }
 
 /// `read` up to [`READ_ATTEMPTS`] times [`READ_PAUSE`] apart, retrying only
@@ -10346,6 +10369,50 @@ pub(crate) fn sample_result() -> DeployProjectsResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 27-24: a pooled connection the gateway closed under a read is retried
+    /// (a fresh connection answers), while an unreachable gateway is not.
+    #[tokio::test]
+    async fn read_transient_covers_a_connection_closed_under_the_request() {
+        use crate::client::ReqwestGatewayApi;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                // Read the request, then close without an answer.
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+        });
+        let api = ReqwestGatewayApi::for_tests(&format!("http://{addr}"), None);
+        let err = GatewayProjects(&api)
+            .export_bytes("CapApp")
+            .await
+            .expect_err("the connection is closed without an answer");
+        assert!(
+            read_transient(&err),
+            "a request answered by a closed connection is retried: {err:?}"
+        );
+        // Nothing listens there: a refused connection is not retried.
+        let refused = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let dead = refused.local_addr().expect("addr");
+        drop(refused);
+        let api = ReqwestGatewayApi::for_tests(&format!("http://{dead}"), None);
+        let err = GatewayProjects(&api)
+            .export_bytes("CapApp")
+            .await
+            .expect_err("nothing listens");
+        assert!(!read_transient(&err), "a refused connection: {err:?}");
+    }
 
     fn sample_zip() -> Vec<u8> {
         use std::io::Write as _;
