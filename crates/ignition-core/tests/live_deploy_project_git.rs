@@ -38,20 +38,29 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ignition_core::actions::deploy_projects::{GatewayProjects, ProjectGateway};
+use ignition_core::actions::deploy_projects::{
+    CHILDREN_POLL_S, CHILDREN_SETTLE_S, DeployProjectsResult, GatewayProjects, NoProjectsObserver,
+    ProjectGateway, ProjectsInput, ProjectsRunOptions, ProjectsSurfaces, TAG_VERIFY_POLL_S,
+    TAG_VERIFY_SETTLE_S, TagDeleteSurface, deploy_projects_prepare, deploy_projects_run,
+    load_project,
+};
 use ignition_core::actions::script::script_run;
 use ignition_core::actions::webdev::webdev_deploy_with;
 use ignition_core::client::deploy_api::scan_and_wait;
 use ignition_core::client::scan::ScanKind;
-use ignition_core::client::{GatewayApi, ReqwestGatewayApi};
+use ignition_core::client::{DeployApi, GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{self, Config, Credential, Secret};
+use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::git_advance::{AdvancePrep, prepare_advance};
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
 use ignition_core::deploy::git_state::{GitRefs, GitState, GitStateKind, classify};
+use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupPolicy};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact};
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::{GitEntry, GitHostRead, GitStateWriter};
+use ignition_core::deploy::transport::{self, projects::project_host_for_node};
+use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
 
 /// The only gateway this gate may talk to.
@@ -1478,5 +1487,722 @@ async fn git_pull_push_roundtrip() {
             "remote_after": remote_after,
             "committed_deleted_files": deleted,
         }),
+    );
+}
+
+// ------------------------------------------------------------------- 27-23
+//
+// C4 on the single-node rig: the shipped `ign deploy projects`, wired in
+// process as the CLI wires it, against the module-managed CapApp. Every gate
+// compares what JGit inside the module says with what the run predicted
+// (`data.git.expected_drift`); a difference is a cut-over blocker (D-25), so
+// the assertions here are never loosened.
+
+/// The target file's environment.
+const ENV: &str = "rig";
+/// The origin URL the module holds in CapApp's `.git/config` (the git-server
+/// container's name). The test checkout keeps it as `remote.origin.url` so the
+/// run's `url_key` comparison matches, and reaches the server through
+/// `insteadOf` onto the host path of the same bare repository.
+const GATEWAY_ORIGIN: &str = "http://git-server/git/capapp.git";
+const GATEWAY_ORIGIN_BASE: &str = "http://git-server/git/";
+/// The reason every override of these gates carries.
+const REASON: &str = "27-23 live gate on a disposable rig";
+
+/// The flags of one in-process run, as the CLI fills them.
+#[derive(Default, Clone)]
+struct DeployFlags {
+    artifact_sha256: Option<String>,
+    discard_gateway_changes: Option<String>,
+    allow_git_sync_hazards: Option<String>,
+    first_change: bool,
+}
+
+/// A temp release checkout and targets root, alive for one run.
+struct Deployment {
+    _scratch: tempfile::TempDir,
+    repo: PathBuf,
+    targets: PathBuf,
+}
+
+/// A checkout of the rig remote with HEAD on `release` (a tag), whose origin is
+/// the gateway's own URL, and a targets root whose master is a `local:` node on
+/// the rig's data directory.
+fn deployment(rig: &Rig, release: &str) -> Deployment {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let repo = scratch.path().join("repo");
+    let targets = scratch.path().join("targets-root");
+    let remote = rig.remote.to_str().expect("utf8");
+    git(
+        scratch.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-hardlinks",
+            remote,
+            repo.to_str().expect("utf8"),
+        ],
+    );
+    git(&repo, &["remote", "set-url", "origin", GATEWAY_ORIGIN]);
+    let base = format!(
+        "{}/",
+        rig.remote
+            .parent()
+            .expect("the bare repository has a parent")
+            .display()
+    );
+    git(
+        &repo,
+        &[
+            "config",
+            &format!("url.{base}.insteadOf"),
+            GATEWAY_ORIGIN_BASE,
+        ],
+    );
+    git(&repo, &["checkout", "-q", release]);
+    // ign's own run directory is under `.ign/`.
+    let exclude = repo.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().expect("info dir")).expect("info dir");
+    std::fs::write(&exclude, ".ign/\n").expect("exclude");
+    std::fs::create_dir_all(targets.join("targets")).expect("targets dir");
+    std::fs::write(
+        targets.join("targets").join(format!("{ENV}.yaml")),
+        format!(
+            "schema_version: 1\ngateway: {RIG_GATEWAY_NAME}\nmode: production\nnodes:\n  master:\n    \
+             profile: rig\n    gateway_name: {RIG_GATEWAY_NAME}\n    local:\n      data_dir: '{}'\n",
+            rig.data.display()
+        ),
+    )
+    .expect("target file");
+    Deployment {
+        _scratch: scratch,
+        repo,
+        targets,
+    }
+}
+
+/// `ign deploy projects` in process, as the CLI wires it: the real client, the
+/// real host reads over a `local:` master on the rig data root, the master's
+/// tree reader and `DeployApi`, the CLI's timings. `check` is `--check`. The
+/// result JSON goes to the evidence directory under `step`.
+async fn deploy_in_process(
+    rig: &Rig,
+    check: bool,
+    env: &str,
+    release: &str,
+    flags: &DeployFlags,
+    step: &str,
+) -> Result<DeployProjectsResult, CoreError> {
+    let api = rig.api();
+    let dep = deployment(rig, release);
+    let input = ProjectsInput {
+        repo: dep.repo.clone(),
+        targets: dep.targets.clone(),
+        env: env.to_string(),
+        release: release.to_string(),
+        allow_downgrade: false,
+        allow_first_change: flags.first_change.then(|| REASON.to_string()),
+        discard_gateway_changes: flags.discard_gateway_changes.clone(),
+        allow_git_sync_hazards: flags.allow_git_sync_hazards.clone(),
+        allow_destructive: false,
+        allow_manual_undo: false,
+        artifact_sha256: flags.artifact_sha256.clone(),
+        tags_sha256: None,
+    };
+    let loaded = load_project(&input)?;
+    let host = project_host_for_node(
+        &input.targets,
+        &loaded.target_file,
+        "nodes.master",
+        &loaded.target.nodes.master,
+    )?;
+    let tree = transport::for_node(
+        &input.targets,
+        &loaded.target_file,
+        "nodes.master",
+        &loaded.target.nodes.master,
+    )?;
+    let gateway = GatewayProjects(&api);
+    let surfaces = ProjectsSurfaces {
+        gateway: &gateway,
+        host: host.as_ref(),
+        tree: Some(tree.as_ref()),
+        apply_host: None,
+        deploy: Some(&api as &dyn DeployApi),
+        tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
+    };
+    let opts = ProjectsRunOptions {
+        repo: input.repo.clone(),
+        targets_root: input.targets.clone(),
+        target_file: loaded.target_file.clone(),
+        master: loaded.target.nodes.master.clone(),
+        record_writer: None,
+        tag_record_writer: None,
+        run_writer: None,
+        designers: DesignersPolicy::default(),
+        children_settle: Duration::from_secs(CHILDREN_SETTLE_S),
+        children_poll: Duration::from_secs(CHILDREN_POLL_S),
+        tag_verify_settle: Duration::from_secs(TAG_VERIFY_SETTLE_S),
+        tag_verify_poll: Duration::from_secs(TAG_VERIFY_POLL_S),
+        backup: None,
+        backup_policy: BackupPolicy {
+            budget: Duration::from_secs(300),
+            interval: Duration::from_secs(BACKUP_POLL_S),
+        },
+        tag_delete_ready: Duration::from_secs(
+            ignition_core::deploy::tag_delete::TAG_DELETE_READY_TIMEOUT_S,
+        ),
+        tag_delete_poll: Duration::from_secs(
+            ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
+        ),
+        git_writer: None,
+    };
+    let prepared = deploy_projects_prepare(&loaded, &input, &surfaces).await?;
+    let result = if check {
+        prepared.into_check_result()
+    } else {
+        deploy_projects_run(
+            prepared,
+            &loaded,
+            &input,
+            &surfaces,
+            &opts,
+            &NoProjectsObserver,
+        )
+        .await?
+    };
+    write_evidence(
+        rig,
+        step,
+        &serde_json::to_value(&result).expect("serializes"),
+    );
+    Ok(result)
+}
+
+/// Every file under `dir`, relative path to bytes (a `.git` of the rig's size:
+/// a few dozen small files).
+fn dir_manifest(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, rel: &str, out: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(root.join(rel)).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if entry.file_type().expect("type").is_dir() {
+                walk(root, &child, out);
+            } else {
+                out.insert(
+                    child.clone(),
+                    std::fs::read(root.join(&child)).unwrap_or_default(),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, "", &mut out);
+    out
+}
+
+/// The strings of a JSON array, or empty.
+fn strs(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A refusal's gate and keys, or a panic naming what came instead.
+fn refusal(outcome: Result<DeployProjectsResult, CoreError>, step: &str) -> (String, Vec<String>) {
+    match outcome {
+        Err(CoreError::DestructiveChangeRefused { gate, keys, .. }) => (gate, keys),
+        Err(other) => panic!(
+            "{step}: expected a destructive_change_refused, got {}: {other}",
+            other.code()
+        ),
+        Ok(result) => panic!(
+            "{step}: expected a refusal, the run answered outcome {}",
+            result.outcome.as_str()
+        ),
+    }
+}
+
+/// The module's `commit` of `paths` (module resource names) through the script
+/// function reached by reflection; the stdout, or the module's error text.
+async fn module_commit(
+    api: &ReqwestGatewayApi,
+    config: &Config,
+    paths: &[String],
+    message: &str,
+) -> Result<String, String> {
+    let literal: Vec<String> = paths.iter().map(|p| format!("\"{p}\"")).collect();
+    let code = format!(
+        "{MODULE_PREAMBLE}print \"COMMIT %s\" % sm.commit(\"{APP}\", \"{APP_USER}\", [{}], \"{message}\")\n",
+        literal.join(", ")
+    );
+    try_script(api, config, &code).await
+}
+
+/// The module's `push` of CapApp.
+async fn module_push(api: &ReqwestGatewayApi, config: &Config) -> Result<String, String> {
+    let code = format!("{MODULE_PREAMBLE}print \"PUSH %s\" % sm.push(\"{APP}\", \"{APP_USER}\")\n");
+    try_script(api, config, &code).await
+}
+
+/// Push a release commit and its annotated tag `tag` to the rig remote's
+/// `production` (a temp clone changes `code.py`); the new commit id.
+fn push_release(rig: &Rig, tag: &str, body: &str) -> String {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = dir.path().join("w");
+    let remote = rig.remote.to_str().expect("utf8");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-hardlinks",
+            "-b",
+            "production",
+            remote,
+            work.to_str().expect("utf8"),
+        ],
+    );
+    std::fs::write(work.join(CODE_PY), body).expect("code.py");
+    git(&work, &["add", "-A"]);
+    let ident = [
+        "-c",
+        "user.name=rig",
+        "-c",
+        "user.email=rig@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+    ];
+    let mut commit = ident.to_vec();
+    commit.extend(["commit", "-q", "-m", tag]);
+    git(&work, &commit);
+    let mut tagging = ident.to_vec();
+    tagging.extend(["tag", "-a", tag, "-m", tag]);
+    git(&work, &tagging);
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            remote,
+            "HEAD:refs/heads/production",
+            &format!("refs/tags/{tag}"),
+        ],
+    );
+    // The git server container reads this tree as another user.
+    let _ = Command::new("chmod")
+        .args(["-R", "a+rX", remote])
+        .status()
+        .expect("chmod");
+    git(&work, &["rev-parse", "HEAD"])
+}
+
+/// The rig driver's `reset27` under a `git.yaml` variant: CapApp re-cloned by
+/// the module at v1.0.0, the remote's production at v1.1.0. The name guard of
+/// [`rig`] has already run; the driver checks the URL again itself.
+fn driver_reset(mode: &str) {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/live-rig-deploy/capture27.sh");
+    let status = Command::new("bash")
+        .arg(&script)
+        .arg("reset27")
+        .env("GIT27_YAML_MODE", mode)
+        .status()
+        .expect("bash runs the rig driver");
+    assert!(status.success(), "capture27.sh reset27 ({mode}) failed");
+}
+
+/// `git.yaml` in place: the template shape, with the production variant
+/// switched on when `production` and exactly one import flag when `flag` names
+/// it (`importImages`, `importTags`, `importThemes`, `tags_importOnStartup`).
+fn write_git_yaml(rig: &Rig, production: bool, flag: Option<&str>) {
+    let on = |name: &str| flag == Some(name);
+    let mut text = format!(
+        "- repo_uri: {GATEWAY_ORIGIN}\n\
+         \x20 repo_branch: production\n\
+         \x20 ignition_projectName: {APP}\n\
+         \x20 ignition_userName: admin\n\
+         \x20 ignition_inheritable: false\n\
+         \x20 user_name: rig\n\
+         \x20 user_email: rig@example.invalid\n\
+         \x20 user_password: not-checked\n\
+         \x20 commissioning_importThemes: {}\n\
+         \x20 commissioning_importTags: {}\n\
+         \x20 commissioning_importImages: {}\n\
+         \x20 commissioning_enforceBranch: false\n\
+         \x20 tags_importOnStartup: {}\n",
+        on("importThemes"),
+        on("importTags"),
+        on("importImages"),
+        on("tags_importOnStartup"),
+    );
+    if production {
+        text.push_str(
+            "  production_mode: true\n  production_branch: production\n  production_tagPattern: \"v*\"\n",
+        );
+    } else {
+        text.push_str("  production_mode: false\n");
+    }
+    std::fs::write(rig.data.join("git.yaml"), text).expect("git.yaml write");
+    eprintln!(
+        "LIVE-YAML production={production} flag={} written (the credential key is not shown)",
+        flag.unwrap_or("none")
+    );
+}
+
+/// What a managed deploy leaves, for the evidence and the captures.
+struct ManagedOutcome {
+    evidence: serde_json::Value,
+}
+
+/// One managed deploy of `release` as the shipped path does it, with every
+/// assertion of 27-23 Task 1: `--check` (state managed, drift unknown, `.git`
+/// untouched), the apply with `--artifact-sha256` (imported, `post_status`
+/// matched, the dropped member), then JGit's status against
+/// `data.git.expected_drift` as sets, 0 unpushed, and the branch.
+async fn managed_deploy(
+    rig: &Rig,
+    api: &ReqwestGatewayApi,
+    label: &str,
+    release: &str,
+    first: bool,
+    branch: &str,
+) -> ManagedOutcome {
+    let (_work, config) = script_config(api, &rig.url).await;
+    let gitdir = rig.project_dir().join(".git");
+
+    // --check: reads only.
+    let manifest_before = dir_manifest(&gitdir);
+    let flags = DeployFlags {
+        first_change: first,
+        ..DeployFlags::default()
+    };
+    let check = deploy_in_process(rig, true, ENV, release, &flags, &format!("{label}-check"))
+        .await
+        .unwrap_or_else(|err| panic!("{label} check: {} ({err})", err.code()));
+    let check_json = serde_json::to_value(&check).expect("check json");
+    let git_node = &check_json["git"]["nodes"][0];
+    assert_eq!(
+        git_node["state"], "managed",
+        "{label}: the module's repo is managed: {git_node}"
+    );
+    assert!(
+        check_json["git"]["expected_drift"].is_null()
+            && check_json["git"]["expected_drift_count"].is_null()
+            && check_json["git"]["expected_drift_complete"] == false,
+        "{label}: --check must report the drift as unknown (W-6): {}",
+        check_json["git"]
+    );
+    eprintln!(
+        "LIVE-C4 {label} check: state=managed expected_drift=null count=null complete=false action={} dirty_count={} dirty_source={}",
+        check_json["action"], git_node["dirty_count"], git_node["dirty_source"]
+    );
+    let manifest_after = dir_manifest(&gitdir);
+    let changed: Vec<&String> = manifest_before
+        .iter()
+        .filter(|(path, bytes)| manifest_after.get(*path) != Some(*bytes))
+        .map(|(path, _)| path)
+        .chain(
+            manifest_after
+                .keys()
+                .filter(|path| !manifest_before.contains_key(*path)),
+        )
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "{label}: --check changed the gateway's .git: {changed:?}"
+    );
+    eprintln!(
+        "LIVE-C4 {label} check_left_git_manifest_unchanged files={}",
+        manifest_before.len()
+    );
+
+    // The apply, with the digest the check showed.
+    let flags = DeployFlags {
+        artifact_sha256: Some(check.artifact_sha256.clone()),
+        first_change: first,
+        ..DeployFlags::default()
+    };
+    let started = Instant::now();
+    let applied = deploy_in_process(rig, false, ENV, release, &flags, label)
+        .await
+        .unwrap_or_else(|err| panic!("{label} apply: {} ({err})", err.code()));
+    let applied_ms = started.elapsed().as_millis();
+    let applied_json = serde_json::to_value(&applied).expect("apply json");
+    assert_eq!(
+        applied.outcome.as_str(),
+        "imported",
+        "{label}: outcome (slug {}): {}",
+        applied_json["slug"],
+        applied_json["git"]
+    );
+    let node = &applied_json["git"]["nodes"][0];
+    let restore = &node["restore"];
+    eprintln!(
+        "LIVE-C4 {label} apply: outcome=imported ms={applied_ms} restored={} advanced={} verified={} post_status={} dropped={} reason={}",
+        restore["restored"],
+        restore["advanced"],
+        restore["verified"],
+        restore["post_status"],
+        restore["dropped"],
+        restore["reason"]
+    );
+    assert!(
+        restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true,
+        "{label}: the handover did not complete: {restore}"
+    );
+    assert_eq!(
+        restore["post_status"], "matched",
+        "{label}: the master is a local node, so the run's own post-advance disk status ran (D-25): {restore}"
+    );
+    let dropped = strs(&restore["dropped"]);
+    assert_eq!(applied_json["git"]["expected_drift_complete"], true);
+    let predicted = strs(&applied_json["git"]["expected_drift"]);
+    assert_eq!(
+        predicted.len() as u64,
+        applied_json["git"]["expected_drift_count"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
+        "{label}: the drift list is not capped here"
+    );
+
+    // JGit inside the module says what the run predicted.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let jg = jgit(api, &config).await;
+    let expected: BTreeSet<String> = predicted.iter().map(|file| module_path(file)).collect();
+    let extra: Vec<&String> = jg.paths.difference(&expected).collect();
+    let missing: Vec<&String> = expected.difference(&jg.paths).collect();
+    eprintln!(
+        "LIVE-C4 {label} jgit: uncommitted={} expected={} extra={} missing={} unpushed={} branch={}",
+        jg.paths.len(),
+        expected.len(),
+        extra.len(),
+        missing.len(),
+        jg.unpushed,
+        jg.branch
+    );
+    for row in &jg.rows {
+        eprintln!("LIVE-C4 {label} jgit-row {row}");
+    }
+    for path in &predicted {
+        eprintln!("LIVE-C4 {label} drift-path {path}");
+    }
+    assert!(
+        extra.is_empty() && missing.is_empty(),
+        "{label}: CUT-OVER BLOCKER (D-25): JGit differs from expected_drift: extra={extra:?} missing={missing:?}"
+    );
+    assert_eq!(jg.unpushed, 0, "{label}: unpushed commits after the deploy");
+    assert_eq!(jg.branch, branch, "{label}: current branch");
+    assert!(
+        !jg.paths.contains(NOTES) && jg.rows.iter().all(|row| !row.ends_with(NOTES)),
+        "{label}: the dropped member must be in no JGit list"
+    );
+    assert!(
+        jg.rows.iter().all(|row| !row.starts_with("Deleted ")),
+        "{label}: JGit lists a path as deleted: {:?}",
+        jg.rows
+    );
+    eprintln!(
+        "LIVE-CHECK {label} jgit_equals_expected_drift files={}",
+        predicted.len()
+    );
+    assert!(
+        dropped.iter().any(|path| path == NOTES),
+        "{label}: restore.dropped must name the unlisted member {NOTES} (checker B3): {dropped:?}"
+    );
+
+    // The save is the run's own area; the gate leaves the rig tidy for the
+    // next run.
+    let evidence = serde_json::json!({
+        "label": label,
+        "release": release,
+        "outcome": applied.outcome.as_str(),
+        "check_expected_drift_null": check_json["git"]["expected_drift"].is_null(),
+        "post_status": restore["post_status"],
+        "dropped": dropped,
+        "expected_drift": predicted,
+        "jgit_paths": jg.paths,
+        "jgit_rows": jg.rows,
+        "unpushed": jg.unpushed,
+        "branch": jg.branch,
+        "apply_ms": applied_ms,
+        "git_manifest_files": manifest_before.len(),
+    });
+    write_evidence(rig, &format!("{label}-summary"), &evidence);
+    ManagedOutcome { evidence }
+}
+
+/// Commit the drift through the module and push (production mode): the push
+/// must succeed and the remote tip's tree must still hold everything outside
+/// the artifact scope (R-8).
+async fn commit_drift_and_push(
+    rig: &Rig,
+    api: &ReqwestGatewayApi,
+    label: &str,
+) -> serde_json::Value {
+    let (_work, config) = script_config(api, &rig.url).await;
+    let before = jgit(api, &config).await;
+    let paths: Vec<String> = before.paths.iter().cloned().collect();
+    let remote_before = git(&rig.remote, &["rev-parse", "refs/heads/production"]);
+    let committed = module_commit(api, &config, &paths, "normalize gateway form").await;
+    eprintln!("LIVE-COMMIT {label} {committed:?}");
+    committed.expect("the module's commit answers");
+    let after_commit = jgit(api, &config).await;
+    eprintln!(
+        "LIVE-C4 {label} after_commit: uncommitted={} unpushed={}",
+        after_commit.paths.len(),
+        after_commit.unpushed
+    );
+    assert!(
+        after_commit.paths.is_empty(),
+        "{label}: the status is not clean after committing the drift: {:?}",
+        after_commit.rows
+    );
+    assert_eq!(after_commit.unpushed, 1, "{label}: one commit to push");
+    let pushed = module_push(api, &config).await;
+    eprintln!("LIVE-PUSH {label} {pushed:?}");
+    pushed.expect("the module's push in production mode succeeds once the status is clean");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let remote_after = git(&rig.remote, &["rev-parse", "refs/heads/production"]);
+    let local_head = git(&rig.project_dir(), &["rev-parse", "HEAD"]);
+    assert_ne!(
+        remote_after, remote_before,
+        "{label}: the remote tip did not move"
+    );
+    assert_eq!(
+        remote_after, local_head,
+        "{label}: the remote tip is not the pushed HEAD"
+    );
+    let tree = git(
+        &rig.remote,
+        &["ls-tree", "-r", "--name-only", "refs/heads/production"],
+    );
+    let outside = [
+        "README.md",
+        "tags/default/tags.json",
+        "images/logo.txt",
+        "deploy/project.yaml",
+        ".gitignore",
+    ];
+    let missing: Vec<&str> = outside
+        .iter()
+        .copied()
+        .filter(|p| !tree.lines().any(|l| l == *p))
+        .collect();
+    eprintln!(
+        "LIVE-CHECK {label} push_succeeds_and_remote_tree_keeps_out_of_scope_files kept={} missing={missing:?} total_files={}",
+        outside.len() - missing.len(),
+        tree.lines().count()
+    );
+    assert!(
+        missing.is_empty(),
+        "{label}: the pushed tree lost files: {missing:?}"
+    );
+    let final_status = jgit(api, &config).await;
+    assert!(final_status.paths.is_empty());
+    assert_eq!(final_status.unpushed, 0);
+    serde_json::json!({
+        "label": label,
+        "committed_paths": paths,
+        "remote_moved": true,
+        "remote_is_local_head": true,
+        "kept_out_of_scope_files": outside.len() - missing.len(),
+        "final_uncommitted": final_status.paths.len(),
+        "final_unpushed": final_status.unpushed,
+    })
+}
+
+/// 27-23 Task 1, template variant: a managed project at v1.0.0 is deployed to
+/// v1.1.0; then, under the production variant, a v1.2.0 pushed to the remote's
+/// `production` is deployed and the module commits the drift and pushes.
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_deploy_managed_e2e() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_deploy_managed_e2e");
+    let api = rig.api();
+    let host = HostGit::new();
+
+    let (state, refs) = gateway_state(&rig, &host).await;
+    assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
+    let (_keep, _checkout, c1) = release_checkout(&rig, "v1.0.0");
+    assert!(
+        refs.heads.values().any(|id| id == &c1),
+        "the module's clone must sit at v1.0.0 (run reset27 first)"
+    );
+
+    let template = managed_deploy(
+        &rig,
+        &api,
+        "c4-template-v1.1.0",
+        "v1.1.0",
+        true,
+        "production",
+    )
+    .await;
+
+    // Production variant over the same gateway: the module restarts with
+    // production_mode on, a v1.2.0 reaches the remote, the run deploys it.
+    write_production_yaml(&rig);
+    restart_gateway(&api).await;
+    let tip = push_release(&rig, "v1.2.0", "def f():\n    return 4\n");
+    eprintln!("LIVE-C4 production pushed v1.2.0 tip={}", &tip[..7]);
+    let production = managed_deploy(
+        &rig,
+        &api,
+        "c4-production-v1.2.0",
+        "v1.2.0",
+        false,
+        "production",
+    )
+    .await;
+    let pushed = commit_drift_and_push(&rig, &api, "c4-production-v1.2.0").await;
+
+    write_evidence(
+        &rig,
+        "git_deploy_managed_e2e",
+        &serde_json::json!({
+            "template": template.evidence,
+            "production": production.evidence,
+            "production_push": pushed,
+        }),
+    );
+}
+
+/// 27-23 Task 1, D-17: the managed deploy under each `git.yaml` variant, each
+/// from a freshly reset rig (`reset27` under that variant), with the same
+/// assertions.
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_variants_e2e() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_variants_e2e");
+    let api = rig.api();
+    let mut recorded = Vec::new();
+    for (mode, label) in [
+        ("template", "c4-variant-template-v1.1.0"),
+        ("production", "c4-variant-production-v1.1.0"),
+    ] {
+        driver_reset(mode);
+        let outcome = managed_deploy(&rig, &api, label, "v1.1.0", true, "production").await;
+        recorded.push(outcome.evidence);
+    }
+    write_evidence(
+        &rig,
+        "git_variants_e2e",
+        &serde_json::json!({ "variants": recorded }),
     );
 }

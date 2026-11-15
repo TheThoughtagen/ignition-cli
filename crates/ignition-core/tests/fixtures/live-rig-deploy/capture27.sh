@@ -396,6 +396,28 @@ app_has_git() {
   docker exec "$(cid)" sh -c "test -d $CONTAINER_DATA/projects/$APP/.git"
 }
 
+# git_server_ok: the git server answers the smart-HTTP advertisement (200). The
+# Apache cgid socket inside the server container can disappear after hours up
+# (observed in 27-23: every request answered 503 and the module's clone left an
+# empty repository behind), so a reset restarts the server and checks this.
+git_server_ok() {
+  local code
+  code=$(docker exec "$(cid)" sh -c "curl -s -o /dev/null -w '%{http_code}' 'http://git-server/git/$BARE/info/refs?service=git-upload-pack'" 2> /dev/null || true)
+  [ "$code" = 200 ]
+}
+
+# wait_clone SECONDS: the module's clone of the remote finished: the tracked
+# branch's ref and the index exist. `.git` exists as soon as the clone starts
+# (an empty repository with an unborn HEAD), so its presence proves nothing.
+wait_clone() {
+  local limit=${1:-300} end
+  end=$(( $(date +%s) + limit ))
+  until docker exec "$(cid)" sh -c "test -f $CONTAINER_DATA/projects/$APP/.git/index && test -f $CONTAINER_DATA/projects/$APP/.git/refs/heads/production" 2> /dev/null; do
+    [ "$(date +%s)" -lt "$end" ] || return 1
+    sleep 3
+  done
+}
+
 # ----------------------------------------------------------------- up / mint
 
 up27() {
@@ -496,10 +518,20 @@ reset27() {
   curl -sS -m 60 -o /dev/null -X DELETE -H "X-Ignition-API-Token: $IGN_GIT27_RIG_TOKEN" "$BASE$PRJ/$APP?confirm=true" || true
   # The module cloned into the directory: remove what the API delete left.
   docker exec -u root "$(cid)" sh -c "rm -rf $CONTAINER_DATA/projects/$APP"
+  # The server container's CGI socket can vanish after hours up: restart it
+  # and prove the advertisement answers before the module clones.
+  dc restart git-server > /dev/null 2>&1 || true
+  local tries=0
+  until git_server_ok; do
+    tries=$(( tries + 1 ))
+    [ "$tries" -lt 20 ] || die "reset27: the git server does not answer the smart-HTTP advertisement"
+    sleep 3
+  done
   docker restart "$(cid)" > /dev/null
   wait_running 600 || die "reset27: the gateway is not RUNNING within 600 s"
   wait_app 600 || die "reset27: $APP did not answer find within 600 s"
-  sleep 45
+  wait_clone 600 || die "reset27: the module's clone of $APP did not finish within 600 s (no refs/heads/production and index)"
+  sleep 15
   app_has_git || die "reset27: $APP has no .git directory (the module did not clone it)"
   # The clone is at v1.0.0; now the release reaches the remote's production.
   publish27
