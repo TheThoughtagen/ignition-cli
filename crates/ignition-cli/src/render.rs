@@ -1999,6 +1999,13 @@ fn git_lines(
         }
     }
     lines.extend(git_discard_lines(result, git));
+    // `--allow-git-sync-hazards` (27-18): the reason is operator text.
+    if let Some(reason) = &git.hazards_acknowledged {
+        lines.push(format!(
+            "git sync hazards acknowledged: {}",
+            escape_control(reason)
+        ));
+    }
     lines.push(if git.expected_drift_complete {
         format!(
             "expected drift: {} (after import)",
@@ -5243,6 +5250,26 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle}: {text}");
         }
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn git_lines_show_the_hazard_acknowledgement_escaped() {
+        let mut node = git_node("managed");
+        node.hazards = vec!["import_tags".into()];
+        let mut git = git_report(node);
+        git.hazards_acknowledged = Some("tags on purpose\u{1b}[2J".to_string());
+        let mut result = projects_result();
+        result.git = Some(git);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("hazards: import_tags"), "{text}");
+        assert!(
+            text.contains("git sync hazards acknowledged: tags on purpose\\u{1b}[2J"),
+            "{text}"
+        );
         assert!(
             !text.chars().any(|c| c.is_control() && c != '\n'),
             "{text:?}"

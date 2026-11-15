@@ -957,6 +957,7 @@ pub enum DeployCommand {
                 "allow_downgrade",
                 "allow_first_change",
                 "discard_gateway_changes",
+                "allow_git_sync_hazards",
                 "allow_destructive",
                 "allow_manual_undo",
                 "rehearse",
@@ -1030,6 +1031,17 @@ pub enum DeployCommand {
         /// (`destructive_change_refused`, exit 2)
         #[arg(long, value_name = "REASON")]
         discard_gateway_changes: Option<String>,
+        /// Acknowledge, with a reason of 1 to 500 characters, that the
+        /// gateway's git module will run the start-sync imports `git.yaml`
+        /// sets for the project at its next start: a tag import while
+        /// `tags/` is present on the node, or a branch enforcement (stash,
+        /// switch, pull). `--check` lists the flags `git.yaml` sets as
+        /// `data.git.nodes[].hazards`. Without it a hazard that damaged the
+        /// gateway in testing is refused (`destructive_change_refused` gate
+        /// `git_sync_hazard`, exit 2); setting the flag false for the project
+        /// in `git.yaml` removes it
+        #[arg(long, value_name = "REASON")]
+        allow_git_sync_hazards: Option<String>,
         /// Let the deploy delete the tags the previous deploy of this
         /// project placed and the repo no longer holds; `--check` lists them
         /// (`data.tags.removed`). The gateway needs the tag-delete route

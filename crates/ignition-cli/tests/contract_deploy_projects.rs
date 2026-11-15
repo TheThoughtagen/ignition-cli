@@ -3808,6 +3808,107 @@ async fn git_override_reason_bounds() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 27-18 (D-21): `--allow-git-sync-hazards <REASON>`.
+// ---------------------------------------------------------------------------
+
+/// `--help` lists the flag with its `REASON` value and the `data.git` key a
+/// check lists the hazards under.
+#[tokio::test]
+async fn git_hazard_flag_parses() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--allow-git-sync-hazards <REASON>"), "{text}");
+    for kept in ["data.git.nodes[].hazards", "git_sync_hazard", "git.yaml"] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+
+    // With a reason it parses and the check proceeds to the gateway read.
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &["--allow-git-sync-hazards", "the module imports on purpose"],
+        ),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["action"], "record");
+    assert!(data["git"].is_null(), "no .git, no git block: {data}");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// The acknowledgement undoes nothing: clap refuses it beside
+/// `--rollback-run` (usage, exit 2) before anything is contacted.
+#[tokio::test]
+async fn git_hazard_conflicts_with_rollback_run() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let out = run(
+        &server,
+        &rollback_args(
+            &fx,
+            "20261109T101500Z-ab12",
+            &["--allow-git-sync-hazards", "x"],
+        ),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-git-sync-hazards") && stderr.contains("--rollback-run"),
+        "{stderr}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+/// The reason is 1 to 500 characters (`invalid_input`, exit 2, before any
+/// request) and data: a shell metacharacter reason is accepted and runs
+/// nothing.
+#[tokio::test]
+async fn git_hazard_reason_bounds() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let long = "x".repeat(501);
+    for reason in [long.as_str(), ""] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--allow-git-sync-hazards", reason]),
+        );
+        assert_eq!(out.status.code(), Some(2), "{} chars", reason.len());
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{err}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("--allow-git-sync-hazards"), "{message}");
+    }
+    assert!(methods(&server).await.is_empty());
+
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let reason = "x\"; touch pwned-27-18; $(id) `id`";
+    let out = run(
+        &server,
+        &args_with(&fx, "v1.0.0", &["--allow-git-sync-hazards", reason]),
+    );
+    assert_eq!(data_of(&out)["action"], "record");
+    assert!(!fx.repo.join("pwned-27-18").exists());
+    assert!(
+        !std::env::current_dir()
+            .expect("cwd")
+            .join("pwned-27-18")
+            .exists()
+    );
+}
+
 fn git_in(dir: &Path, args: &[&str]) {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -3922,5 +4023,67 @@ async fn git_override_refusal_names_flag() {
         data["git"]["discarded"].is_null(),
         "a check discards nothing"
     );
+    assert_only_gets(&methods(&server).await);
+}
+
+/// A `git_sync_hazard` refusal names `--allow-git-sync-hazards <reason>` and
+/// the hazard word; with the flag the same check passes, lists the word under
+/// `data.git.nodes[].hazards` and records the reason in
+/// `data.git.hazards_acknowledged`, sending GET requests only.
+#[tokio::test]
+async fn git_hazard_refusal_names_flag() {
+    let fx = fixture();
+    git_managed_fixture(&fx);
+    put(
+        &fx.data,
+        "git.yaml",
+        b"- ignition_projectName: CapApp\n  user_password: dummy-credential\n  \
+          commissioning_enforceBranch: true\n",
+    );
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused", "{err}");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in [
+        "git_sync_hazard",
+        "enforce_branch",
+        "--allow-git-sync-hazards <reason>",
+    ] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(!message.contains("dummy-credential"), "{message}");
+    assert_only_gets(&methods(&server).await);
+
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &[
+                "--allow-git-sync-hazards",
+                "branch enforcement is wanted",
+                "--allow-first-change",
+                "adopt the repo",
+            ],
+        ),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["git"]["nodes"][0]["hazards"][0], "enforce_branch");
+    assert_eq!(
+        data["git"]["hazards_acknowledged"],
+        "branch enforcement is wanted"
+    );
+    assert!(!data.to_string().contains("dummy-credential"), "{data}");
     assert_only_gets(&methods(&server).await);
 }
