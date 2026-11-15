@@ -312,6 +312,103 @@ pub async fn restore_and_advance(
     })
 }
 
+/// After an import that did not read back as the artifact (K11): put the
+/// saved `.git` back exactly as it was if the import removed it, and never
+/// advance it.
+///
+/// The `.git` is probed: absent, the save must still equal what was saved, is
+/// restored, and the restored copy must read back as the save; present (the
+/// import left a repo or the module recreated one), nothing is written and
+/// the repo is left as it is. A `.git` that is not a directory is
+/// `git_recreated` and is left alone. The save is kept in every case: the
+/// caller removes it once it knows the repo equals it.
+pub async fn restore_unchanged(
+    read: &dyn GitHostRead,
+    write: &dyn GitStateWriter,
+    gateway: &str,
+    project: &str,
+    save: &GitSaveReport,
+) -> Result<GitRestoreReport, GitRestoreFailure> {
+    let fail = |reason: &'static str, restored: bool, paths: Vec<String>, detail: String| {
+        GitRestoreFailure {
+            reason,
+            restored,
+            paths,
+            detail: redact_text(&detail),
+            save_path: save.path.clone(),
+        }
+    };
+    let files = read.read_git_state(project).await.map_err(|e| {
+        fail(
+            "restore_failed",
+            false,
+            Vec::new(),
+            format!("the .git probe failed: {e}"),
+        )
+    })?;
+    let report = |restored: bool| GitRestoreReport {
+        restored,
+        advanced: false,
+        verified: restored,
+        expected_drift: Vec::new(),
+        dropped: Vec::new(),
+        save_path: save.path.clone(),
+    };
+    match files.kind {
+        GitEntry::Absent => {
+            let still = read
+                .save_manifest(gateway, project, &save.run_id)
+                .await
+                .map_err(|e| {
+                    fail(
+                        "restore_failed",
+                        false,
+                        Vec::new(),
+                        format!("the save cannot be read: {e}"),
+                    )
+                })?;
+            if still != save.manifest {
+                return Err(fail(
+                    "restore_failed",
+                    false,
+                    Vec::new(),
+                    "the save no longer matches what was saved; nothing was restored".to_string(),
+                ));
+            }
+            let back = write
+                .restore_git(gateway, project, &save.run_id)
+                .await
+                .map_err(|e| {
+                    fail(
+                        "restore_failed",
+                        false,
+                        Vec::new(),
+                        format!("the save could not be restored: {e}"),
+                    )
+                })?;
+            if back != save.manifest {
+                return Err(fail(
+                    "restore_failed",
+                    false,
+                    Vec::new(),
+                    "the restored .git does not match the save".to_string(),
+                ));
+            }
+            Ok(report(true))
+        }
+        GitEntry::Directory => Ok(report(false)),
+        GitEntry::File | GitEntry::Symlink | GitEntry::Other => Err(fail(
+            "git_recreated",
+            false,
+            vec![".git".to_string()],
+            format!(
+                ".git is now a {}, not a directory; it is left as it is",
+                files.kind.as_str()
+            ),
+        )),
+    }
+}
+
 fn describe(name: &GitWriteName) -> String {
     format!(".git/{}", name.rel())
 }

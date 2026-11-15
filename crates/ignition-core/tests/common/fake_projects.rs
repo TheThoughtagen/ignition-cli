@@ -210,6 +210,9 @@ pub struct FakeProjects {
     stamp: AtomicU64,
     empty_changes: AtomicBool,
     designers: Mutex<DesignersScript>,
+    /// How many Designer reads still report one attached session once the run
+    /// is past its verify (27-13, `with_designers_after_verify`).
+    designers_after_verify: Mutex<u64>,
     /// What `gateway-info` answers as the gateway's name.
     gateway_name: Mutex<Option<String>>,
     /// What the redundancy status answers as the gateway's role.
@@ -367,6 +370,7 @@ impl FakeProjects {
             stamp: AtomicU64::new(0),
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
+            designers_after_verify: Mutex::new(0),
             gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
             redundancy_role: Mutex::new(Some("Independent".to_string())),
             churn: Mutex::new(BTreeMap::new()),
@@ -870,6 +874,21 @@ impl FakeProjects {
         self
     }
 
+    /// One Designer session is attached for the next `polls` Designer reads
+    /// made after the run's verify (27-13, D-07): the reads after the gateway
+    /// has served two exports (the prepare's and the run's own first, the
+    /// pre-image of an import or the live read of a `record`), so the
+    /// pre-check of an import is not affected. The reads after those `polls`
+    /// find no session, as a Designer that closed.
+    #[allow(dead_code)]
+    pub fn with_designers_after_verify(self, polls: u64) -> Self {
+        *self
+            .designers_after_verify
+            .lock()
+            .expect("designers after verify") = polls;
+        self
+    }
+
     /// Every Designer list read fails with `network_error`.
     pub fn with_designers_error(self) -> Self {
         self.designers.lock().expect("designers").fail = true;
@@ -1179,11 +1198,25 @@ impl ProjectGateway for FakeProjects {
     }
 
     async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
-        let read = {
+        let (read, exports) = {
             let mut calls = self.calls.lock().expect("calls");
             calls.designers += 1;
-            calls.designers - 1
+            (calls.designers - 1, calls.export.len())
         };
+        if exports >= 2 {
+            let mut left = self
+                .designers_after_verify
+                .lock()
+                .expect("designers after verify");
+            if *left > 0 {
+                *left -= 1;
+                return Ok(vec![(
+                    "dana".to_string(),
+                    String::new(),
+                    "ws-2".to_string(),
+                )]);
+            }
+        }
         let script = self.designers.lock().expect("designers");
         if script.fail {
             return Err(CoreError::Network {

@@ -1978,8 +1978,10 @@ const PROSE_REMOVED_SHOWN: usize = 20;
 /// ([`crate::deploy::tag_storable::check_storable`]).
 ///
 /// The `.git` probe comes next (DPRJ-04, D-11): a project the git module
-/// still manages is refused as `project_git_managed` before any gateway read.
-/// An unreadable probe is `transport_failed`, never "no git".
+/// manages is read, gated and prepared for the handover before any gateway
+/// read ([`git::prepare_git_host`]); a `.git` that cannot be handed over is
+/// refused as `project_git_managed` with a reason word. An unreadable probe is
+/// `transport_failed`, never "no git".
 pub async fn deploy_projects_prepare(
     loaded: &LoadedProject,
     input: &ProjectsInput,
@@ -3134,6 +3136,69 @@ pub enum ProjectsEvent {
         /// `content_differs`.
         reason: Option<&'static str>,
     },
+    /// The gateway repo of a node the git module manages was read and
+    /// classified before the run's first write (Phase 27). Names, counts and
+    /// ids only.
+    GitStateRead {
+        /// `nodes.master` or `nodes.backup`.
+        node: String,
+        /// `managed` (or `adoptable`).
+        state: &'static str,
+        /// The tracked branch.
+        branch: Option<String>,
+        /// The gateway HEAD commit.
+        head: Option<String>,
+        /// How many commits are on no remote branch.
+        unpushed: usize,
+        /// The size of `R..G`.
+        not_merged: usize,
+        /// How many members the live project changed since the gateway HEAD.
+        dirty: Option<usize>,
+    },
+    /// The gateway `.git` was copied to the host-local save (Phase 27).
+    GitSaved {
+        /// The node.
+        node: String,
+        /// Where the save is, relative to the node's ledger root.
+        path: String,
+        /// Regular files in the copy.
+        files: usize,
+        /// Their total size.
+        bytes: u64,
+    },
+    /// The saved `.git` was copied back because the import had removed it.
+    GitRestored {
+        /// The node.
+        node: String,
+    },
+    /// The repo was advanced to the release commit and every written file was
+    /// read back.
+    GitAdvanced {
+        /// The node.
+        node: String,
+        /// The release commit.
+        release_commit: String,
+        /// How many in-scope members the gateway did not keep.
+        dropped: usize,
+        /// How many paths the module will list as uncommitted.
+        expected_drift: usize,
+    },
+    /// The save was removed because everything held.
+    GitSaveRemoved {
+        /// The node.
+        node: String,
+        /// Where the save was.
+        path: String,
+    },
+    /// The restore or the advance failed or was refused; the save is kept.
+    GitRestoreFailed {
+        /// The node.
+        node: String,
+        /// One of the restore reason words.
+        reason: String,
+        /// Where the kept save is; `None` when no save was taken.
+        path: Option<String>,
+    },
     /// The run ended.
     Finished {
         /// How it ended.
@@ -3179,6 +3244,12 @@ impl ProjectsEvent {
             ProjectsEvent::BackupWaitStarted { .. } => "backup_wait_started",
             ProjectsEvent::BackupResync { .. } => "backup_resync",
             ProjectsEvent::BackupVerdict { .. } => "backup_verdict",
+            ProjectsEvent::GitStateRead { .. } => "git_state_read",
+            ProjectsEvent::GitSaved { .. } => "git_saved",
+            ProjectsEvent::GitRestored { .. } => "git_restored",
+            ProjectsEvent::GitAdvanced { .. } => "git_advanced",
+            ProjectsEvent::GitSaveRemoved { .. } => "git_save_removed",
+            ProjectsEvent::GitRestoreFailed { .. } => "git_restore_failed",
             ProjectsEvent::Finished { .. } => "finished",
         }
     }
@@ -3279,6 +3350,42 @@ impl ProjectsEvent {
             }
             ProjectsEvent::BackupVerdict { converged, reason } => {
                 serde_json::json!({ "converged": converged, "reason": reason })
+            }
+            ProjectsEvent::GitStateRead {
+                node,
+                state,
+                branch,
+                head,
+                unpushed,
+                not_merged,
+                dirty,
+            } => serde_json::json!({
+                "node": node, "state": state, "branch": branch, "head": head,
+                "unpushed": unpushed, "not_merged": not_merged, "dirty": dirty
+            }),
+            ProjectsEvent::GitSaved {
+                node,
+                path,
+                files,
+                bytes,
+            } => serde_json::json!({
+                "node": node, "path": path, "files": files, "bytes": bytes
+            }),
+            ProjectsEvent::GitRestored { node } => serde_json::json!({ "node": node }),
+            ProjectsEvent::GitAdvanced {
+                node,
+                release_commit,
+                dropped,
+                expected_drift,
+            } => serde_json::json!({
+                "node": node, "release_commit": release_commit, "dropped": dropped,
+                "expected_drift": expected_drift
+            }),
+            ProjectsEvent::GitSaveRemoved { node, path } => {
+                serde_json::json!({ "node": node, "path": path })
+            }
+            ProjectsEvent::GitRestoreFailed { node, reason, path } => {
+                serde_json::json!({ "node": node, "reason": reason, "path": path })
             }
             ProjectsEvent::Finished { outcome } => {
                 serde_json::json!({ "outcome": outcome.as_str() })
@@ -3735,7 +3842,7 @@ pub async fn deploy_projects_run(
     // cannot take it refuses before anything is written.
     let built_git;
     let git_writer: Option<&dyn GitStateWriter> = match (&prepared_git, plan.action) {
-        (Some(_), ProjectAction::Import) => match opts.git_writer {
+        (Some(_), ProjectAction::Import | ProjectAction::Record) => match opts.git_writer {
             Some(writer) => Some(writer),
             None => {
                 built_git = git_state_writer_for_node(
@@ -4069,6 +4176,13 @@ async fn execute(
             "designers_timeout_s": designers.timeout_s,
             "designers_seen": sessions_json(&designers.seen),
             "run_dir_git": run_dir.git_status().as_record(),
+            // Phase 27: what the run found in the gateway repo, ids and words
+            // only; null for a project without a `.git`.
+            "git": plan.git.as_deref().map(|git| serde_json::json!({
+                "state": git.master().state,
+                "head": git.master().head,
+                "release_commit": git.release_commit,
+            })),
         }),
     )?;
     run_dir.write_json("plan.json", plan)?;
@@ -4093,6 +4207,23 @@ async fn execute(
     }
     if designers.skipped {
         events.emit(ProjectsEvent::DesignersSkipped)?;
+    }
+    // Phase 27: the gateway repo was read in the prepare, before the run
+    // directory existed; its first event is the first line of the run's log
+    // about it.
+    if writers.git.is_some()
+        && let Some(git) = plan.git.as_deref()
+    {
+        let node = git.master();
+        events.emit(ProjectsEvent::GitStateRead {
+            node: node.node.clone(),
+            state: node.state,
+            branch: node.branch.clone(),
+            head: node.head.clone(),
+            unpushed: node.unpushed.len(),
+            not_merged: node.not_merged_count,
+            dirty: node.dirty_count,
+        })?;
     }
 
     let mut result = plan.clone();
@@ -4221,6 +4352,37 @@ async fn execute(
             &mut events,
         )
         .await;
+        // Phase 27: the project already is the artifact, so the repo is
+        // advanced in place to the release commit (never replaced), after the
+        // Designer gate, and proved as after an import. A failure keeps the
+        // deploy and its record and ends the run as `git_restore_failed`.
+        let mut git_failed = false;
+        if let (Some(git_run), Some(read), Some(report)) =
+            (writers.git, surfaces.host.git(), result.git.as_mut())
+        {
+            let after = git::git_record_advance(
+                git_run.prepared,
+                report,
+                run_id.as_str(),
+                &git::AfterInputs {
+                    read,
+                    write: git_run.writer,
+                    git: &git_run.host_git,
+                    gateway: &plan.gateway,
+                    project,
+                    export_zip: &zip,
+                    post_status: &git_run.post_status,
+                    api: gateway,
+                    designers: &opts.designers,
+                },
+            )
+            .await;
+            for event in after.events {
+                events.emit_late(event);
+            }
+            result.warnings.extend(after.warnings);
+            git_failed = after.failed;
+        }
         // On a pair the backup's copy of the owned tags is checked (26-13).
         let backup = backup_step(
             &mut result,
@@ -4239,6 +4401,7 @@ async fn execute(
             &mut events,
             backup == Some(false),
             record_written,
+            git_failed,
         );
         return Ok(result);
     }
@@ -4455,6 +4618,12 @@ async fn execute(
                 if let Some(report) = result.git.as_mut() {
                     report.set_save(&saved);
                 }
+                events.emit_late(ProjectsEvent::GitSaved {
+                    node: "nodes.master".to_string(),
+                    path: saved.path.clone(),
+                    files: saved.manifest.files,
+                    bytes: saved.manifest.bytes,
+                });
                 git_saved = Some(saved);
             }
             Err(err) if tags_wrote => {
@@ -4677,28 +4846,28 @@ async fn execute(
             surfaces.host.git(),
             result.git.as_mut(),
         ) {
-            // Interim for D-07 until 27-13's `git_restore_designer_gate`: the
-            // `.git` is never put back while a Designer is attached.
-            let designers_attached = match gateway.designers().await {
-                Ok(list) => Ok(list.len()),
-                Err(err) => Err(err.code().to_string()),
-            };
+            // D-07: the Designer gate runs again right before the `.git`
+            // write, whatever the pre-check found.
             let after = git::git_after_verify(
                 git_run.prepared,
                 report,
+                saved,
                 &git::AfterInputs {
                     read,
                     write: git_run.writer,
                     git: &git_run.host_git,
                     gateway: &plan.gateway,
                     project,
-                    saved,
                     export_zip: zip,
                     post_status: &git_run.post_status,
-                    designers_attached,
+                    api: gateway,
+                    designers: &opts.designers,
                 },
             )
             .await;
+            for event in after.events {
+                events.emit_late(event);
+            }
             result.warnings.extend(after.warnings);
             if after.failed {
                 result.outcome = ProjectOutcome::GitRestoreFailed;
@@ -4761,6 +4930,33 @@ async fn execute(
                 host_journal_location(loaded),
                 rollback_run_command(&input.env, run_id.as_str())
             ));
+        }
+        // Phase 27 (K11): the saved `.git` goes back exactly as it was when
+        // the import removed it, and is never advanced. The outcome stays
+        // `imported_unverified` whatever the restore does.
+        if let (Some(git_run), Some(saved), Some(read), Some(report)) = (
+            writers.git,
+            git_saved.as_ref(),
+            surfaces.host.git(),
+            result.git.as_mut(),
+        ) {
+            let after = git::git_after_unverified(
+                report,
+                saved,
+                &git::UnverifiedInputs {
+                    read,
+                    write: git_run.writer,
+                    gateway: &plan.gateway,
+                    project,
+                    api: gateway,
+                    designers: &opts.designers,
+                },
+            )
+            .await;
+            for event in after.events {
+                events.emit_late(event);
+            }
+            result.warnings.extend(after.warnings);
         }
     }
     // D-06, K7: a parent that was replaced is followed by a look at the
@@ -9219,6 +9415,7 @@ fn finish_recorded(
     events: &mut RunEvents<'_>,
     backup_unsynced: bool,
     record_written: bool,
+    git_failed: bool,
 ) {
     result.record_written = record_written;
     result.outcome = if result.tags.is_some() {
@@ -9228,6 +9425,13 @@ fn finish_recorded(
     };
     if backup_unsynced && result.tags.is_some() {
         mark_backup_unsynced(result);
+    }
+    // Phase 27: a repo that could not be advanced after a `record` is its own
+    // verdict (the deploy and the record stay); it outranks an unsynced backup.
+    if git_failed {
+        result.outcome = ProjectOutcome::GitRestoreFailed;
+        result.ok = false;
+        result.slug = Some(GIT_RESTORE_FAILED_SLUG.to_string());
     }
     if record_written {
         events.emit_late(ProjectsEvent::RecordWritten);
@@ -9440,7 +9644,7 @@ mod tests {
         };
         let mut result = sample_result();
 
-        finish_recorded(&mut result, &mut events, false, true);
+        finish_recorded(&mut result, &mut events, false, true, false);
 
         assert!(result.record_written, "the record is on the host");
         assert_eq!(result.outcome, ProjectOutcome::Recorded);

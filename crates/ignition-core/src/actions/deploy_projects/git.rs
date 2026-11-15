@@ -28,16 +28,25 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
-use super::{LoadedProject, ProjectAction, ProjectsInput, ProjectsSurfaces};
+use super::{
+    LoadedProject, ProjectAction, ProjectGateway, ProjectsEvent, ProjectsInput, ProjectsSurfaces,
+};
+use crate::deploy::apply::hold::SystemClock;
+use crate::deploy::apply::preflight::{
+    DesignersMode, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
+};
 use crate::deploy::git_advance::{AdvancePrep, prepare_advance};
 use crate::deploy::git_gate::{
     GitGateFailure, LIST_CAP, NodeGates, ReleaseCheckout, RemoteView, check_release_checkout,
     gate_node, remote_view,
 };
-use crate::deploy::git_handover::{GitRestoreFailure, GitSaveReport, restore_and_advance, save};
+use crate::deploy::git_handover::{
+    GitRestoreFailure, GitSaveReport, restore_and_advance, restore_unchanged, save,
+};
 use crate::deploy::git_objects::dirty_from_gateway;
 use crate::deploy::git_remote::HostGit;
 use crate::deploy::git_state::{GitFiles, GitHead, GitRefs, GitState, GitStateKind, classify};
@@ -100,7 +109,7 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
     ),
     (
         "designer_attached",
-        "git_after_verify interim Designer check (27-12), git_restore_designer_gate (27-13)",
+        "git_restore_designer_gate (27-13, D-07), called before every post-import .git write; 27-21 adds git_after_rollback",
     ),
 ];
 
@@ -115,6 +124,12 @@ pub const PRODUCED_HERE: &[&str] = &[
 /// The restore reason of a restore that was not attempted because a Designer
 /// was attached (D-07, checker W-4).
 pub const REASON_DESIGNER_ATTACHED: &str = "designer_attached";
+
+/// How long the Designer gate before a post-import `.git` write waits for an
+/// attached session to close when the run's own `--designers` mode is not
+/// `wait` (D-07, checker W-4). Under `--designers wait` the run's timeout
+/// applies instead.
+pub const GIT_RESTORE_DESIGNER_WAIT_S: u64 = 30;
 
 /// The restore reason of a post-advance disk status that differs from
 /// `expected_drift` (D-25).
@@ -516,11 +531,13 @@ pub async fn prepare_git_host(
 /// The dirty list is itemised for every managed node: from ign's store when
 /// it holds the gateway HEAD, else from the gateway's own objects (D-24); a
 /// failure to read them refuses `deploy_preflight_failed` check
-/// `git_gateway_objects`. Only an `import` is gated: an unpushed, unmerged or
+/// `git_gateway_objects`. An `import` is gated: an unpushed, unmerged or
 /// dirty repo refuses `destructive_change_refused` (gates `git_unpushed`,
 /// `git_not_merged`, `git_dirty`) and a release off the tracked branch
-/// refuses `project_git_managed` reason `release_not_on_branch`. A `skip`
-/// whose HEAD is not the release adds a warning. `expected_drift` stays null
+/// refuses `project_git_managed` reason `release_not_on_branch`. A `record`
+/// (which advances the repo in place, 27-13) is refused for the same
+/// unpushed, not-merged and off-branch findings but not for dirty work. A
+/// `skip` whose HEAD is not the release adds a warning. `expected_drift` stays null
 /// (W-6).
 pub async fn prepare_git_live(
     prepared: &mut PreparedGit,
@@ -589,7 +606,12 @@ pub async fn prepare_git_live(
              deployed, so it was left as it is"
         ));
     }
-    let enforce = prepared.mode == GitMode::Enforce && action == ProjectAction::Import;
+    // An import discards what the gateway repo holds beyond the release, and
+    // a `record` moves the branch to the release in place (27-13): both refuse
+    // a release off the tracked branch and commits no remote has. Dirty work
+    // refuses only an import: a `record` leaves the project as it is.
+    let enforce = prepared.mode == GitMode::Enforce
+        && matches!(action, ProjectAction::Import | ProjectAction::Record);
     if enforce {
         if !gates.release_on_branch {
             return Err(managed(project, &kind, "release_not_on_branch"));
@@ -608,7 +630,7 @@ pub async fn prepare_git_live(
                 keys: gates.not_merged.clone(),
             });
         }
-        if gates.dirty_count > 0 {
+        if action == ProjectAction::Import && gates.dirty_count > 0 {
             return Err(CoreError::DestructiveChangeRefused {
                 gate: "git_dirty".to_string(),
                 count: gates.dirty_count,
@@ -647,17 +669,30 @@ pub async fn git_before_import(
     save(read, write, gateway, project, run_id).await
 }
 
-/// What [`git_after_verify`] concluded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a post-import step of the handover concluded.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GitAfter {
-    /// The restore or the advance failed (or was refused); the outcome is
-    /// `git_restore_failed`.
+    /// The restore or the advance failed (or was refused); the outcome of a
+    /// verified run is `git_restore_failed`.
     pub failed: bool,
     /// Lines for the run's warnings (redacted).
     pub warnings: Vec<String>,
+    /// The events of the step, in order: names, counts, ids and the save path
+    /// only (never repo content). The caller logs them.
+    pub events: Vec<ProjectsEvent>,
 }
 
-/// The inputs of [`git_after_verify`] that are not the report.
+impl GitAfter {
+    fn new() -> GitAfter {
+        GitAfter {
+            failed: false,
+            warnings: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
+/// The inputs of the post-import steps that are not the report.
 pub struct AfterInputs<'a> {
     /// The host's read surface.
     pub read: &'a dyn GitHostRead,
@@ -669,15 +704,14 @@ pub struct AfterInputs<'a> {
     pub gateway: &'a str,
     /// The project.
     pub project: &'a str,
-    /// The save taken before the import.
-    pub saved: &'a GitSaveReport,
-    /// The read-back export the verify used.
+    /// The read-back export the verify used (the live export of a `record`).
     pub export_zip: &'a [u8],
     /// How the post-advance status is proved.
     pub post_status: &'a PostStatusMode,
-    /// The Designers attached right now: how many, or why that could not be
-    /// read (interim for D-07 until `git_restore_designer_gate`, 27-13).
-    pub designers_attached: Result<usize, String>,
+    /// The gateway's REST surface, for the Designer gate (D-07).
+    pub api: &'a dyn ProjectGateway,
+    /// The run's `--designers` policy; the gate derives its own from it.
+    pub designers: &'a DesignersPolicy,
 }
 
 fn capped_paths(mut paths: Vec<String>) -> (Vec<String>, usize) {
@@ -688,7 +722,66 @@ fn capped_paths(mut paths: Vec<String>) -> (Vec<String>, usize) {
     (paths, count)
 }
 
+/// The Designer policy the gate before a post-import `.git` write uses
+/// (D-07, checker W-4): always `wait`, whatever mode the run used before the
+/// import; the run's `--designers` timeout when that mode was `wait`, else
+/// [`GIT_RESTORE_DESIGNER_WAIT_S`]; the run's poll interval (the production
+/// default is `DESIGNERS_POLL_S`).
+pub fn restore_policy(run: &DesignersPolicy) -> DesignersPolicy {
+    DesignersPolicy {
+        mode: DesignersMode::Wait,
+        timeout: if run.mode == DesignersMode::Wait {
+            run.timeout
+        } else {
+            Duration::from_secs(GIT_RESTORE_DESIGNER_WAIT_S)
+        },
+        interval: run.interval,
+    }
+}
+
+/// The Designer check right before a post-import `.git` write (D-07, checker
+/// W-4): the import is done and the `.git` may be absent, so a Designer
+/// session that is attached now could run `setupLocalRepo` against it. While
+/// one is attached nothing is written; the gate waits under
+/// [`restore_policy`] and a session still attached at the end, or a list that
+/// cannot be read (fail closed), is a [`GitRestoreFailure`] with reason
+/// `designer_attached` naming the open sessions, with the save kept at
+/// `save_path`. `polls` collects the sessions open at each read, for the
+/// `designers_poll` events.
+pub async fn git_restore_designer_gate(
+    api: &dyn ProjectGateway,
+    run: &DesignersPolicy,
+    save_path: &str,
+    polls: &mut Vec<usize>,
+) -> Result<(), GitRestoreFailure> {
+    let policy = restore_policy(run);
+    let blocked = |detail: String| GitRestoreFailure {
+        reason: REASON_DESIGNER_ATTACHED,
+        restored: false,
+        paths: Vec::new(),
+        detail,
+        save_path: save_path.to_string(),
+    };
+    let gate = designers_gate(|| api.designers(), &policy, &SystemClock, &mut |open| {
+        polls.push(open);
+        Ok(())
+    })
+    .await;
+    match gate {
+        Ok((DesignersVerdict::Clear, _)) => Ok(()),
+        Ok((_, seen)) => Err(blocked(format!(
+            "{}; the .git is not written while one is attached",
+            designers_detail(&seen)
+        ))),
+        Err(err) => Err(blocked(format!(
+            "the attached Designers could not be read ({}); the .git is not written blind",
+            err.code()
+        ))),
+    }
+}
+
 fn failed_restore(report: &mut GitReport, failure: &GitRestoreFailure) -> GitAfter {
+    let node_name = report.master().node.clone();
     let node = report.master_mut();
     node.restore = Some(RestoreInfo {
         restored: failure.restored,
@@ -703,7 +796,7 @@ fn failed_restore(report: &mut GitReport, failure: &GitRestoreFailure) -> GitAft
     });
     let mut line = format!(
         "project {}: git {}: {}; the saved .git is at {}",
-        report.master().node.trim_start_matches("nodes."),
+        node_name.trim_start_matches("nodes."),
         failure.reason,
         failure.detail,
         failure.save_path
@@ -717,54 +810,145 @@ fn failed_restore(report: &mut GitReport, failure: &GitRestoreFailure) -> GitAft
             .collect();
         line.push_str(&format!(" ({})", shown.join(", ")));
     }
-    GitAfter {
-        failed: true,
-        warnings: vec![line],
+    let mut after = GitAfter::new();
+    after.failed = true;
+    after.warnings.push(line);
+    if failure.restored {
+        after.events.push(ProjectsEvent::GitRestored {
+            node: node_name.clone(),
+        });
     }
+    after.events.push(ProjectsEvent::GitRestoreFailed {
+        node: node_name,
+        reason: failure.reason.to_string(),
+        path: Some(failure.save_path.clone()),
+    });
+    after
 }
 
 /// Step 3b: after a green verify, restore the save, advance the repo to the
 /// release commit, prove the result and remove the save.
 ///
-/// While a Designer is attached nothing is restored: reason
-/// `designer_attached`, the save kept (D-07 interim). A failure of any step
-/// keeps the save and names it; the deploy itself stays (D-09). On a `local`
-/// node a status over the project directory on disk must equal the predicted
-/// drift (D-25, never with the gateway `.git` as the git dir); on an `ssh`
-/// node `post_status` is `not_checked`.
+/// The Designer gate ([`git_restore_designer_gate`]) runs first: while a
+/// session is attached nothing is restored or written, reason
+/// `designer_attached`, the save kept (D-07). A failure of any step keeps the
+/// save and names it; the deploy itself stays (D-09). On a `local` node a
+/// status over the project directory on disk must equal the predicted drift
+/// (D-25, never with the gateway `.git` as the git dir); on an `ssh` node
+/// `post_status` is `not_checked`.
 pub async fn git_after_verify(
     prepared: &PreparedGit,
     report: &mut GitReport,
+    saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
 ) -> GitAfter {
-    let save_path = inputs.saved.path.clone();
-    let blocked = |detail: String| GitRestoreFailure {
-        reason: REASON_DESIGNER_ATTACHED,
-        restored: false,
-        paths: Vec::new(),
-        detail,
-        save_path: save_path.clone(),
+    let mut polls = Vec::new();
+    let gate =
+        git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls).await;
+    let mut after = match gate {
+        Err(failure) => failed_restore(report, &failure),
+        Ok(()) => advance_after(prepared, report, saved, inputs).await,
     };
-    match &inputs.designers_attached {
-        Ok(0) => {}
-        Ok(n) => {
-            return failed_restore(
-                report,
-                &blocked(format!(
-                    "{n} Designer session(s) are attached; the .git is not put back while one is"
-                )),
-            );
+    after.events.splice(
+        0..0,
+        polls
+            .into_iter()
+            .map(|open| ProjectsEvent::DesignersPoll { open }),
+    );
+    after
+}
+
+/// The `record` action's advance (live equals the artifact, no import ran):
+/// the repo is read again and saved, the Designer gate runs, and the repo is
+/// advanced in place to the release commit (`restore_and_advance`'s present
+/// branch: the `.git` is never replaced or deleted), proved as after an
+/// import, and the save removed. A change of HEAD, refs or config since the
+/// plan is `git_recreated` with nothing written; a save that cannot be taken
+/// is `restore_failed` with nothing written.
+pub async fn git_record_advance(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    run_id: &str,
+    inputs: &AfterInputs<'_>,
+) -> GitAfter {
+    let saved = match git_before_import(
+        prepared,
+        inputs.read,
+        inputs.write,
+        inputs.git,
+        inputs.gateway,
+        inputs.project,
+        run_id,
+    )
+    .await
+    {
+        Ok(saved) => saved,
+        Err(err) => {
+            let (reason, detail) = match &err {
+                CoreError::PlanStale { .. } => (
+                    "git_recreated",
+                    "the git repository changed since the plan (HEAD, refs or config); \
+                     nothing was advanced"
+                        .to_string(),
+                ),
+                other => (
+                    "restore_failed",
+                    format!(
+                        "the .git could not be saved before the advance ({}); nothing was \
+                         advanced",
+                        other.code()
+                    ),
+                ),
+            };
+            let node_name = report.master().node.clone();
+            report.master_mut().restore = Some(RestoreInfo {
+                restored: false,
+                advanced: false,
+                verified: false,
+                post_status: None,
+                post_status_note: None,
+                dropped: Vec::new(),
+                dropped_count: 0,
+                reason: Some(reason.to_string()),
+                save_kept: false,
+            });
+            let mut after = GitAfter::new();
+            after.failed = true;
+            after.warnings.push(format!(
+                "project {}: git {reason}: {detail}",
+                inputs.project
+            ));
+            after.events.push(ProjectsEvent::GitRestoreFailed {
+                node: node_name,
+                reason: reason.to_string(),
+                path: None,
+            });
+            return after;
         }
-        Err(code) => {
-            return failed_restore(
-                report,
-                &blocked(format!(
-                    "the attached Designers could not be read ({code}); the .git is not put back \
-                     blind"
-                )),
-            );
-        }
-    }
+    };
+    report.set_save(&saved);
+    let mut after = git_after_verify(prepared, report, &saved, inputs).await;
+    after.events.insert(
+        0,
+        ProjectsEvent::GitSaved {
+            node: report.master().node.clone(),
+            path: saved.path.clone(),
+            files: saved.manifest.files,
+            bytes: saved.manifest.bytes,
+        },
+    );
+    after
+}
+
+/// The advance itself, after the Designer gate passed.
+async fn advance_after(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+) -> GitAfter {
+    let save_path = saved.path.clone();
+    let node_name = report.master().node.clone();
     let Some(prep) = prepared.prep.as_ref() else {
         return failed_restore(
             report,
@@ -783,7 +967,7 @@ pub async fn git_after_verify(
         inputs.git,
         &prepared.checkout.path,
         &prepared.state,
-        inputs.saved,
+        saved,
         prep,
         inputs.export_zip,
     )
@@ -806,10 +990,18 @@ pub async fn git_after_verify(
         reason: None,
         save_kept: true,
     };
-    let mut after = GitAfter {
-        failed: false,
-        warnings: Vec::new(),
-    };
+    let mut after = GitAfter::new();
+    if done.restored {
+        after.events.push(ProjectsEvent::GitRestored {
+            node: node_name.clone(),
+        });
+    }
+    after.events.push(ProjectsEvent::GitAdvanced {
+        node: node_name.clone(),
+        release_commit: report.release_commit.clone(),
+        dropped: dropped_count,
+        expected_drift: drift_count,
+    });
     match inputs.post_status {
         PostStatusMode::NotChecked => {
             restore.post_status = Some("not_checked");
@@ -865,29 +1057,160 @@ pub async fn git_after_verify(
         }
     }
     report.master_mut().restore = Some(restore);
-    if !after.failed {
-        // Everything held: the save goes. A save that cannot be removed is
-        // left and reported, never a failure of a deploy that verified.
-        match inputs
-            .write
-            .remove_git_save(inputs.gateway, inputs.project, &inputs.saved.run_id)
-            .await
-        {
-            Ok(()) => {
-                if let Some(r) = report.master_mut().restore.as_mut() {
-                    r.save_kept = false;
-                }
-            }
-            Err(err) => after.warnings.push(format!(
-                "project {}: the saved .git at {save_path} could not be removed ({})",
-                inputs.project,
-                err.code()
-            )),
-        }
+    if after.failed {
+        after.events.push(ProjectsEvent::GitRestoreFailed {
+            node: node_name,
+            reason: REASON_POST_STATUS_MISMATCH.to_string(),
+            path: Some(save_path),
+        });
+    } else {
+        remove_save(report, saved, inputs, &mut after).await;
     }
     report.expected_drift = Some(drift);
     report.expected_drift_count = Some(drift_count);
     report.expected_drift_complete = true;
+    after
+}
+
+/// Everything held: the save goes. A save that cannot be removed is left and
+/// reported, never a failure of a deploy that verified.
+async fn remove_save(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    after: &mut GitAfter,
+) {
+    match inputs
+        .write
+        .remove_git_save(inputs.gateway, inputs.project, &saved.run_id)
+        .await
+    {
+        Ok(()) => {
+            if let Some(r) = report.master_mut().restore.as_mut() {
+                r.save_kept = false;
+            }
+            after.events.push(ProjectsEvent::GitSaveRemoved {
+                node: report.master().node.clone(),
+                path: saved.path.clone(),
+            });
+        }
+        Err(err) => after.warnings.push(format!(
+            "project {}: the saved .git at {} could not be removed ({})",
+            inputs.project,
+            saved.path,
+            err.code()
+        )),
+    }
+}
+
+/// The inputs of [`git_after_unverified`].
+pub struct UnverifiedInputs<'a> {
+    /// The host's read surface.
+    pub read: &'a dyn GitHostRead,
+    /// The host's git writer.
+    pub write: &'a dyn GitStateWriter,
+    /// The gateway the save belongs to.
+    pub gateway: &'a str,
+    /// The project.
+    pub project: &'a str,
+    /// The gateway's REST surface, for the Designer gate (D-07).
+    pub api: &'a dyn ProjectGateway,
+    /// The run's `--designers` policy.
+    pub designers: &'a DesignersPolicy,
+}
+
+/// K11: the import did not read back as the artifact. The Designer gate runs;
+/// then the saved `.git` is put back exactly as saved if the import removed
+/// it ([`restore_unchanged`]) and the repo is never advanced. A repo that is
+/// still present is left untouched. The save is removed only when the repo
+/// equals it, else it is kept and named. A failure is reported in
+/// `restore` and in the warnings; it never changes the run's outcome, which
+/// stays `imported_unverified`.
+pub async fn git_after_unverified(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+) -> GitAfter {
+    let mut polls = Vec::new();
+    let gate =
+        git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls).await;
+    let mut after = match gate {
+        Err(failure) => failed_restore(report, &failure),
+        Ok(()) => {
+            match restore_unchanged(
+                inputs.read,
+                inputs.write,
+                inputs.gateway,
+                inputs.project,
+                saved,
+            )
+            .await
+            {
+                Err(failure) => failed_restore(report, &failure),
+                Ok(done) => {
+                    let node_name = report.master().node.clone();
+                    report.master_mut().restore = Some(RestoreInfo {
+                        restored: done.restored,
+                        advanced: false,
+                        verified: done.verified,
+                        post_status: None,
+                        post_status_note: None,
+                        dropped: Vec::new(),
+                        dropped_count: 0,
+                        reason: None,
+                        save_kept: true,
+                    });
+                    let mut after = GitAfter::new();
+                    if done.restored {
+                        after
+                            .events
+                            .push(ProjectsEvent::GitRestored { node: node_name });
+                    }
+                    // The save is removed only when the repo now equals it.
+                    let equal = matches!(
+                        inputs.read.git_manifest(inputs.project).await,
+                        Ok(now) if now == saved.manifest
+                    );
+                    if equal {
+                        match inputs
+                            .write
+                            .remove_git_save(inputs.gateway, inputs.project, &saved.run_id)
+                            .await
+                        {
+                            Ok(()) => {
+                                if let Some(r) = report.master_mut().restore.as_mut() {
+                                    r.save_kept = false;
+                                }
+                                after.events.push(ProjectsEvent::GitSaveRemoved {
+                                    node: report.master().node.clone(),
+                                    path: saved.path.clone(),
+                                });
+                            }
+                            Err(err) => after.warnings.push(format!(
+                                "project {}: the saved .git at {} could not be removed ({})",
+                                inputs.project,
+                                saved.path,
+                                err.code()
+                            )),
+                        }
+                    } else {
+                        after.warnings.push(format!(
+                            "project {}: the import left a git repository that is not the one \
+                             saved; it was left as it is and the saved .git is at {}",
+                            inputs.project, saved.path
+                        ));
+                    }
+                    after
+                }
+            }
+        }
+    };
+    after.events.splice(
+        0..0,
+        polls
+            .into_iter()
+            .map(|open| ProjectsEvent::DesignersPoll { open }),
+    );
     after
 }
 

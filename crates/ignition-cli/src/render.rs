@@ -1654,11 +1654,15 @@ fn deploy_projects_human_lines(
     } else {
         // A deploy: what happened, then where its files are. The run id and
         // directory come from the library, the outcome word is a fixed one.
-        lines.push(format!(
-            "outcome: {}{}",
-            result.outcome.as_str(),
-            if result.ok { "" } else { " (NOT verified)" }
-        ));
+        if result.outcome == ProjectOutcome::GitRestoreFailed {
+            lines.push(git_restore_failed_line(result));
+        } else {
+            lines.push(format!(
+                "outcome: {}{}",
+                result.outcome.as_str(),
+                if result.ok { "" } else { " (NOT verified)" }
+            ));
+        }
         match (&result.run_id, &result.run_dir) {
             (Some(id), Some(dir)) => {
                 lines.push(format!("run {}", escape_control(id)));
@@ -1715,7 +1719,22 @@ fn deploy_projects_human_lines(
                 escape_control(slug)
             ));
         }
-        if let Some(slug) = result.slug.as_ref().filter(|_| !rolled_back && !unsynced) {
+        // The git verdict (27-12, D-09): the project was deployed, verified
+        // and recorded; only the gateway repository was not handed over.
+        let git_failed = result.outcome == ProjectOutcome::GitRestoreFailed;
+        if let Some(slug) = result.slug.as_ref().filter(|_| git_failed) {
+            lines.push(format!(
+                "verdict: {}: the project was deployed, read back equal and recorded; its git \
+                 repository was not handed over and nothing was rolled back; restore the .git by \
+                 hand from the copy named above",
+                escape_control(slug)
+            ));
+        }
+        if let Some(slug) = result
+            .slug
+            .as_ref()
+            .filter(|_| !rolled_back && !unsynced && !git_failed)
+        {
             lines.push(format!(
                 "verdict: {}: the project read back does not equal the artifact; the release record was not written and nothing was restored",
                 escape_control(slug)
@@ -1796,11 +1815,197 @@ fn deploy_projects_human_lines(
             ));
         }
     }
+    lines.extend(git_lines(result));
     lines.extend(owned_tag_lines(result));
     lines.extend(tag_lines(result));
     for warning in &result.warnings {
         lines.push(format!("warning: {}", escape_control(warning)));
     }
+    lines
+}
+
+/// Ids or paths a git line names before it counts the rest.
+const GIT_LINES_SHOWN: usize = 5;
+
+/// `a, b, c (and N more)` over the first [`GIT_LINES_SHOWN`] entries, each
+/// escaped; ids shortened when `short`.
+fn git_names(list: &[String], count: usize, short: bool) -> String {
+    let shown: Vec<String> = list
+        .iter()
+        .take(GIT_LINES_SHOWN)
+        .map(|n| {
+            if short {
+                short_id(Some(n))
+            } else {
+                escape_control(n)
+            }
+        })
+        .collect();
+    let mut text = shown.join(", ");
+    if count > shown.len() {
+        text.push_str(&format!(" (and {} more)", count - shown.len()));
+    }
+    text
+}
+
+/// The `outcome:` line of a `git_restore_failed` run (D-09): the deploy is
+/// kept, the reason word and the saved copy are named.
+fn git_restore_failed_line(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> String {
+    let node = result.git.as_deref().map(|g| g.master());
+    let restore = node.and_then(|n| n.restore.as_ref());
+    let reason = restore
+        .and_then(|r| r.reason.as_deref())
+        .unwrap_or("unknown");
+    let copy = match (node.and_then(|n| n.save.as_ref()), restore) {
+        (Some(save), Some(restore)) if restore.save_kept => {
+            format!("copy at {}", escape_control(&save.path))
+        }
+        _ => "nothing was changed in .git".to_string(),
+    };
+    format!(
+        "outcome: git_restore_failed (project deployed, .git not restored: {}; {copy})",
+        escape_control(reason)
+    )
+}
+
+/// The gateway repository's lines (`data.git`, Phase 27): one block per node,
+/// then the drift line. Words, branch names, ids, counts and paths only; every
+/// name comes from the gateway or the repo, so every name is escaped. Nothing
+/// for a project without a `.git`.
+fn git_lines(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> Vec<String> {
+    let Some(git) = result.git.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for node in &git.nodes {
+        let name = escape_control(node.node.trim_start_matches("nodes."));
+        let branch = node
+            .branch
+            .as_deref()
+            .map_or_else(|| "no branch".to_string(), escape_control);
+        lines.push(format!(
+            "git {name}: {} on {branch} at {}",
+            node.state,
+            short_id(node.head.as_deref())
+        ));
+        if node.adopted {
+            lines.push(format!(
+                "  adopted onto {branch} (branch from {})",
+                match node.branch_source {
+                    Some("git_yaml") => "git.yaml",
+                    Some("target") => "target",
+                    Some(other) => other,
+                    None => "config",
+                }
+            ));
+        }
+        let dirty = node.dirty.as_deref().unwrap_or(&[]);
+        lines.push(format!(
+            "  unpushed {}, not merged {}, dirty {}{}",
+            node.unpushed.len(),
+            node.not_merged_count,
+            node.dirty_count.unwrap_or(0),
+            if node.dirty_source == Some("gateway_objects") {
+                " (dirty from the gateway's own objects)"
+            } else {
+                ""
+            }
+        ));
+        if !node.unpushed.is_empty() {
+            lines.push(format!(
+                "  unpushed: {}",
+                git_names(&node.unpushed, node.unpushed.len(), true)
+            ));
+        }
+        if node.not_merged_count > 0 {
+            lines.push(format!(
+                "  not merged: {}",
+                git_names(&node.not_merged, node.not_merged_count, true)
+            ));
+        }
+        if !dirty.is_empty() {
+            lines.push(format!(
+                "  dirty: {}",
+                git_names(dirty, node.dirty_count.unwrap_or(dirty.len()), false)
+            ));
+        }
+        if !node.hazards.is_empty() {
+            lines.push(format!(
+                "  hazards: {}",
+                node.hazards
+                    .iter()
+                    .map(|h| escape_control(h))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(save) = &node.save {
+            lines.push(format!(
+                "  saved .git: {} ({} file(s), {} byte(s))",
+                escape_control(&save.path),
+                save.files,
+                save.bytes
+            ));
+        }
+        if let Some(restore) = &node.restore {
+            match restore.reason.as_deref() {
+                Some(reason) => lines.push(format!(
+                    "  restore: failed ({}){}",
+                    escape_control(reason),
+                    if restore.advanced {
+                        "; the repository was advanced"
+                    } else {
+                        "; the repository was not advanced"
+                    }
+                )),
+                None if restore.restored && !restore.advanced => {
+                    lines.push("  restore: restored unchanged (not advanced)".to_string());
+                }
+                None => lines.push(format!(
+                    "  restore: {}, advanced to the release{}",
+                    if restore.restored {
+                        ".git put back"
+                    } else {
+                        ".git kept in place"
+                    },
+                    if restore.verified { ", read back" } else { "" }
+                )),
+            }
+            match restore.post_status {
+                Some("not_checked") => lines.push("  post status: not checked (D-25)".to_string()),
+                Some(word) => lines.push(format!("  post status: {}", escape_control(word))),
+                None => {}
+            }
+            if restore.dropped_count > 0 {
+                lines.push(format!(
+                    "  dropped by the gateway: {}",
+                    restore.dropped_count
+                ));
+            }
+            if node.save.is_some() {
+                lines.push(
+                    if restore.save_kept {
+                        "  save kept"
+                    } else {
+                        "  save removed"
+                    }
+                    .to_string(),
+                );
+            }
+        }
+    }
+    lines.push(if git.expected_drift_complete {
+        format!(
+            "expected drift: {} (after import)",
+            git.expected_drift_count.unwrap_or(0)
+        )
+    } else {
+        "expected drift: unknown until the import".to_string()
+    });
     lines
 }
 
@@ -2814,7 +3019,59 @@ pub(crate) fn describe_projects_event(
             Some(reason) => format!("backup node does not hold the owned tags ({reason})"),
             None => format!("backup node holds the owned tags: converged={converged}"),
         },
+        ProjectsEvent::GitStateRead {
+            node,
+            state,
+            branch,
+            head,
+            ..
+        } => format!(
+            "git {}: {state} on {} at {}",
+            escape_control(node.trim_start_matches("nodes.")),
+            escape_control(branch.as_deref().unwrap_or("no branch")),
+            short_id(head.as_deref())
+        ),
+        ProjectsEvent::GitSaved {
+            node, files, bytes, ..
+        } => format!(
+            "git {}: .git saved ({files} file(s), {bytes} byte(s))",
+            escape_control(node.trim_start_matches("nodes."))
+        ),
+        ProjectsEvent::GitRestored { node } => format!(
+            "git {}: .git put back from the save",
+            escape_control(node.trim_start_matches("nodes."))
+        ),
+        ProjectsEvent::GitAdvanced {
+            node,
+            release_commit,
+            ..
+        } => format!(
+            "git {}: repository advanced to {}",
+            escape_control(node.trim_start_matches("nodes.")),
+            short_id(Some(release_commit))
+        ),
+        ProjectsEvent::GitSaveRemoved { node, .. } => format!(
+            "git {}: save removed",
+            escape_control(node.trim_start_matches("nodes."))
+        ),
+        ProjectsEvent::GitRestoreFailed { node, reason, path } => format!(
+            "git {}: .git not handed over ({}){}",
+            escape_control(node.trim_start_matches("nodes.")),
+            escape_control(reason),
+            match path {
+                Some(path) => format!("; the saved copy is at {}", escape_control(path)),
+                None => String::new(),
+            }
+        ),
         ProjectsEvent::Finished { outcome } => format!("finished: {}", outcome.as_str()),
+    }
+}
+
+/// The first 12 characters of a commit id, escaped; `none` for a missing one.
+fn short_id(id: Option<&str>) -> String {
+    match id {
+        Some(id) => escape_control(&id.chars().take(12).collect::<String>()),
+        None => "none".to_string(),
     }
 }
 
@@ -4772,6 +5029,274 @@ mod tests {
         assert!(
             !text.chars().any(|c| c.is_control() && c != '\n'),
             "no raw control character reaches the terminal: {text:?}"
+        );
+    }
+
+    // ---- 27-13: the gateway repository's lines ----
+
+    fn git_node(
+        state: &'static str,
+    ) -> ignition_core::actions::deploy_projects::git::NodeGitReport {
+        ignition_core::actions::deploy_projects::git::NodeGitReport {
+            node: "nodes.master".into(),
+            state,
+            reason: None,
+            branch: Some("production".into()),
+            branch_source: Some("config"),
+            remote: Some("capapp".into()),
+            remote_url: Some("https://git.example.invalid/capapp.git".into()),
+            head: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            adopted: false,
+            unpushed: Vec::new(),
+            not_merged: Vec::new(),
+            not_merged_count: 0,
+            dirty: Some(Vec::new()),
+            dirty_count: Some(0),
+            dirty_source: Some("release_store"),
+            hazards: Vec::new(),
+            save: None,
+            restore: None,
+        }
+    }
+
+    fn git_report(
+        node: ignition_core::actions::deploy_projects::git::NodeGitReport,
+    ) -> Box<ignition_core::actions::deploy_projects::git::GitReport> {
+        Box::new(ignition_core::actions::deploy_projects::git::GitReport {
+            release_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+            nodes: vec![node],
+            expected_drift: None,
+            expected_drift_count: None,
+            expected_drift_complete: false,
+            would_discard: None,
+            discarded: None,
+            hazards_acknowledged: None,
+        })
+    }
+
+    fn restore_info() -> ignition_core::actions::deploy_projects::git::RestoreInfo {
+        ignition_core::actions::deploy_projects::git::RestoreInfo {
+            restored: true,
+            advanced: true,
+            verified: true,
+            post_status: Some("matched"),
+            post_status_note: None,
+            dropped: Vec::new(),
+            dropped_count: 0,
+            reason: None,
+            save_kept: false,
+        }
+    }
+
+    #[test]
+    fn git_lines_for_a_managed_check_say_drift_is_unknown() {
+        let mut result = projects_result();
+        result.git = Some(git_report(git_node("managed")));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("git master: managed on production at 0123456789ab"),
+            "{text}"
+        );
+        assert!(text.contains("unpushed 0, not merged 0, dirty 0"), "{text}");
+        assert!(
+            text.contains("expected drift: unknown until the import"),
+            "{text}"
+        );
+        assert!(!text.contains("restore:"), "no restore in a check: {text}");
+        assert!(!text.contains("https://"), "no URL in the lines: {text}");
+        let mut none = projects_result();
+        none.git = None;
+        assert!(
+            !deploy_projects_human_lines(&none)
+                .join("\n")
+                .contains("git master")
+        );
+    }
+
+    #[test]
+    fn git_lines_name_an_adopted_node_and_its_branch_source() {
+        let mut node = git_node("adoptable");
+        node.adopted = true;
+        node.branch_source = Some("git_yaml");
+        let mut result = projects_result();
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("adopted onto production (branch from git.yaml)"),
+            "{text}"
+        );
+        let mut node = git_node("adoptable");
+        node.adopted = true;
+        node.branch_source = Some("target");
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("(branch from target)"), "{text}");
+    }
+
+    #[test]
+    fn git_lines_list_hazards_gate_counts_and_gateway_object_dirty_paths() {
+        let mut node = git_node("managed");
+        node.hazards = vec!["tags_restore".into(), "images_restore".into()];
+        node.unpushed = vec!["a".repeat(40)];
+        node.not_merged = vec!["b".repeat(40), "c".repeat(40)];
+        node.not_merged_count = 2;
+        node.dirty = Some(vec!["ignition/script-python/a\u{1b}[2J.py".into()]);
+        node.dirty_count = Some(1);
+        node.dirty_source = Some("gateway_objects");
+        let mut result = projects_result();
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "hazards: tags_restore, images_restore",
+            "unpushed 1, not merged 2, dirty 1 (dirty from the gateway's own objects)",
+            "  unpushed: aaaaaaaaaaaa",
+            "  not merged: bbbbbbbbbbbb, cccccccccccc",
+            "  dirty: ignition/script-python/a\\u{1b}[2J.py",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn git_lines_for_a_green_run_show_the_restore_and_the_drift() {
+        use ignition_core::actions::deploy_projects::git::SaveInfo;
+        let mut node = git_node("managed");
+        node.save = Some(SaveInfo {
+            path: "ign-deploy/gw/projects/App/git-save/r1/repo".into(),
+            files: 12,
+            bytes: 3400,
+        });
+        let mut restore = restore_info();
+        restore.dropped = vec!["ignition/script-python/x.py".into()];
+        restore.dropped_count = 1;
+        node.restore = Some(restore);
+        let mut report = git_report(node);
+        report.expected_drift = Some(vec!["a".into(), "b".into()]);
+        report.expected_drift_count = Some(2);
+        report.expected_drift_complete = true;
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ignition_core::actions::deploy_projects::ProjectOutcome::Imported;
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        result.git = Some(report);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "restore: .git put back, advanced to the release, read back",
+            "post status: matched",
+            "dropped by the gateway: 1",
+            "save removed",
+            "expected drift: 2 (after import)",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+
+        // An ssh node's disk status is not run.
+        let mut ssh = restore_info();
+        ssh.post_status = Some("not_checked");
+        let mut node = git_node("managed");
+        node.restore = Some(ssh);
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("post status: not checked (D-25)"), "{text}");
+
+        // Unchanged: restored without an advance.
+        let mut unchanged = restore_info();
+        unchanged.advanced = false;
+        let mut node = git_node("managed");
+        node.restore = Some(unchanged);
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("restore: restored unchanged"), "{text}");
+    }
+
+    #[test]
+    fn git_restore_failed_outcome_names_the_reason_and_the_copy() {
+        use ignition_core::actions::deploy_projects::ProjectOutcome;
+        use ignition_core::actions::deploy_projects::git::SaveInfo;
+        let mut node = git_node("managed");
+        node.save = Some(SaveInfo {
+            path: "ign-deploy/gw/projects/App/git-save/r1/repo".into(),
+            files: 12,
+            bytes: 3400,
+        });
+        let mut restore = restore_info();
+        restore.restored = false;
+        restore.advanced = false;
+        restore.verified = false;
+        restore.post_status = None;
+        restore.reason = Some("designer_attached".into());
+        restore.save_kept = true;
+        node.restore = Some(restore);
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::GitRestoreFailed;
+        result.ok = false;
+        result.slug = Some("deploy_git_restore_failed".into());
+        result.record_written = true;
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains(
+                "outcome: git_restore_failed (project deployed, .git not restored: \
+                 designer_attached; copy at ign-deploy/gw/projects/App/git-save/r1/repo)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("NOT verified"),
+            "the deploy is verified: {text}"
+        );
+        assert!(
+            !text.contains("does not equal the artifact"),
+            "not the unverified-import verdict: {text}"
+        );
+        assert!(
+            text.contains("verdict: deploy_git_restore_failed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("restore: failed (designer_attached); the repository was not advanced"),
+            "{text}"
+        );
+        assert!(text.contains("save kept"), "{text}");
+    }
+
+    #[test]
+    fn git_events_describe_names_ids_and_the_copy_only() {
+        use ignition_core::actions::deploy_projects::ProjectsEvent;
+        let line = |e| describe_projects_event(&e);
+        assert!(
+            line(ProjectsEvent::GitStateRead {
+                node: "nodes.master".into(),
+                state: "managed",
+                branch: Some("production".into()),
+                head: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                unpushed: 0,
+                not_merged: 0,
+                dirty: Some(0),
+            })
+            .contains("git master: managed on production at 0123456789ab")
+        );
+        let failed = line(ProjectsEvent::GitRestoreFailed {
+            node: "nodes.master".into(),
+            reason: "designer_attached".into(),
+            path: Some("ign-deploy/gw/projects/App/git-save/r1/repo".into()),
+        });
+        assert!(failed.contains("designer_attached") && failed.contains("git-save/r1"));
+        assert!(
+            line(ProjectsEvent::GitRestoreFailed {
+                node: "nodes.master".into(),
+                reason: "restore_failed".into(),
+                path: None,
+            })
+            .contains("not handed over")
         );
     }
 }

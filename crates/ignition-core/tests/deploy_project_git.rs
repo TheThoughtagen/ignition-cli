@@ -266,6 +266,75 @@ async fn restore_never_overwrites() {
     assert_eq!(std::fs::read(f.git_dir().join("HEAD")).expect("HEAD"), head);
 }
 
+/// K11 (27-13): an import that removed `.git` is followed by the saved repo
+/// exactly as it was, and never by an advance.
+#[tokio::test]
+async fn restore_unchanged_puts_the_saved_repo_back() {
+    use ignition_core::deploy::git_handover::restore_unchanged;
+    let f = GitFixture::new();
+    let node = f.node();
+    let before = node.git_manifest(PROJECT).await.expect("manifest");
+    let saved = save(&node, &node, GATEWAY, PROJECT, RUN)
+        .await
+        .expect("save");
+    f.module_import(false, &[], &[], &[]);
+    assert!(!f.git_dir().exists(), "the import removed .git");
+
+    let report = restore_unchanged(&node, &node, GATEWAY, PROJECT, &saved)
+        .await
+        .expect("restored");
+    assert!(report.restored && !report.advanced);
+    assert!(report.expected_drift.is_empty() && report.dropped.is_empty());
+    assert_eq!(node.git_manifest(PROJECT).await.expect("manifest"), before);
+    assert_eq!(
+        f.git_in_project(&["rev-parse", "HEAD"]),
+        f.c1,
+        "not advanced"
+    );
+}
+
+/// A `.git` that survived the import is left exactly as it is: nothing is
+/// written, and nothing advances.
+#[tokio::test]
+async fn restore_unchanged_leaves_a_present_repo() {
+    use ignition_core::deploy::git_handover::restore_unchanged;
+    let f = GitFixture::new();
+    let node = f.node();
+    let saved = save(&node, &node, GATEWAY, PROJECT, RUN)
+        .await
+        .expect("save");
+    f.module_import(true, &[], &[], &[]);
+    let before = node.git_manifest(PROJECT).await.expect("manifest");
+
+    let report = restore_unchanged(&node, &node, GATEWAY, PROJECT, &saved)
+        .await
+        .expect("left as it is");
+    assert!(!report.restored && !report.advanced);
+    assert_eq!(node.git_manifest(PROJECT).await.expect("manifest"), before);
+    assert_eq!(f.git_in_project(&["rev-parse", "HEAD"]), f.c1);
+}
+
+/// A save that no longer matches what was saved is never restored.
+#[tokio::test]
+async fn restore_unchanged_refuses_a_changed_save() {
+    use ignition_core::deploy::git_handover::restore_unchanged;
+    let f = GitFixture::new();
+    let node = f.node();
+    let mut saved = save(&node, &node, GATEWAY, PROJECT, RUN)
+        .await
+        .expect("save");
+    f.module_import(false, &[], &[], &[]);
+    saved.manifest.files += 1;
+
+    let failure = restore_unchanged(&node, &node, GATEWAY, PROJECT, &saved)
+        .await
+        .expect_err("the save does not match");
+    assert_eq!(failure.reason, "restore_failed");
+    assert!(!failure.restored);
+    assert!(!f.git_dir().exists(), "nothing was written");
+    assert!(RESTORE_REASONS.contains(&failure.reason));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn save_refuses_symlink() {
@@ -1416,6 +1485,7 @@ mod published {
         ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces,
         TagDeleteSurface, deploy_projects_prepare, deploy_projects_run, load_project,
     };
+    use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
     use ignition_core::deploy::git_remote::HostGit as Git;
     use ignition_core::deploy::transport::local::LocalFsTransport;
     use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
@@ -1617,6 +1687,18 @@ mod published {
             prepared: ProjectsPrepared,
             git_writer: Option<&dyn GitStateWriter>,
         ) -> Result<DeployProjectsResult, CoreError> {
+            self.run_prepared_with(host, loaded, prepared, git_writer, Default::default())
+                .await
+        }
+
+        pub async fn run_prepared_with(
+            &self,
+            host: &StubHost,
+            loaded: &LoadedProject,
+            prepared: ProjectsPrepared,
+            git_writer: Option<&dyn GitStateWriter>,
+            designers: DesignersPolicy,
+        ) -> Result<DeployProjectsResult, CoreError> {
             let input = self.input();
             deploy_projects_run(
                 prepared,
@@ -1639,7 +1721,7 @@ mod published {
                     tag_record_writer: None,
                     run_writer: None,
                     git_writer,
-                    designers: Default::default(),
+                    designers,
                     children_settle: std::time::Duration::from_secs(1),
                     children_poll: std::time::Duration::from_millis(5),
                     tag_verify_settle: std::time::Duration::from_secs(1),
@@ -1656,6 +1738,72 @@ mod published {
 
         pub async fn apply(&self) -> Result<DeployProjectsResult, CoreError> {
             self.apply_with(&self.host()).await
+        }
+
+        /// An apply under the given `--designers` policy.
+        pub async fn apply_designers(
+            &self,
+            designers: DesignersPolicy,
+        ) -> Result<DeployProjectsResult, CoreError> {
+            let host = self.host();
+            let (loaded, prepared) = self.plan_with(&host).await?;
+            self.run_prepared_with(&host, &loaded, prepared, None, designers)
+                .await
+        }
+
+        /// The project directory holds the artifact (the import already
+        /// happened outside this tool) and the gateway reports the same, so
+        /// the plan is a `record`: the `.git` stays at C1 and is dirty
+        /// against it.
+        pub async fn make_live_equal_artifact(&self) {
+            use std::io::Read as _;
+            self.f.module_import(true, &[], &[], &[]);
+            self.sync_live();
+            // The gateway's directory holds the bytes its export carries (G2).
+            let zip = ignition_core::actions::deploy_projects::ProjectGateway::export_bytes(
+                &self.gateway,
+                PROJECT,
+            )
+            .await
+            .expect("export");
+            let mut archive =
+                zip::ZipArchive::new(std::io::Cursor::new(zip)).expect("the export is a zip");
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index).expect("entry");
+                if entry.is_dir() {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("member");
+                let path = self.f.project_dir().join(entry.name());
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(path, bytes).expect("write member");
+            }
+        }
+
+        /// The run directory of `result`.
+        pub fn run_path(&self, result: &DeployProjectsResult) -> PathBuf {
+            self.repo
+                .join(result.run_dir.as_deref().expect("the run has a directory"))
+        }
+
+        /// `events.ndjson` of the run, one JSON value per line.
+        pub fn events(&self, result: &DeployProjectsResult) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.run_path(result).join("events.ndjson"))
+                .expect("events")
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("an event line"))
+                .collect()
+        }
+
+        /// The names of the `git_*` events, in order.
+        pub fn git_events(&self, result: &DeployProjectsResult) -> Vec<String> {
+            self.events(result)
+                .iter()
+                .filter_map(|e| e["event"].as_str())
+                .filter(|n| n.starts_with("git_"))
+                .map(str::to_string)
+                .collect()
         }
 
         pub async fn apply_with(&self, host: &StubHost) -> Result<DeployProjectsResult, CoreError> {
@@ -2304,5 +2452,365 @@ mod published {
         let node = prepared.report.master();
         assert_eq!(node.dirty, Some(Vec::new()));
         assert_eq!(node.dirty_source, Some("gateway_objects"));
+    }
+
+    // ---- 27-13: events, run.json, the record advance, K11, the Designer gate ----
+
+    /// `--designers wait` for `timeout_ms`, polling every 5 ms.
+    fn wait_ms(timeout_ms: u64) -> DesignersPolicy {
+        DesignersPolicy {
+            mode: DesignersMode::Wait,
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            interval: std::time::Duration::from_millis(5),
+        }
+    }
+
+    /// `--designers fail` (the default mode) with a fast poll, so the gate's
+    /// 30 s wait is only ever spent on the polls a test scripts.
+    fn fail_fast_poll() -> DesignersPolicy {
+        DesignersPolicy {
+            mode: DesignersMode::Fail,
+            timeout: std::time::Duration::from_secs(600),
+            interval: std::time::Duration::from_millis(5),
+        }
+    }
+
+    fn run_json(rig: &Rig, result: &DeployProjectsResult) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(rig.run_path(result).join("run.json")).expect("run"))
+            .expect("run.json parses")
+    }
+
+    #[tokio::test]
+    async fn git_events_in_order() {
+        let rig = Rig::new();
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert_eq!(
+            rig.git_events(&result),
+            [
+                "git_state_read",
+                "git_saved",
+                "git_restored",
+                "git_advanced",
+                "git_save_removed"
+            ]
+        );
+        let events = rig.events(&result);
+        let named = |name: &str| {
+            events
+                .iter()
+                .find(|e| e["event"] == name)
+                .unwrap_or_else(|| panic!("{name} is logged"))
+                .clone()
+        };
+        let read = named("git_state_read");
+        assert_eq!(read["node"], "nodes.master");
+        assert_eq!(read["state"], "managed");
+        assert_eq!(read["head"], rig.f.c1.as_str());
+        assert_eq!(named("git_advanced")["release_commit"], rig.f.c2.as_str());
+        let saved = named("git_saved");
+        assert!(
+            saved["path"]
+                .as_str()
+                .is_some_and(|p| p.contains("git-save"))
+        );
+
+        // Names, counts, ids and the save path only: no repo file content and
+        // no URL userinfo reach the log (T-27-63).
+        let log =
+            std::fs::read_to_string(rig.run_path(&result).join("events.ndjson")).expect("events");
+        for (path, bytes) in members_of(&rig.f.project_dir()) {
+            let text = String::from_utf8_lossy(&bytes).trim().to_string();
+            if text.len() > 8 {
+                assert!(!log.contains(&text), "{path} content is in the event log");
+            }
+        }
+        assert!(!log.contains("@"), "no userinfo shaped text: {log}");
+        let json = serde_json::to_string(&result).expect("result json");
+        assert!(
+            !json.contains("password") && !json.contains("token"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_json_records_git() {
+        let rig = Rig::new();
+        let result = rig.apply().await.expect("the apply completes");
+        let run = run_json(&rig, &result);
+        assert_eq!(run["git"]["state"], "managed");
+        assert_eq!(run["git"]["head"], rig.f.c1.as_str());
+        assert_eq!(run["git"]["release_commit"], rig.f.c2.as_str());
+        assert_eq!(
+            run["git"].as_object().map(|o| o.len()),
+            Some(3),
+            "state, head and release_commit only: {run}"
+        );
+
+        // A project without `.git` has `git: null`.
+        let rig = Rig::new();
+        std::fs::remove_dir_all(rig.f.git_dir()).expect("no .git");
+        let result = rig.apply().await.expect("the apply completes");
+        assert!(run_json(&rig, &result)["git"].is_null());
+        assert!(rig.git_events(&result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_restore_failed_event() {
+        let rig = Rig::new();
+        let host = rig.host();
+        let writer = FailAdvance(rig.f.node());
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert_eq!(
+            rig.git_events(&result),
+            [
+                "git_state_read",
+                "git_saved",
+                "git_restored",
+                "git_restore_failed"
+            ]
+        );
+        let events = rig.events(&result);
+        let failed = events
+            .iter()
+            .find(|e| e["event"] == "git_restore_failed")
+            .expect("logged");
+        assert_eq!(failed["reason"], "advance_failed");
+        let save = git_of(&result).master().save.clone().expect("save named");
+        assert_eq!(failed["path"], save.path.as_str());
+        let last = events.last().expect("events");
+        assert_eq!(last["event"], "finished");
+        assert_eq!(last["outcome"], "git_restore_failed");
+    }
+
+    #[tokio::test]
+    async fn record_action_advances_in_place() {
+        let rig = Rig::new();
+        rig.make_live_equal_artifact().await;
+        let result = rig.apply().await.expect("the record completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Recorded,
+            "{:?} {:?}",
+            result.warnings,
+            result.git.as_ref().map(|g| g.master().restore.clone())
+        );
+        assert!(result.ok && result.record_written);
+        assert!(rig.gateway.import_calls().is_empty(), "no import");
+        let git = git_of(&result);
+        let restore = git.master().restore.as_ref().expect("restore reported");
+        assert!(!restore.restored, "no restore: the .git was never removed");
+        assert!(restore.advanced && restore.verified);
+        assert_eq!(restore.post_status, Some("matched"));
+        assert!(!restore.save_kept);
+        assert!(git.expected_drift_complete);
+        let drift = git.expected_drift.clone().expect("drift after the advance");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert_eq!(rig.f.status_paths(), drift);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert_eq!(
+            rig.git_events(&result),
+            [
+                "git_state_read",
+                "git_saved",
+                "git_advanced",
+                "git_save_removed"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn record_refuses_unpushed_commits() {
+        // A record moves the branch to the release: commits no remote has
+        // would be orphaned, so it refuses like an import (27-13).
+        let rig = Rig::new();
+        rig.f.designer_commit(false);
+        rig.make_live_equal_artifact().await;
+        let err = refusal(rig.apply().await);
+        assert_eq!(gate_of(&err).0, "git_unpushed");
+        assert_eq!(rig.run_dirs(), 0);
+        assert!(rig.save_trees().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unverified_restores_unchanged() {
+        let rig = Rig::new();
+        rig.gateway.mutate_child_after_import(PROJECT, 1000);
+        let before = rig.git_manifest().await;
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+        assert!(!result.ok && !result.record_written);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let git = git_of(&result);
+        let restore = git.master().restore.as_ref().expect("restore reported");
+        assert!(restore.restored && !restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None);
+        assert!(
+            !restore.save_kept,
+            "the save equals the repo and is removed"
+        );
+        assert_eq!(rig.git_manifest().await, before, ".git is as it was saved");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c1);
+        assert!(rig.save_trees().is_empty());
+        assert!(!git.expected_drift_complete && git.expected_drift.is_none());
+        assert_eq!(
+            rig.git_events(&result),
+            [
+                "git_state_read",
+                "git_saved",
+                "git_restored",
+                "git_save_removed"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn designer_attached_at_restore() {
+        let rig = Rig::with(|g| g.with_designers_after_verify(100_000));
+        let result = rig
+            .apply_designers(wait_ms(60))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert!(!result.ok);
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        assert!(result.record_written, "the deploy and its record stay");
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert_eq!(restore.reason.as_deref(), Some("designer_attached"));
+        assert!(!restore.restored && !restore.advanced && restore.save_kept);
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(rig.f.data_dir.join(&save.path).is_dir(), "the save is kept");
+        assert!(
+            !rig.f.git_dir().exists(),
+            "nothing was written to .git: it is still absent"
+        );
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("designer_attached"))
+            .expect("the refusal is reported");
+        assert!(
+            warning.contains("dana") && warning.contains(&save.path),
+            "{warning}"
+        );
+        assert!(
+            rig.git_events(&result)
+                .contains(&"git_restore_failed".to_string())
+        );
+        assert!(
+            !rig.git_events(&result)
+                .contains(&"git_advanced".to_string())
+        );
+        // The gate polled under the run's own `--designers wait` timeout.
+        let polls = rig
+            .events(&result)
+            .iter()
+            .filter(|e| e["event"] == "designers_poll")
+            .count();
+        assert!(polls >= 2, "the gate waited and polled: {polls}");
+    }
+
+    #[tokio::test]
+    async fn designer_detaches_within_wait() {
+        // The run's mode is `fail`: the gate still waits (30 s at most, 5 ms
+        // between reads here) and the session closes after two reads.
+        let rig = Rig::with(|g| g.with_designers_after_verify(2));
+        let result = rig
+            .apply_designers(fail_fast_poll())
+            .await
+            .expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.ok);
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert!(restore.restored && restore.advanced && restore.reason.is_none());
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        let opens: Vec<u64> = rig
+            .events(&result)
+            .iter()
+            .filter(|e| e["event"] == "designers_poll")
+            .filter_map(|e| e["open"].as_u64())
+            .collect();
+        // One read at the pre-check (fail mode, no poll event of its own is
+        // logged for it by `wait`), then the gate's three reads.
+        assert!(opens.ends_with(&[1, 1, 0]), "{opens:?}");
+    }
+
+    #[tokio::test]
+    async fn post_import_paths_wait_for_designer() {
+        // The record action: the advance is refused while a session is
+        // attached, and `.git` stays exactly as it was.
+        let rig = Rig::with(|g| g.with_designers_after_verify(100_000));
+        rig.make_live_equal_artifact().await;
+        let before = rig.git_manifest().await;
+        let result = rig
+            .apply_designers(wait_ms(60))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        assert!(result.record_written);
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert_eq!(restore.reason.as_deref(), Some("designer_attached"));
+        assert!(!restore.advanced && restore.save_kept);
+        assert_eq!(rig.git_manifest().await, before, ".git is unchanged");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c1);
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(rig.f.data_dir.join(&save.path).is_dir(), "the save is kept");
+
+        // The unverified import: the outcome stays `imported_unverified`, the
+        // repo is not put back while a session is attached.
+        let rig = Rig::with(|g| g.with_designers_after_verify(100_000));
+        rig.gateway.mutate_child_after_import(PROJECT, 1000);
+        let result = rig
+            .apply_designers(wait_ms(60))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert_eq!(restore.reason.as_deref(), Some("designer_attached"));
+        assert!(!restore.restored && restore.save_kept);
+        assert!(!rig.f.git_dir().exists(), ".git is still absent");
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+    }
+
+    #[test]
+    fn restore_gate_policy_follows_the_run() {
+        use ignition_core::actions::deploy_projects::git::{
+            GIT_RESTORE_DESIGNER_WAIT_S, restore_policy,
+        };
+        use ignition_core::deploy::apply::preflight::DESIGNERS_POLL_S;
+        let default = restore_policy(&DesignersPolicy::default());
+        assert_eq!(default.mode, DesignersMode::Wait);
+        assert_eq!(
+            default.timeout,
+            std::time::Duration::from_secs(GIT_RESTORE_DESIGNER_WAIT_S)
+        );
+        assert_eq!(GIT_RESTORE_DESIGNER_WAIT_S, 30);
+        assert_eq!(
+            default.interval,
+            std::time::Duration::from_secs(DESIGNERS_POLL_S)
+        );
+        let proceed = restore_policy(&DesignersPolicy {
+            mode: DesignersMode::Proceed,
+            ..DesignersPolicy::default()
+        });
+        assert_eq!(proceed.mode, DesignersMode::Wait, "whatever the run used");
+        assert_eq!(proceed.timeout.as_secs(), GIT_RESTORE_DESIGNER_WAIT_S);
+        let waiting = restore_policy(&wait_ms(1234));
+        assert_eq!(waiting.timeout, std::time::Duration::from_millis(1234));
     }
 }
