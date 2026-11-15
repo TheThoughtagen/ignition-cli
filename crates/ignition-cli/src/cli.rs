@@ -956,6 +956,7 @@ pub enum DeployCommand {
                 "tags_sha256",
                 "allow_downgrade",
                 "allow_first_change",
+                "discard_gateway_changes",
                 "allow_destructive",
                 "allow_manual_undo",
                 "rehearse",
@@ -1018,6 +1019,17 @@ pub enum DeployCommand {
         /// release must equal the live project
         #[arg(long, value_name = "REASON")]
         allow_first_change: Option<String>,
+        /// Let the deploy overwrite gateway repo work that is uncommitted,
+        /// unpushed or not merged into the release, with a reason of 1 to 500
+        /// characters. The run saves the live project first, keeps the
+        /// abandoned commits reachable under `refs/ign-discarded/<run-id>`
+        /// and keeps the saved repository; `--check` lists what it would
+        /// discard as `data.git.would_discard`. It passes only those three
+        /// refusals; every other refusal and a failed git preflight still
+        /// stop the run. Without it each of the three is refused
+        /// (`destructive_change_refused`, exit 2)
+        #[arg(long, value_name = "REASON")]
+        discard_gateway_changes: Option<String>,
         /// Let the deploy delete the tags the previous deploy of this
         /// project placed and the repo no longer holds; `--check` lists them
         /// (`data.tags.removed`). The gateway needs the tag-delete route

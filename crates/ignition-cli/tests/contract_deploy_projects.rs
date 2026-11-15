@@ -3696,3 +3696,231 @@ fn apply_action_classifies_provider_emptied_and_tag_plan_stale() {
     let line = text[stale..].lines().next().unwrap_or_default();
     assert!(line.contains("tags"), "{line}");
 }
+
+// ---------------------------------------------------------------------------
+// 27-16 (D-05): `--discard-gateway-changes <REASON>`.
+// ---------------------------------------------------------------------------
+
+/// `--help` lists the flag with its `REASON` value, says what it keeps, and
+/// never suggests deleting a `.git`.
+#[tokio::test]
+async fn git_override_flag_parses() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        text.contains("--discard-gateway-changes <REASON>"),
+        "{text}"
+    );
+    for kept in ["refs/ign-discarded/<run-id>", "would_discard"] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+    let lowered = text.to_lowercase();
+    assert!(
+        !lowered.contains("delete the .git") && !lowered.contains("remove the .git"),
+        "the flag never suggests deleting a .git: {text}"
+    );
+
+    // With a reason it parses and the check proceeds to the gateway read.
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &["--discard-gateway-changes", "adopt the repo"],
+        ),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["action"], "record");
+    assert!(data["git"].is_null(), "no .git, no git block: {data}");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// The override undoes nothing: clap refuses it beside `--rollback-run`
+/// (usage, exit 2) before anything is contacted.
+#[tokio::test]
+async fn git_override_conflicts_with_rollback_run() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let out = run(
+        &server,
+        &rollback_args(
+            &fx,
+            "20261109T101500Z-ab12",
+            &["--discard-gateway-changes", "x"],
+        ),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--discard-gateway-changes") && stderr.contains("--rollback-run"),
+        "{stderr}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+/// An empty reason and one over 500 characters are `invalid_input` (exit 2)
+/// before any request; 500 characters pass. The reason is data: a shell
+/// metacharacter reason is accepted and runs nothing.
+#[tokio::test]
+async fn git_override_reason_bounds() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let long = "x".repeat(501);
+    for reason in [long.as_str(), ""] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--discard-gateway-changes", reason]),
+        );
+        assert_eq!(out.status.code(), Some(2), "{} chars", reason.len());
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{err}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("--discard-gateway-changes"), "{message}");
+    }
+    assert!(methods(&server).await.is_empty());
+
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let edge = "y".repeat(500);
+    for reason in [edge.as_str(), "x\"; touch pwned-27-16; $(id) `id`"] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--discard-gateway-changes", reason]),
+        );
+        assert_eq!(data_of(&out)["action"], "record");
+    }
+    assert!(!fx.repo.join("pwned-27-16").exists());
+    assert!(
+        !std::env::current_dir()
+            .expect("cwd")
+            .join("pwned-27-16")
+            .exists()
+    );
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=ign-test",
+            "-c",
+            "user.email=ign-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The fixture repo committed and tagged `v1.0.0`, pushed to a bare remote,
+/// with the gateway's project directory a clone of that remote: a managed
+/// `.git` whose HEAD is the release, so a live change makes it dirty.
+fn git_managed_fixture(fx: &Fixture) {
+    let remote = fx._scratch.path().join("remote.git");
+    git_in(
+        fx._scratch.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().expect("utf-8"),
+        ],
+    );
+    git_in(&fx.repo, &["init", "-q", "-b", "main"]);
+    put(&fx.repo, ".gitignore", b".ign/\n");
+    git_in(&fx.repo, &["add", "-A"]);
+    git_in(&fx.repo, &["commit", "-q", "-m", "release"]);
+    git_in(&fx.repo, &["tag", "v1.0.0"]);
+    git_in(
+        &fx.repo,
+        &["remote", "add", "origin", remote.to_str().expect("utf-8")],
+    );
+    git_in(&fx.repo, &["push", "-q", "-u", "origin", "main", "--tags"]);
+    let project = fx.data.join("projects/CapApp");
+    std::fs::remove_dir_all(&project).ok();
+    git_in(
+        fx._scratch.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().expect("utf-8"),
+            project.to_str().expect("utf-8"),
+        ],
+    );
+}
+
+/// A `git_dirty` refusal names `--discard-gateway-changes <reason>` and the
+/// dirty path; with the flag the same check passes and lists
+/// `data.git.would_discard`, writing nothing.
+#[tokio::test]
+async fn git_override_refusal_names_flag() {
+    let fx = fixture();
+    git_managed_fixture(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V2, true)).await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused", "{err}");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["git_dirty", "--discard-gateway-changes <reason>"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        message.contains("ignition/script-python/cap/code.py"),
+        "{message}"
+    );
+    assert_only_gets(&methods(&server).await);
+
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &[
+                "--discard-gateway-changes",
+                "the designer edit is dropped",
+                "--allow-first-change",
+                "adopt the repo",
+            ],
+        ),
+    );
+    let data = data_of(&out);
+    let would = &data["git"]["would_discard"];
+    assert_eq!(would["dirty"], "listed", "{data}");
+    assert_eq!(would["paths_count"], 1, "{data}");
+    assert_eq!(would["paths"][0], "ignition/script-python/cap/code.py");
+    assert!(
+        data["git"]["discarded"].is_null(),
+        "a check discards nothing"
+    );
+    assert_only_gets(&methods(&server).await);
+}
