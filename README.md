@@ -4306,7 +4306,9 @@ every ancestor to refuse a symlink on the path.
 [`deploy projects`](#deploy-projects) needs only the **list** right (read and
 execute on Linux, `ReadAndExecute` on Windows) on `data/projects` and on each
 project directory it asks about, and **no write right anywhere under
-`data/projects`**: the deploy account's write right stays on the mode collection.
+`data/projects`**: the deploy account's write right stays on the mode collection
+(a project the git module manages is the one exception, and takes one narrow
+grant on its own directory; see *Projects the git module manages*).
 As the capture hosts are provisioned no grant is needed (a project directory
 the gateway creates is `755` on Linux and inherits `Users` read-and-execute on
 Windows). A host that keeps its project directories private needs one:
@@ -5794,6 +5796,63 @@ the gateway repository's remote URL, and it must be at the release tag. An
 unreachable remote, a shallow or modified checkout or a missing host git is
 `deploy_preflight_failed`, with one of these checks: `git_host`, `git_checkout`,
 `git_remote`, `git_write_access`, `git_free_space`, `git_gateway_objects`.
+
+**Write access and the grant.** The read-only grant above is enough to look at a
+project's `.git`, not to put it back: the restore creates a staging directory in
+`data/projects/<project>`, moves the saved `.git` into place there, and the
+advance then writes the refs, a pack and the index inside it. The deploy account
+therefore needs write access on that one project directory, and on nothing
+else: never `data/projects` and never the data directory. One grant per project
+the git module manages, applied by a human on the host (`ign` never changes a
+host's permissions):
+
+- *Linux* (as root or an administrator; paths are neutral placeholders):
+
+  ```text
+  P=<data>/projects/<project>
+  setfacl    -m u:<deploy-account>:rwx "$P"
+  setfacl -d -m u:<deploy-account>:rwx,u:<gateway-account>:rwx "$P"
+  getfacl -p "$P"
+  ```
+
+  `<gateway-account>` is the account the gateway service runs as. The default
+  entries (`-d`) cover what `tar` or `git` create below the directory, but they
+  are **not** what gives the gateway write access on the restored `.git`: a
+  copy resets each file's ACL to its mode, so the named entries do not carry.
+  The guarantee is a step the restore takes itself. When the project
+  directory's owner is an account that is neither root nor the deploy account
+  (the gateway account), the restore, run as the deploy account, adds
+  `u:<gateway-account>:rwX` to every file and directory of the restored `.git`
+  (and the default form on directories) before it puts the copy in place, and
+  reads one file back with `getfacl -n -p` to confirm the entry is effectively
+  `rw-`. That needs `setfacl` and `getfacl` on the host. A gateway that runs as
+  root needs no step, because root ignores ACLs.
+- *Windows* (elevated prompt):
+
+  ```text
+  icacls "<data>\projects\<project>" /grant "<COMPUTERNAME>\<deploy-account>:(OI)(CI)M"
+  icacls "<data>\projects\<project>"
+  ```
+
+  Modify with container and object inheritance on the one project directory.
+  What the restore creates inherits the entries of `data\projects`, which hold
+  the gateway service account (`LocalSystem` by default) with Full control; a
+  service that runs as another account must hold at least Modify there.
+
+**The preflight refuses before any write.** An apply proves the grant, and that
+there is room, before the run directory exists and before the first request to
+the gateway: it creates and removes a probe file (`.ign-probe-<id>`) in
+`data/projects/<project>` and in its `.git`, and, on a Linux host whose gateway
+account is neither root nor the deploy account, checks that the explicit ACL
+step above would leave that account effective `rw-` on a file in `.git`. It
+then checks the free space on the file system that holds the saved copy
+against twice the size of the live `.git` plus the size of the pack the advance
+writes plus 64 MiB. The sizes come from a directory listing; nothing is hashed.
+A missing grant is `deploy_preflight_failed` with check `git_write_access`
+naming the path that refused (`projects/<project>` or `projects/<project>/.git`);
+too little room is check `git_free_space` with both figures. Either leaves no
+run directory and no change on the gateway. `--check` never probes (it builds no
+writer), so a missing grant shows at the apply, not at the check.
 
 **What it refuses, and what clears each.** Before any write, in `--check` and
 in the apply alike:
