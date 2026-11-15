@@ -158,6 +158,9 @@ pub struct RehearsalPrepared {
     plan: DeployProjectsResult,
     tag_records: BTreeMap<String, TagRecord>,
     removals: bool,
+    /// What the git gates found on the production gateway's repo, as warnings
+    /// (report mode: the apply would refuse, 27-20).
+    git_warnings: Vec<String>,
 }
 
 /// One owned provider of the seed.
@@ -277,6 +280,11 @@ pub struct DeployRehearsalResult {
     pub release: String,
     /// The rehearsal.
     pub rehearsal: RehearsalReport,
+    /// What the git gates found on the production gateway's repo, read-only
+    /// (27-20, GITDEP-10): `data.git` as `--check` reports it, with the word
+    /// the apply would refuse with in `nodes[0].reason`; null when
+    /// production holds no `.git`.
+    pub git: Option<Box<git::GitReport>>,
     /// Warnings in order.
     pub warnings: Vec<String>,
     /// False for a red rehearsal.
@@ -566,17 +574,24 @@ pub async fn deploy_projects_rehearse_prepare(
         &rehearsal.url,
     )?;
     check_reported_names(rehearsal, surfaces.gateway).await?;
-    let (plan, tag_records) = match deploy_projects_prepare(loaded, input, surfaces).await? {
-        ProjectsPrepared::Ready {
-            plan, tag_records, ..
-        } => (plan, tag_records),
-        ProjectsPrepared::Unchanged(_) => {
-            return Err(CoreError::InvalidInput {
-                reason: "--rehearse: the plan changes nothing, so there is nothing to rehearse"
-                    .to_string(),
-            });
-        }
-    };
+    // The production gateway may hold a module-managed `.git`: the git gates
+    // report here and never refuse (GITDEP-10). A transport failure still
+    // refuses, and the rehearsal never builds a git writer.
+    let (plan, tag_records, git_warnings) =
+        match deploy_projects_prepare_with(loaded, input, surfaces, git::GitMode::Report).await? {
+            ProjectsPrepared::Ready {
+                plan,
+                tag_records,
+                git_warnings,
+                ..
+            } => (plan, tag_records, git_warnings),
+            ProjectsPrepared::Unchanged(_) => {
+                return Err(CoreError::InvalidInput {
+                    reason: "--rehearse: the plan changes nothing, so there is nothing to rehearse"
+                        .to_string(),
+                });
+            }
+        };
     let rloaded = rehearsal_loaded(loaded, rehearsal);
     let removals = removal_gate(&plan, &rloaded, input, &rehearsal.surfaces)?;
     let prose = format!(
@@ -599,6 +614,7 @@ pub async fn deploy_projects_rehearse_prepare(
         plan,
         tag_records,
         removals,
+        git_warnings,
     })
 }
 
@@ -954,11 +970,12 @@ pub async fn deploy_projects_rehearse(
         tag_records,
         removals,
         seed_settle,
+        git_warnings,
         ..
     } = prepared;
     let mut rloaded = rehearsal_loaded(loaded, rehearsal);
     let mut rplan = plan.clone();
-    let mut warnings = Vec::new();
+    let mut warnings = git_warnings;
     let Some(env_tags) = plan.tags.as_ref() else {
         return Err(CoreError::Internal(
             "a rehearsal plan without tags".to_string(),
@@ -1334,6 +1351,7 @@ async fn rehearse_in(
             run_dir: rel.to_string(),
             elapsed_s: (started.elapsed().as_millis() as f64) / 1000.0,
         },
+        git: plan.git.clone(),
         warnings,
         ok,
         slug: (!ok).then(|| REHEARSAL_RED_SLUG.to_string()),

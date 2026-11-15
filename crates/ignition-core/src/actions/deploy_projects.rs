@@ -1773,6 +1773,9 @@ pub enum ProjectsPrepared {
         /// The gateway repo the git module manages, prepared (Phase 27);
         /// `None` for a project whose master has no `.git`.
         git: Option<Box<git::PreparedGit>>,
+        /// The warnings the git gates added (a rehearsal's report-mode
+        /// findings among them), in order; also in `plan.warnings`.
+        git_warnings: Vec<String>,
     },
     /// Nothing to do (`skip`): outcome `skipped`. Returned before any session
     /// write, and no `.ign/` directory is created.
@@ -2014,6 +2017,18 @@ pub async fn deploy_projects_prepare(
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
 ) -> Result<ProjectsPrepared, CoreError> {
+    deploy_projects_prepare_with(loaded, input, surfaces, git::GitMode::Enforce).await
+}
+
+/// [`deploy_projects_prepare`] with the git gates applied as `mode` says
+/// (27-20): [`git::GitMode::Report`] is the rehearsal's, which records every
+/// git refusal but a transport failure in `data.git` and as a warning.
+async fn deploy_projects_prepare_with(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    mode: git::GitMode,
+) -> Result<ProjectsPrepared, CoreError> {
     let project = &loaded.file.project;
     let gateway = surfaces.gateway;
     let gateway_name = &loaded.target.gateway;
@@ -2037,7 +2052,21 @@ pub async fn deploy_projects_prepare(
     // read and any write. A `.git` that cannot be handed over refuses
     // `project_git_managed` with its reason.
     let git_entry = surfaces.host.git_entry(project).await?;
-    let mut prepared_git = git::prepare_git_host(loaded, input, surfaces, git_entry).await?;
+    let mut git_warnings = Vec::new();
+    let (mut prepared_git, refused_git) = match git::prepare_git_host_with(
+        loaded,
+        input,
+        surfaces,
+        git_entry,
+        mode,
+        &mut git_warnings,
+    )
+    .await?
+    {
+        git::HostPrep::Absent => (None, None),
+        git::HostPrep::Ready(prepared) => (Some(*prepared), None),
+        git::HostPrep::Refused(report) => (None, Some(report)),
+    };
 
     // The release record (V5): absent means this tool has not deployed the
     // project here; a record that cannot be trusted refuses and is never read
@@ -2077,7 +2106,7 @@ pub async fn deploy_projects_prepare(
     // read from the host before any gateway read: another project's record
     // claims the provider, and a record that cannot be trusted refuses.
     let tag_records = read_tag_records(loaded, surfaces.host).await?;
-    let mut warnings = Vec::new();
+    let mut warnings = git_warnings.clone();
     // The host journal of an earlier tag-owning run (26-12): a `--check`
     // reports it, an apply refuses before any write.
     let journal = read_project_journal(loaded, surfaces.host).await?;
@@ -2172,6 +2201,7 @@ pub async fn deploy_projects_prepare(
     // list and the refusals, before the first-deploy gate and long before any
     // write.
     if let Some(prepared) = prepared_git.as_mut() {
+        let before = warnings.len();
         git::prepare_git_live(
             prepared,
             live.as_ref(),
@@ -2181,6 +2211,7 @@ pub async fn deploy_projects_prepare(
             &mut warnings,
         )
         .await?;
+        git_warnings.extend(warnings[before..].iter().cloned());
     }
     // The first `ign` deploy of a project must not change what the gateway
     // runs without a stated reason (D-12, V3).
@@ -2360,7 +2391,10 @@ pub async fn deploy_projects_prepare(
         missing_tags_unavailable,
         missing_tags_limit: MISSING_TAGS_LIMIT,
         tags,
-        git: prepared_git.as_ref().map(|p| Box::new(p.report.clone())),
+        git: prepared_git
+            .as_ref()
+            .map(|p| Box::new(p.report.clone()))
+            .or(refused_git),
         outcome,
         ok: true,
         slug: None,
@@ -2373,6 +2407,7 @@ pub async fn deploy_projects_prepare(
             plan,
             tag_records,
             git: prepared_git.map(Box::new),
+            git_warnings,
         }
     })
 }

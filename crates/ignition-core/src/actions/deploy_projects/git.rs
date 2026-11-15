@@ -549,11 +549,189 @@ pub async fn refusal_reason(surfaces: &ProjectsSurfaces<'_>, project: &str, kind
 /// release, an unreadable remote or an advance that cannot be built refuses
 /// `deploy_preflight_failed` (checks `git_host`, `git_checkout`,
 /// `git_remote`). Nothing is written.
+///
+/// In [`GitMode::Report`] (a rehearsal, 27-20) a refusal that is not a
+/// transport failure is not returned: it comes back as
+/// [`HostPrep::Refused`], a report that names the refusal word, and a warning
+/// in `findings` that says the apply would refuse.
+pub async fn prepare_git_host_with(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    entry: GitEntry,
+    mode: GitMode,
+    findings: &mut Vec<String>,
+) -> Result<HostPrep, CoreError> {
+    let mut seen = HostSeen::default();
+    match prepare_git_host_inner(loaded, input, surfaces, entry, mode, &mut seen).await {
+        Ok(Some(prepared)) => Ok(HostPrep::Ready(Box::new(prepared))),
+        Ok(None) => Ok(HostPrep::Absent),
+        Err(err) if mode == GitMode::Report && is_refusal(&err) => {
+            let project = loaded.file.project.as_str();
+            let (word, text) = describe_refusal(&err);
+            findings.push(format!("project {project}: the apply would refuse: {text}"));
+            Ok(HostPrep::Refused(Box::new(seen.report(word))))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// [`prepare_git_host_with`] in [`GitMode::Enforce`]: every refusal is
+/// returned.
 pub async fn prepare_git_host(
     loaded: &LoadedProject,
     input: &ProjectsInput,
     surfaces: &ProjectsSurfaces<'_>,
     entry: GitEntry,
+) -> Result<Option<PreparedGit>, CoreError> {
+    match prepare_git_host_with(
+        loaded,
+        input,
+        surfaces,
+        entry,
+        GitMode::Enforce,
+        &mut Vec::new(),
+    )
+    .await?
+    {
+        HostPrep::Ready(prepared) => Ok(Some(*prepared)),
+        HostPrep::Absent | HostPrep::Refused(_) => Ok(None),
+    }
+}
+
+/// What [`prepare_git_host_with`] decided.
+#[derive(Debug, Clone)]
+pub enum HostPrep {
+    /// The master holds no `.git`: no host git and no network call was made.
+    Absent,
+    /// The repo was read, gated and prepared.
+    Ready(Box<PreparedGit>),
+    /// Report mode only: the prepare would have refused. What was learned
+    /// before the refusal, with the refusal word in `nodes[0].reason`.
+    Refused(Box<GitReport>),
+}
+
+/// What the host half of the prepare learned before it stopped (report mode
+/// builds the refused report from it).
+#[derive(Debug, Default)]
+struct HostSeen {
+    state: Option<&'static str>,
+    branch: Option<String>,
+    remote: Option<String>,
+    remote_url: Option<String>,
+    head: Option<String>,
+    release_commit: Option<String>,
+}
+
+impl HostSeen {
+    fn report(self, word: String) -> GitReport {
+        GitReport {
+            release_commit: self.release_commit.unwrap_or_default(),
+            nodes: vec![NodeGitReport {
+                node: "nodes.master".to_string(),
+                state: self.state.unwrap_or("managed"),
+                reason: Some(word),
+                branch: self.branch,
+                branch_source: None,
+                remote: self.remote,
+                remote_url: self.remote_url,
+                head: self.head,
+                adopted: false,
+                unpushed: Vec::new(),
+                not_merged: Vec::new(),
+                not_merged_count: 0,
+                dirty: None,
+                dirty_count: None,
+                dirty_source: None,
+                hazards: Vec::new(),
+                save: None,
+                restore: None,
+            }],
+            expected_drift: None,
+            expected_drift_count: None,
+            expected_drift_complete: false,
+            would_discard: None,
+            discarded: None,
+            hazards_acknowledged: None,
+        }
+    }
+}
+
+/// Whether `err` is a git refusal a rehearsal reports instead of returning:
+/// a reasoned `project_git_managed`, a gate, or a failed preflight check. A
+/// transport failure and everything else is returned in every mode.
+fn is_refusal(err: &CoreError) -> bool {
+    matches!(
+        err,
+        CoreError::ProjectGitManaged { .. }
+            | CoreError::DestructiveChangeRefused { .. }
+            | CoreError::DeployPreflightFailed { .. }
+    )
+}
+
+/// The word a refusal is known by (the gate, the reason or the check) and the
+/// sentence that names it. Counts and words only; a preflight detail is
+/// already redacted.
+fn describe_refusal(err: &CoreError) -> (String, String) {
+    match err {
+        CoreError::DestructiveChangeRefused { gate, count, .. } => (
+            gate.clone(),
+            format!("destructive_change_refused, gate {gate} ({count})"),
+        ),
+        CoreError::ProjectGitManaged { reason, .. } => (
+            reason.clone(),
+            format!("project_git_managed, reason {reason}"),
+        ),
+        CoreError::DeployPreflightFailed { failures } => {
+            let check = failures
+                .first()
+                .map_or_else(|| "git_host".to_string(), |f| f.check.clone());
+            let detail = crate::deploy::git_gate::detail_of(err);
+            (
+                check.clone(),
+                format!("deploy_preflight_failed, check {check}: {detail}"),
+            )
+        }
+        other => (other.code().to_string(), other.code().to_string()),
+    }
+}
+
+/// A refusal the apply would give: returned in enforce mode, recorded in
+/// report mode (a warning, and the word in the master's `reason`).
+fn refuse(
+    prepared: &mut PreparedGit,
+    warnings: &mut Vec<String>,
+    project: &str,
+    err: CoreError,
+) -> Result<(), CoreError> {
+    if prepared.mode == GitMode::Enforce {
+        return Err(err);
+    }
+    record_finding(prepared, warnings, project, &err);
+    Ok(())
+}
+
+fn record_finding(
+    prepared: &mut PreparedGit,
+    warnings: &mut Vec<String>,
+    project: &str,
+    err: &CoreError,
+) {
+    let (word, text) = describe_refusal(err);
+    warnings.push(format!("project {project}: the apply would refuse: {text}"));
+    let node = prepared.report.master_mut();
+    if node.reason.is_none() {
+        node.reason = Some(word);
+    }
+}
+
+async fn prepare_git_host_inner(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    entry: GitEntry,
+    git_mode: GitMode,
+    seen: &mut HostSeen,
 ) -> Result<Option<PreparedGit>, CoreError> {
     if !entry.is_present() {
         return Ok(None);
@@ -572,6 +750,13 @@ pub async fn prepare_git_host(
     };
     let git = surfaces.host.host_git();
     let found = read_state(read, &git, project).await?;
+    seen.state = Some(state_word(found.state.kind));
+    seen.branch.clone_from(&found.state.tracked);
+    seen.head = head_commit(&found.state);
+    if let Some(remote) = &found.state.remote {
+        seen.remote = Some(remote.name.clone());
+        seen.remote_url = Some(remote.url_redacted.clone());
+    }
     let adoptable = found.state.kind == GitStateKind::Adoptable;
     if found.state.kind != GitStateKind::Managed && !adoptable {
         return Err(managed(project, kind, &reason_of(&found.state)));
@@ -585,6 +770,7 @@ pub async fn prepare_git_host(
     let checkout = check_release_checkout(&git, &input.repo, &input.release, &remote.url_key)
         .await
         .map_err(|e| gate_failure(e, project, kind))?;
+    seen.release_commit = Some(checkout.commit.clone());
     // The adoption branch is decided from an explicit source before the remote
     // is asked anything: JGit's default `master` in an unborn HEAD is never
     // taken as intent (D-23, T-27-39).
@@ -658,7 +844,7 @@ pub async fn prepare_git_host(
         hazards_acknowledged: None,
     };
     Ok(Some(PreparedGit {
-        mode: GitMode::Enforce,
+        mode: git_mode,
         state: found.state,
         refs,
         checkout,
@@ -781,7 +967,8 @@ fn hazard_warning(project: &str, hazard: Hazard, tags_present: bool) -> String {
 /// given; the reason is then recorded in `data.git.hazards_acknowledged`. The
 /// others, and the unknown state of an absent or unreadable `git.yaml`, are
 /// warnings. Only an `import` or a `record` hands the kept `.git` over, so a
-/// `skip` and a report-only mode warn and never refuse.
+/// `skip` warns and never refuses; in report mode the refusal is recorded (a
+/// warning, 27-20).
 fn apply_hazards(
     prepared: &mut PreparedGit,
     action: ProjectAction,
@@ -807,8 +994,7 @@ fn apply_hazards(
     if refusing.is_empty() {
         return Ok(());
     }
-    let enforce = prepared.mode == GitMode::Enforce
-        && matches!(action, ProjectAction::Import | ProjectAction::Record);
+    let enforce = matches!(action, ProjectAction::Import | ProjectAction::Record);
     if !enforce {
         for hazard in &refusing {
             warnings.push(hazard_warning(project, *hazard, tags));
@@ -826,11 +1012,25 @@ fn apply_hazards(
             prepared.report.hazards_acknowledged = Some(reason.clone());
             Ok(())
         }
-        None => Err(CoreError::DestructiveChangeRefused {
-            gate: "git_sync_hazard".to_string(),
-            count: refusing.len(),
-            keys: refusing.iter().map(|h| h.word().to_string()).collect(),
-        }),
+        None => {
+            // A rehearsal reports the hazards it names and what the apply
+            // would do about them; the apply refuses.
+            if prepared.mode == GitMode::Report {
+                for hazard in &refusing {
+                    warnings.push(hazard_warning(project, *hazard, tags));
+                }
+            }
+            refuse(
+                prepared,
+                warnings,
+                project,
+                CoreError::DestructiveChangeRefused {
+                    gate: "git_sync_hazard".to_string(),
+                    count: refusing.len(),
+                    keys: refusing.iter().map(|h| h.word().to_string()).collect(),
+                },
+            )
+        }
     }
 }
 
@@ -914,7 +1114,28 @@ fn discard_plan(
 /// [`WouldDiscard`] of `data.git` and a [`DiscardPlan`] the run acts on
 /// (27-15, D-05). `release_not_on_branch`, `project_git_managed` and every
 /// preflight failure still refuse (D-11).
+///
+/// In [`GitMode::Report`] every refusal above except a transport failure is
+/// recorded (a warning that the apply would refuse, and the word in the
+/// master's `reason`) and the facts stay in `data.git` (27-20).
 pub async fn prepare_git_live(
+    prepared: &mut PreparedGit,
+    live: Option<&CanonicalDigest>,
+    action: ProjectAction,
+    loaded: &LoadedProject,
+    surfaces: &ProjectsSurfaces<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    match prepare_git_live_inner(prepared, live, action, loaded, surfaces, warnings).await {
+        Err(err) if prepared.mode == GitMode::Report && is_refusal(&err) => {
+            record_finding(prepared, warnings, loaded.file.project.as_str(), &err);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+async fn prepare_git_live_inner(
     prepared: &mut PreparedGit,
     live: Option<&CanonicalDigest>,
     action: ProjectAction,
@@ -991,21 +1212,26 @@ pub async fn prepare_git_live(
     // a `record` moves the branch to the release in place (27-13): both refuse
     // a release off the tracked branch and commits no remote has. Dirty work
     // refuses only an import: a `record` leaves the project as it is.
-    let enforce = prepared.mode == GitMode::Enforce
-        && matches!(action, ProjectAction::Import | ProjectAction::Record);
+    let enforce = matches!(action, ProjectAction::Import | ProjectAction::Record);
     if enforce {
         // `release_not_on_branch` (like `project_git_managed` and every
-        // preflight failure) has no override (D-11).
+        // preflight failure) has no override (D-11). In report mode the
+        // refusals are recorded and the facts above stay in the report.
         if !gates.release_on_branch {
-            return Err(managed(project, &kind, "release_not_on_branch"));
+            refuse(
+                prepared,
+                warnings,
+                project,
+                managed(project, &kind, "release_not_on_branch"),
+            )?;
         }
         let dirty_refuses = action == ProjectAction::Import && gates.dirty_count > 0;
         let refuses = !gates.unpushed.is_empty() || gates.not_merged_count > 0 || dirty_refuses;
-        match (&prepared.discard_reason, refuses) {
+        match (prepared.discard_reason.clone(), refuses) {
             // `--discard-gateway-changes` passes exactly the three C1 refusals
             // and turns them into what `--check` reports (27-15, D-05).
             (Some(reason), true) => {
-                let plan = discard_plan(reason, &gates, action, project, &prepared.state)?;
+                let plan = discard_plan(&reason, &gates, action, project, &prepared.state)?;
                 prepared.report.would_discard = Some(plan.would.clone());
                 prepared.discard = Some(plan);
             }
@@ -1013,25 +1239,40 @@ pub async fn prepare_git_live(
             (Some(_), false) => {}
             (None, _) => {
                 if !gates.unpushed.is_empty() {
-                    return Err(CoreError::DestructiveChangeRefused {
-                        gate: "git_unpushed".to_string(),
-                        count: gates.unpushed.len(),
-                        keys: gates.unpushed.clone(),
-                    });
+                    refuse(
+                        prepared,
+                        warnings,
+                        project,
+                        CoreError::DestructiveChangeRefused {
+                            gate: "git_unpushed".to_string(),
+                            count: gates.unpushed.len(),
+                            keys: gates.unpushed.clone(),
+                        },
+                    )?;
                 }
                 if gates.not_merged_count > 0 {
-                    return Err(CoreError::DestructiveChangeRefused {
-                        gate: "git_not_merged".to_string(),
-                        count: gates.not_merged_count,
-                        keys: gates.not_merged.clone(),
-                    });
+                    refuse(
+                        prepared,
+                        warnings,
+                        project,
+                        CoreError::DestructiveChangeRefused {
+                            gate: "git_not_merged".to_string(),
+                            count: gates.not_merged_count,
+                            keys: gates.not_merged.clone(),
+                        },
+                    )?;
                 }
                 if dirty_refuses {
-                    return Err(CoreError::DestructiveChangeRefused {
-                        gate: "git_dirty".to_string(),
-                        count: gates.dirty_count,
-                        keys: gates.dirty.clone().unwrap_or_default(),
-                    });
+                    refuse(
+                        prepared,
+                        warnings,
+                        project,
+                        CoreError::DestructiveChangeRefused {
+                            gate: "git_dirty".to_string(),
+                            count: gates.dirty_count,
+                            keys: gates.dirty.clone().unwrap_or_default(),
+                        },
+                    )?;
                 }
             }
         }
@@ -1068,10 +1309,9 @@ async fn prepare_adoption_live(
             "project {project}: the gateway repo is a partial repository; nothing is deployed, so \
              it was left as it is"
         )),
-        ProjectAction::Import | ProjectAction::Record
-            if prepared.mode == GitMode::Enforce && !on_branch =>
-        {
-            return Err(managed(project, &prepared.kind, "release_not_on_branch"));
+        ProjectAction::Import | ProjectAction::Record if !on_branch => {
+            let err = managed(project, &prepared.kind, "release_not_on_branch");
+            refuse(prepared, warnings, project, err)?;
         }
         _ => {}
     }
