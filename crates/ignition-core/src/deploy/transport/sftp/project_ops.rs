@@ -378,7 +378,7 @@ pub(super) const GIT_RESTORE_SH: &str = concat!(
     "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then ",
     "if ! command -v setfacl >/dev/null 2>&1; then rm -rf -- \"$stage\"; echo 'the gateway account needs write access to the restored .git and the host has no setfacl' >&2; exit 6; fi; ",
     "sg \"$stage\"; setfacl -R -P -m \"u:$gu:rwX\" \"$stage\" && sg \"$stage\" && find -P \"$stage\" -type d -exec setfacl -d -m \"u:$gu:rwX\" {} + || { rm -rf -- \"$stage\"; echo 'setfacl failed on the restored .git' >&2; exit 6; }; ",
-    "if command -v getfacl >/dev/null 2>&1; then e=$(getfacl -p -- \"$stage/config\" 2>/dev/null | grep \"^user:$gu:\"); ",
+    "if command -v getfacl >/dev/null 2>&1; then e=$(getfacl -n -p -- \"$stage/config\" 2>/dev/null | grep \"^user:$gu:\"); ",
     "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) rm -rf -- \"$stage\"; echo 'the gateway account has no effective write access on the restored .git' >&2; exit 6;; esac;; ",
     "*) rm -rf -- \"$stage\"; echo 'the gateway account has no ACL entry on the restored .git' >&2; exit 6;; esac; fi; fi; ",
     "sg \"$stage\"; staged=$(mf \"$stage\") || { r=$?; rm -rf -- \"$stage\"; exit $r; }; ",
@@ -391,16 +391,29 @@ pub(super) const GIT_RESTORE_SH: &str = concat!(
 
 pub(super) const GIT_PROBE_W_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in ls rm; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in ls rm id awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    // D-G1: when the gateway runs as an account that is neither root nor the
+    // deploy account, the restore gives it an explicit named ACL entry; the
+    // probe file in `.git` proves that step can work (setfacl and getfacl
+    // exist, the entry is accepted, its effective rights are rw-) before
+    // anything is written.
+    "ag() { [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ] || return 0; ",
+    "if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then rm -f -- \"$1\"; printf 'the gateway account needs write access to the restored .git and the host has no setfacl or getfacl (checked in %s)\\n' \"$2\" >&2; exit 6; fi; ",
+    "setfacl -m \"u:$gu:rw\" \"$1\" 2>/dev/null || { rm -f -- \"$1\"; printf 'setfacl failed on the probe file in %s\\n' \"$2\" >&2; exit 6; }; ",
+    "e=$(getfacl -n -p \"$1\" 2>/dev/null | grep \"^user:$gu:\"); ",
+    "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) rm -f -- \"$1\"; printf 'the gateway account would have no effective write access on the restored .git (checked in %s)\\n' \"$2\" >&2; exit 6;; esac;; ",
+    "*) rm -f -- \"$1\"; printf 'the gateway account has no ACL entry on the probe file in %s\\n' \"$2\" >&2; exit 6;; esac; }; ",
     "pw() { [ -d \"$1\" ] && [ ! -L \"$1\" ] || { printf '%s is not a real directory\\n' \"$2\" >&2; exit 4; }; ",
     "if pr \"$1/$3\"; then printf 'a probe file already exists in %s\\n' \"$2\" >&2; exit 4; fi; ",
     "( set -C; : > \"$1/$3\" ) 2>/dev/null || { printf 'a probe file cannot be created in %s\\n' \"$2\" >&2; exit 3; }; ",
+    "if [ \"$4\" = acl ]; then ag \"$1/$3\" \"$2\"; fi; ",
     "rm -f -- \"$1/$3\" || { printf 'the probe file in %s cannot be removed\\n' \"$2\" >&2; exit 3; }; }; ",
     "[ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "pw \"$1/$2\" \"$2\" \"$3\"; pw \"$1/$2/.git\" \"$2/.git\" \"$3\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
+    "gu=$(ls -ldn -- \"$1/$2\" 2>/dev/null | awk '{print $3}'); me=$(id -u); ",
+    "pw \"$1/$2\" \"$2\" \"$3\"; pw \"$1/$2/.git\" \"$2/.git\" \"$3\" acl; printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
 pub(super) const GIT_LOCK_SH: &str = concat!(
@@ -3506,15 +3519,23 @@ mod tests {
                 "setfacl",
                 &format!("echo \"$*\" >> {}", calls.display()),
             );
+            let read_calls = bin.path().join("getfacl-calls");
             shim(
                 bin.path(),
                 "getfacl",
-                &format!("echo 'user::rw-'; echo 'user:{uid}:rw-'; echo 'mask::rw-'"),
+                &format!(
+                    "echo \"$*\" >> {}; echo 'user::rw-'; echo 'user:{uid}:rw-'; echo 'mask::rw-'",
+                    read_calls.display()
+                ),
             );
             let path = format!("{}:{}", bin.path().display(), system_path());
             let out = rig.restore(&path);
             assert_eq!(out.code, 0, "{}", out.stderr);
             assert!(rig.git().join("config").is_file());
+            // getfacl prints a named account by name unless asked for numbers,
+            // and the entry is looked up by uid.
+            let read = std::fs::read_to_string(&read_calls).expect("getfacl calls");
+            assert!(read.starts_with("-n -p -- "), "{read}");
             let log = std::fs::read_to_string(&calls).expect("setfacl calls");
             let lines: Vec<&str> = log.lines().collect();
             assert!(
@@ -3614,6 +3635,209 @@ mod tests {
             assert_eq!(out.code, 6, "{}", out.stderr);
             assert!(out.stderr.contains("setfacl"), "{}", out.stderr);
             assert!(!rig.git().exists());
+        }
+
+        fn probe(rig: &Rig, path: &str) -> Out {
+            run(
+                GIT_PROBE_W_SH,
+                &[&rig.data(), "projects/CapApp", ".ign-probe-r1"],
+                path,
+            )
+        }
+
+        fn no_probe_left(rig: &Rig) {
+            for dir in ["data/projects/CapApp", "data/projects/CapApp/.git"] {
+                assert!(
+                    !rig.root.path().join(dir).join(".ign-probe-r1").exists(),
+                    "a probe file is left in {dir}"
+                );
+            }
+        }
+
+        /// A directory of symlinks to the tools a probe needs, minus the
+        /// ones named in `without`.
+        fn tool_dir(without: &[&str]) -> tempfile::TempDir {
+            let bin = tempfile::tempdir().expect("bin");
+            for tool in ["ls", "rm", "awk", "grep"] {
+                if without.contains(&tool) {
+                    continue;
+                }
+                let found = Command::new("sh")
+                    .args(["-c", &format!("command -v {tool}")])
+                    .output()
+                    .expect("sh");
+                let target = String::from_utf8_lossy(&found.stdout).trim().to_string();
+                if found.status.success() && target.starts_with('/') {
+                    std::os::unix::fs::symlink(&target, bin.path().join(tool)).expect("link");
+                }
+            }
+            bin
+        }
+
+        #[test]
+        fn probe_without_a_foreign_gateway_account_makes_no_acl_call() {
+            let rig = Rig::new();
+            let bin = tempfile::tempdir().expect("bin");
+            let calls = bin.path().join("calls");
+            // The project directory belongs to the account that runs the
+            // probe: no ACL step.
+            for tool in ["setfacl", "getfacl"] {
+                shim(
+                    bin.path(),
+                    tool,
+                    &format!("echo \"{tool} $*\" >> {}", calls.display()),
+                );
+            }
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = probe(&rig, &path);
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(
+                out.stdout.contains("IGN-RESULT:{\"ok\":1}"),
+                "{}",
+                out.stdout
+            );
+            assert!(!calls.exists(), "no ACL call for the deploy account itself");
+            no_probe_left(&rig);
+        }
+
+        #[test]
+        fn probe_proves_the_acl_step_for_a_non_root_gateway_account() {
+            if my_uid() == "0" {
+                println!("running as root; the gateway-account branch cannot be set up");
+                return;
+            }
+            let rig = Rig::new();
+            let bin = tempfile::tempdir().expect("bin");
+            let calls = bin.path().join("calls");
+            let uid = my_uid();
+            // The probe runs as "uid 424242"; the project directory belongs
+            // to the real account, which therefore plays the gateway account.
+            shim(bin.path(), "id", "echo 424242");
+            shim(
+                bin.path(),
+                "setfacl",
+                &format!("echo \"setfacl $*\" >> {}", calls.display()),
+            );
+            shim(
+                bin.path(),
+                "getfacl",
+                &format!(
+                    "echo \"getfacl $*\" >> {}; echo 'user::rw-'; echo 'user:{uid}:rw-'; echo 'mask::rw-'",
+                    calls.display()
+                ),
+            );
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = probe(&rig, &path);
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            no_probe_left(&rig);
+            let log = std::fs::read_to_string(&calls).expect("ACL calls");
+            let probe_in_git = rig.git().join(".ign-probe-r1").display().to_string();
+            assert!(
+                log.lines()
+                    .any(|l| l == format!("setfacl -m u:{uid}:rw {probe_in_git}")),
+                "the named entry on the probe file in .git: {log}"
+            );
+            // numeric ids, so a named account is matched by its uid
+            assert!(
+                log.lines()
+                    .any(|l| l == format!("getfacl -n -p {probe_in_git}")),
+                "the entry is read back numerically: {log}"
+            );
+            assert_eq!(
+                log.lines().filter(|l| l.starts_with("setfacl")).count(),
+                1,
+                "only the `.git` probe is checked: {log}"
+            );
+        }
+
+        #[test]
+        fn probe_refuses_when_the_gateway_account_would_only_read() {
+            if my_uid() == "0" {
+                return;
+            }
+            let rig = Rig::new();
+            let bin = tempfile::tempdir().expect("bin");
+            let uid = my_uid();
+            shim(bin.path(), "id", "echo 424242");
+            shim(bin.path(), "setfacl", "exit 0");
+            shim(
+                bin.path(),
+                "getfacl",
+                &format!("echo 'user:{uid}:rw- #effective:r--'"),
+            );
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = probe(&rig, &path);
+            assert_eq!(out.code, 6, "{}", out.stderr);
+            assert!(out.stderr.contains("effective"), "{}", out.stderr);
+            assert!(
+                out.stderr.contains("projects/CapApp/.git"),
+                "{}",
+                out.stderr
+            );
+            no_probe_left(&rig);
+        }
+
+        #[test]
+        fn probe_refuses_when_getfacl_shows_no_entry() {
+            if my_uid() == "0" {
+                return;
+            }
+            let rig = Rig::new();
+            let bin = tempfile::tempdir().expect("bin");
+            shim(bin.path(), "id", "echo 424242");
+            shim(bin.path(), "setfacl", "exit 0");
+            shim(
+                bin.path(),
+                "getfacl",
+                "echo 'user::rw-'; echo 'group::r--'; echo 'mask::r--'",
+            );
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = probe(&rig, &path);
+            assert_eq!(out.code, 6, "{}", out.stderr);
+            assert!(out.stderr.contains("no ACL entry"), "{}", out.stderr);
+            no_probe_left(&rig);
+        }
+
+        #[test]
+        fn probe_refuses_when_setfacl_fails() {
+            if my_uid() == "0" {
+                return;
+            }
+            let rig = Rig::new();
+            let bin = tempfile::tempdir().expect("bin");
+            shim(bin.path(), "id", "echo 424242");
+            shim(bin.path(), "setfacl", "exit 1");
+            shim(bin.path(), "getfacl", "exit 0");
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = probe(&rig, &path);
+            assert_eq!(out.code, 6, "{}", out.stderr);
+            assert!(out.stderr.contains("setfacl failed"), "{}", out.stderr);
+            no_probe_left(&rig);
+        }
+
+        #[test]
+        fn probe_refuses_without_setfacl_or_getfacl_for_a_foreign_gateway_account() {
+            if my_uid() == "0" {
+                return;
+            }
+            for missing in ["setfacl", "getfacl"] {
+                let rig = Rig::new();
+                let bin = tool_dir(&[]);
+                shim(bin.path(), "id", "echo 424242");
+                for tool in ["setfacl", "getfacl"] {
+                    if tool != missing {
+                        shim(bin.path(), tool, "exit 0");
+                    }
+                }
+                let out = probe(&rig, &bin.path().display().to_string());
+                assert_eq!(out.code, 6, "{missing}: {}", out.stderr);
+                assert!(
+                    out.stderr.contains("setfacl or getfacl"),
+                    "{missing}: {}",
+                    out.stderr
+                );
+                no_probe_left(&rig);
+            }
         }
 
         #[test]
