@@ -716,6 +716,14 @@ pub struct ProjectsInput {
     /// `--allow-first-change <REASON>`: let the first `ign` deploy of a
     /// project change what the gateway runs (D-12). 1 to 500 characters.
     pub allow_first_change: Option<String>,
+    /// `--discard-gateway-changes <REASON>` (D-05): let the deploy overwrite
+    /// gateway repo work that is uncommitted, unpushed or not merged into the
+    /// release. 1 to 500 characters; the reason is read by the git gate (27-15).
+    pub discard_gateway_changes: Option<String>,
+    /// `--allow-git-sync-hazards <REASON>` (D-21): acknowledge the hazards the
+    /// git module's start-sync can cause for this deploy. 1 to 500
+    /// characters; the reason is read by the hazard gate (27-18).
+    pub allow_git_sync_hazards: Option<String>,
     /// `--allow-destructive` (26-20, D-02): let the run delete the tags the
     /// previous deploy of this project placed and the repo no longer holds
     /// (`data.tags.removed`), through the master's tag-delete route.
@@ -742,6 +750,10 @@ pub struct ProjectsInput {
 
 /// The longest `--allow-first-change` reason accepted.
 pub const FIRST_CHANGE_REASON_MAX: usize = 500;
+
+/// The longest `--discard-gateway-changes` or `--allow-git-sync-hazards`
+/// reason accepted (the same bound as `--allow-first-change`).
+pub const OVERRIDE_REASON_MAX: usize = FIRST_CHANGE_REASON_MAX;
 
 /// Everything read offline.
 #[derive(Debug, Clone)]
@@ -811,6 +823,21 @@ fn load_with(input: &ProjectsInput, release: Release) -> Result<LoadedProject, C
                     "--allow-first-change <reason>: the reason is 1 to {FIRST_CHANGE_REASON_MAX} characters"
                 ),
             });
+        }
+    }
+    for (flag, reason) in [
+        ("--discard-gateway-changes", &input.discard_gateway_changes),
+        ("--allow-git-sync-hazards", &input.allow_git_sync_hazards),
+    ] {
+        if let Some(reason) = reason {
+            let chars = reason.chars().count();
+            if chars == 0 || chars > OVERRIDE_REASON_MAX {
+                return Err(CoreError::InvalidInput {
+                    reason: format!(
+                        "{flag} <reason>: the reason is 1 to {OVERRIDE_REASON_MAX} characters"
+                    ),
+                });
+            }
         }
     }
     if let Some(hash) = &input.artifact_sha256

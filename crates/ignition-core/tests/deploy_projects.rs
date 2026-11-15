@@ -127,6 +127,8 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             allow_manual_undo: false,
             artifact_sha256: None,
@@ -719,6 +721,44 @@ fn first_change_input(checkout: &Checkout, reason: Option<&str>) -> ProjectsInpu
     let mut input = checkout.input();
     input.allow_first_change = reason.map(str::to_string);
     input
+}
+
+/// The reason bounds shared by the two git override flags (D-05, D-21): 1 to
+/// 500 characters, `invalid_input` naming the flag from `load_project`, which
+/// runs before any host or gateway is handed to the deploy.
+fn assert_override_reason_bounds(flag: &str, set: fn(&mut ProjectsInput, String)) {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new();
+    for (label, reason) in [("empty", String::new()), ("501", "x".repeat(501))] {
+        let mut input = repo.input();
+        set(&mut input, reason);
+        let err = load_project(&input).expect_err("an out-of-bounds reason is refused");
+        assert_eq!(err.code(), "invalid_input", "{label}: {err}");
+        assert!(err.to_string().contains(flag), "{label}: {err}");
+    }
+    // Characters, not bytes: 500 two-byte characters pass.
+    for reason in ["x".to_string(), "x".repeat(500), "\u{e9}".repeat(500)] {
+        let mut input = repo.input();
+        set(&mut input, reason);
+        load_project(&input).expect("a 1 to 500 character reason loads");
+    }
+    assert_untouched(&gateway);
+}
+
+/// D-05: `discard_gateway_changes` is a 1 to 500 character reason.
+#[test]
+fn discard_reason_bounds() {
+    assert_override_reason_bounds("--discard-gateway-changes", |input, reason| {
+        input.discard_gateway_changes = Some(reason);
+    });
+}
+
+/// D-21: `allow_git_sync_hazards` is a 1 to 500 character reason.
+#[test]
+fn hazard_reason_bounds() {
+    assert_override_reason_bounds("--allow-git-sync-hazards", |input, reason| {
+        input.allow_git_sync_hazards = Some(reason);
+    });
 }
 
 /// D-12, V3: no record and a live project that differs from the artifact is
