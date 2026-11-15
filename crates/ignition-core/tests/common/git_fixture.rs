@@ -11,14 +11,20 @@
 //!   the remote is named for the repo (`capapp`), single-branch fetch refspec,
 //!   `[branch "production"]` tracking it, `[http] sslVerify = false`;
 //! - [`GitFixture::module_import`], the R-3 simulation: an import that deletes
-//!   `.git`, `tags/`, `images/` and the README and writes the artifact's files.
+//!   `.git`, `tags/`, `images/` and the README and writes the artifact's files;
+//! - [`GitFixture::partial_setup_local_repo`], the shape the module's
+//!   `setupLocalRepo` leaves against a remote with no `master` (G6, 27-17): an
+//!   unborn `master` HEAD, remote `origin`, the remote's branches and tags in
+//!   `packed-refs`, no index, no `[branch]` section.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ignition_core::deploy::git_advance::{AdvancePrep, prepare_advance};
+use ignition_core::deploy::git_advance::{
+    AdvanceMode, AdvancePrep, prepare_advance, prepare_advance_with,
+};
 use ignition_core::deploy::git_remote::HostGit;
 use ignition_core::deploy::git_state::{GitRefs, GitState, GitStateKind, classify};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact};
@@ -52,6 +58,10 @@ pub const LOCAL_ONLY_RES: &str = "ignition/script-python/cap/local/resource.json
 pub const EXTRA: &str = "ignition/script-python/cap/extra.txt";
 /// A file a designer commits on the gateway and never pushes.
 pub const UNPUSHED: &str = "ignition/script-python/cap/util/unpushed.py";
+/// The dummy credential [`GitFixture::with_git_yaml`] writes into `git.yaml`
+/// (a `user_password` and the userinfo of `repo_uri`). It must reach no
+/// envelope field, event line, run-directory file or error text.
+pub const GIT_YAML_SECRET: &str = "gy-dummy-credential-7f3a91c2";
 
 /// Whether `path` is one an artifact carries (the project root allowlist).
 pub fn in_scope(path: &str) -> bool {
@@ -193,6 +203,122 @@ impl GitFixture {
             c1,
             c2,
         }
+    }
+
+    /// Replace the gateway clone's `.git` with the partial repo the module's
+    /// `setupLocalRepo` leaves when the remote has no `master` (G6): an unborn
+    /// `master` HEAD, one remote `origin` with the default refspec, every
+    /// remote branch and tag fetched into `packed-refs`, `[http] sslVerify =
+    /// false`, no local branch, no index and no `[branch]` section. The work
+    /// tree is left as it is. Never deletes anything but the clone's own
+    /// `.git`, which the fixture created.
+    pub fn partial_setup_local_repo(&self) {
+        let project = self.project_dir();
+        std::fs::remove_dir_all(self.git_dir()).expect("the fixture's clone .git goes");
+        git(&project, &["init", "-q", "-b", "master"]);
+        git(
+            &project,
+            &[
+                "remote",
+                "add",
+                "origin",
+                self.remote.to_str().expect("utf8"),
+            ],
+        );
+        git(&project, &["config", "http.sslVerify", "false"]);
+        git(&project, &["fetch", "-q", "origin", "--tags"]);
+        git(&project, &["pack-refs", "--all"]);
+        self.assert_partial_shape();
+    }
+
+    /// The same partial shape built from the module's clone itself, so the
+    /// repo holds objects only up to C1 (the release C2 is missing and an
+    /// adoption must send it as a pack): the clone's local branch, index, logs
+    /// and `[branch]` section go, `HEAD` points at an unborn `master`, the
+    /// remote is renamed `origin`.
+    pub fn partial_behind(&self) {
+        let project = self.project_dir();
+        git(&project, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+        git(
+            &project,
+            &["update-ref", "-d", &format!("refs/heads/{BRANCH}")],
+        );
+        git(
+            &project,
+            &["config", "--remove-section", &format!("branch.{BRANCH}")],
+        );
+        git(&project, &["remote", "rename", REMOTE, "origin"]);
+        git(&project, &["pack-refs", "--all"]);
+        let dot_git = self.git_dir();
+        let _ = std::fs::remove_file(dot_git.join("index"));
+        let _ = std::fs::remove_dir_all(dot_git.join("logs"));
+        self.assert_partial_shape();
+    }
+
+    /// The G6 recording, as asserts: nothing the partial shape lacks is there.
+    fn assert_partial_shape(&self) {
+        let project = self.project_dir();
+        assert_eq!(
+            git(&project, &["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+        assert_eq!(
+            git(&project, &["for-each-ref", "refs/heads"]),
+            "",
+            "no local branch"
+        );
+        assert!(!self.git_dir().join("index").exists(), "no index");
+        assert_eq!(git(&project, &["remote"]), "origin");
+        let config = std::fs::read_to_string(self.git_dir().join("config")).expect("config");
+        assert!(!config.contains("[branch"), "no [branch] section: {config}");
+    }
+
+    /// Write `<data_dir>/git.yaml`: one entry per `(project, repo_branch)`,
+    /// each with a `user_password`, a `user_name`, a `repo_uri` that carries
+    /// [`GIT_YAML_SECRET`] as userinfo and a key this build does not know.
+    /// With `repo_branch` `None` the entry names no branch.
+    pub fn with_git_yaml(&self, entries: &[(&str, Option<&str>)]) {
+        let mut text = String::new();
+        for (project, branch) in entries {
+            text.push_str(&format!("- ignition_projectName: {project}\n"));
+            text.push_str(&format!(
+                "  repo_uri: https://dummy-user:{GIT_YAML_SECRET}@git.example/org/capapp.git\n"
+            ));
+            if let Some(branch) = branch {
+                text.push_str(&format!("  repo_branch: {branch}\n"));
+            }
+            text.push_str(&format!(
+                "  user_name: dummy-user\n  user_password: {GIT_YAML_SECRET}\n  \
+                 commissioning_importTags: \"true\"\n  unknown_future_key: [1, 2]\n"
+            ));
+        }
+        put(&self.data_dir, "git.yaml", &text);
+    }
+
+    /// Point the partial repo's `origin` at `url`.
+    pub fn set_gateway_remote_url(&self, url: &str) {
+        git(&self.project_dir(), &["remote", "set-url", "origin", url]);
+    }
+
+    /// A branch the release is not on: created at `main`'s tip and pushed.
+    pub fn push_branch_without_release(&self, branch: &str) {
+        let root = self._dir.path();
+        let scratch = root.join(format!("scratch-branch-{branch}"));
+        git(
+            root,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                self.remote.to_str().expect("utf8"),
+                scratch.to_str().expect("utf8"),
+            ],
+        );
+        git(
+            &scratch,
+            &["push", "-q", "origin", &format!("main:refs/heads/{branch}")],
+        );
     }
 
     /// `data/projects/CapApp`.
@@ -485,6 +611,31 @@ impl GitFixture {
         let prep = prepare_advance(host, &self.checkout, &state, &refs, &self.c2, &members)
             .await
             .expect("prepare");
+        (state, prep)
+    }
+
+    /// Everything the handover needs before the import for a partial repo: the
+    /// adoptable state and the prepared adoption of `branch` at C2.
+    pub async fn prepare_adopt(&self, host: &HostGit, branch: &str) -> (GitState, AdvancePrep) {
+        let (state, refs) = self.gateway_state(host).await;
+        assert_eq!(state.kind, GitStateKind::Adoptable, "{state:?}");
+        let config = std::fs::read(self.git_dir().join("config")).expect("config");
+        let members = self.artifact().digest.members.keys().cloned().collect();
+        let prep = prepare_advance_with(
+            host,
+            &self.checkout,
+            &state,
+            &refs,
+            &self.c2,
+            &members,
+            AdvanceMode::Adopt {
+                branch: branch.to_string(),
+                remote: "origin".to_string(),
+                config,
+            },
+        )
+        .await
+        .expect("prepare the adoption");
         (state, prep)
     }
 

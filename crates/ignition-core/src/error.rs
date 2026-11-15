@@ -2339,6 +2339,11 @@ impl CoreError {
                         "merge or tag the release on the tracked branch of the remote, then \
                          run the check again"
                     }
+                    "branch_required" => {
+                        "name the branch the partial repository is adopted onto: set \
+                         repo_branch for the project in the gateway's git.yaml, or git_branch \
+                         in the target file; the release must be on that branch of the remote"
+                    }
                     "mid_operation" | "locked" => {
                         "finish or abort the git operation on the gateway, then run the \
                          check again"
@@ -4348,7 +4353,13 @@ mod tests {
         assert!(!hint.contains("ign "), "{hint}");
         assert!(hint.contains("remote"), "{hint}");
         // Every reason has a hint that never tells anyone to delete the repo.
-        for reason in ["release_not_on_branch", "locked", "detached_head", "x"] {
+        for reason in [
+            "release_not_on_branch",
+            "branch_required",
+            "locked",
+            "detached_head",
+            "x",
+        ] {
             let hint = CoreError::ProjectGitManaged {
                 project: "CapApp".into(),
                 location: "projects/CapApp/.git".into(),
@@ -4360,6 +4371,20 @@ mod tests {
             assert!(!hint.contains("remove this project"), "{reason}: {hint}");
         }
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_git_managed"));
+        // 27-17: the hint of `branch_required` names both places a branch can
+        // come from, in the order they are tried.
+        let hint = CoreError::ProjectGitManaged {
+            project: "CapApp".into(),
+            location: "projects/CapApp/.git".into(),
+            kind: "directory".into(),
+            reason: "branch_required".into(),
+        }
+        .hint()
+        .expect("hint required");
+        let yaml = hint.find("repo_branch").expect("names repo_branch");
+        let target = hint.find("git_branch").expect("names git_branch");
+        assert!(yaml < target, "{hint}");
+        assert!(!hint.contains("ign "), "{hint}");
     }
 
     /// 25-10: the four-place rule for `project_parent_invalid` (variant,

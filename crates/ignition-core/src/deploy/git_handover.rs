@@ -25,7 +25,9 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::git_advance::{AdvanceFailure, AdvancePrep, GitWriteName, finish_advance};
+use super::git_advance::{
+    AdvanceFailure, AdvancePrep, GitWriteName, config_digest, finish_advance,
+};
 use super::git_remote::HostGit;
 use super::git_state::{GitState, GitStateKind, classify, redact_text};
 use super::ledger::{LedgerRoot, git_save_location};
@@ -276,17 +278,47 @@ pub async fn restore_and_advance(
                         .to_string(),
                 ));
             }
+            if !config_is_base(read, project, prep).await.map_err(|e| {
+                core(
+                    "restore_failed",
+                    "the restored .git config cannot be read",
+                    e,
+                )
+            })? {
+                return Err(fail(
+                    "restore_failed",
+                    vec![".git/config".to_string()],
+                    "the restored .git config is not the config the advance was prepared \
+                     against (it changed between the prepare and the save)"
+                        .to_string(),
+                ));
+            }
         }
         GitEntry::Directory => {
             let now = classify_live(read, git, project)
                 .await
                 .map_err(|e| core("restore_failed", "the .git probe failed", e))?;
-            if now.kind != GitStateKind::Managed || &now != state {
+            // A managed repo is advanced and an adoptable one is adopted; the
+            // prepare's classification must be exactly what is there now.
+            if !matches!(now.kind, GitStateKind::Managed | GitStateKind::Adoptable) || &now != state
+            {
                 return Err(fail(
                     "git_recreated",
                     vec![".git".to_string()],
                     "the .git the import left is not the repo the advance was prepared against; \
                      it is left as it is"
+                        .to_string(),
+                ));
+            }
+            if !config_is_base(read, project, prep)
+                .await
+                .map_err(|e| core("restore_failed", "the .git config cannot be read", e))?
+            {
+                return Err(fail(
+                    "git_recreated",
+                    vec![".git/config".to_string()],
+                    "the .git config is not the config the advance was prepared against; it is \
+                     left as it is"
                         .to_string(),
                 ));
             }
@@ -342,6 +374,22 @@ pub async fn restore_and_advance(
         save_path: save.path.clone(),
         keep_save: discard.is_some(),
     })
+}
+
+/// Whether the live `.git` config is the one an adoption's config was built
+/// from (27-17): the adopted config replaces the whole file, so it is written
+/// only over the bytes it was derived from. True when the advance carries no
+/// config.
+async fn config_is_base(
+    read: &dyn GitHostRead,
+    project: &str,
+    prep: &AdvancePrep,
+) -> Result<bool, CoreError> {
+    let Some(base) = &prep.config_base else {
+        return Ok(true);
+    };
+    let files = read.read_git_state(project).await?;
+    Ok(files.config.as_deref().map(config_digest).as_deref() == Some(base.as_str()))
 }
 
 /// After an import that did not read back as the artifact (K11): put the

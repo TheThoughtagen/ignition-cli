@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use super::git_state::{GIT_SMALL_FILE_MAX, redact_text};
+use super::git_state::{GIT_SMALL_FILE_MAX, branch_name_problem, redact_text};
 use super::git_state::{GitBranchConfig, GitConfig, GitFiles, GitHead, GitRefs, GitRemoteConfig};
 use crate::error::{CoreError, PreflightFailure};
 
@@ -378,6 +378,117 @@ impl HostGit {
             record_config_entry(&mut config, &key, value);
         }
         Ok(config)
+    }
+
+    /// Check that `name` is a branch name git itself accepts, after ign's own
+    /// pure check ([`branch_name_problem`]) so nothing that starts with `-` or
+    /// holds a revision-syntax character reaches an argument list. The name
+    /// comes from a gateway file or a target file: the refusal never echoes it
+    /// (27-17, T-27-38).
+    pub async fn check_branch_name(&self, name: &str) -> Result<(), CoreError> {
+        if branch_name_problem(name).is_some() {
+            return Err(host_failure(
+                "the adoption branch name is not a valid branch name",
+            ));
+        }
+        let full = format!("refs/heads/{name}");
+        let done = self
+            .run(Call::new(["check-ref-format", full.as_str()]).isolated())
+            .await?;
+        match done.code {
+            Some(0) => Ok(()),
+            Some(1) => Err(host_failure(
+                "the adoption branch name is not a valid branch name",
+            )),
+            _ => Err(host_failure(format!(
+                "git check-ref-format failed: {}",
+                done.stderr.trim()
+            ))),
+        }
+    }
+
+    /// The gateway `config` with a `[branch "<branch>"]` section that tracks
+    /// `remote`'s `<branch>` (27-17, D-13): `branch.<b>.remote = <remote>` and
+    /// `branch.<b>.merge = refs/heads/<b>`, each added only when absent.
+    ///
+    /// The bytes are copied to a private temp file and edited there with
+    /// `git config --file <tmp> --no-includes` under an empty global config:
+    /// git never runs with the gateway repo as its git dir and follows no
+    /// include (T-27-40). A value that is already set and differs refuses:
+    /// ign does not rewrite an upstream somebody chose.
+    pub async fn adopt_branch_config(
+        &self,
+        config: &[u8],
+        branch: &str,
+        remote: &str,
+    ) -> Result<Vec<u8>, CoreError> {
+        if config.len() > GIT_SMALL_FILE_MAX {
+            return Err(host_failure("the gateway config is over its size limit"));
+        }
+        self.check_branch_name(branch).await?;
+        require_safe_name(remote, "remote")?;
+        let dir = scratch_dir()?;
+        let file = dir.path().join("config");
+        write_scratch(&file, config)?;
+        let merge = format!("refs/heads/{branch}");
+        for (var, want) in [("remote", remote), ("merge", merge.as_str())] {
+            let key = format!("branch.{branch}.{var}");
+            let have = self
+                .run(
+                    Call::new([
+                        OsStr::new("config"),
+                        OsStr::new("--file"),
+                        file.as_os_str(),
+                        OsStr::new("--no-includes"),
+                        OsStr::new("--get-all"),
+                        OsStr::new(&key),
+                    ])
+                    .cwd(dir.path())
+                    .isolated(),
+                )
+                .await?;
+            match have.code {
+                Some(0) => {
+                    let text = String::from_utf8_lossy(&have.stdout);
+                    let mut values = text.lines();
+                    if values.next() != Some(want) || values.next().is_some() {
+                        return Err(host_failure(format!(
+                            "the gateway config already sets {} to another value; it is not \
+                             rewritten",
+                            redact_text(&key)
+                        )));
+                    }
+                }
+                Some(1) => {
+                    self.run_ok(
+                        "config",
+                        Call::new([
+                            OsStr::new("config"),
+                            OsStr::new("--file"),
+                            file.as_os_str(),
+                            OsStr::new("--no-includes"),
+                            OsStr::new(&key),
+                            OsStr::new(want),
+                        ])
+                        .cwd(dir.path())
+                        .isolated(),
+                    )
+                    .await?;
+                }
+                _ => {
+                    return Err(host_failure(format!(
+                        "git config failed: {}",
+                        have.stderr.trim()
+                    )));
+                }
+            }
+        }
+        let bytes = std::fs::read(&file)
+            .map_err(|e| host_failure(format!("a private temp file could not be read: {e}")))?;
+        if bytes.len() > GIT_SMALL_FILE_MAX {
+            return Err(host_failure("the adopted config is over its size limit"));
+        }
+        Ok(bytes)
     }
 
     /// Read a gateway repo's refs through a scratch git dir. `Ok(None)` when
@@ -2130,6 +2241,140 @@ mod tests {
             .await
             .expect("parse");
         assert_eq!(config.remotes.keys().collect::<Vec<_>>(), ["capapp"]);
+    }
+
+    const PARTIAL_CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\
+[remote \"origin\"]\n\turl = https://user:secret@git.example/org/capapp.git\n\
+\tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+[http]\n\tsslVerify = false\n";
+
+    #[tokio::test]
+    async fn adopt_branch_config_adds_the_upstream_section() {
+        let host = HostGit::new();
+        let out = host
+            .adopt_branch_config(PARTIAL_CONFIG.as_bytes(), "production", "origin")
+            .await
+            .expect("adopted");
+        let text = String::from_utf8(out.clone()).expect("utf8");
+        // What the module wrote stays, the section is added.
+        assert!(text.starts_with(PARTIAL_CONFIG), "{text}");
+        assert!(text.contains("[branch \"production\"]"), "{text}");
+        let parsed = host.parse_config(&out).await.expect("parse");
+        let branch = &parsed.branches["production"];
+        assert_eq!(branch.remote.as_deref(), Some("origin"));
+        assert_eq!(branch.merge.as_deref(), Some("refs/heads/production"));
+        assert_eq!(parsed.remotes.len(), 1);
+
+        // A branch name with a slash is one subsection.
+        let out = host
+            .adopt_branch_config(PARTIAL_CONFIG.as_bytes(), "release/1.2", "origin")
+            .await
+            .expect("adopted");
+        let parsed = host.parse_config(&out).await.expect("parse");
+        assert_eq!(
+            parsed.branches["release/1.2"].merge.as_deref(),
+            Some("refs/heads/release/1.2")
+        );
+    }
+
+    /// Each value is added only when absent; the same value again changes
+    /// nothing, another value refuses.
+    #[tokio::test]
+    async fn adopt_branch_config_only_when_absent() {
+        let host = HostGit::new();
+        let once = host
+            .adopt_branch_config(PARTIAL_CONFIG.as_bytes(), "production", "origin")
+            .await
+            .expect("adopted");
+        let twice = host
+            .adopt_branch_config(&once, "production", "origin")
+            .await
+            .expect("idempotent");
+        assert_eq!(once, twice);
+
+        let half = format!("{PARTIAL_CONFIG}[branch \"production\"]\n\tremote = origin\n");
+        let out = host
+            .adopt_branch_config(half.as_bytes(), "production", "origin")
+            .await
+            .expect("completed");
+        let parsed = host.parse_config(&out).await.expect("parse");
+        assert_eq!(
+            parsed.branches["production"].merge.as_deref(),
+            Some("refs/heads/production")
+        );
+
+        for other in [
+            "[branch \"production\"]\n\tremote = elsewhere\n",
+            "[branch \"production\"]\n\tmerge = refs/heads/other\n",
+        ] {
+            let text = format!("{PARTIAL_CONFIG}{other}");
+            let err = host
+                .adopt_branch_config(text.as_bytes(), "production", "origin")
+                .await
+                .expect_err("another value is not rewritten");
+            assert_eq!(err.code(), "deploy_preflight_failed");
+            assert!(err.to_string().contains("already sets"), "{err}");
+        }
+    }
+
+    /// The config is copied to a private file: an include is never followed
+    /// and the gateway's own bytes are never a git dir (T-27-40).
+    #[tokio::test]
+    async fn adopt_branch_config_follows_no_include_and_checks_names() {
+        let host = HostGit::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let extra = dir.path().join("extra");
+        std::fs::write(&extra, "[branch \"production\"]\n\tremote = elsewhere\n").expect("write");
+        let text = format!("{PARTIAL_CONFIG}[include]\n\tpath = {}\n", extra.display());
+        let out = host
+            .adopt_branch_config(text.as_bytes(), "production", "origin")
+            .await
+            .expect("an include is not followed");
+        assert!(String::from_utf8_lossy(&out).contains("remote = origin"));
+
+        for bad in ["-x", "a..b", "x.lock", "", "a b", "@{-1}"] {
+            let err = host
+                .adopt_branch_config(PARTIAL_CONFIG.as_bytes(), bad, "origin")
+                .await
+                .expect_err(bad);
+            assert_eq!(err.code(), "deploy_preflight_failed", "{bad}");
+        }
+        for bad in ["-x", "a b", "", "a..b"] {
+            assert!(
+                host.adopt_branch_config(PARTIAL_CONFIG.as_bytes(), "production", bad)
+                    .await
+                    .is_err(),
+                "remote {bad:?}"
+            );
+        }
+        let big = vec![b'#'; GIT_SMALL_FILE_MAX + 1];
+        assert!(
+            host.adopt_branch_config(&big, "production", "origin")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn check_branch_name_is_pure_then_git() {
+        let host = HostGit::new();
+        for ok in ["production", "release/1.2"] {
+            host.check_branch_name(ok).await.expect(ok);
+        }
+        for bad in [
+            "",
+            "-x",
+            "--upload-pack=x",
+            "a..b",
+            "x.lock",
+            "a b",
+            "x~1",
+            "@",
+        ] {
+            assert!(host.check_branch_name(bad).await.is_err(), "{bad:?}");
+        }
+        let err = host.check_branch_name("a..b").await.expect_err("bad");
+        assert!(!err.to_string().contains("a..b"), "the name is not echoed");
     }
 
     fn files_with(head: &str) -> GitFiles {

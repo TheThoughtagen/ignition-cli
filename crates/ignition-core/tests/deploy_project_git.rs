@@ -3353,4 +3353,599 @@ mod published {
         };
         assert!(!err.to_string().contains("--discard-gateway-changes"));
     }
+
+    // ---- 27-17: adopting the partial repo `setupLocalRepo` leaves ----
+
+    const ADOPT_BRANCH: &str = "production";
+
+    /// A rig whose gateway repo is the G6 partial shape.
+    fn adopting() -> Rig {
+        let rig = Rig::new();
+        rig.f.partial_setup_local_repo();
+        rig
+    }
+
+    /// The target file gains `git_branch: <branch>`.
+    fn set_target_branch(rig: &Rig, branch: &str) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(rig.targets.path().join("targets/dev.yaml"))
+            .expect("the target file");
+        writeln!(file, "git_branch: {branch}").expect("append");
+    }
+
+    fn files_below(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files_below(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The dummy credential of `git.yaml` is in no envelope field, event
+    /// line, run-directory file or warning (T-27-37).
+    fn assert_secret_free(rig: &Rig, result: &DeployProjectsResult) {
+        use common::git_fixture::GIT_YAML_SECRET;
+        let mut texts = vec![
+            serde_json::to_string(result).expect("json"),
+            format!("{result:?}"),
+            result.warnings.join("\n"),
+        ];
+        let mut files = Vec::new();
+        files_below(&rig.repo.join(".ign"), &mut files);
+        assert!(!files.is_empty(), "the run left files to scan");
+        for file in files {
+            texts.push(String::from_utf8_lossy(&std::fs::read(&file).expect("read")).into_owned());
+        }
+        for text in texts {
+            assert!(!text.contains(GIT_YAML_SECRET), "the credential leaked");
+            assert!(!text.contains("dummy-user"), "the user name leaked");
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_from_git_yaml() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert!(result.ok && result.slug.is_none());
+        let git = git_of(&result);
+        let node = git.master();
+        assert_eq!(node.state, "adoptable");
+        assert!(node.adopted);
+        assert_eq!(node.branch.as_deref(), Some(ADOPT_BRANCH));
+        assert_eq!(node.branch_source, Some("git_yaml"));
+        assert_eq!(node.remote.as_deref(), Some("origin"));
+        assert_eq!(node.head, None, "an unborn HEAD has no commit");
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert!(restore.advanced && restore.verified && restore.reason.is_none());
+        assert_eq!(restore.post_status, Some("matched"));
+        assert!(!restore.save_kept);
+        let drift = git.expected_drift.clone().expect("drift known after adopt");
+        assert!(git.expected_drift_complete);
+
+        assert_eq!(
+            rig.f.git_in_project(&["symbolic-ref", "HEAD"]),
+            format!("refs/heads/{ADOPT_BRANCH}")
+        );
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert_eq!(
+            rig.f
+                .git_in_project(&["rev-parse", &format!("refs/remotes/origin/{ADOPT_BRANCH}")]),
+            rig.f.c2
+        );
+        assert_eq!(
+            rig.f
+                .git_in_project(&["config", &format!("branch.{ADOPT_BRANCH}.merge")]),
+            format!("refs/heads/{ADOPT_BRANCH}")
+        );
+        assert_eq!(
+            rig.f
+                .git_in_project(&["config", &format!("branch.{ADOPT_BRANCH}.remote")]),
+            "origin"
+        );
+        // What the module left in the config stays.
+        assert_eq!(rig.f.git_in_project(&["config", "http.sslVerify"]), "false");
+        assert_eq!(rig.f.status_paths(), drift);
+        rig.f.git_in_project(&["fsck", "--connectivity-only"]);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert!(
+            rig.git_events(&result)
+                .contains(&"git_advanced".to_string())
+        );
+
+        let json = serde_json::to_value(git).expect("json");
+        assert_eq!(json["nodes"][0]["adopted"], true);
+        assert_eq!(json["nodes"][0]["branch_source"], "git_yaml");
+        assert!(json["nodes"][0]["dirty"].is_null());
+        assert_secret_free(&rig, &result);
+    }
+
+    /// No git.yaml: the target's `git_branch` names the branch. The repo here
+    /// holds objects only up to C1, so the adoption sends the release as a
+    /// pack and the repo still passes fsck.
+    #[tokio::test]
+    async fn adopt_from_target_key() {
+        let rig = Rig::new();
+        rig.f.partial_behind();
+        set_target_branch(&rig, ADOPT_BRANCH);
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let node = git_of(&result).master();
+        assert_eq!(node.state, "adoptable");
+        assert!(node.adopted);
+        assert_eq!(node.branch.as_deref(), Some(ADOPT_BRANCH));
+        assert_eq!(node.branch_source, Some("target"));
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        rig.f.git_in_project(&["fsck", "--connectivity-only"]);
+        assert_eq!(
+            rig.f
+                .git_in_project(&["config", &format!("branch.{ADOPT_BRANCH}.remote")]),
+            "origin"
+        );
+    }
+
+    /// git.yaml first, then the target key.
+    #[tokio::test]
+    async fn adopt_branch_source_order() {
+        // git.yaml wins over the target key.
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        set_target_branch(&rig, "main");
+        let result = rig.check().await.expect("check");
+        let node = git_of(&result).master();
+        assert_eq!(node.branch.as_deref(), Some(ADOPT_BRANCH));
+        assert_eq!(node.branch_source, Some("git_yaml"));
+
+        // An entry without repo_branch, or for another project, falls through.
+        for entries in [
+            vec![(PROJECT, None)],
+            vec![("OtherProject", Some("main"))],
+            vec![(PROJECT, Some("main")), (PROJECT, Some(ADOPT_BRANCH))],
+        ] {
+            let rig = adopting();
+            rig.f.with_git_yaml(&entries);
+            set_target_branch(&rig, ADOPT_BRANCH);
+            let result = rig.check().await.expect("check");
+            let node = git_of(&result).master();
+            assert_eq!(node.branch.as_deref(), Some(ADOPT_BRANCH), "{entries:?}");
+            assert_eq!(node.branch_source, Some("target"), "{entries:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_branch_required() {
+        let rig = adopting();
+        let before = rig.git_manifest().await;
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "branch_required");
+        assert_eq!(rig.git_manifest().await, before, ".git is untouched");
+        let hint = err.hint().expect("a hint");
+        assert!(
+            hint.contains("repo_branch") && hint.contains("git_branch"),
+            "{hint}"
+        );
+
+        // A git.yaml that does not name a branch for this project is no source.
+        for entries in [
+            vec![(PROJECT, None)],
+            vec![("OtherProject", Some(ADOPT_BRANCH))],
+        ] {
+            let rig = adopting();
+            rig.f.with_git_yaml(&entries);
+            let err = refused_alike(&rig).await;
+            assert_eq!(reason_of(&err), "branch_required", "{entries:?}");
+            assert!(
+                !err.to_string()
+                    .contains(common::git_fixture::GIT_YAML_SECRET)
+            );
+        }
+    }
+
+    /// JGit's default `master` in the unborn HEAD is never taken as intent,
+    /// even when the remote has a `master`.
+    #[tokio::test]
+    async fn adopt_never_takes_the_unborn_head_name() {
+        let rig = adopting();
+        rig.f.push_branch_without_release("master");
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "branch_required");
+    }
+
+    #[tokio::test]
+    async fn adopt_release_not_on_branch() {
+        let rig = adopting();
+        // `main` holds the first commit only; the release is on production.
+        rig.f.with_git_yaml(&[(PROJECT, Some("main"))]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "release_not_on_branch");
+
+        // A branch the remote does not have holds nothing.
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some("no-such-branch"))]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "release_not_on_branch");
+    }
+
+    #[tokio::test]
+    async fn adopt_remote_mismatch() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.f
+            .set_gateway_remote_url("https://git.example/other/elsewhere.git");
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "remote_mismatch");
+    }
+
+    /// D-13: the partial repo holds no commit, so a live project that differs
+    /// from every commit still adopts and no dirty, unpushed or not-merged
+    /// fact is reported.
+    #[tokio::test]
+    async fn adopt_skips_dirty_and_unpushed() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let node = git_of(&result).master();
+        assert!(node.adopted);
+        assert_eq!(node.dirty, None);
+        assert_eq!(node.dirty_count, None);
+        assert_eq!(node.dirty_source, None);
+        assert!(node.unpushed.is_empty() && node.not_merged.is_empty());
+        assert_eq!(node.not_merged_count, 0);
+        assert!(git_of(&result).would_discard.is_none());
+        assert!(git_of(&result).discarded.is_none());
+        let json = serde_json::to_value(git_of(&result)).expect("json");
+        assert!(json["nodes"][0]["dirty"].is_null());
+    }
+
+    /// A `record` (live already equals the artifact) adopts too: the repo is
+    /// advanced where it stands, never replaced.
+    #[tokio::test]
+    async fn adopt_record_action_adopts() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.make_live_equal_artifact().await;
+        let result = rig.apply().await.expect("the record completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Recorded,
+            "{:?}",
+            result.warnings
+        );
+        assert!(rig.gateway.import_calls().is_empty(), "no import");
+        let node = git_of(&result).master();
+        assert!(node.adopted, "{node:?}");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert_eq!(
+            rig.f.git_in_project(&["symbolic-ref", "HEAD"]),
+            format!("refs/heads/{ADOPT_BRANCH}")
+        );
+        rig.f.git_in_project(&["fsck", "--connectivity-only"]);
+    }
+
+    /// An unborn HEAD that is not the adoptable shape keeps its reason word.
+    #[tokio::test]
+    async fn adopt_not_adoptable_keeps_unborn_head() {
+        // A local branch.
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.f
+            .git_in_project(&["update-ref", "refs/heads/local-work", &rig.f.c1]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "unborn_head");
+
+        // An index.
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.f.git_in_project(&["read-tree", &rig.f.c1]);
+        assert!(rig.f.git_dir().join("index").exists());
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "unborn_head");
+
+        // Another remote.
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.f
+            .git_in_project(&["remote", "add", "second", "https://git.example/x/y.git"]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "multiple_remotes");
+
+        // A merge in progress.
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        std::fs::write(
+            rig.f.git_dir().join("MERGE_HEAD"),
+            format!("{}\n", rig.f.c1),
+        )
+        .expect("marker");
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "mid_operation");
+    }
+
+    /// The `.git` is never deleted: not by a refusal, not by an adoption.
+    #[tokio::test]
+    async fn adopt_never_deletes_the_gateway_git() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some("main"))]);
+        let before = rig.git_manifest().await;
+        let _ = refused_alike(&rig).await;
+        assert_eq!(rig.git_manifest().await, before);
+        assert!(rig.f.git_dir().is_dir());
+    }
+
+    /// `--check` reports the plan and writes nothing.
+    #[tokio::test]
+    async fn adopt_check_writes_nothing() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        let before = rig.git_manifest().await;
+        let result = rig.check().await.expect("the check completes");
+        assert_eq!(result.outcome, ProjectOutcome::Checked);
+        let git = git_of(&result);
+        let node = git.master();
+        assert_eq!(node.state, "adoptable");
+        assert_eq!(node.branch.as_deref(), Some(ADOPT_BRANCH));
+        assert_eq!(node.branch_source, Some("git_yaml"));
+        assert!(!node.adopted, "nothing was adopted by a check");
+        assert_eq!(node.dirty, None);
+        assert!(node.save.is_none() && node.restore.is_none());
+        assert_eq!(git.expected_drift, None);
+        assert_eq!(git.expected_drift_count, None);
+        assert!(!git.expected_drift_complete);
+        let json = serde_json::to_value(git).expect("json");
+        assert!(json["expected_drift"].is_null());
+        assert!(rig.save_trees().is_empty());
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert_eq!(rig.git_manifest().await, before, ".git is byte-identical");
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_eq!(
+            rig.f.git_in_project(&["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+    }
+
+    /// The dummy credential in `git.yaml` reaches nothing the run writes or
+    /// says, on success and on every refusal.
+    #[tokio::test]
+    async fn adopt_secret_never_reported() {
+        use common::git_fixture::GIT_YAML_SECRET;
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        let result = rig.apply().await.expect("the apply completes");
+        assert_secret_free(&rig, &result);
+
+        // A branch name git does not accept refuses without echoing anything.
+        for branch in ["-x", "a..b", "x.lock"] {
+            let rig = adopting();
+            rig.f.with_git_yaml(&[(PROJECT, Some(branch))]);
+            let err = refusal(rig.apply().await);
+            assert_eq!(err.code(), "deploy_preflight_failed", "{branch}");
+            let text = format!("{err} {err:?}");
+            assert!(!text.contains(GIT_YAML_SECRET), "{text}");
+            assert!(!text.contains(branch), "the value is not echoed: {text}");
+        }
+
+        // A git.yaml that does not parse names the file and nothing else.
+        let rig = adopting();
+        common::git_fixture::put(
+            &rig.f.data_dir,
+            "git.yaml",
+            &format!("- ignition_projectName: CapApp\n  user_password: [{GIT_YAML_SECRET}\n"),
+        );
+        let err = refusal(rig.apply().await);
+        assert_eq!(err.code(), "deploy_run_invalid");
+        let text = format!("{err} {err:?}");
+        assert!(text.contains("git.yaml"), "{text}");
+        assert!(!text.contains(GIT_YAML_SECRET), "{text}");
+
+        // So does one over the size cap.
+        let rig = adopting();
+        common::git_fixture::put(
+            &rig.f.data_dir,
+            "git.yaml",
+            &"#".repeat(ignition_core::deploy::yamlio::YAML_MAX_BYTES + 1),
+        );
+        let err = refusal(rig.apply().await);
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(err.to_string().contains("git.yaml"));
+    }
+
+    /// A config somebody already pointed elsewhere is not rewritten.
+    #[tokio::test]
+    async fn adopt_conflicting_upstream_refuses() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        rig.f.git_in_project(&[
+            "config",
+            &format!("branch.{ADOPT_BRANCH}.remote"),
+            "elsewhere",
+        ]);
+        let before = rig.git_manifest().await;
+        let err = refusal(rig.apply().await);
+        assert_eq!(preflight_checks(&err), ["git_host"]);
+        assert!(err.to_string().contains("already sets"), "{err}");
+        assert_eq!(rig.git_manifest().await, before);
+        assert!(rig.gateway.import_calls().is_empty());
+    }
+
+    /// A config that changed between the plan and the save is a stale plan:
+    /// the adopted config would replace it whole.
+    #[tokio::test]
+    async fn adopt_config_changed_after_the_plan_is_stale() {
+        let rig = adopting();
+        rig.f.with_git_yaml(&[(PROJECT, Some(ADOPT_BRANCH))]);
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        rig.f.git_in_project(&["config", "core.comment", "changed"]);
+        let err = refusal(rig.run_prepared(&host, &loaded, prepared, None).await);
+        assert_eq!(err.code(), "plan_stale", "{err}");
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "nothing was imported"
+        );
+        assert!(rig.save_trees().is_empty(), "nothing was saved");
+        assert_eq!(
+            rig.f.git_in_project(&["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+    }
+
+    // ---- the adoption's advance, below the action ----
+
+    fn write_label(name: &GitWriteName) -> String {
+        match name {
+            GitWriteName::PackFile(_) => "pack".to_string(),
+            GitWriteName::PackIndex(_) => "idx".to_string(),
+            other => other.rel(),
+        }
+    }
+
+    /// The adoption's writes come in the fixed order: pack, pack index, branch
+    /// ref, remote-tracking ref, config, HEAD, index; a managed advance has
+    /// no config write.
+    #[tokio::test]
+    async fn adopt_writes_in_the_fixed_order() {
+        use ignition_core::deploy::git_advance::finish_advance;
+        let f = GitFixture::new();
+        f.partial_behind();
+        let host = HostGit::new();
+        let (_state, prep) = f.prepare_adopt(&host, BRANCH).await;
+        assert!(prep.adopted);
+        assert!(
+            prep.pack.is_some(),
+            "the release is missing: it is sent as a pack"
+        );
+        let config = String::from_utf8(prep.config.clone().expect("config")).expect("utf8");
+        assert!(
+            config.contains(&format!("[branch \"{BRANCH}\"]")),
+            "{config}"
+        );
+        f.module_import(true, &[], &[], &[]);
+        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip())
+            .await
+            .expect("the plan");
+        let order: Vec<String> = plan.writes.iter().map(|w| write_label(&w.name)).collect();
+        assert_eq!(
+            order,
+            [
+                "pack".to_string(),
+                "idx".to_string(),
+                format!("refs/heads/{BRANCH}"),
+                format!("refs/remotes/origin/{BRANCH}"),
+                "config".to_string(),
+                "HEAD".to_string(),
+                "index".to_string(),
+            ]
+        );
+        // The first write is only planned: nothing was written.
+        assert_eq!(
+            f.git_in_project(&["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+
+        // A managed repo has no config write.
+        let m = GitFixture::new();
+        let (_state, prep) = m.prepare(&host).await;
+        assert!(!prep.adopted && prep.config.is_none() && prep.config_base.is_none());
+        m.module_import(true, &[], &[], &[]);
+        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip())
+            .await
+            .expect("the plan");
+        assert!(
+            plan.writes
+                .iter()
+                .all(|w| !matches!(w.name, GitWriteName::Config))
+        );
+    }
+
+    /// The whole handover with a pack: the module's import deletes `.git`, the
+    /// save is restored and the adoption is written; the release objects the
+    /// partial repo lacked arrive and fsck passes.
+    #[tokio::test]
+    async fn adopt_handover_sends_the_missing_release() {
+        let f = GitFixture::new();
+        f.partial_behind();
+        let host = HostGit::new();
+        let node = f.node();
+        let (state, prep) = f.prepare_adopt(&host, BRANCH).await;
+        let saved = save(&node, &node, GATEWAY, PROJECT, RUN)
+            .await
+            .expect("save");
+        f.module_import(false, &[UTIL_RES], &[], &[]);
+        let report = restore_and_advance(
+            &node,
+            &node,
+            &host,
+            &f.checkout,
+            &state,
+            &saved,
+            &prep,
+            &f.export_zip(),
+            None,
+        )
+        .await
+        .expect("the handover");
+        assert!(
+            report.restored && report.advanced && report.verified,
+            "{report:?}"
+        );
+        assert_eq!(f.git_in_project(&["rev-parse", "HEAD"]), f.c2);
+        f.git_in_project(&["fsck", "--connectivity-only"]);
+        assert_eq!(f.status_paths(), report.expected_drift);
+        assert_eq!(
+            f.git_in_project(&["config", &format!("branch.{BRANCH}.merge")]),
+            format!("refs/heads/{BRANCH}")
+        );
+    }
+
+    /// The adopted config is written only over the config it was built from.
+    #[tokio::test]
+    async fn adopt_refuses_a_config_that_changed() {
+        let f = GitFixture::new();
+        f.partial_setup_local_repo();
+        let host = HostGit::new();
+        let node = f.node();
+        let (state, prep) = f.prepare_adopt(&host, BRANCH).await;
+        let saved = save(&node, &node, GATEWAY, PROJECT, RUN)
+            .await
+            .expect("save");
+        f.module_import(true, &[], &[], &[]);
+        f.git_in_project(&["config", "core.comment", "changed"]);
+        let failure = restore_and_advance(
+            &node,
+            &node,
+            &host,
+            &f.checkout,
+            &state,
+            &saved,
+            &prep,
+            &f.export_zip(),
+            None,
+        )
+        .await
+        .expect_err("a changed config is refused");
+        assert_eq!(failure.reason, "git_recreated");
+        assert_eq!(failure.paths, [".git/config"]);
+        assert_eq!(
+            f.git_in_project(&["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+        assert!(
+            !f.git_dir().join("refs/heads").join(BRANCH).exists(),
+            "no branch ref was written"
+        );
+        assert!(!f.git_dir().join("index").exists(), "no index was written");
+    }
 }

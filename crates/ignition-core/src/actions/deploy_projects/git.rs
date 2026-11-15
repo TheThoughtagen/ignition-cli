@@ -6,9 +6,12 @@
 //!
 //! 1. [`prepare_git_host`] (right after the `.git` probe): read the gateway
 //!    repo's files, classify them, check the release checkout, ask the remote
-//!    for its heads and build the advance input ([`prepare_advance`]) on ign's
-//!    machine. Nothing is written; a failure here refuses before any write,
-//!    in `--check` and in the apply alike (B5).
+//!    for its heads and build the advance input ([`prepare_advance_with`]) on
+//!    ign's machine. Nothing is written; a failure here refuses before any
+//!    write, in `--check` and in the apply alike (B5). A partial repo the
+//!    module left behind (adoptable, D-13) takes the same steps with its
+//!    branch named explicitly: `git.yaml` `repo_branch`, else the target's
+//!    `git_branch`, else the run refuses `branch_required` (D-23).
 //! 2. [`prepare_git_live`] (after the live export): the gate facts against the
 //!    live project, the itemised dirty list (from the gateway's own objects
 //!    when ign's store lacks the gateway HEAD, D-24) and the refusals.
@@ -39,7 +42,7 @@ use crate::deploy::apply::hold::SystemClock;
 use crate::deploy::apply::preflight::{
     DesignersMode, DesignersPolicy, DesignersVerdict, designers_detail, designers_gate,
 };
-use crate::deploy::git_advance::{AdvancePrep, prepare_advance};
+use crate::deploy::git_advance::{AdvanceMode, AdvancePrep, config_digest, prepare_advance_with};
 use crate::deploy::git_gate::{
     GitGateFailure, LIST_CAP, NodeGates, ReleaseCheckout, RemoteView, check_release_checkout,
     gate_node, remote_view,
@@ -50,6 +53,7 @@ use crate::deploy::git_handover::{
 use crate::deploy::git_objects::dirty_from_gateway;
 use crate::deploy::git_remote::HostGit;
 use crate::deploy::git_state::{GitFiles, GitHead, GitRefs, GitState, GitStateKind, classify};
+use crate::deploy::git_yaml::{entry_for, parse_git_yaml};
 use crate::deploy::ledger::{LedgerRoot, git_save_location};
 use crate::deploy::project_artifact::CanonicalDigest;
 use crate::deploy::transport::projects::{
@@ -378,6 +382,15 @@ pub fn discard_ref_name(run_id: &str) -> String {
     format!("refs/ign-discarded/{run_id}")
 }
 
+/// Where an adoption's branch came from, and which branch it is (27-17, D-23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adoption {
+    /// The branch the partial repo is adopted onto.
+    pub branch: String,
+    /// `git_yaml` or `target`; there is no implicit source.
+    pub source: &'static str,
+}
+
 /// Everything the prepare learned about one managed gateway repo.
 #[derive(Debug, Clone)]
 pub struct PreparedGit {
@@ -394,8 +407,12 @@ pub struct PreparedGit {
     /// The advance input, built before any write; `None` only for a state
     /// that will not be handed over.
     pub prep: Option<AdvancePrep>,
-    /// The gate facts, once [`prepare_git_live`] ran.
+    /// The gate facts, once [`prepare_git_live`] ran. `None` for an adopted
+    /// repo: it holds no commit, so there is nothing to gate (D-13).
     pub gates: Option<NodeGates>,
+    /// The branch and its source when the repo is adopted (27-17); `None` for
+    /// a managed repo.
+    pub adopt: Option<Adoption>,
     /// The `--discard-gateway-changes` reason, when given (27-15).
     pub discard_reason: Option<String>,
     /// What the override discards, once [`prepare_git_live`] found something
@@ -537,7 +554,8 @@ pub async fn prepare_git_host(
     };
     let git = surfaces.host.host_git();
     let found = read_state(read, &git, project).await?;
-    if found.state.kind != GitStateKind::Managed {
+    let adoptable = found.state.kind == GitStateKind::Adoptable;
+    if found.state.kind != GitStateKind::Managed && !adoptable {
         return Err(managed(project, kind, &reason_of(&found.state)));
     }
     let (Some(refs), Some(remote)) = (found.refs.clone(), found.state.remote.clone()) else {
@@ -549,19 +567,40 @@ pub async fn prepare_git_host(
     let checkout = check_release_checkout(&git, &input.repo, &input.release, &remote.url_key)
         .await
         .map_err(|e| gate_failure(e, project, kind))?;
+    // The adoption branch is decided from an explicit source before the remote
+    // is asked anything: JGit's default `master` in an unborn HEAD is never
+    // taken as intent (D-23, T-27-39).
+    let adopt = if adoptable {
+        Some(adoption_branch(loaded, read, &git, project, kind).await?)
+    } else {
+        None
+    };
     let view = remote_view(&git, &checkout)
         .await
         .map_err(|e| gate_failure(e, project, kind))?;
     let members: BTreeSet<String> = loaded.artifact.digest.members.keys().cloned().collect();
-    // B5: the pack, its base and the release blobs are built here, before any
-    // write, in `--check` and in the apply alike.
-    let prep = prepare_advance(
+    let mode = match (&adopt, &found.files.config) {
+        (Some(adopt), Some(config)) => AdvanceMode::Adopt {
+            branch: adopt.branch.clone(),
+            remote: remote.name.clone(),
+            config: config.clone(),
+        },
+        (Some(_), None) => {
+            return Err(managed(project, kind, "no_remote"));
+        }
+        (None, _) => AdvanceMode::FastForward,
+    };
+    // B5: the pack, its base, the release blobs and (for an adoption) the
+    // adopted config are built here, before any write, in `--check` and in the
+    // apply alike.
+    let prep = prepare_advance_with(
         &git,
         &input.repo,
         &found.state,
         &refs,
         &checkout.commit,
         &members,
+        mode,
     )
     .await
     .map_err(|e| preflight("git_host", crate::deploy::git_gate::detail_of(&e)))?;
@@ -571,11 +610,16 @@ pub async fn prepare_git_host(
             node: "nodes.master".to_string(),
             state: state_word(found.state.kind),
             reason: None,
-            branch: found.state.tracked.clone(),
-            branch_source: Some("config"),
+            branch: match &adopt {
+                Some(adopt) => Some(adopt.branch.clone()),
+                None => found.state.tracked.clone(),
+            },
+            branch_source: Some(adopt.as_ref().map_or("config", |a| a.source)),
             remote: Some(remote.name.clone()),
             remote_url: Some(remote.url_redacted.clone()),
             head: head_commit(&found.state),
+            // True once the advance wrote (`advance_after`): a plan that has
+            // not run, or a run that stopped, adopted nothing.
             adopted: false,
             unpushed: Vec::new(),
             not_merged: Vec::new(),
@@ -602,12 +646,55 @@ pub async fn prepare_git_host(
         view,
         prep: Some(prep),
         gates: None,
+        adopt,
         discard_reason: input.discard_gateway_changes.clone(),
         discard: None,
         report,
         kind: kind.to_string(),
         head_log_tail: found.files.head_log_tail,
     }))
+}
+
+/// The branch a partial repo is adopted onto and where it came from (D-23):
+/// the module's `git.yaml` `repo_branch` for the project, else the target's
+/// `git_branch`, else the run refuses `project_git_managed` reason
+/// `branch_required`. No other source exists: the unborn `HEAD` of a partial
+/// repo names JGit's default (`master`), which is never intent.
+///
+/// `git.yaml` is untrusted data that holds a credential: it is read with its
+/// size cap, parsed through the allow-list ([`parse_git_yaml`]) and dropped; no
+/// value of it reaches a message. The chosen name must pass ign's pure branch
+/// check and git's own (T-27-38).
+async fn adoption_branch(
+    loaded: &LoadedProject,
+    read: &dyn GitHostRead,
+    git: &HostGit,
+    project: &str,
+    kind: &str,
+) -> Result<Adoption, CoreError> {
+    let entries = match read.read_git_yaml().await? {
+        Some(bytes) => parse_git_yaml(&bytes)?,
+        None => Vec::new(),
+    };
+    let from_yaml = entry_for(&entries, project)
+        .and_then(|e| e.repo_branch.as_deref())
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    let (branch, source, label) = match (from_yaml, loaded.target.git_branch.as_deref()) {
+        (Some(branch), _) => (branch.to_string(), "git_yaml", "git.yaml repo_branch"),
+        (None, Some(branch)) => (branch.to_string(), "target", "the target's git_branch"),
+        (None, None) => return Err(managed(project, kind, "branch_required")),
+    };
+    git.check_branch_name(&branch).await.map_err(|e| {
+        preflight(
+            "git_host",
+            format!(
+                "the adoption branch from {label} is not usable: {}",
+                crate::deploy::git_gate::detail_of(&e)
+            ),
+        )
+    })?;
+    Ok(Adoption { branch, source })
 }
 
 /// What `--discard-gateway-changes <reason>` discards, from the gates' facts
@@ -720,6 +807,9 @@ pub async fn prepare_git_live(
         });
     };
     let git = surfaces.host.host_git();
+    if let Some(adopt) = prepared.adopt.clone() {
+        return prepare_adoption_live(prepared, &adopt, action, project, &git, warnings).await;
+    }
     let mut gates = gate_node(
         &git,
         &prepared.checkout,
@@ -810,6 +900,44 @@ pub async fn prepare_git_live(
     Ok(())
 }
 
+/// [`prepare_git_live`] for an adopted repo (27-17, D-13): the partial repo
+/// holds no commit, so there is no unpushed, not-merged or dirty fact to gate
+/// and the report keeps those empty (`dirty: null`). Only the release must be
+/// on the adoption branch of the remote (D-11): an import or a `record` of a
+/// release the branch does not hold refuses `project_git_managed` reason
+/// `release_not_on_branch`, with no override (like every other reason). A
+/// `skip` adopts nothing and only warns.
+async fn prepare_adoption_live(
+    prepared: &mut PreparedGit,
+    adopt: &Adoption,
+    action: ProjectAction,
+    project: &str,
+    git: &HostGit,
+    warnings: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    let release = prepared.checkout.commit.clone();
+    let on_branch = match prepared.view.heads.get(&adopt.branch) {
+        Some(tip) => git
+            .is_ancestor(&prepared.checkout.path, &release, tip)
+            .await
+            .map_err(|e| preflight("git_host", crate::deploy::git_gate::detail_of(&e)))?,
+        None => false,
+    };
+    match action {
+        ProjectAction::Skip => warnings.push(format!(
+            "project {project}: the gateway repo is a partial repository; nothing is deployed, so \
+             it was left as it is"
+        )),
+        ProjectAction::Import | ProjectAction::Record
+            if prepared.mode == GitMode::Enforce && !on_branch =>
+        {
+            return Err(managed(project, &prepared.kind, "release_not_on_branch"));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Step 3a: right before the import, read the repo again and save it.
 ///
 /// Any change of HEAD, refs or config since the prepare is `plan_stale`
@@ -824,7 +952,16 @@ pub async fn git_before_import(
     run_id: &str,
 ) -> Result<GitSaveReport, CoreError> {
     let now = read_state(read, git, project).await?;
-    if now.state != prepared.state || now.refs.as_ref() != Some(&prepared.refs) {
+    // An adoption replaces the whole config: it is built from the bytes the
+    // prepare read, so any other config is a change since the plan.
+    let config_changed = prepared
+        .prep
+        .as_ref()
+        .and_then(|prep| prep.config_base.as_deref())
+        .is_some_and(|base| {
+            now.files.config.as_deref().map(config_digest).as_deref() != Some(base)
+        });
+    if now.state != prepared.state || now.refs.as_ref() != Some(&prepared.refs) || config_changed {
         return Err(CoreError::PlanStale {
             expected: head_commit(&prepared.state).unwrap_or_else(|| "none".to_string()),
             actual: head_commit(&now.state).unwrap_or_else(|| "none".to_string()),
@@ -1201,6 +1338,8 @@ async fn advance_after(
         discarded.keep_ref = Some(discard_ref_name(&saved.run_id));
     }
 
+    // The advance wrote: a partial repo is now adopted (27-17).
+    report.master_mut().adopted = prepared.adopt.is_some() && done.advanced;
     let (dropped, dropped_count) = capped_paths(done.dropped.clone());
     let (drift, drift_count) = capped_paths(done.expected_drift.clone());
     let mut restore = RestoreInfo {

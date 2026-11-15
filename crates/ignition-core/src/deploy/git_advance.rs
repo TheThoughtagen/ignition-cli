@@ -22,6 +22,14 @@
 //!   returns the [`AdvancePlan`]: fixed [`GitWrite`]s in the order the host
 //!   applies them. It writes nothing.
 //!
+//! A partial repo the module left behind (an unborn `HEAD`, no local branch, no
+//! index; [`GitStateKind::Adoptable`]) is advanced the same way under
+//! [`AdvanceMode::Adopt`] (27-17, D-13): the branch the caller names gets the
+//! local and the remote-tracking ref, `HEAD` points at it, the index is written,
+//! and a `[branch "<b>"]` section is added to the gateway `config`. That config
+//! is built in [`prepare_advance_with`] with host git on a private copy, before
+//! any gateway write, like the pack.
+//!
 //! The base of the pack is every commit id the gateway's own refs name that
 //! ign's store holds ([`pack_bases`]); an id ign's store lacks (an unpushed
 //! gateway HEAD) is never passed to `pack-objects`, and with no usable base the
@@ -31,6 +39,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
 use std::path::Path;
+
+use sha2::{Digest, Sha256};
 
 use super::apply::run_store::RunId;
 use super::git_remote::{HostGit, PackFiles, host_failure, is_object_id, safe_ref_name};
@@ -162,12 +172,35 @@ pub async fn pack_bases(
     Ok(bases)
 }
 
+/// What kind of repo an advance starts from and so what it writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdvanceMode {
+    /// A managed repo: the tracked branch moves to the release commit.
+    FastForward,
+    /// A partial repo (27-17, D-13): the named branch is created at the
+    /// release commit, with its remote-tracking ref, and `config` gains the
+    /// branch's upstream section.
+    Adopt {
+        /// The branch to adopt onto (an explicit, validated name).
+        branch: String,
+        /// The one remote's name in the gateway config.
+        remote: String,
+        /// The gateway `config` as the prepare read it.
+        config: Vec<u8>,
+    },
+}
+
+/// The lowercase hex sha256 of `bytes`: how a config is recognised later.
+pub fn config_digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 /// What [`prepare_advance`] computed before any gateway write. It holds no
 /// index and no assume-unchanged set: those depend on what the gateway kept,
 /// which only the read-back export shows.
 #[derive(Debug, Clone)]
 pub struct AdvancePrep {
-    /// The tracked branch.
+    /// The tracked branch (the adoption branch of an adopted repo).
     pub branch: String,
     /// The remote's name in the gateway config.
     pub remote: String,
@@ -184,10 +217,19 @@ pub struct AdvancePrep {
     /// R's bytes of every in-scope tree path (tree intersected with the
     /// artifact members).
     pub release_blobs: BTreeMap<String, Vec<u8>>,
+    /// The repo is adopted rather than fast-forwarded (27-17).
+    pub adopted: bool,
+    /// The gateway `config` with the adoption branch's upstream section, built
+    /// before any write; `None` for a fast-forward.
+    pub config: Option<Vec<u8>>,
+    /// The digest of the config [`config`](Self::config) was built from: the
+    /// handover refuses to write it over any other config.
+    pub config_base: Option<String>,
 }
 
 /// Compute everything of an advance that needs objects, on ign's machine,
-/// before any write to a gateway. `state` must be managed.
+/// before any write to a gateway. `state` must be managed. A fast-forward of
+/// a managed repo; [`prepare_advance_with`] takes the mode.
 pub async fn prepare_advance(
     git: &HostGit,
     checkout: &Path,
@@ -196,18 +238,76 @@ pub async fn prepare_advance(
     release_commit: &str,
     artifact_members: &BTreeSet<String>,
 ) -> Result<AdvancePrep, CoreError> {
-    let not_managed = || CoreError::InvalidInput {
+    prepare_advance_with(
+        git,
+        checkout,
+        state,
+        refs,
+        release_commit,
+        artifact_members,
+        AdvanceMode::FastForward,
+    )
+    .await
+}
+
+/// [`prepare_advance`] for either kind of repo. [`AdvanceMode::FastForward`]
+/// needs a managed `state`; [`AdvanceMode::Adopt`] needs an adoptable one whose
+/// one remote is the mode's, and builds the adopted config here (the pack comes
+/// from the same [`pack_bases`] rule, which for a partial repo means the
+/// remote-tracking ids of its `packed-refs` that ign's store holds).
+pub async fn prepare_advance_with(
+    git: &HostGit,
+    checkout: &Path,
+    state: &GitState,
+    refs: &GitRefs,
+    release_commit: &str,
+    artifact_members: &BTreeSet<String>,
+    mode: AdvanceMode,
+) -> Result<AdvancePrep, CoreError> {
+    let wrong_state = |want: &str| CoreError::InvalidInput {
         reason: format!(
-            "an advance needs a managed gateway repo, not a {} one",
+            "this advance needs {want}, not a {} one",
             state.kind.as_str()
         ),
     };
-    if state.kind != GitStateKind::Managed {
-        return Err(not_managed());
-    }
-    let (Some(branch), Some(remote)) = (&state.tracked, &state.remote) else {
-        return Err(not_managed());
+    let Some(remote) = &state.remote else {
+        return Err(wrong_state("a gateway repo with one remote"));
     };
+    let (branch, config, config_base, adopted) = match &mode {
+        AdvanceMode::FastForward => {
+            if state.kind != GitStateKind::Managed {
+                return Err(wrong_state("a managed gateway repo"));
+            }
+            let Some(branch) = &state.tracked else {
+                return Err(wrong_state("a managed gateway repo"));
+            };
+            (branch.clone(), None, None, false)
+        }
+        AdvanceMode::Adopt {
+            branch,
+            remote: named,
+            config,
+        } => {
+            if state.kind != GitStateKind::Adoptable || state.tracked.is_some() {
+                return Err(wrong_state("an adoptable gateway repo"));
+            }
+            if named != &remote.name {
+                return Err(CoreError::InvalidInput {
+                    reason: "the adoption remote is not the gateway repo's one remote".to_string(),
+                });
+            }
+            let adopted = git
+                .adopt_branch_config(config, branch, &remote.name)
+                .await?;
+            (
+                branch.clone(),
+                Some(adopted),
+                Some(config_digest(config)),
+                true,
+            )
+        }
+    };
+    let branch = &branch;
     if !is_object_id(release_commit) {
         return Err(host_failure("the release commit is not a full hex id"));
     }
@@ -239,6 +339,9 @@ pub async fn prepare_advance(
         tree_paths,
         artifact_members: artifact_members.clone(),
         release_blobs,
+        adopted,
+        config,
+        config_base,
     })
 }
 
@@ -350,7 +453,8 @@ pub struct AdvancePlan {
     pub remote: String,
     /// The release commit.
     pub release_commit: String,
-    /// Pack, pack index, branch ref, remote-tracking ref, HEAD, index.
+    /// Pack, pack index, branch ref, remote-tracking ref, config (adoption
+    /// only), HEAD, index.
     pub writes: Vec<GitWrite>,
     /// Release tree paths the export does not hold, byte-sorted; marked
     /// assume-unchanged in the index.
@@ -466,6 +570,14 @@ pub async fn finish_advance(
         },
         bytes: commit_line,
     });
+    // An adopted repo's upstream section: after the remote-tracking ref,
+    // before HEAD, so a reader that sees HEAD on the branch sees the section.
+    if let Some(config) = &prep.config {
+        writes.push(GitWrite {
+            name: GitWriteName::Config,
+            bytes: config.clone(),
+        });
+    }
     writes.push(GitWrite {
         name: GitWriteName::Head,
         bytes: format!("ref: refs/heads/{}\n", prep.branch).into_bytes(),
@@ -1018,7 +1130,80 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
                 .collect(),
+            adopted: false,
+            config: None,
+            config_base: None,
         }
+    }
+
+    /// Each mode takes only its own kind of repo, and an adoption only names
+    /// the repo's own remote.
+    #[tokio::test]
+    async fn prepare_with_refuses_the_wrong_mode() {
+        use crate::deploy::git_state::GitRemote;
+        let f = Fixture::new();
+        let host = HostGit::new();
+        let (managed, refs) = f.gateway_state(&host).await;
+        assert_eq!(managed.kind, GitStateKind::Managed);
+        let members = f.members(&host, &[]).await;
+        let config = std::fs::read(f.git_dir().join("config")).expect("config");
+        let adopt = |remote: &str| AdvanceMode::Adopt {
+            branch: "production".to_string(),
+            remote: remote.to_string(),
+            config: config.clone(),
+        };
+        // An adoption of a managed repo.
+        let err = prepare_advance_with(
+            &host,
+            &f.seed,
+            &managed,
+            &refs,
+            &f.c2,
+            &members,
+            adopt("origin"),
+        )
+        .await
+        .expect_err("a managed repo is not adopted");
+        assert_eq!(err.code(), "invalid_input");
+
+        // A fast-forward of an adoptable repo.
+        let adoptable = GitState {
+            kind: GitStateKind::Adoptable,
+            reason: None,
+            head: managed.head.clone(),
+            remote: managed.remote.clone(),
+            tracked: None,
+            remote_refs: BTreeMap::new(),
+        };
+        let err = prepare_advance(&host, &f.seed, &adoptable, &refs, &f.c2, &members)
+            .await
+            .expect_err("an adoptable repo is not fast-forwarded");
+        assert_eq!(err.code(), "invalid_input");
+
+        // An adoption that names a remote the repo does not have.
+        let err = prepare_advance_with(
+            &host,
+            &f.seed,
+            &adoptable,
+            &refs,
+            &f.c2,
+            &members,
+            adopt("not-the-remote"),
+        )
+        .await
+        .expect_err("another remote");
+        assert_eq!(err.code(), "invalid_input");
+
+        // A state with no remote has nothing to advance.
+        let none = GitState {
+            remote: None::<GitRemote>,
+            ..adoptable
+        };
+        assert!(
+            prepare_advance(&host, &f.seed, &none, &refs, &f.c2, &members)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
