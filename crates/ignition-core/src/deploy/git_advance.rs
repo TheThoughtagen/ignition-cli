@@ -356,7 +356,12 @@ pub struct DriftPrediction {
     pub untracked: Vec<String>,
     /// Export members that are not artifact members.
     pub unexpected: Vec<String>,
-    /// Artifact members the export lacks: the gateway did not keep them.
+    /// In-scope release files the gateway does not hold after the import:
+    /// artifact members the export lacks (the gateway did not keep them) and
+    /// files inside the artifact's own directories that the artifact left out
+    /// (a file no `resource.json` lists, a denied or `.ignexclude`d path),
+    /// which the gateway never receives. All are assume-unchanged, never
+    /// drift (checker B3).
     pub dropped: Vec<String>,
 }
 
@@ -378,12 +383,33 @@ pub fn predict_drift(
             prediction.untracked.push(path.clone());
         }
     }
-    prediction.dropped = prep
+    // The artifact's roots are the first segments of its members (`ignition`,
+    // `com.inductiveautomation.perspective`, ...); a release file below one of
+    // them that is not an artifact member and not in the export is in scope
+    // but never reaches the gateway. A path outside every root (README, tags,
+    // images, deploy) is out of scope and not reported.
+    let roots: BTreeSet<&str> = prep
+        .artifact_members
+        .iter()
+        .filter_map(|m| m.split_once('/').map(|(root, _)| root))
+        .collect();
+    let mut dropped: BTreeSet<String> = prep
         .artifact_members
         .iter()
         .filter(|m| !export_members.contains_key(*m))
         .cloned()
         .collect();
+    dropped.extend(
+        prep.tree_paths
+            .iter()
+            .filter(|p| !prep.artifact_members.contains(*p) && !export_members.contains_key(*p))
+            .filter(|p| {
+                p.split_once('/')
+                    .is_some_and(|(root, _)| roots.contains(root))
+            })
+            .cloned(),
+    );
+    prediction.dropped = dropped.into_iter().collect();
     prediction
 }
 
@@ -1229,6 +1255,32 @@ mod tests {
         assert_eq!(got.untracked, vec!["d", "f"]);
         assert_eq!(got.unexpected, vec!["y", "z"]);
         assert_eq!(got.dropped, vec!["e"]);
+    }
+
+    #[test]
+    fn predict_drift_reports_unlisted_in_scope_release_files_as_dropped() {
+        // NOTES.txt sits in a resource folder whose resource.json does not list
+        // it, so the artifact leaves it out and the gateway never holds it; it
+        // is in scope and must be reported. README and deploy/ are out of scope.
+        let prep = prep_of(
+            &[
+                "project.json",
+                "ignition/x/code.py",
+                "ignition/x/NOTES.txt",
+                "deploy/project.yaml",
+                "README.md",
+            ],
+            &["project.json", "ignition/x/code.py"],
+            &[("project.json", "P"), ("ignition/x/code.py", "C")],
+        );
+        let export: BTreeMap<String, Vec<u8>> =
+            [("project.json", "P"), ("ignition/x/code.py", "C")]
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
+                .collect();
+        let got = predict_drift(&prep, &export);
+        assert_eq!(got.dropped, vec!["ignition/x/NOTES.txt"]);
+        assert!(got.modified.is_empty() && got.untracked.is_empty() && got.unexpected.is_empty());
     }
 
     #[tokio::test]
