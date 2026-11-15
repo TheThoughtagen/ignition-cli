@@ -56,6 +56,13 @@ pub struct Target {
     /// (Phase 26 hardening). Optional, default false.
     #[serde(default)]
     pub require_rehearsal: bool,
+    /// The branch a partial gateway repository is adopted onto when the git
+    /// module's `git.yaml` has no `repo_branch` for the project (Phase 27,
+    /// D-13, D-23). Optional. The release must be on that branch of the
+    /// remote. A build older than Phase 27 refuses the key, which fails
+    /// closed.
+    #[serde(default)]
+    pub git_branch: Option<String>,
 }
 
 /// The nodes of one environment.
@@ -247,6 +254,13 @@ impl Target {
                 "mode {:?}: names a directory this tool reserves for tag records",
                 self.mode
             ));
+        }
+        // The adoption branch becomes a ref and a config subsection of a
+        // gateway repo (T-27-38): the finding names the key, never the value.
+        if let Some(branch) = &self.git_branch
+            && let Some(why) = super::git_state::branch_name_problem(branch)
+        {
+            push(format!("git_branch: {why}"));
         }
         let backup = self.nodes.backup.as_ref().map(|n| ("nodes.backup", n));
         for (label, node) in std::iter::once(("nodes.master", &self.nodes.master)).chain(backup) {
@@ -512,6 +526,40 @@ mod tests {
                     .map(|f| f.message)
                     .collect();
             assert!(all.iter().any(|m| m.contains(needle)), "{all:?}");
+        }
+    }
+
+    #[test]
+    fn target_git_branch_valid() {
+        let base = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: p\n";
+        let t = Target::parse("targets/x.yaml", base.as_bytes()).expect("parses");
+        assert_eq!(t.git_branch, None);
+        for ok in ["production", "release/1.2", "main"] {
+            let yaml = format!("{base}git_branch: {ok}\n");
+            let t = Target::parse("targets/x.yaml", yaml.as_bytes()).expect(ok);
+            assert_eq!(t.git_branch.as_deref(), Some(ok));
+        }
+    }
+
+    #[test]
+    fn target_git_branch_invalid() {
+        let base = "schema_version: 1\ngateway: g\nmode: dev\nnodes:\n  master:\n    profile: p\n";
+        for bad in [
+            "'..'", "'-x'", "'x.lock'", "'x/'", "''", "'a b'", "'a..b'", "'/x'",
+        ] {
+            let yaml = format!("{base}git_branch: {bad}\n");
+            let all: Vec<String> =
+                findings(Target::parse("targets/x.yaml", yaml.as_bytes()).expect_err(bad))
+                    .into_iter()
+                    .map(|f| f.message)
+                    .collect();
+            assert_eq!(all.len(), 1, "{bad}: {all:?}");
+            assert!(all[0].starts_with("git_branch:"), "{all:?}");
+            // The finding names the key, never the value.
+            let value = bad.trim_matches('\'');
+            if value.len() > 2 {
+                assert!(!all[0].contains(value), "{all:?}");
+            }
         }
     }
 

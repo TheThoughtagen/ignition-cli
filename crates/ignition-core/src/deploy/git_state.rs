@@ -253,8 +253,10 @@ pub enum GitStateKind {
     Absent,
     /// A normal repo the module manages: a tracked branch with an upstream.
     Managed,
-    /// A partial repo the module left behind that ign may complete (27-17;
-    /// [`classify`] does not return it yet).
+    /// A partial repo the module left behind that ign may complete (27-17,
+    /// D-13): an unborn `HEAD`, no local branch, no index, exactly one remote
+    /// and no mid-operation marker. It holds no commit, so there is no local
+    /// work to lose; ign adopts it onto an explicitly named branch.
     Adoptable,
     /// A shape ign refuses; see [`GitState::reason`].
     Unsupported,
@@ -327,8 +329,16 @@ impl GitState {
 ///
 /// Order, first match wins: absent; `symlink`; `not_directory`; `no_head`;
 /// `mid_operation`; `locked`; `shallow`; `alternates`; `no_remote`;
-/// `multiple_remotes`; `detached_head`; `unborn_head`; `no_upstream`;
+/// `multiple_remotes`; `detached_head`; an unborn `HEAD` (adoptable when no
+/// local branch and no index exists, else `unborn_head`); `no_upstream`;
 /// otherwise managed.
+///
+/// The adoptable shape is the one the module's `setupLocalRepo` leaves when
+/// the remote has no `master` (G6): by the time the unborn `HEAD` is reached
+/// the repo has no marker and exactly one remote, so only the absence of every
+/// `refs/heads/*` (loose or packed) and of the index remains to be checked. It
+/// says nothing about which branch to adopt onto: an unborn `HEAD` names JGit's
+/// default (`master`), never intent.
 pub fn classify(files: &GitFiles, config: Option<&GitConfig>, refs: Option<&GitRefs>) -> GitState {
     match files.kind {
         GitEntry::Absent => return GitState::plain(GitStateKind::Absent),
@@ -366,7 +376,19 @@ pub fn classify(files: &GitFiles, config: Option<&GitConfig>, refs: Option<&GitR
         GitHead::Branch { name, commit } => (name, commit.is_some()),
     };
     if !born {
-        return GitState::unsupported("unborn_head", head);
+        // A repo with a local branch or an index holds work (or the trace of
+        // it) that adoption would not account for: it stays refused.
+        if !refs.heads.is_empty() || files.index_present {
+            return GitState::unsupported("unborn_head", head);
+        }
+        return GitState {
+            kind: GitStateKind::Adoptable,
+            reason: None,
+            head,
+            remote: Some(remote_of(remote_name, remote_config)),
+            tracked: None,
+            remote_refs: remote_refs_of(refs, remote_name),
+        };
     }
     let upstream_ok = config
         .branches
@@ -376,27 +398,74 @@ pub fn classify(files: &GitFiles, config: Option<&GitConfig>, refs: Option<&GitR
     if !upstream_ok {
         return GitState::unsupported("no_upstream", head);
     }
+    GitState {
+        kind: GitStateKind::Managed,
+        reason: None,
+        head,
+        remote: Some(remote_of(remote_name, remote_config)),
+        tracked: Some(branch.clone()),
+        remote_refs: remote_refs_of(refs, remote_name),
+    }
+}
+
+fn remote_of(name: &str, config: &GitRemoteConfig) -> GitRemote {
+    GitRemote {
+        name: name.to_string(),
+        url_redacted: redact_url(&config.url),
+        url_key: url_key(&config.url),
+    }
+}
+
+/// The remote's tracking refs by short branch name.
+fn remote_refs_of(refs: &GitRefs, remote_name: &str) -> BTreeMap<String, String> {
     let prefix = format!("refs/remotes/{remote_name}/");
-    let remote_refs = refs
-        .remotes
+    refs.remotes
         .iter()
         .filter_map(|(name, id)| {
             name.strip_prefix(&prefix)
                 .map(|short| (short.to_string(), id.clone()))
         })
-        .collect();
-    GitState {
-        kind: GitStateKind::Managed,
-        reason: None,
-        head,
-        remote: Some(GitRemote {
-            name: remote_name.clone(),
-            url_redacted: redact_url(&remote_config.url),
-            url_key: url_key(&remote_config.url),
-        }),
-        tracked: Some(branch.clone()),
-        remote_refs,
+        .collect()
+}
+
+/// Why `name` cannot be a branch name ign writes into a gateway repo's refs
+/// and config, or `None` (T-27-38). Pure and conservative: a strict subset of
+/// what git accepts, because the name becomes a path below `.git/refs/heads`
+/// and a config subsection. Non-empty; only `A-Za-z0-9._/-`; at most 200
+/// characters; no `..` or `//`; no leading `-` or `/`; no trailing `/`, `.` or
+/// `.lock`; no component that starts with `.` or ends with `.lock`.
+pub fn branch_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("must not be empty");
     }
+    if name.len() > 200 {
+        return Some("must be at most 200 characters");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+    {
+        return Some("may hold only letters, digits and . _ / -");
+    }
+    if name.starts_with('-') {
+        return Some("must not start with `-`");
+    }
+    if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
+        return Some("must not start or end with `/` or hold an empty component");
+    }
+    if name.contains("..") {
+        return Some("must not contain `..`");
+    }
+    if name.ends_with('.') {
+        return Some("must not end with `.`");
+    }
+    if name
+        .split('/')
+        .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return Some("a component must not start with `.` or end with `.lock`");
+    }
+    None
 }
 
 /// `url` with its userinfo removed: `scheme://user:pass@host/x` and the
@@ -707,6 +776,123 @@ mod tests {
         for word in &seen {
             assert!(HOST_REASONS.contains(&word.as_str()), "{word}");
         }
+    }
+
+    /// The partial repo `setupLocalRepo` leaves against a remote with no
+    /// `master` (G6, both `git.yaml` variants): an unborn `master` HEAD, one
+    /// remote named `origin`, every remote branch and tag already fetched into
+    /// `packed-refs`, no local branch, no index, no `[branch]` section.
+    fn g6_partial(variant_remote_refs: &[(&str, &str)]) -> (GitFiles, GitConfig, GitRefs) {
+        let mut f = files(GitEntry::Directory);
+        f.head = Some(b"ref: refs/heads/master\n".to_vec());
+        f.index_present = false;
+        let c = config(&["origin"], None);
+        let mut r = GitRefs {
+            head: GitHead::Branch {
+                name: "master".to_string(),
+                commit: None,
+            },
+            heads: BTreeMap::new(),
+            remotes: BTreeMap::new(),
+        };
+        for (branch, id) in variant_remote_refs {
+            r.remotes
+                .insert(format!("refs/remotes/origin/{branch}"), (*id).to_string());
+        }
+        (f, c, r)
+    }
+
+    #[test]
+    fn classify_adoptable_g6() {
+        // The template and the production variants leave one shape.
+        for refs_of in [
+            &[("main", SHA_A), ("production", SHA_B)][..],
+            &[("production", SHA_B), ("main", SHA_A)][..],
+        ] {
+            let (f, c, r) = g6_partial(refs_of);
+            let state = classify(&f, Some(&c), Some(&r));
+            assert_eq!(state.kind, GitStateKind::Adoptable, "{state:?}");
+            assert_eq!(state.reason, None);
+            assert_eq!(state.kind.as_str(), "adoptable");
+            assert_eq!(
+                state.tracked, None,
+                "an unborn HEAD names no tracked branch"
+            );
+            assert_eq!(
+                state.remote.as_ref().map(|r| r.name.as_str()),
+                Some("origin")
+            );
+            assert_eq!(
+                state.remote_refs.get("production").map(String::as_str),
+                Some(SHA_B)
+            );
+            assert_eq!(state.remote_refs.len(), 2);
+            assert!(!format!("{state:?}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn classify_unborn_not_adoptable() {
+        // A local branch beside an unborn HEAD.
+        let (f, c, mut r) = g6_partial(&[("production", SHA_B)]);
+        r.heads
+            .insert("refs/heads/production".to_string(), SHA_A.to_string());
+        let state = classify(&f, Some(&c), Some(&r));
+        assert_eq!(reason(&state), "unborn_head");
+        // An index beside an unborn HEAD.
+        let (mut f, c, r) = g6_partial(&[("production", SHA_B)]);
+        f.index_present = true;
+        let state = classify(&f, Some(&c), Some(&r));
+        assert_eq!(reason(&state), "unborn_head");
+        // The earlier reasons still win over adoption.
+        let (mut f, c, r) = g6_partial(&[("production", SHA_B)]);
+        f.markers.push("MERGE_HEAD".to_string());
+        assert_eq!(reason(&classify(&f, Some(&c), Some(&r))), "mid_operation");
+        let (f, _, r) = g6_partial(&[("production", SHA_B)]);
+        assert_eq!(
+            reason(&classify(&f, Some(&config(&["a", "b"], None)), Some(&r))),
+            "multiple_remotes"
+        );
+        assert_eq!(
+            reason(&classify(&f, Some(&config(&[], None)), Some(&r))),
+            "no_remote"
+        );
+    }
+
+    #[test]
+    fn branch_names_are_checked_purely() {
+        for ok in ["production", "main", "release/1.2", "a-b_c.d", "v1"] {
+            assert_eq!(branch_name_problem(ok), None, "{ok}");
+        }
+        for bad in [
+            "",
+            "..",
+            "a..b",
+            "-x",
+            "--upload-pack=x",
+            "/x",
+            "x/",
+            "a//b",
+            "x.",
+            "x.lock",
+            "a/b.lock",
+            "a/.hidden",
+            ".x",
+            "a b",
+            "a:b",
+            "a~1",
+            "a^",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "a@{b",
+            "x\n",
+            "\u{e9}",
+        ] {
+            assert!(branch_name_problem(bad).is_some(), "{bad:?}");
+        }
+        assert!(branch_name_problem(&"a".repeat(201)).is_some());
     }
 
     #[test]
