@@ -6122,6 +6122,56 @@ When a restore or the advance fails the run ends `git_restore_failed` (slug
 `deploy_git_restore_failed`, exit 6): see [the verdict
 exception](#the-git-restore-failed-outcome-of-a-git-managed-project-2026-11-15).
 
+**When a run fails.** Every way a run can end leaves the gateway repository
+consistent with the project it ends with, or says exactly where it is not.
+
+- **A rollback restores the repository unchanged (D-08).** When a tag-owning
+  run rolls the project back by importing its pre-image, the `.git` the run
+  saved goes back exactly as it was and is never advanced. After the project
+  step the `.git` is probed: if the import removed it, the Designer check of
+  the restore runs (while a session is attached nothing is written, the save is
+  kept and the rollback's `left` list names the save path with
+  `designer_attached`) and the save is copied back; a `.git` that is still there
+  and equals the save is left as it is and the save removed; a `.git` that
+  differs from the save is left exactly as it is, the save is kept, and the
+  `left` list names the save path. Anything in `left` makes the rollback
+  `rollback_failed`, as any other unrestored state does, and its message names
+  the save path. The rollback never deletes, renames or overwrites a `.git`
+  that differs from the save.
+- **`--rollback-run` does the same.** A project that holds a `.git` it can
+  classify (managed or adoptable) is no longer refused: the undo saves the
+  repository, imports the pre-image again and puts the repository back
+  unchanged (`data.git.nodes[]` reports `save` and `restore`; `release_commit`
+  is empty because an undo has no release). It restores the repository as it
+  was when the undo started: after a run that went green the repository had
+  been advanced to the release, and that is the repository the undo puts back.
+  A shape the deploy cannot hand over (a detached `HEAD`, a mid-operation
+  repository, and the rest of the reason table) still refuses
+  `project_git_managed` with its reason, before anything is written, with
+  `--check` as well.
+- **A repository created during the import is never overwritten.** While
+  `.git` is absent a Designer that opens the project runs the module's
+  `setupLocalRepo`, which creates a new partial repository. If one is there when
+  the run puts the repository back, the run ends `git_restore_failed` with
+  `restore.reason` `git_recreated`: the project is deployed and recorded, the
+  repository now at `.git` is left byte for byte as it is, and the saved copy
+  (the repository as it was before the import) is kept and named in
+  `data.git.nodes[].save.path`.
+- **Putting the saved copy back by hand.** Do it with no Designer attached to
+  the project. The copy is the whole `.git` directory, at
+  `ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo` below the
+  node's data directory. On a POSIX host: if a `.git` is in the way, move it
+  aside first (`mv projects/<project>/.git projects/<project>/.git.recreated`),
+  then `cp -a ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo
+  projects/<project>/.git`. On a Windows host, in PowerShell: `Move-Item
+  projects\<project>\.git projects\<project>\.git.recreated` if one is in the
+  way, then `Copy-Item -Recurse
+  ign-deploy\<gateway>\projects\<project>\git-save\<run-id>\repo
+  projects\<project>\.git`. Once `.git` is back, the module's next start sync
+  works again; the saved copy can be removed when you are done with it. In CI,
+  `git_restore_failed` fails the job and the job must not be run again before
+  this is done (see **Failures** under the composite actions).
+
 **Rehearsals and CI.** `--rehearse` keeps working for a project whose
 production gateway holds a module-managed `.git`. It reads that repository
 the way `--check` does, but in report mode: every finding that would refuse
@@ -6938,7 +6988,14 @@ write and was restored and verified (`tags_rolled_back`, or `rolled_back` when
 the project import failed) fails the job with the rollback's cause; nothing of
 the release is live. `applied_backup_unsynced` fails the job too: the master
 applied and recorded the release and the backup did not hold the owned tags in
-time, so the pair needs a look before anything is re-run. A tag-owning run
+time, so the pair needs a look before anything is re-run. `git_restore_failed`
+(exit 6, `deploy_git_restore_failed`) fails the job too: the project is
+deployed and its release recorded, but the gateway's `.git` was not restored.
+The headline names the restore reason (`data.git.nodes[].restore.reason`) and
+the saved copy (`data.git.nodes[].save.path`, on that node's host) and says the
+workflow must not be run again before the repository is restored from it (see
+[Projects the git module manages](#projects-the-git-module-manages), **When a
+run fails**). A tag-owning run
 whose automatic rollback did not finish (`rollback_failed`, exit 6, on stderr)
 fails the job with a headline that says the gateway is partly changed, that the
 workflow must not be re-run, and the `ign deploy projects --env <env>
@@ -6958,6 +7015,16 @@ review. Neither the actions nor the workflow pass `--allow-downgrade` or
 `--allow-first-change`: a downgrade or a first change to a project, or the first
 `ign` deploy of an owned tag provider that adds or changes tags, is refused
 (`destructive_change_refused`) and an administrator runs it by hand.
+
+The verdicts the projects apply classifies, as `ign` emits them:
+
+| What `ign` returned | Read from | What the job does |
+|---------------------|-----------|-------------------|
+| exit 6, `imported_unverified` (`deploy_project_unverified`) | stdout `data.outcome`, `data.restore_command` | fails: the project read back is not the artifact; restore with the command |
+| exit 6, `tags_rolled_back` or `rolled_back` (`deploy_rolled_back`) | stdout `data.outcome`, `data.tags.rollback.cause` | fails: restored automatically and verified; the release is not live |
+| exit 6, `applied_backup_unsynced` (`deploy_backup_unsynced`) | stdout `data.outcome`, `data.tags.backup.reason` | fails: master is live, backup lagging, do not rerun |
+| exit 6, `git_restore_failed` (`deploy_git_restore_failed`) | stdout `data.outcome`, `data.git.nodes[].save.path`, `data.git.nodes[].restore.reason` | fails: deployed and recorded, the gateway's `.git` was not restored; restore it by hand from the saved copy, do not rerun |
+| exit 6, `rollback_failed` | stderr `error.code`, `error.message` | fails: the gateway is partly changed; do not rerun; recover with the `--rollback-run` command the message names |
 The job uploads `run.json`, `result.json` and `events.ndjson` of the run
 directory it created and the two `ign` envelopes, never the saved pre-image.
 

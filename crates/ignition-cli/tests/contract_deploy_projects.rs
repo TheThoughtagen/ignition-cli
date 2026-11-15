@@ -3697,6 +3697,75 @@ fn apply_action_classifies_provider_emptied_and_tag_plan_stale() {
     assert!(line.contains("tags"), "{line}");
 }
 
+/// 27-21 (D-09, T-27-48): the apply action classifies `git_restore_failed` as
+/// a failure whose message says the project is deployed and recorded, names
+/// the restore reason and the saved copy from `data.git.nodes[]`, and says the
+/// job must not be rerun before the repository is restored. The values come
+/// out of ign's JSON, so they stay strings: the branch never reaches a shell
+/// or a `run:` block, and flattens them to one line.
+#[test]
+fn apply_action_classifies_git_restore_failed() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("action.yml lacks {needle:?}"))
+    };
+    let start = at(
+        "if (exit === 6 && data && data.ok === false && data.outcome === 'git_restore_failed') {",
+    );
+    let backup = at("data.outcome === 'applied_backup_unsynced'");
+    let rolled = at("err.code === 'rollback_failed'");
+    assert!(
+        backup < start && start < rolled,
+        "the branch sits between applied_backup_unsynced and rollback_failed"
+    );
+    let end = start
+        + text[start..]
+            .find("\n            }\n")
+            .expect("the branch ends");
+    let branch = &text[start..end];
+    for needle in [
+        "'git_restore_failed'",
+        "data.git.nodes",
+        "n.restore.reason",
+        "n.save.path",
+        "the project is deployed and its release is recorded",
+        "the gateway\\'s .git was not restored",
+        "the saved copy is at",
+        "do not re-run this workflow before the repository is restored from it",
+        "result(false,",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The untrusted values are only strings in the message (T-27-48).
+    assert!(!branch.contains("${{"), "{branch}");
+    assert!(!branch.contains("run:"), "{branch}");
+    assert!(branch.contains("oneLine("), "{branch}");
+    let one_line = text
+        .lines()
+        .find(|l| l.contains("const oneLine = "))
+        .expect("the flattening helper");
+    assert!(
+        one_line.contains("u0000-") && one_line.contains(".slice(0, 300)"),
+        "{one_line}"
+    );
+    // The outcome output lists it, in the action and in the reusable workflow.
+    for rel in [
+        ".github/actions/deploy-projects-apply/action.yml",
+        ".github/workflows/deploy-projects.yml",
+    ] {
+        let file = repo_file(rel);
+        let desc = file
+            .lines()
+            .find(|l| l.contains("Classified outcome of the apply"))
+            .unwrap_or_else(|| panic!("{rel}: no outcome description"));
+        assert!(desc.contains("git_restore_failed"), "{rel}: {desc}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 27-20 (D-23, checker W16): the composite actions and the git token.
 // ---------------------------------------------------------------------------

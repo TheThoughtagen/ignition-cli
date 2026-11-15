@@ -92,7 +92,7 @@ inputs:
 
 outputs:
   outcome:
-    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, rollback_failed, and so on).
+    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, git_restore_failed, rollback_failed, and so on).
     value: ${{ steps.report.outputs.outcome }}
   run_id:
     description: ign run id of the apply (empty when no run directory was written).
@@ -657,6 +657,10 @@ runs:
             try { return JSON.parse(lines.slice(i).join('\n')); } catch (e) { return null; }
           };
           const list = (v) => (Array.isArray(v) ? v : []);
+          // A value that came out of ign's JSON (a save path, a reason) is untrusted
+          // data: kept as a string, never passed to a shell or into a run: block, and
+          // flattened to one capped line so it cannot add markdown or log commands.
+          const oneLine = (v) => str(v).replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ').replace(/`/g, "'").trim().slice(0, 300);
 
           // Pure classification of one apply, from the exit code plus the envelopes
           // exactly as ign emits them.
@@ -707,6 +711,21 @@ runs:
                 prefix + ' applied_backup_unsynced (' + str(data.slug) + '): the master applied and recorded the release, the backup did not hold the owned tags (' +
                   str(bk.reason) + '); do not re-run; check the redundant pair',
                 []);
+            }
+            // Phase 27 (D-09): the project is deployed and its release recorded, but the
+            // gateway's .git was not put back. ign names the saved copy; a re-run would
+            // import over a repository that is still missing or changed.
+            if (exit === 6 && data && data.ok === false && data.outcome === 'git_restore_failed') {
+              const nodes = data.git && Array.isArray(data.git.nodes) ? data.git.nodes : [];
+              const failed = nodes.filter((n) => n && typeof n === 'object' && n.restore && typeof n.restore === 'object' && n.restore.reason);
+              const where = failed.map((n) => 'node ' + oneLine(n.node) + ': ' + oneLine(n.restore.reason) +
+                '; saved copy at ' + (n.save && n.save.path ? oneLine(n.save.path) : 'unknown') + ' on that node\'s host');
+              return result(false, 'git_restore_failed',
+                prefix + ' git_restore_failed (' + oneLine(data.slug) + '): the project is deployed and its release is recorded, but the gateway\'s .git was not restored' +
+                  (failed.length ? ' (' + failed.map((n) => oneLine(n.restore.reason)).join(', ') + ')' : '') +
+                  '; the saved copy is at ' + (failed.length ? failed.map((n) => (n.save && n.save.path ? oneLine(n.save.path) : 'an unknown path')).join(', ') : 'the path the run output names') +
+                  '; do not re-run this workflow before the repository is restored from it',
+                where);
             }
             // A tag-owning run whose automatic rollback, or a --rollback-run undo, did not
             // finish: ign's only shape is the stderr error envelope, code rollback_failed,
