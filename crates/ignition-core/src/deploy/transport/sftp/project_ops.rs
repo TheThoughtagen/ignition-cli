@@ -397,19 +397,27 @@ pub(super) const GIT_PROBE_W_SH: &str = concat!(
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
     // D-G1: when the gateway runs as an account that is neither root nor the
     // deploy account, the restore gives it an explicit named ACL entry; the
-    // probe file in `.git` proves that step can work (setfacl and getfacl
-    // exist, the entry is accepted, its effective rights are rw-) before
-    // anything is written.
+    // check proves that step can work (setfacl and getfacl exist, the entry
+    // is accepted, its effective rights are rw-) before anything is written.
+    // `.git` is a directory the gateway account can write, so the file the
+    // ACL is set on lives in a private stage made with `mkdir -m 700` (atomic,
+    // refused when anything is at the name, so a planted link is never
+    // followed), and setfacl is physical (-P): no principal but the deploy
+    // account (and root, which ignores ACLs) can swap anything inside it.
     "ag() { [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ] || return 0; ",
-    "if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then rm -f -- \"$1\"; printf 'the gateway account needs write access to the restored .git and the host has no setfacl or getfacl (checked in %s)\\n' \"$2\" >&2; exit 6; fi; ",
-    "setfacl -m \"u:$gu:rw\" \"$1\" 2>/dev/null || { rm -f -- \"$1\"; printf 'setfacl failed on the probe file in %s\\n' \"$2\" >&2; exit 6; }; ",
-    "e=$(getfacl -n -p \"$1\" 2>/dev/null | grep \"^user:$gu:\"); ",
-    "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) rm -f -- \"$1\"; printf 'the gateway account would have no effective write access on the restored .git (checked in %s)\\n' \"$2\" >&2; exit 6;; esac;; ",
-    "*) rm -f -- \"$1\"; printf 'the gateway account has no ACL entry on the probe file in %s\\n' \"$2\" >&2; exit 6;; esac; }; ",
+    "if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1 || ! command -v mkdir >/dev/null 2>&1 || ! command -v rmdir >/dev/null 2>&1; then rm -f -- \"$1/$3\"; printf 'the gateway account needs write access to the restored .git and the host has no setfacl, getfacl, mkdir or rmdir (checked in %s)\\n' \"$2\" >&2; exit 6; fi; ",
+    "st=\"$1/$3.acl\"; mkdir -m 700 -- \"$st\" 2>/dev/null || { rm -f -- \"$1/$3\"; printf '%s.acl exists or cannot be created in %s; it is left alone\\n' \"$3\" \"$2\" >&2; exit 4; }; ",
+    "af=\"$st/p\"; pf=\"$1/$3\"; ac() { rm -f -- \"$af\" \"$pf\"; rmdir -- \"$st\" 2>/dev/null; }; ",
+    "[ ! -L \"$st\" ] && [ -d \"$st\" ] || { ac; printf '%s.acl is not a real directory\\n' \"$3\" >&2; exit 4; }; ",
+    "( set -C; : > \"$af\" ) 2>/dev/null && [ -f \"$af\" ] && [ ! -L \"$af\" ] || { ac; printf 'a probe file cannot be created in %s\\n' \"$2\" >&2; exit 3; }; ",
+    "setfacl -P -m \"u:$gu:rw\" \"$af\" 2>/dev/null || { ac; printf 'setfacl failed on the probe file in %s\\n' \"$2\" >&2; exit 6; }; ",
+    "e=$(getfacl -n -p \"$af\" 2>/dev/null | grep \"^user:$gu:\"); ac; ",
+    "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) printf 'the gateway account would have no effective write access on the restored .git (checked in %s)\\n' \"$2\" >&2; exit 6;; esac;; ",
+    "*) printf 'the gateway account has no ACL entry on the probe file in %s\\n' \"$2\" >&2; exit 6;; esac; }; ",
     "pw() { [ -d \"$1\" ] && [ ! -L \"$1\" ] || { printf '%s is not a real directory\\n' \"$2\" >&2; exit 4; }; ",
     "if pr \"$1/$3\"; then printf 'a probe file already exists in %s\\n' \"$2\" >&2; exit 4; fi; ",
     "( set -C; : > \"$1/$3\" ) 2>/dev/null || { printf 'a probe file cannot be created in %s\\n' \"$2\" >&2; exit 3; }; ",
-    "if [ \"$4\" = acl ]; then ag \"$1/$3\" \"$2\"; fi; ",
+    "if [ \"$4\" = acl ]; then ag \"$1\" \"$2\" \"$3\"; fi; ",
     "rm -f -- \"$1/$3\" || { printf 'the probe file in %s cannot be removed\\n' \"$2\" >&2; exit 3; }; }; ",
     "[ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
     "gu=$(ls -ldn -- \"$1/$2\" 2>/dev/null | awk '{print $3}'); me=$(id -u); ",
@@ -3647,10 +3655,12 @@ mod tests {
 
         fn no_probe_left(rig: &Rig) {
             for dir in ["data/projects/CapApp", "data/projects/CapApp/.git"] {
-                assert!(
-                    !rig.root.path().join(dir).join(".ign-probe-r1").exists(),
-                    "a probe file is left in {dir}"
-                );
+                for name in [".ign-probe-r1", ".ign-probe-r1.acl"] {
+                    assert!(
+                        std::fs::symlink_metadata(rig.root.path().join(dir).join(name)).is_err(),
+                        "{name} is left in {dir}"
+                    );
+                }
             }
         }
 
@@ -3658,7 +3668,7 @@ mod tests {
         /// ones named in `without`.
         fn tool_dir(without: &[&str]) -> tempfile::TempDir {
             let bin = tempfile::tempdir().expect("bin");
-            for tool in ["ls", "rm", "awk", "grep"] {
+            for tool in ["ls", "rm", "awk", "grep", "mkdir", "rmdir"] {
                 if without.contains(&tool) {
                     continue;
                 }
@@ -3731,22 +3741,111 @@ mod tests {
             assert_eq!(out.code, 0, "{}", out.stderr);
             no_probe_left(&rig);
             let log = std::fs::read_to_string(&calls).expect("ACL calls");
-            let probe_in_git = rig.git().join(".ign-probe-r1").display().to_string();
+            // The ACL is set on a file in a private stage below `.git`, never
+            // on a name another principal could have swapped for a link, and
+            // setfacl is physical (-P).
+            let staged = rig.git().join(".ign-probe-r1.acl/p").display().to_string();
             assert!(
                 log.lines()
-                    .any(|l| l == format!("setfacl -m u:{uid}:rw {probe_in_git}")),
-                "the named entry on the probe file in .git: {log}"
+                    .any(|l| l == format!("setfacl -P -m u:{uid}:rw {staged}")),
+                "the named entry on the staged file in .git: {log}"
             );
             // numeric ids, so a named account is matched by its uid
             assert!(
-                log.lines()
-                    .any(|l| l == format!("getfacl -n -p {probe_in_git}")),
+                log.lines().any(|l| l == format!("getfacl -n -p {staged}")),
                 "the entry is read back numerically: {log}"
             );
             assert_eq!(
                 log.lines().filter(|l| l.starts_with("setfacl")).count(),
                 1,
                 "only the `.git` probe is checked: {log}"
+            );
+        }
+
+        /// A directory with one file and the file's mode, to prove a planted
+        /// link's target is left alone.
+        fn victim(rig: &Rig) -> (PathBuf, PathBuf) {
+            let outside = rig.root.path().join("outside");
+            std::fs::create_dir_all(&outside).expect("outside");
+            let file = outside.join("victim");
+            std::fs::write(&file, "keep").expect("victim");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+            (outside, file)
+        }
+
+        fn assert_victim_untouched(outside: &Path, file: &Path) {
+            let mode = std::fs::metadata(file)
+                .expect("victim")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o640, "the target's mode changed");
+            assert_eq!(std::fs::read_to_string(file).expect("read"), "keep");
+            let names: Vec<_> = std::fs::read_dir(outside)
+                .expect("outside")
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert_eq!(
+                names.len(),
+                1,
+                "something was created in the target: {names:?}"
+            );
+        }
+
+        /// A link planted at the stage name the ACL check uses is never
+        /// followed: nothing is created or changed in its target, and no ACL
+        /// tool runs.
+        #[test]
+        fn probe_never_follows_a_link_planted_at_the_acl_stage() {
+            if my_uid() == "0" {
+                return;
+            }
+            let rig = Rig::new();
+            let (outside, file) = victim(&rig);
+            std::os::unix::fs::symlink(&outside, rig.git().join(".ign-probe-r1.acl"))
+                .expect("plant");
+            let bin = tempfile::tempdir().expect("bin");
+            let calls = bin.path().join("calls");
+            shim(bin.path(), "id", "echo 424242");
+            for tool in ["setfacl", "getfacl"] {
+                shim(
+                    bin.path(),
+                    tool,
+                    &format!("echo \"{tool} $*\" >> {}", calls.display()),
+                );
+            }
+            let path = format!("{}:{}", bin.path().display(), system_path());
+            let out = probe(&rig, &path);
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert!(out.stderr.contains("left alone"), "{}", out.stderr);
+            assert!(!calls.exists(), "no ACL call went through the link");
+            assert_victim_untouched(&outside, &file);
+            assert!(
+                std::fs::symlink_metadata(rig.git().join(".ign-probe-r1.acl"))
+                    .expect("link")
+                    .file_type()
+                    .is_symlink(),
+                "the planted entry is left alone"
+            );
+        }
+
+        /// A link planted at the probe file's own name is refused as an
+        /// existing probe and its target is left alone.
+        #[test]
+        fn probe_refuses_a_link_planted_at_the_probe_name() {
+            let rig = Rig::new();
+            let (outside, file) = victim(&rig);
+            std::os::unix::fs::symlink(&file, rig.git().join(".ign-probe-r1")).expect("plant");
+            let out = probe(&rig, &system_path());
+            assert_eq!(out.code, 4, "{}", out.stderr);
+            assert!(out.stderr.contains("already exists"), "{}", out.stderr);
+            assert_victim_untouched(&outside, &file);
+            assert!(
+                std::fs::symlink_metadata(rig.git().join(".ign-probe-r1"))
+                    .expect("link")
+                    .file_type()
+                    .is_symlink(),
+                "the planted entry is left alone"
             );
         }
 
@@ -3832,7 +3931,7 @@ mod tests {
                 let out = probe(&rig, &bin.path().display().to_string());
                 assert_eq!(out.code, 6, "{missing}: {}", out.stderr);
                 assert!(
-                    out.stderr.contains("setfacl or getfacl"),
+                    out.stderr.contains("has no setfacl, getfacl"),
                     "{missing}: {}",
                     out.stderr
                 );
