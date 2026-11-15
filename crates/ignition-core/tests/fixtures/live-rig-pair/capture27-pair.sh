@@ -15,15 +15,19 @@
 #            pre-pair shapes, publish the release to the remote's production,
 #            then `setup-pair.sh mint` and `pair`.
 #   reset    both nodes back to the state `up` leaves. A rig `up` built that no
-#            `g5` has used yet is already in that state (a marker says so);
-#            otherwise the rig is torn down and built again.
+#            `g5` or gate has used yet is already in that state (a marker says
+#            so); a rig that is up is cloned again in place (`reclone`: the
+#            remote's production back at v1.0.0, CapApp removed on both nodes,
+#            both gateways restarted, the release published again); otherwise
+#            the rig is built from scratch.
 #   g5       the G5 steps (below); everything goes to
 #            $STATE/evidence/27-04-g5.log and the last line is
 #            `LIVE-RAN capture27-pair g5`, printed only when every step finished
 #   live LOG TEST...
 #            (27-25, checker W13) the pair gates of live_deploy_project_git:
 #            sources tokens.env, exports IGNITION_LIVE_PAIR=1, IGN_PAIR_DATA_A,
-#            IGN_PAIR_DATA_B and IGN_LIVE_EVIDENCE_DIR, runs cargo test with
+#            IGN_PAIR_DATA_B, IGN_PAIR_REMOTE (the rig's bare repository) and
+#            IGN_LIVE_EVIDENCE_DIR, runs cargo test with
 #            `--ignored --nocapture --test-threads=1`, tees to
 #            $STATE/evidence/LOG.log and fails when cargo fails or a named
 #            test's `LIVE-RAN` line is missing
@@ -87,6 +91,9 @@ APP=CapApp
 BARE=capapp.git
 MODULE_VER=2.3.4
 CDATA=/usr/local/bin/ignition/data
+# IGN_PAIR_WAIT_S: how long up waits for each node (default 600 s; a loaded
+# machine running the amd64 image under emulation needs more).
+WAIT_S=${IGN_PAIR_WAIT_S:-600}
 STATE=${IGN_PAIR_RIG_STATE:-$HOME/.cache/ign-pair-rig}
 umask 077
 mkdir -p "$STATE"
@@ -137,6 +144,17 @@ get() {
   tok=${!var:-}
   [ -n "$tok" ] || die "no token for node $node"
   curl -sS -m 120 -H "X-Ignition-API-Token: $tok" "$(base_of "$node")$path"
+}
+
+# wait_git_server: the git server answers the smart-HTTP advertisement from a
+# container on the rig network (the nodes reach it the same way), within 60 s.
+wait_git_server() {
+  local tries=0
+  until docker run --rm --network "${PROJECT}_rig" alpine:3 wget -q -O /dev/null "http://git-server/git/$BARE/info/refs?service=git-upload-pack" > /dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 20 ] || die "the git server does not answer the smart-HTTP advertisement"
+    sleep 3
+  done
 }
 
 wait_running() { # NODE SECS
@@ -248,6 +266,58 @@ rig_has_module() {
   [ -f "$S27/compose.git.yml" ] && [ -f "$S27/ready" ] && [ -n "$(cid a)" ] && [ -n "$(cid b)" ]
 }
 
+# wait_clones: each node's module has finished its clone of CapApp (a finished
+# clone has an index; an empty partial `.git` is not a clone), within WAIT_S.
+wait_clones() {
+  local node end
+  end=$(( $(date +%s) + WAIT_S ))
+  for node in a b; do
+    until [ -f "$(pdir "$node")/.git/index" ]; do
+      [ "$(date +%s)" -lt "$end" ] || die "the module on node $node did not clone $APP within $WAIT_S s"
+      sleep 5
+    done
+  done
+}
+
+# wait_pair_settled: gw-b reports Backup, linked and Good, within 600 s.
+wait_pair_settled() {
+  local t0 settled=no
+  t0=$(date +%s)
+  while [ $(( $(date +%s) - t0 )) -lt 600 ]; do
+    if bash "$HERE/setup-pair.sh" status | awk '$1 == "gw-b" && $4 == "true" && $5 == "false" && $7 == "Good" { found = 1 } END { exit !found }'; then settled=yes; break; fi
+    sleep 5
+  done
+  bash "$HERE/setup-pair.sh" status
+  [ "$settled" = yes ] || echo "warning: the pair did not report settled within 600 s; g5 records the status as is"
+}
+
+# reclone: both nodes back to the state `up` leaves, in place: the remote's
+# production back to v1.0.0, CapApp removed on both nodes, both gateways
+# restarted (each module clones at its start), then the release published
+# again. Much cheaper than a rebuild of the pair.
+reclone() {
+  token_env
+  rig_has_module || die "reclone: the pair with the git module is not up: run up first"
+  wait_git_server
+  local bare=$SINGLE/repo/$BARE
+  seedgit -C "$bare" update-ref refs/heads/production "$(seedgit -C "$bare" rev-parse 'v1.0.0^{commit}')"
+  chmod -R a+rX "$bare"
+  local node
+  for node in a b; do
+    docker exec -u root "$(cid "$node")" sh -c "rm -rf $CDATA/projects/$APP"
+  done
+  docker restart "$(cid a)" "$(cid b)" > /dev/null
+  wait_running a "$WAIT_S"
+  wait_running b "$WAIT_S"
+  wait_clones
+  sleep 45
+  # The release reaches the remote's production now; the clones stay at v1.0.0.
+  IGN_GIT27_RIG_STATE=$SINGLE bash "$DEPLOY_FIX/capture27.sh" publish27
+  wait_pair_settled
+  : > "$S27/fresh"
+  echo "reclone: both nodes cloned at v1.0.0, the remote's production at v1.1.0"
+}
+
 up() {
   command -v docker > /dev/null || die "docker is not installed"
   command -v "$IGN" > /dev/null || die "$IGN is not on PATH: run cargo install --path crates/ignition-cli --force"
@@ -257,41 +327,49 @@ up() {
     echo "up: the pair with the git module is already up; left as is"
     return 0
   fi
+  local resume=no
   if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")" ]; then
-    die "REFUSING: compose project $PROJECT has containers but not this script's git rig; run: bash $0 down"
+    # A start that ran out of patience (a loaded machine runs the amd64 image
+    # under emulation) is resumed, never rebuilt.
+    [ -f "$S27/starting" ] && [ -f "$S27/compose.git.yml" ] || die "REFUSING: compose project $PROJECT has containers but not this script's git rig; run: bash $0 down"
+    resume=yes
+    echo "up: resuming a start that had not finished"
   fi
-  mkdir -p "$S27"
-  # The seed, the template git.yaml and the git server files come from the
-  # single-rig driver, into a state directory of their own.
-  /bin/rm -rf "$SINGLE"
-  export IGN_GIT27_RIG_STATE=$SINGLE
-  mkdir -p "$SINGLE"
-  bash "$DEPLOY_FIX/capture27.sh" files27 > /dev/null
-  bash "$DEPLOY_FIX/capture27.sh" seed27
-  bash "$DEPLOY_FIX/capture27.sh" yaml27 template
-  unset IGN_GIT27_RIG_STATE
-  /bin/rm -rf "$IGN_PAIR_DATA_A" "$IGN_PAIR_DATA_B"
-  mkdir -p "$IGN_PAIR_DATA_A/config/resources" "$IGN_PAIR_DATA_B/config/resources"
-  write_override
-  : > "$STATE/mode.env"
-  : > "$STATE/credentials.log"
-  : > "$STATE/step-times.log"
-  : > "$STATE/pair-before.log"
-  utc > "$STATE/start-utc"
-  echo "up: starting both nodes with the git module (about two minutes each)"
-  IGN_PAIR_MODE_A=-Dign.pair.rig.noop=true IGN_PAIR_MODE_B=-Dign.pair.rig.noop=true dc up -d --build > /dev/null
-  wait_running a 600
-  wait_running b 600
+  if [ "$resume" = no ]; then
+    mkdir -p "$S27"
+    # The seed, the template git.yaml and the git server files come from the
+    # single-rig driver, into a state directory of their own.
+    /bin/rm -rf "$SINGLE"
+    export IGN_GIT27_RIG_STATE=$SINGLE
+    mkdir -p "$SINGLE"
+    bash "$DEPLOY_FIX/capture27.sh" files27 > /dev/null
+    bash "$DEPLOY_FIX/capture27.sh" seed27
+    bash "$DEPLOY_FIX/capture27.sh" yaml27 template
+    unset IGN_GIT27_RIG_STATE
+    /bin/rm -rf "$IGN_PAIR_DATA_A" "$IGN_PAIR_DATA_B"
+    mkdir -p "$IGN_PAIR_DATA_A/config/resources" "$IGN_PAIR_DATA_B/config/resources"
+    write_override
+    : > "$STATE/mode.env"
+    : > "$STATE/credentials.log"
+    : > "$STATE/step-times.log"
+    : > "$STATE/pair-before.log"
+    utc > "$STATE/start-utc"
+    # The git server is started and proven first: a gateway that starts while
+    # the server is not there cannot clone, and its module leaves an empty
+    # partial `.git` (compose created the container once without starting it).
+    echo "up: starting the git server and proving its smart-HTTP advertisement"
+    dc up -d --build git-server > /dev/null
+    wait_git_server
+    echo "up: starting both nodes with the git module (about two minutes each)"
+    IGN_PAIR_MODE_A=-Dign.pair.rig.noop=true IGN_PAIR_MODE_B=-Dign.pair.rig.noop=true dc up -d --build > /dev/null
+    wait_git_server
+    : > "$S27/starting"
+  fi
+  wait_running a "$WAIT_S"
+  wait_running b "$WAIT_S"
   # Both nodes run unpaired here, so each module's first start clones CapApp on
   # its own node. Wait for both, then record the shapes.
-  local node end
-  end=$(( $(date +%s) + 420 ))
-  for node in a b; do
-    until [ -d "$(pdir "$node")/.git" ]; do
-      [ "$(date +%s)" -lt "$end" ] || die "up: the module on node $node did not clone $APP within 420 s"
-      sleep 5
-    done
-  done
+  wait_clones
   sleep 45
   {
     echo "PRE-PAIR (both nodes started unpaired, module cloned on each)"
@@ -303,14 +381,7 @@ up() {
   bash "$HERE/setup-pair.sh" mint > /dev/null
   bash "$HERE/setup-pair.sh" pair
   token_env
-  local t0 settled=no
-  t0=$(date +%s)
-  while [ $(( $(date +%s) - t0 )) -lt 600 ]; do
-    if bash "$HERE/setup-pair.sh" status | awk '$1 == "gw-b" && $4 == "true" && $5 == "false" && $7 == "Good" { found = 1 } END { exit !found }'; then settled=yes; break; fi
-    sleep 5
-  done
-  bash "$HERE/setup-pair.sh" status
-  [ "$settled" = yes ] || echo "up: warning: the pair did not report settled within 600 s; g5 records the status as is"
+  wait_pair_settled
   : > "$S27/ready"
   : > "$S27/fresh"
   echo "up: the pair with the git module is up"
@@ -319,6 +390,11 @@ up() {
 reset() {
   if rig_has_module && [ -f "$S27/fresh" ]; then
     echo "reset: the rig is in the state up leaves (no g5 has used it); nothing to do"
+    return 0
+  fi
+  if rig_has_module; then
+    echo "reset: cloning CapApp again on both nodes in place"
+    reclone
     return 0
   fi
   echo "reset: tearing the pair down and building it again"
@@ -334,7 +410,7 @@ down() {
   fi
   # the gateways wrote their project directories as another user
   docker run --rm -v "$STATE:/s" alpine:3 sh -c 'rm -rf /s/data-a /s/data-b /s/capture27/single' > /dev/null 2>&1 || true
-  /bin/rm -rf "$S27/compose.git.yml" "$S27/ready" "$S27/fresh" "$S27/pre-pair.txt" "$S27/ign-config.toml"
+  /bin/rm -rf "$S27/compose.git.yml" "$S27/ready" "$S27/fresh" "$S27/starting" "$S27/pre-pair.txt" "$S27/ign-config.toml"
   echo "down: removed compose project $PROJECT, the git server and the override (evidence kept)"
 }
 
@@ -495,8 +571,11 @@ live() {
   token_env
   mkdir -p "$STATE/evidence"
   log=$STATE/evidence/$name.log
+  # a gate deploys to the pair: the rig is no longer in the state `up` leaves
+  /bin/rm -f "$S27/fresh"
   export IGNITION_LIVE_PAIR=1
   export IGN_PAIR_DATA_A IGN_PAIR_DATA_B
+  export IGN_PAIR_REMOTE=$SINGLE/repo/$BARE
   export IGN_LIVE_EVIDENCE_DIR=$STATE/evidence
   (
     cd "$REPO"

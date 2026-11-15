@@ -55,8 +55,9 @@ use ignition_core::deploy::git_advance::{AdvancePrep, GitWrite, prepare_advance}
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
 use ignition_core::deploy::git_state::{GitHead, GitRefs, GitState, GitStateKind, classify};
-use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupPolicy};
+use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact, canonical_digest};
+use ignition_core::deploy::tag_converge::BackupTags;
 use ignition_core::deploy::transport::local::LocalFsTransport;
 use ignition_core::deploy::transport::projects::{
     GitEntry, GitHostRead, GitManifest, GitStateWriter,
@@ -171,6 +172,19 @@ struct Rig {
     evidence: PathBuf,
     /// The rig's bare repository.
     remote: PathBuf,
+    /// The gateway name the target file declares (`ign-git27-rig`, or the pair
+    /// rig's master).
+    gateway: String,
+    /// The backup node of the pair rig (27-25); `None` on the single-node rig.
+    backup: Option<PairBackup>,
+}
+
+/// The backup node of the pair rig: its loopback URL, API token and the host
+/// directory bound onto its `data/projects`.
+struct PairBackup {
+    url: String,
+    token: String,
+    data: PathBuf,
 }
 
 impl Rig {
@@ -234,6 +248,8 @@ async fn rig() -> Option<Rig> {
         data,
         evidence,
         remote,
+        gateway: RIG_GATEWAY_NAME.to_string(),
+        backup: None,
     };
     let info = GatewayApi::gateway_info(&rig.api())
         .await
@@ -368,11 +384,12 @@ async fn jgit(api: &ReqwestGatewayApi, config: &Config) -> Jgit {
 
 /// `.git` as the host read shows it, classified, with the refs.
 async fn gateway_state(rig: &Rig, host: &HostGit) -> (GitState, GitRefs) {
-    let files = rig
-        .node()
-        .read_git_state(APP)
-        .await
-        .expect("host read of .git");
+    node_state(&rig.node(), host).await
+}
+
+/// [`gateway_state`] over any node's data directory (the pair rig's backup).
+async fn node_state(node: &LocalFsTransport, host: &HostGit) -> (GitState, GitRefs) {
+    let files = node.read_git_state(APP).await.expect("host read of .git");
     files.check_caps().expect("caps");
     let config = host
         .parse_config(
@@ -1584,12 +1601,23 @@ fn deployment(rig: &Rig, release: &str) -> Deployment {
     std::fs::create_dir_all(exclude.parent().expect("info dir")).expect("info dir");
     std::fs::write(&exclude, ".ign/\n").expect("exclude");
     std::fs::create_dir_all(targets.join("targets")).expect("targets dir");
+    let backup_block = rig
+        .backup
+        .as_ref()
+        .map(|backup| {
+            format!(
+                "  backup:\n    profile: pair-b\n    local:\n      data_dir: '{}'\n",
+                backup.data.display()
+            )
+        })
+        .unwrap_or_default();
     std::fs::write(
         targets.join("targets").join(format!("{ENV}.yaml")),
         format!(
-            "schema_version: 1\ngateway: {RIG_GATEWAY_NAME}\nmode: production\nnodes:\n  master:\n    \
-             profile: rig\n    gateway_name: {RIG_GATEWAY_NAME}\n    local:\n      data_dir: '{}'\n",
-            rig.data.display()
+            "schema_version: 1\ngateway: {gateway}\nmode: production\nnodes:\n  master:\n    \
+             profile: rig\n    gateway_name: {gateway}\n    local:\n      data_dir: '{}'\n{backup_block}",
+            rig.data.display(),
+            gateway = rig.gateway,
         ),
     )
     .expect("target file");
@@ -1655,6 +1683,18 @@ async fn deploy_in_process_with(
         &loaded.target.nodes.master,
     )?;
     let gateway = GatewayProjects(&api);
+    // The backup of the pair rig (27-25), read only exactly as the CLI builds
+    // it: its own client, no file transport (the target's `local` block is read
+    // by the run's own host builders).
+    let backup_api = rig.backup.as_ref().map(|backup| {
+        ReqwestGatewayApi::for_tests(
+            &backup.url,
+            Some(Credential::Token(Secret::new(backup.token.clone()))),
+        )
+    });
+    let backup_node = backup_api
+        .as_ref()
+        .map(|api| BackupNode::new(api, api, None));
     let surfaces = ProjectsSurfaces {
         gateway: &gateway,
         host: host.as_ref(),
@@ -1676,7 +1716,7 @@ async fn deploy_in_process_with(
         children_poll: Duration::from_secs(CHILDREN_POLL_S),
         tag_verify_settle: Duration::from_secs(TAG_VERIFY_SETTLE_S),
         tag_verify_poll: Duration::from_secs(TAG_VERIFY_POLL_S),
-        backup: None,
+        backup: backup_node.as_ref().map(|node| node as &dyn BackupTags),
         backup_policy: BackupPolicy {
             budget: Duration::from_secs(300),
             interval: Duration::from_secs(BACKUP_POLL_S),
@@ -3348,4 +3388,479 @@ async fn git_designer_evidence() {
         }
         other => panic!("IGN_DESIGNER_EVIDENCE is before or after, not {other:?}"),
     }
+}
+
+// ---- 27-25 Task 1: the pair rig, git module 2.3.4 on both nodes -----------------
+//
+// `capture27-pair.sh live <log> git_pair_e2e` (it sources `tokens.env` and exports
+// `IGNITION_LIVE_PAIR=1`, `IGN_PAIR_DATA_A`, `IGN_PAIR_DATA_B`,
+// `IGN_PAIR_REMOTE` and `IGN_LIVE_EVIDENCE_DIR`). Loopback only; both gateways
+// are named by the guards below before anything is written. A JGit-versus-
+// `expected_drift` difference on either node is a cut-over blocker (D-25): no
+// assertion here is loosened.
+
+const PAIR_NAME_A: &str = "ign-pair-a";
+const PAIR_NAME_B: &str = "ign-pair-b";
+
+/// The pair rig as a [`Rig`]: gw-a is the master (its `data/projects` is bound
+/// onto `IGN_PAIR_DATA_A/projects`), gw-b the backup. `None` is the quiet green
+/// skip.
+async fn pair_rig() -> Option<Rig> {
+    if std::env::var("IGNITION_LIVE_PAIR").as_deref() != Ok("1") {
+        skip("IGNITION_LIVE_PAIR is not 1");
+        return None;
+    }
+    let url_a = std::env::var("IGN_PAIR_URL_A").unwrap_or_else(|_| "http://localhost:18300".into());
+    let url_b = std::env::var("IGN_PAIR_URL_B").unwrap_or_else(|_| "http://localhost:18301".into());
+    for (var, url) in [("IGN_PAIR_URL_A", &url_a), ("IGN_PAIR_URL_B", &url_b)] {
+        if let Err(why) = local_url_guard(url) {
+            panic!("{var} refused: {why}");
+        }
+    }
+    let token_a = require_env("IGN_PAIR_TOKEN_A");
+    let token_b = require_env("IGN_PAIR_TOKEN_B");
+    let data_a = PathBuf::from(require_env("IGN_PAIR_DATA_A"));
+    let data_b = PathBuf::from(require_env("IGN_PAIR_DATA_B"));
+    for (var, dir) in [("IGN_PAIR_DATA_A", &data_a), ("IGN_PAIR_DATA_B", &data_b)] {
+        assert!(
+            dir.join("projects").is_dir(),
+            "{var} has no projects directory"
+        );
+    }
+    let evidence = PathBuf::from(require_env("IGN_LIVE_EVIDENCE_DIR"));
+    std::fs::create_dir_all(&evidence).expect("evidence dir");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root")
+        .canonicalize()
+        .expect("repo root resolves");
+    for (what, dir) in [
+        ("IGN_LIVE_EVIDENCE_DIR", &evidence),
+        ("IGN_PAIR_DATA_A", &data_a),
+        ("IGN_PAIR_DATA_B", &data_b),
+    ] {
+        assert!(
+            !dir.canonicalize()
+                .expect("resolves")
+                .starts_with(&repo_root),
+            "{what} must be outside the repository"
+        );
+    }
+    let remote = PathBuf::from(require_env("IGN_PAIR_REMOTE"));
+    assert!(remote.is_dir(), "the pair rig's bare repository is missing");
+    let rig = Rig {
+        url: url_a,
+        token: token_a,
+        data: data_a,
+        evidence,
+        remote,
+        gateway: PAIR_NAME_A.to_string(),
+        backup: Some(PairBackup {
+            url: url_b,
+            token: token_b,
+            data: data_b,
+        }),
+    };
+    let info_a = GatewayApi::gateway_info(&rig.api())
+        .await
+        .expect("gateway-info of gw-a for the name guard");
+    assert_eq!(
+        info_a.name.as_deref(),
+        Some(PAIR_NAME_A),
+        "refusing: gw-a is not the {PAIR_NAME_A} fixture"
+    );
+    let info_b = GatewayApi::gateway_info(&pair_api_b(&rig))
+        .await
+        .expect("gateway-info of gw-b for the name guard");
+    assert!(
+        matches!(info_b.name.as_deref(), Some(PAIR_NAME_A | PAIR_NAME_B)),
+        "refusing: gw-b is not the pair rig's backup"
+    );
+    Some(rig)
+}
+
+/// The backup's own client (token auth).
+fn pair_api_b(rig: &Rig) -> ReqwestGatewayApi {
+    let backup = rig.backup.as_ref().expect("the pair rig has a backup");
+    ReqwestGatewayApi::for_tests(
+        &backup.url,
+        Some(Credential::Token(Secret::new(backup.token.clone()))),
+    )
+}
+
+/// The commit a classified repo's HEAD names.
+fn head_commit(refs: &GitRefs) -> String {
+    match &refs.head {
+        GitHead::Branch {
+            commit: Some(commit),
+            ..
+        }
+        | GitHead::Detached { commit } => commit.clone(),
+        other => panic!("HEAD names no commit: {other:?}"),
+    }
+}
+
+/// Every git event of a pair run with the node it names and the time it was
+/// heard (names, nodes and milliseconds only).
+struct PairTimeline {
+    start: Instant,
+    seen: std::sync::Mutex<Vec<(u128, &'static str, String)>>,
+}
+
+impl PairTimeline {
+    fn new() -> PairTimeline {
+        PairTimeline {
+            start: Instant::now(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// When the first event `name` for `node` was heard.
+    fn at(&self, name: &str, node: &str) -> Option<u128> {
+        self.seen
+            .lock()
+            .expect("timeline")
+            .iter()
+            .find(|(_, n, who)| *n == name && who == node)
+            .map(|(at, _, _)| *at)
+    }
+}
+
+impl ProjectsObserver for PairTimeline {
+    fn event(&self, event: &ProjectsEvent) {
+        let node = match event {
+            ProjectsEvent::GitStateRead { node, .. }
+            | ProjectsEvent::GitSaved { node, .. }
+            | ProjectsEvent::GitRestored { node }
+            | ProjectsEvent::GitAdvanced { node, .. }
+            | ProjectsEvent::GitSaveRemoved { node, .. }
+            | ProjectsEvent::GitRestoreFailed { node, .. } => node.clone(),
+            _ => "-".to_string(),
+        };
+        self.seen.lock().expect("timeline").push((
+            self.start.elapsed().as_millis(),
+            event.name(),
+            node,
+        ));
+    }
+}
+
+/// 27-25 Task 1 (C4 pair, D-16, D-19): with the module on both nodes and both
+/// clones at v1.0.0, `--check` reports two managed nodes and changes nothing;
+/// one apply of v1.1.0 leaves both repositories at the release, with JGit's
+/// status on each node equal to `data.git.expected_drift`; a backup repository
+/// moved one commit behind by hand is refused `nodes_disagree` live.
+#[tokio::test]
+#[ignore = "needs the pair rig with the git module on both nodes: IGNITION_LIVE_PAIR=1"]
+async fn git_pair_e2e() {
+    let Some(rig) = pair_rig().await else { return };
+    eprintln!("LIVE-RAN git_pair_e2e");
+    let backup = rig.backup.as_ref().expect("pair");
+    let api_a = rig.api();
+    let api_b = pair_api_b(&rig);
+    let host = HostGit::new();
+    let node_a = LocalFsTransport::new(rig.data.clone(), "nodes.master");
+    let node_b = LocalFsTransport::new(backup.data.clone(), "nodes.backup");
+
+    let (_keep, checkout, c2) = release_checkout(&rig, "v1.1.0");
+    let c1 = git(&checkout, &["rev-parse", "v1.0.0^{commit}"]);
+    let parent = git(&checkout, &["rev-parse", &format!("{c2}~1")]);
+    for (label, node) in [("master", &node_a), ("backup", &node_b)] {
+        let (state, refs) = node_state(node, &host).await;
+        assert_eq!(
+            state.kind,
+            GitStateKind::Managed,
+            "{label}: the module's clone must classify as managed: {state:?}"
+        );
+        assert_eq!(
+            head_commit(&refs),
+            c1,
+            "{label}: the module's clone must sit at v1.0.0 (run the pair driver's reset first)"
+        );
+    }
+    eprintln!("LIVE-PAIR start: both nodes managed at v1.0.0");
+
+    // The scriptExec route is deployed on the master and follows to the backup
+    // by the project sync; JGit is asked on each node through its own route.
+    let (_work, config) = script_config(&api_a, &rig.url).await;
+    let started = Instant::now();
+    loop {
+        match script_run(&api_b, &config, "rig", WEBDEV_PROJECT, "print 1").await {
+            Ok(_) => break,
+            Err(err) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(300),
+                    "the scriptExec route never answered on the backup: {}",
+                    err.code()
+                );
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+    eprintln!(
+        "LIVE-PAIR script route answers on the backup after {} s",
+        started.elapsed().as_secs()
+    );
+
+    // --check: two managed nodes; reads only on both.
+    let gitdir_a = rig.project_dir().join(".git");
+    let gitdir_b = backup.data.join("projects").join(APP).join(".git");
+    let before = (dir_manifest(&gitdir_a), dir_manifest(&gitdir_b));
+    let first = DeployFlags {
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let check = deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "pair-check")
+        .await
+        .unwrap_or_else(|err| panic!("pair check: {} ({err})", err.code()));
+    let check_json = serde_json::to_value(&check).expect("check json");
+    let nodes = check_json["git"]["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 2, "two managed nodes: {}", check_json["git"]);
+    assert_eq!(nodes[0]["node"], "nodes.master");
+    assert_eq!(nodes[1]["node"], "nodes.backup");
+    assert_eq!(nodes[0]["state"], "managed");
+    assert_eq!(nodes[1]["state"], "managed");
+    assert!(
+        check_json["git"]["expected_drift"].is_null()
+            && check_json["git"]["expected_drift_complete"] == false,
+        "--check reports the drift as unknown: {}",
+        check_json["git"]
+    );
+    let after = (dir_manifest(&gitdir_a), dir_manifest(&gitdir_b));
+    assert!(
+        before == after,
+        "--check changed a node's .git (master equal {}, backup equal {})",
+        before.0 == after.0,
+        before.1 == after.1
+    );
+    eprintln!(
+        "LIVE-PAIR check: nodes=2 master_state={} backup_state={} master_head_is_v1_0_0={} backup_head_is_v1_0_0={} git_manifests_unchanged=true files_master={} files_backup={}",
+        nodes[0]["state"],
+        nodes[1]["state"],
+        nodes[0]["head"] == serde_json::Value::String(c1.clone()),
+        nodes[1]["head"] == serde_json::Value::String(c1.clone()),
+        before.0.len(),
+        before.1.len()
+    );
+
+    // The apply, with the digest the check showed.
+    let flags = DeployFlags {
+        artifact_sha256: Some(check.artifact_sha256.clone()),
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let timeline = PairTimeline::new();
+    let extras = Extras {
+        observer: Some(&timeline),
+        git_writer: None,
+    };
+    let started = Instant::now();
+    let applied = deploy_in_process_with(&rig, false, ENV, "v1.1.0", &flags, "pair-apply", &extras)
+        .await
+        .unwrap_or_else(|err| panic!("pair apply: {} ({err})", err.code()));
+    let apply_ms = started.elapsed().as_millis();
+    let applied_json = serde_json::to_value(&applied).expect("apply json");
+    for (at, name, node) in timeline.seen.lock().expect("timeline").iter() {
+        eprintln!("LIVE-PAIR event {name} node={node} at {at} ms");
+    }
+    // Every finding of the run is recorded and the gate goes on, so one
+    // difference never hides the next measurement (the JGit comparison and the
+    // `nodes_disagree` refusal below); the gate fails at the end naming each.
+    let mut problems: Vec<String> = Vec::new();
+    if applied.outcome.as_str() != "imported" {
+        problems.push(format!(
+            "pair outcome is {} (slug {})",
+            applied.outcome.as_str(),
+            applied_json["slug"]
+        ));
+    }
+    let nodes = applied_json["git"]["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 2, "{}", applied_json["git"]);
+    for (index, label) in ["master", "backup"].iter().enumerate() {
+        let restore = &nodes[index]["restore"];
+        eprintln!(
+            "LIVE-PAIR {label} apply: restored={} advanced={} verified={} post_status={} dropped={} reason={}",
+            restore["restored"],
+            restore["advanced"],
+            restore["verified"],
+            restore["post_status"],
+            restore["dropped"],
+            restore["reason"]
+        );
+        if !(restore["advanced"] == true && restore["verified"] == true) {
+            problems.push(format!("{label}: the handover did not complete: {restore}"));
+        }
+        if restore["post_status"] != "matched" {
+            problems.push(format!(
+                "{label}: post_status is {} ({}); the node is local, so the run's own post-advance disk status ran",
+                restore["post_status"], nodes[index]["restore"]["post_status_note"]
+            ));
+        }
+        if !strs(&restore["dropped"]).iter().any(|path| path == NOTES) {
+            problems.push(format!(
+                "{label}: restore.dropped does not name the unlisted member"
+            ));
+        }
+    }
+    let wait_ms = match (
+        timeline.at("git_advanced", "nodes.master"),
+        timeline.at("git_advanced", "nodes.backup"),
+    ) {
+        (Some(master), Some(backup)) => Some(backup.saturating_sub(master)),
+        _ => None,
+    };
+    eprintln!(
+        "LIVE-PAIR backup wait: master_git_advanced_to_backup_git_advanced_ms={wait_ms:?} apply_ms={apply_ms}"
+    );
+
+    // Both repositories are at the release.
+    for (label, node) in [("master", &node_a), ("backup", &node_b)] {
+        let (state, refs) = node_state(node, &host).await;
+        if state.kind != GitStateKind::Managed {
+            problems.push(format!("{label}: the repository is {:?}", state.kind));
+        }
+        if head_commit(&refs) != c2 {
+            problems.push(format!("{label}: HEAD is not the release"));
+        }
+    }
+    eprintln!("LIVE-PAIR heads checked against the release");
+
+    // JGit inside each node's module says what the run predicted (D-25).
+    assert_eq!(applied_json["git"]["expected_drift_complete"], true);
+    let predicted = strs(&applied_json["git"]["expected_drift"]);
+    assert_eq!(
+        predicted.len() as u64,
+        applied_json["git"]["expected_drift_count"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
+        "the drift list is not capped here"
+    );
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let mut jgit_rows = Vec::new();
+    for (label, api) in [("master", &api_a), ("backup", &api_b)] {
+        let jg = jgit(api, &config).await;
+        let (extra, missing) = drift_difference(&jg, &predicted);
+        eprintln!(
+            "LIVE-PAIR {label} jgit: uncommitted={} expected={} extra={} missing={} unpushed={} branch={}",
+            jg.paths.len(),
+            predicted.len(),
+            extra.len(),
+            missing.len(),
+            jg.unpushed,
+            jg.branch
+        );
+        for row in &jg.rows {
+            eprintln!("LIVE-PAIR {label} jgit-row {row}");
+        }
+        if !(extra.is_empty() && missing.is_empty()) {
+            problems.push(format!(
+                "{label}: CUT-OVER BLOCKER (D-25): JGit differs from expected_drift: extra={extra:?} missing={missing:?}"
+            ));
+        }
+        if jg.unpushed != 0 {
+            problems.push(format!("{label}: unpushed commits after the deploy"));
+        }
+        if jg.branch != "production" {
+            problems.push(format!("{label}: current branch is {}", jg.branch));
+        }
+        let deleted: Vec<&String> = jg
+            .rows
+            .iter()
+            .filter(|row| row.starts_with("Deleted "))
+            .collect();
+        if !deleted.is_empty() {
+            problems.push(format!(
+                "{label}: CUT-OVER BLOCKER (D-25): JGit lists {} path(s) as Deleted that expected_drift lists as modified: {deleted:?}",
+                deleted.len()
+            ));
+        }
+        if extra.is_empty() && missing.is_empty() && deleted.is_empty() {
+            eprintln!(
+                "LIVE-CHECK pair {label} jgit_equals_expected_drift files={}",
+                predicted.len()
+            );
+        }
+        jgit_rows.push(serde_json::json!({
+            "node": label,
+            "jgit_paths": jg.paths,
+            "unpushed": jg.unpushed,
+            "branch": jg.branch,
+        }));
+    }
+
+    // The advance holds on the backup: the redundancy sync does not take the
+    // advanced repository away a while later (G5).
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let (state_b, refs_b) = node_state(&node_b, &host).await;
+    if state_b.kind != GitStateKind::Managed || head_commit(&refs_b) != c2 {
+        problems.push("the backup's advanced HEAD is gone 20 s after the run".to_string());
+    } else {
+        eprintln!("LIVE-PAIR backup repository still at the release 20 s after the run");
+    }
+
+    // D-16, D-19: the backup's repository one commit behind the master's is
+    // refused before anything is written.
+    let backup_ref = gitdir_b.join("refs/heads/production");
+    let kept = std::fs::read(&backup_ref).expect("the backup's branch ref is a loose file");
+    std::fs::write(&backup_ref, format!("{parent}\n")).expect("move the backup behind");
+    let flags_check = DeployFlags::default();
+    let outcome = deploy_in_process(&rig, true, ENV, "v1.1.0", &flags_check, "pair-disagree").await;
+    // Whatever the check answered, the backup goes back as it was.
+    std::fs::write(&backup_ref, &kept).expect("put the backup's ref back");
+    let disagree = match outcome {
+        Err(CoreError::ProjectGitManaged { reason, .. }) => {
+            eprintln!("LIVE-REFUSAL project_git_managed reason={reason}");
+            if reason != "nodes_disagree" {
+                problems.push(format!(
+                    "the refusal reason is {reason}, not nodes_disagree"
+                ));
+            }
+            reason
+        }
+        Err(other) => {
+            problems.push(format!(
+                "expected project_git_managed nodes_disagree, got {}: {other}",
+                other.code()
+            ));
+            other.code().to_string()
+        }
+        Ok(result) => {
+            let action = serde_json::to_value(&result).expect("json")["action"].clone();
+            problems.push(format!(
+                "expected a nodes_disagree refusal, the check answered action {action}"
+            ));
+            "not refused".to_string()
+        }
+    };
+    let (_, refs_back) = node_state(&node_b, &host).await;
+    assert_eq!(head_commit(&refs_back), c2, "the backup's ref is back");
+
+    write_evidence(
+        &rig,
+        "git_pair_e2e",
+        &serde_json::json!({
+            "outcome": applied.outcome.as_str(),
+            "apply_ms": apply_ms,
+            "backup_wait_ms": wait_ms,
+            "nodes": nodes
+                .iter()
+                .map(|n| serde_json::json!({
+                    "node": n["node"],
+                    "restored": n["restore"]["restored"],
+                    "advanced": n["restore"]["advanced"],
+                    "verified": n["restore"]["verified"],
+                    "post_status": n["restore"]["post_status"],
+                }))
+                .collect::<Vec<_>>(),
+            "expected_drift": predicted,
+            "jgit": jgit_rows,
+            "nodes_disagree": disagree,
+            "problems": problems,
+        }),
+    );
+    assert!(
+        problems.is_empty(),
+        "findings of the pair run: {problems:#?}"
+    );
 }
