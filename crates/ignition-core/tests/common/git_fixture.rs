@@ -356,6 +356,50 @@ impl GitFixture {
         self.project_dir().join(".git")
     }
 
+    /// The backup node's data dir (27-22): a second gateway data dir whose
+    /// `projects/CapApp` is a byte copy of the master's module-style clone as
+    /// it is NOW (so the two nodes agree on origin, branch and HEAD), taken the
+    /// first time this is called. Change either clone afterwards to make the
+    /// nodes differ.
+    pub fn backup_data_dir(&self) -> PathBuf {
+        let dir = self
+            .data_dir
+            .parent()
+            .expect("the fixture root")
+            .join("data-b");
+        if !dir.exists() {
+            std::fs::create_dir_all(dir.join("projects")).expect("mkdir");
+            let status = Command::new("cp")
+                .arg("-R")
+                .arg(self.project_dir())
+                .arg(dir.join("projects").join(PROJECT))
+                .status()
+                .expect("cp runs");
+            assert!(status.success(), "the backup clone is copied");
+        }
+        dir
+    }
+
+    /// `data-b/projects/CapApp`.
+    pub fn backup_project_dir(&self) -> PathBuf {
+        self.backup_data_dir().join("projects").join(PROJECT)
+    }
+
+    /// `data-b/projects/CapApp/.git`.
+    pub fn backup_git_dir(&self) -> PathBuf {
+        self.backup_project_dir().join(".git")
+    }
+
+    /// Run host git in the backup's project dir.
+    pub fn git_in_backup(&self, args: &[&str]) -> String {
+        git(&self.backup_project_dir(), args)
+    }
+
+    /// The local-filesystem transport over the backup's data dir.
+    pub fn backup_node(&self) -> LocalFsTransport {
+        LocalFsTransport::new(self.backup_data_dir(), "nodes.backup")
+    }
+
     /// The local-filesystem transport over the gateway data dir.
     pub fn node(&self) -> LocalFsTransport {
         LocalFsTransport::new(self.data_dir.clone(), "nodes.master")

@@ -64,6 +64,17 @@ pub trait BackupTags: Send + Sync {
     async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError>;
     /// The backup's redundancy status.
     async fn status(&self) -> Result<RedundancyStatusWire, CoreError>;
+    /// The backup's export zip of `project`, in memory (a GET, Phase 27,
+    /// 27-22): what the wait for the backup's own copy of the project reads
+    /// until it equals the artifact. The default body fails closed, so an
+    /// implementation that cannot read the project is never taken to hold it.
+    async fn project_export(&self, project: &str) -> Result<Vec<u8>, CoreError> {
+        let _ = project;
+        Err(CoreError::Internal(
+            "this backup handle cannot export a project (project_export is not implemented)"
+                .to_string(),
+        ))
+    }
     /// Whether the backup's log says the gateway gave up syncing at or
     /// after `since_ms` (D-10 of Phase 24).
     async fn sync_exhausted(&self, since_ms: i64) -> Result<bool, CoreError>;
@@ -77,6 +88,10 @@ impl BackupTags for BackupNode<'_> {
 
     async fn status(&self) -> Result<RedundancyStatusWire, CoreError> {
         BackupNode::status(self).await
+    }
+
+    async fn project_export(&self, project: &str) -> Result<Vec<u8>, CoreError> {
+        BackupNode::project_export(self, project).await
     }
 
     async fn sync_exhausted(&self, since_ms: i64) -> Result<bool, CoreError> {

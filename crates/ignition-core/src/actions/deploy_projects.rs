@@ -55,9 +55,12 @@
 //! 6. a `record` plan (the live project already is the artifact, K14) only
 //!    writes the record.
 //!
-//! The import goes to the master node's gateway; the backup node is never
-//! contacted (the redundancy sync carries the project to it). Every return
-//! after the run directory exists writes `result.json` first.
+//! The import goes to the master node's gateway only; the redundancy sync
+//! carries the project to the backup, whose REST handle stays GET-only. On a
+//! pair whose backup holds a gateway `.git` (Phase 27, 27-22) the backup's host
+//! is read like the master's, and the only writes on it are below
+//! `data/projects/<p>/.git` and its ledger root. Every return after the run
+//! directory exists writes `result.json` first.
 //!
 //! ## Children of a parent project (25-15)
 //!
@@ -335,8 +338,9 @@ use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::projects::{
     GitStateWriter, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
-    git_state_writer_for_node, local_data_dir_for_node, project_run_writer_for_node,
-    release_writer_for_node, tag_record_names_problem, tag_record_writer_for_node,
+    git_state_writer_for_node, local_data_dir_for_node, project_host_for_node,
+    project_run_writer_for_node, release_writer_for_node, tag_record_names_problem,
+    tag_record_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
@@ -1772,6 +1776,10 @@ pub enum ProjectsPrepared {
         /// The gateway repo the git module manages, prepared (Phase 27);
         /// `None` for a project whose master has no `.git`.
         git: Option<Box<git::PreparedGit>>,
+        /// The backup node's gateway repo on a redundant pair, prepared
+        /// (27-22); `None` when the target has no backup or the backup holds
+        /// no `.git`.
+        backup_git: Option<Box<git::PreparedGit>>,
         /// The warnings the git gates added (a rehearsal's report-mode
         /// findings among them), in order; also in `plan.warnings`.
         git_warnings: Vec<String>,
@@ -2052,16 +2060,14 @@ async fn deploy_projects_prepare_with(
     // `project_git_managed` with its reason.
     let git_entry = surfaces.host.git_entry(project).await?;
     let mut git_warnings = Vec::new();
-    let (mut prepared_git, refused_git) = match git::prepare_git_host_with(
-        loaded,
-        input,
-        surfaces,
-        git_entry,
-        mode,
-        &mut git_warnings,
-    )
-    .await?
-    {
+    // On a pair (27-22, D-19) the backup's repository is read, gated and
+    // compared with the master's here, before any write.
+    let pair =
+        git::prepare_git_pair(loaded, input, surfaces, git_entry, mode, &mut git_warnings).await?;
+    let backup_host = pair.backup_host;
+    let is_pair = pair.pair;
+    let mut backup_git = pair.backup;
+    let (mut prepared_git, refused_git) = match pair.master {
         git::HostPrep::Absent => (None, None),
         git::HostPrep::Ready(prepared) => (Some(*prepared), None),
         git::HostPrep::Refused(report) => (None, Some(report)),
@@ -2207,6 +2213,20 @@ async fn deploy_projects_prepare_with(
             action,
             loaded,
             surfaces,
+            &mut warnings,
+        )
+        .await?;
+        git_warnings.extend(warnings[before..].iter().cloned());
+    }
+    if let (Some(backup), Some(host)) = (backup_git.as_mut(), backup_host.as_deref()) {
+        let before = warnings.len();
+        git::prepare_backup_live(
+            backup,
+            host,
+            surfaces.host.host_git(),
+            live.as_ref(),
+            action,
+            loaded,
             &mut warnings,
         )
         .await?;
@@ -2390,10 +2410,13 @@ async fn deploy_projects_prepare_with(
         missing_tags_unavailable,
         missing_tags_limit: MISSING_TAGS_LIMIT,
         tags,
-        git: prepared_git
-            .as_ref()
-            .map(|p| Box::new(p.report.clone()))
-            .or(refused_git),
+        git: git::pair_report(
+            prepared_git.as_ref().map(|p| &p.report),
+            backup_git.as_ref().map(|p| &p.report),
+            is_pair,
+        )
+        .map(Box::new)
+        .or(refused_git),
         outcome,
         ok: true,
         slug: None,
@@ -2406,6 +2429,7 @@ async fn deploy_projects_prepare_with(
             plan,
             tag_records,
             git: prepared_git.map(Box::new),
+            backup_git: backup_git.map(Box::new),
             git_warnings,
         }
     })
@@ -3881,14 +3905,15 @@ pub async fn deploy_projects_run(
     if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
         return Err(project_journal_present(loaded, &input.env, &journal.run_id));
     }
-    let (mut plan, tag_records, prepared_git) = match prepared {
+    let (mut plan, tag_records, prepared_git, prepared_backup) = match prepared {
         ProjectsPrepared::Unchanged(result) => return Ok(result),
         ProjectsPrepared::Ready {
             plan,
             tag_records,
             git,
+            backup_git,
             ..
-        } => (plan, tag_records, git),
+        } => (plan, tag_records, git, backup_git),
     };
     let removals = removal_gate(&plan, loaded, input, surfaces)?;
     // The record writers are built before anything is written, so a node
@@ -3950,6 +3975,27 @@ pub async fn deploy_projects_run(
                 "nodes.master",
                 &opts.master,
             )?),
+        }),
+        _ => None,
+    };
+    // The backup node's share of the handover (27-22, D-19): its writer, host
+    // and post-advance mode are built here too, before anything is written,
+    // and only for an import or a record. Its REST handle stays the read-only
+    // `opts.backup`; the only write on the backup is below
+    // `data/projects/<p>/.git` and its ledger root.
+    let backup_parts = match (&prepared_backup, plan.action) {
+        (Some(_), ProjectAction::Import | ProjectAction::Record) => {
+            git::backup_writer_and_mode(loaded, &opts.targets_root)?
+        }
+        _ => None,
+    };
+    let backup_run = match (&prepared_backup, &backup_parts) {
+        (Some(prepared), Some((writer, post_status, host))) => Some(BackupGit {
+            prepared: prepared.as_ref(),
+            writer: writer.as_ref(),
+            host: host.as_ref(),
+            host_git: surfaces.host.host_git(),
+            post_status: post_status.clone(),
         }),
         _ => None,
     };
@@ -4031,6 +4077,20 @@ pub async fn deploy_projects_run(
         )
         .await?;
     }
+    if let Some(backup) = backup_run.as_ref()
+        && let Some(read) = backup.host.git()
+    {
+        git::git_preflight_on(
+            git::BACKUP,
+            backup.writer,
+            read,
+            &plan.gateway,
+            &loaded.file.project,
+            backup.prepared.prep.as_ref(),
+            RunId::generate().as_str(),
+        )
+        .await?;
+    }
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(
@@ -4045,6 +4105,7 @@ pub async fn deploy_projects_run(
             tags: tag_writer,
             run: run_writer,
             git: git_run.as_ref(),
+            backup_git: backup_run.as_ref(),
         },
         &run_dir,
         &run_id,
@@ -4360,19 +4421,27 @@ async fn execute(
     // Phase 27: the gateway repo was read in the prepare, before the run
     // directory existed; its first event is the first line of the run's log
     // about it.
-    if writers.git.is_some()
-        && let Some(git) = plan.git.as_deref()
-    {
-        let node = git.master();
-        events.emit(ProjectsEvent::GitStateRead {
-            node: node.node.clone(),
-            state: node.state,
-            branch: node.branch.clone(),
-            head: node.head.clone(),
-            unpushed: node.unpushed.len(),
-            not_merged: node.not_merged_count,
-            dirty: node.dirty_count,
-        })?;
+    if let Some(git) = plan.git.as_deref() {
+        let mut handled = Vec::new();
+        if writers.git.is_some() {
+            handled.push(git.master());
+        }
+        if writers.backup_git.is_some()
+            && let Some(node) = git.nodes.get(1)
+        {
+            handled.push(node);
+        }
+        for node in handled {
+            events.emit(ProjectsEvent::GitStateRead {
+                node: node.node.clone(),
+                state: node.state,
+                branch: node.branch.clone(),
+                head: node.head.clone(),
+                unpushed: node.unpushed.len(),
+                not_merged: node.not_merged_count,
+                dirty: node.dirty_count,
+            })?;
+        }
     }
 
     let mut result = plan.clone();
@@ -4454,6 +4523,7 @@ async fn execute(
                         records: None,
                         release: None,
                         git: None,
+                        backup_git: None,
                     },
                     route,
                     &mut events,
@@ -4554,6 +4624,46 @@ async fn execute(
             }
             result.warnings.extend(after.warnings);
             git_failed = after.failed;
+        }
+        // The backup's repository (27-22): saved, waited for and advanced in
+        // place like the master's; a failure keeps the deploy and ends the run
+        // as `git_restore_failed`.
+        if let (Some(backup_run), Some(read), Some(report)) = (
+            writers.backup_git,
+            writers.backup_git.and_then(|b| b.host.git()),
+            result.git.as_mut(),
+        ) && let Some(mut single) = git::backup_view(report)
+        {
+            let no_backup = NoBackup;
+            let wait = git::BackupWait {
+                backup: opts.backup.unwrap_or(&no_backup),
+                policy: opts.backup_policy,
+            };
+            let after = git::git_record_backup(
+                backup_run.prepared,
+                &mut single,
+                run_id.as_str(),
+                &git::AfterInputs {
+                    read,
+                    write: backup_run.writer,
+                    git: &backup_run.host_git,
+                    gateway: &plan.gateway,
+                    project,
+                    export_zip: &zip,
+                    post_status: &backup_run.post_status,
+                    api: gateway,
+                    designers: &opts.designers,
+                },
+                &wait,
+                &artifact.sha256,
+            )
+            .await;
+            git::merge_backup(report, single);
+            for event in after.events {
+                events.emit_late(event);
+            }
+            result.warnings.extend(after.warnings);
+            git_failed |= after.failed;
         }
         // On a pair the backup's copy of the owned tags is checked (26-13).
         let backup = backup_step(
@@ -4658,6 +4768,7 @@ async fn execute(
                     records: None,
                     release: None,
                     git: None,
+                    backup_git: None,
                 },
                 route,
                 &mut events,
@@ -4761,6 +4872,7 @@ async fn execute(
                         records: None,
                         release: None,
                         git: None,
+                        backup_git: None,
                     },
                     route,
                     &mut events,
@@ -4835,6 +4947,7 @@ async fn execute(
                         records: None,
                         release: None,
                         git: None,
+                        backup_git: None,
                     },
                     route,
                     &mut events,
@@ -4844,6 +4957,81 @@ async fn execute(
             Err(err) => {
                 return Err(unwritten(
                     err,
+                    loaded,
+                    writers.run,
+                    step.writes.host.as_ref(),
+                    &mut events,
+                )
+                .await);
+            }
+        }
+    }
+
+    // Phase 27 (27-22, D-G5): the backup's `.git` is kept the same way, on its
+    // own host, before the import reaches the master: redundancy removes a
+    // module-cloned `.git` from the backup once its project follows.
+    let mut backup_saved: Option<GitSaveReport> = None;
+    if let Some(backup_run) = writers.backup_git
+        && let Some(read) = backup_run.host.git()
+    {
+        match git::git_before_import(
+            backup_run.prepared,
+            read,
+            backup_run.writer,
+            &backup_run.host_git,
+            &plan.gateway,
+            project,
+            run_id.as_str(),
+        )
+        .await
+        {
+            Ok(saved) => {
+                if let Some(report) = result.git.as_mut() {
+                    git::set_backup_save(report, &saved);
+                }
+                events.emit_late(ProjectsEvent::GitSaved {
+                    node: git::BACKUP.to_string(),
+                    path: saved.path.clone(),
+                    files: saved.manifest.files,
+                    bytes: saved.manifest.bytes,
+                });
+                backup_saved = Some(saved);
+            }
+            Err(err) if tags_wrote => {
+                let failure = TagFailure {
+                    cause: RollbackCause::ProjectImportFailed,
+                    what: format!(
+                        "the backup's gateway repo could not be kept before the project import \
+                         ({})",
+                        err.code()
+                    ),
+                    writes: step.writes,
+                };
+                return roll_back(
+                    failure,
+                    Some(ProjectUndo { pre: pre_zip }),
+                    result,
+                    loaded,
+                    input,
+                    surfaces,
+                    opts,
+                    run_id,
+                    rel,
+                    UndoWriters {
+                        run: writers.run,
+                        records: None,
+                        release: None,
+                        git: git_undo(&writers, git_saved.as_ref()),
+                        backup_git: None,
+                    },
+                    route,
+                    &mut events,
+                )
+                .await;
+            }
+            Err(err) => {
+                return Err(unwritten(
+                    on_backup(err),
                     loaded,
                     writers.run,
                     step.writes.host.as_ref(),
@@ -4901,6 +5089,7 @@ async fn execute(
                     records: None,
                     release: None,
                     git: git_undo(&writers, git_saved.as_ref()),
+                    backup_git: backup_undo(&writers, backup_saved.as_ref()),
                 },
                 route,
                 &mut events,
@@ -5062,6 +5251,55 @@ async fn execute(
                 result.slug = Some(GIT_RESTORE_FAILED_SLUG.to_string());
             }
         }
+        // 27-22, D-G5: the master is verified and its repository handled; the
+        // backup's project follows by redundancy, and its `.git` is restored
+        // and advanced once its export equals the artifact. A backup that does
+        // not converge, or whose restore fails, ends the run
+        // `git_restore_failed` (user decision 2026-11-14); the master is never
+        // undone for it.
+        if let (Some(backup_run), Some(saved), Some(zip), Some(read), Some(report)) = (
+            writers.backup_git,
+            backup_saved.as_ref(),
+            readback.as_deref(),
+            writers.backup_git.and_then(|b| b.host.git()),
+            result.git.as_mut(),
+        ) && let Some(mut single) = git::backup_view(report)
+        {
+            let no_backup = NoBackup;
+            let wait = git::BackupWait {
+                backup: opts.backup.unwrap_or(&no_backup),
+                policy: opts.backup_policy,
+            };
+            let after = git::git_after_backup(
+                backup_run.prepared,
+                &mut single,
+                saved,
+                &git::AfterInputs {
+                    read,
+                    write: backup_run.writer,
+                    git: &backup_run.host_git,
+                    gateway: &plan.gateway,
+                    project,
+                    export_zip: zip,
+                    post_status: &backup_run.post_status,
+                    api: gateway,
+                    designers: &opts.designers,
+                },
+                &wait,
+                &artifact.sha256,
+            )
+            .await;
+            git::merge_backup(report, single);
+            for event in after.events {
+                events.emit_late(event);
+            }
+            result.warnings.extend(after.warnings);
+            if after.failed {
+                result.outcome = ProjectOutcome::GitRestoreFailed;
+                result.ok = false;
+                result.slug = Some(GIT_RESTORE_FAILED_SLUG.to_string());
+            }
+        }
     } else if tags_wrote {
         // 26-11, D-07: the tags were applied and the project is not what was
         // reviewed: both are rolled back (this replaces K11 for such a run).
@@ -5093,6 +5331,7 @@ async fn execute(
                 records: None,
                 release: None,
                 git: git_undo(&writers, git_saved.as_ref()),
+                backup_git: backup_undo(&writers, backup_saved.as_ref()),
             },
             route,
             &mut events,
@@ -5145,6 +5384,47 @@ async fn execute(
                 events.emit_late(event);
             }
             result.warnings.extend(after.warnings);
+        }
+        // 27-22 (K11 on the backup): its repository is put back unchanged once
+        // its project has followed the master's, and never advanced. The
+        // outcome stays `imported_unverified` whatever the backup does.
+        if let (Some(backup_run), Some(saved), Some(read), Some(report)) = (
+            writers.backup_git,
+            backup_saved.as_ref(),
+            writers.backup_git.and_then(|b| b.host.git()),
+            result.git.as_mut(),
+        ) && let Some(mut single) = git::backup_view(report)
+        {
+            let no_backup = NoBackup;
+            let wait = git::BackupWait {
+                backup: opts.backup.unwrap_or(&no_backup),
+                policy: opts.backup_policy,
+            };
+            let want = match readback.as_deref().map(|zip| live_digest(project, zip)) {
+                Some(Ok(digest)) => Some(digest.sha256),
+                _ => None,
+            };
+            let step = git::git_rollback_backup(
+                &mut single,
+                saved,
+                &git::UnverifiedInputs {
+                    read,
+                    write: backup_run.writer,
+                    gateway: &plan.gateway,
+                    project,
+                    api: gateway,
+                    designers: &opts.designers,
+                },
+                &wait,
+                want.as_deref(),
+            )
+            .await;
+            git::merge_backup(report, single);
+            for event in step.after.events {
+                events.emit_late(event);
+            }
+            result.warnings.extend(step.after.warnings);
+            result.warnings.extend(step.left);
         }
     }
     // D-06, K7: a parent that was replaced is followed by a look at the
@@ -5227,6 +5507,42 @@ struct Writers<'a> {
     /// The handover of a gateway `.git` around the import (Phase 27), for a
     /// plan that imports over a repo the git module manages.
     git: Option<&'a GitRun<'a>>,
+    /// The backup node's share of that handover on a redundant pair (27-22).
+    backup_git: Option<&'a BackupGit<'a>>,
+}
+
+/// The backup node's share of the handover of a gateway `.git` (27-22, D-G5):
+/// built before anything is written.
+struct BackupGit<'a> {
+    /// What the prepare learned about the backup's repository.
+    prepared: &'a git::PreparedGit,
+    /// The backup's confined git writer (`data/projects/<p>/.git` and the
+    /// ledger root of its host only).
+    writer: &'a dyn GitStateWriter,
+    /// The backup's own host read surface.
+    host: &'a dyn ProjectHost,
+    /// Host git on ign's machine.
+    host_git: crate::deploy::git_remote::HostGit,
+    /// How the post-advance status of the backup is proved (D-25).
+    post_status: git::PostStatusMode,
+}
+
+/// A backup handle for a run that has none (a test that passes no
+/// `opts.backup`): every wait on it fails closed, so a repository is never
+/// handed over on a backup that was not read.
+struct NoBackup;
+
+#[async_trait::async_trait]
+impl BackupTags for NoBackup {
+    async fn tag_export(&self, _provider: &str) -> Result<Vec<u8>, CoreError> {
+        Err(CoreError::Internal("no backup handle".to_string()))
+    }
+    async fn status(&self) -> Result<crate::client::redundancy::RedundancyStatusWire, CoreError> {
+        Err(CoreError::Internal("no backup handle".to_string()))
+    }
+    async fn sync_exhausted(&self, _since_ms: i64) -> Result<bool, CoreError> {
+        Err(CoreError::Internal("no backup handle".to_string()))
+    }
 }
 
 /// Everything a run needs to keep and advance a gateway `.git` (Phase 27):
@@ -5483,6 +5799,35 @@ struct UndoWriters<'a> {
     /// The gateway `.git` the run (or the undo) saved, to be put back
     /// unchanged once the project is rolled back (Phase 27, D-08).
     git: Option<GitUndo<'a>>,
+    /// The backup node's saved `.git` on a redundant pair (27-22, D-08).
+    backup_git: Option<BackupUndo<'a>>,
+}
+
+/// The backup's saved `.git` a rollback puts back (27-22, D-08).
+#[derive(Clone, Copy)]
+struct BackupUndo<'a> {
+    /// The backup's own host read surface.
+    host: &'a dyn ProjectHost,
+    /// The backup's confined git writer.
+    writer: &'a dyn GitStateWriter,
+    /// What was saved before the project changed.
+    saved: &'a GitSaveReport,
+}
+
+/// The backup's step of a rollback of this run: set only once its `.git` was
+/// saved.
+fn backup_undo<'a>(
+    writers: &Writers<'a>,
+    saved: Option<&'a GitSaveReport>,
+) -> Option<BackupUndo<'a>> {
+    match (writers.backup_git, saved) {
+        (Some(run), Some(saved)) => Some(BackupUndo {
+            host: run.host,
+            writer: run.writer,
+            saved,
+        }),
+        _ => None,
+    }
 }
 
 /// The saved gateway `.git` a rollback puts back (D-08).
@@ -5492,6 +5837,11 @@ struct GitUndo<'a> {
     writer: &'a dyn GitStateWriter,
     /// What was saved before the project changed.
     saved: &'a GitSaveReport,
+}
+
+/// A refusal of a step on the backup, naming the node (27-22).
+fn on_backup(err: CoreError) -> CoreError {
+    git::on_node(err, git::BACKUP)
 }
 
 /// The git step of a rollback of this run: set only once the `.git` was saved.
@@ -7466,6 +7816,45 @@ async fn roll_back(
         left.extend(step.left);
     }
 
+    // 1c. 27-22 (D-08): the backup's `.git` goes back unchanged too, once its
+    // project has followed the master's rolled-back project. A backup that does
+    // not converge writes nothing, keeps its save and is a line in `left`.
+    if let (Some(undo), Some(read), Some(report)) = (
+        undo_writers.backup_git,
+        undo_writers.backup_git.and_then(|u| u.host.git()),
+        result.git.as_deref_mut(),
+    ) && let Some(mut single) = git::backup_view(report)
+    {
+        let gateway_name = loaded.target.gateway.clone();
+        let no_backup = NoBackup;
+        let wait = git::BackupWait {
+            backup: opts.backup.unwrap_or(&no_backup),
+            policy: opts.backup_policy,
+        };
+        let want = project_sha(gateway, &project).await;
+        let step = git::git_rollback_backup(
+            &mut single,
+            undo.saved,
+            &git::UnverifiedInputs {
+                read,
+                write: undo.writer,
+                gateway: &gateway_name,
+                project: &project,
+                api: gateway,
+                designers: &opts.designers,
+            },
+            &wait,
+            want.as_deref(),
+        )
+        .await;
+        git::merge_backup(report, single);
+        for event in step.after.events {
+            events.emit_late(event);
+        }
+        result.warnings.extend(step.after.warnings);
+        left.extend(step.left);
+    }
+
     // 2. The tags of every provider the run imported into.
     let empty = BTreeMap::new();
     for provider in sorted(&loaded.owned_tags) {
@@ -8820,11 +9209,32 @@ pub async fn deploy_projects_rollback_run(
     // put back unchanged afterwards (Phase 27, D-08); any other shape refuses
     // as it does for a deploy, before anything is written.
     let git_entry = surfaces.host.git_entry(project).await?;
-    let mut git_report = if git_entry.is_present() {
+    let master_git = if git_entry.is_present() {
         Some(git::check_rollback_run(surfaces, project, git_entry).await?)
     } else {
         None
     };
+    // 27-22 (D-08): on a pair the backup's repository is classified too, and
+    // saved and put back like the master's. A backup with no `ssh` or `local`
+    // block cannot be read and is not handled.
+    let backup_host: Option<Box<dyn ProjectHost>> =
+        match &loaded.target.nodes.backup {
+            Some(node) if node.ssh.is_some() || node.local.is_some() => Some(
+                project_host_for_node(&opts.targets_root, &opts.target_file, git::BACKUP, node)?,
+            ),
+            _ => None,
+        };
+    let backup_git = match backup_host.as_deref() {
+        Some(host) => git::check_rollback_backup(surfaces, host, project).await?,
+        None => None,
+    };
+    let master_git_present = master_git.is_some();
+    let backup_git_present = backup_git.is_some();
+    let mut git_report = git::pair_report(
+        master_git.as_ref(),
+        backup_git.as_ref(),
+        backup_host.is_some(),
+    );
     let set = read_host_set(loaded, input, surfaces.host, &target).await?;
     let mut writes = undo_writes(&set);
     let project_undo = match set.run.project_action.as_str() {
@@ -8943,8 +9353,7 @@ pub async fn deploy_projects_rollback_run(
     // refuses before anything is written.
     let built_git;
     let git_writer: Option<&dyn GitStateWriter> = match &git_report {
-        None => None,
-        Some(_) => match opts.git_writer {
+        Some(_) if master_git_present => match opts.git_writer {
             Some(writer) => Some(writer),
             None => {
                 built_git = git_state_writer_for_node(
@@ -8956,6 +9365,22 @@ pub async fn deploy_projects_rollback_run(
                 Some(built_git.as_ref())
             }
         },
+        _ => None,
+    };
+    // The backup's writer, built with the others (27-22).
+    let backup_writer = match (&backup_host, backup_git_present) {
+        (Some(_), true) => {
+            let node = loaded.target.nodes.backup.as_ref().ok_or_else(|| {
+                CoreError::Internal("the backup node vanished from the target".to_string())
+            })?;
+            Some(git_state_writer_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                git::BACKUP,
+                node,
+            )?)
+        }
+        _ => None,
     };
     // The pre-checks read and write nothing.
     wrong_target_check(loaded, gateway, opts).await?;
@@ -9040,6 +9465,32 @@ pub async fn deploy_projects_rollback_run(
             })?;
             git_saved = Some(saved);
         }
+        // 27-22: the backup's `.git` is saved the same way, on its own host.
+        let mut backup_saved: Option<GitSaveReport> = None;
+        if let (Some(report), Some(writer), Some(host)) = (
+            git_report.as_mut(),
+            backup_writer.as_deref(),
+            backup_host.as_deref(),
+        ) && let Some(read) = host.git()
+        {
+            let saved = crate::deploy::git_handover::save(
+                read,
+                writer,
+                &loaded.target.gateway,
+                project,
+                rid.as_str(),
+            )
+            .await
+            .map_err(on_backup)?;
+            git::set_backup_save(report, &saved);
+            events.emit(ProjectsEvent::GitSaved {
+                node: git::BACKUP.to_string(),
+                path: saved.path.clone(),
+                files: saved.manifest.files,
+                bytes: saved.manifest.bytes,
+            })?;
+            backup_saved = Some(saved);
+        }
         result.git = git_report.take().map(Box::new);
         // The journal says rolling_back before the first gateway write; a
         // host that cannot take it stops the undo with nothing written.
@@ -9083,6 +9534,18 @@ pub async fn deploy_projects_rollback_run(
                 release: Some(release_writer),
                 git: match (git_writer, git_saved.as_ref()) {
                     (Some(writer), Some(saved)) => Some(GitUndo { writer, saved }),
+                    _ => None,
+                },
+                backup_git: match (
+                    backup_writer.as_deref(),
+                    backup_host.as_deref(),
+                    backup_saved.as_ref(),
+                ) {
+                    (Some(writer), Some(host), Some(saved)) => Some(BackupUndo {
+                        host,
+                        writer,
+                        saved,
+                    }),
                     _ => None,
                 },
             },

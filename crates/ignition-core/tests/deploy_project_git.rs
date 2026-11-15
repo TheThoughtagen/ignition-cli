@@ -1574,6 +1574,9 @@ mod published {
         pub discard: Option<String>,
         /// `--allow-git-sync-hazards`, when the run gives one (27-18).
         pub hazard_ack: Option<String>,
+        /// The master's tree reader, for a tag-owning pair (27-22): the
+        /// mode-collection check of a pair reads it.
+        pub tree: Option<LocalFsTransport>,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1704,7 +1707,17 @@ mod published {
                 release: "v1.1.0".to_string(),
                 discard: None,
                 hazard_ack: None,
+                tree: None,
             }
+        }
+
+        /// A tag-owning pair: the master's tree reader is supplied and the
+        /// target declares `nodes.backup`.
+        pub fn tagged_pair(registered: bool) -> Rig {
+            let mut rig = Rig::tagged(registered);
+            rig.tree = Some(rig.f.node());
+            rig.add_backup();
+            rig
         }
 
         pub fn input(&self) -> ProjectsInput {
@@ -1750,6 +1763,19 @@ mod published {
             run_id: &str,
             check: bool,
         ) -> Result<DeployProjectsResult, CoreError> {
+            self.rollback_run_with(run_id, check, None).await
+        }
+
+        /// [`Rig::rollback_run`] on a pair: the backup node answers `backup`.
+        pub async fn rollback_run_with(
+            &self,
+            run_id: &str,
+            check: bool,
+            backup: Option<(
+                &dyn ignition_core::deploy::tag_converge::BackupTags,
+                std::time::Duration,
+            )>,
+        ) -> Result<DeployProjectsResult, CoreError> {
             let input = self.input();
             let loaded = ignition_core::actions::deploy_projects::load_project_for_rollback(&input)
                 .expect("the checkout loads");
@@ -1760,7 +1786,10 @@ mod published {
                 &ProjectsSurfaces {
                     gateway: &self.gateway,
                     host: &host,
-                    tree: None,
+                    tree: self
+                        .tree
+                        .as_ref()
+                        .map(|t| t as &dyn ignition_core::deploy::transport::TreeReader),
                     apply_host: None,
                     deploy: None,
                     tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
@@ -1779,8 +1808,11 @@ mod published {
                     children_poll: std::time::Duration::from_millis(5),
                     tag_verify_settle: std::time::Duration::from_secs(1),
                     tag_verify_poll: std::time::Duration::from_millis(5),
-                    backup: None,
-                    backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+                    backup: backup.map(|(node, _)| node),
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy {
+                        budget: backup.map_or(std::time::Duration::from_secs(1), |(_, b)| b),
+                        interval: std::time::Duration::from_millis(5),
+                    },
                     tag_delete_ready: std::time::Duration::from_millis(50),
                     tag_delete_poll: std::time::Duration::from_millis(5),
                 },
@@ -1810,7 +1842,10 @@ mod published {
                 &ProjectsSurfaces {
                     gateway: &self.gateway,
                     host,
-                    tree: None,
+                    tree: self
+                        .tree
+                        .as_ref()
+                        .map(|t| t as &dyn ignition_core::deploy::transport::TreeReader),
                     apply_host: None,
                     deploy: None,
                     tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
@@ -1847,6 +1882,59 @@ mod published {
             git_writer: Option<&dyn GitStateWriter>,
             designers: DesignersPolicy,
         ) -> Result<DeployProjectsResult, CoreError> {
+            self.run_prepared_full(host, loaded, prepared, git_writer, designers, None)
+                .await
+        }
+
+        /// A redundant pair (27-22): the target gains `nodes.backup` over a
+        /// second data dir that holds a byte copy of the master's clone. Call
+        /// it after the master's repository is shaped and before the backup's
+        /// is (the copy is taken now).
+        pub fn add_backup(&self) {
+            let path = self.targets.path().join("targets/dev.yaml");
+            let mut text = std::fs::read_to_string(&path).expect("the target file");
+            text.push_str(&format!(
+                "  backup:\n    profile: devb\n    local:\n      data_dir: '{}'\n",
+                self.f.backup_data_dir().display()
+            ));
+            std::fs::write(&path, text).expect("the target file is rewritten");
+        }
+
+        /// The fake backup node: a second fake gateway holding what the
+        /// backup's data dir holds, with its own disk mirror (the module
+        /// manages its project, so a sync deletes its `.git`, G5), that follows
+        /// this rig's master after `lag` reads.
+        pub fn backup_node(&self, lag: usize) -> FakeBackupNode<'_> {
+            let members = members_of(&self.f.backup_project_dir());
+            let borrowed: Vec<(&str, Vec<u8>)> = members
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.clone()))
+                .collect();
+            let gw = FakeProjects::new()
+                .with_project(PROJECT, None, false, &borrowed)
+                .with_disk_mirror(&self.f.backup_data_dir(), true);
+            FakeBackupNode {
+                master: &self.gateway,
+                gw,
+                lag,
+                reads: std::sync::Mutex::new(Vec::new()),
+                drop_git_at_first_read: false,
+                backup_git: self.f.backup_git_dir(),
+            }
+        }
+
+        pub async fn run_prepared_full(
+            &self,
+            host: &StubHost,
+            loaded: &LoadedProject,
+            prepared: ProjectsPrepared,
+            git_writer: Option<&dyn GitStateWriter>,
+            designers: DesignersPolicy,
+            backup: Option<(
+                &dyn ignition_core::deploy::tag_converge::BackupTags,
+                std::time::Duration,
+            )>,
+        ) -> Result<DeployProjectsResult, CoreError> {
             let input = self.input();
             deploy_projects_run(
                 prepared,
@@ -1855,7 +1943,10 @@ mod published {
                 &ProjectsSurfaces {
                     gateway: &self.gateway,
                     host,
-                    tree: None,
+                    tree: self
+                        .tree
+                        .as_ref()
+                        .map(|t| t as &dyn ignition_core::deploy::transport::TreeReader),
                     apply_host: None,
                     deploy: None,
                     tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
@@ -1874,12 +1965,35 @@ mod published {
                     children_poll: std::time::Duration::from_millis(5),
                     tag_verify_settle: std::time::Duration::from_secs(1),
                     tag_verify_poll: std::time::Duration::from_millis(5),
-                    backup: None,
-                    backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+                    backup: backup.map(|(node, _)| node),
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy {
+                        budget: backup.map_or(std::time::Duration::from_secs(1), |(_, b)| b),
+                        interval: std::time::Duration::from_millis(5),
+                    },
                     tag_delete_ready: std::time::Duration::from_millis(50),
                     tag_delete_poll: std::time::Duration::from_millis(5),
                 },
                 &NoProjectsObserver,
+            )
+            .await
+        }
+
+        /// An apply on a pair: the backup node answers `backup`, and the wait
+        /// for it lasts `budget`.
+        pub async fn apply_pair(
+            &self,
+            backup: &dyn ignition_core::deploy::tag_converge::BackupTags,
+            budget: std::time::Duration,
+        ) -> Result<DeployProjectsResult, CoreError> {
+            let host = self.host();
+            let (loaded, prepared) = self.plan_with(&host).await?;
+            self.run_prepared_full(
+                &host,
+                &loaded,
+                prepared,
+                None,
+                Default::default(),
+                Some((backup, budget)),
             )
             .await
         }
@@ -1961,9 +2075,12 @@ mod published {
 
         /// Directories named `repo` below the project's `git-save` folder.
         pub fn save_trees(&self) -> Vec<PathBuf> {
-            let root = self
-                .f
-                .data_dir
+            self.save_trees_in(&self.f.data_dir)
+        }
+
+        /// [`Rig::save_trees`] on the data dir `data`.
+        pub fn save_trees_in(&self, data: &std::path::Path) -> Vec<PathBuf> {
+            let root = data
                 .join("ign-deploy/capgw/projects")
                 .join(PROJECT)
                 .join("git-save");
@@ -5184,5 +5301,679 @@ mod published {
             assert!(hint.contains(needle), "{needle}: {hint}");
         }
         assert!(!text.contains("--allow-destructive"));
+    }
+
+    // ---- 27-22: a redundant pair (D-16, D-19, D-G5) ----
+
+    use ignition_core::client::redundancy::RedundancyStatusWire;
+    use ignition_core::deploy::tag_converge::BackupTags;
+
+    /// The backup node as the run sees it, and the sync that feeds it: a
+    /// second fake gateway with its own disk mirror (the module manages its
+    /// project, so every content-changing sync deletes its `.git`, G5 (b)),
+    /// which follows the master's project after `lag` reads. The only call the
+    /// run can make on it is `project_export`, a GET.
+    pub struct FakeBackupNode<'a> {
+        pub master: &'a FakeProjects,
+        pub gw: FakeProjects,
+        pub lag: usize,
+        pub reads: std::sync::Mutex<Vec<String>>,
+        /// The sync already deleted the backup's `.git` when the run reads it
+        /// first (the content changed during the run).
+        pub drop_git_at_first_read: bool,
+        pub backup_git: PathBuf,
+    }
+
+    impl FakeBackupNode<'_> {
+        pub fn reads(&self) -> Vec<String> {
+            self.reads.lock().expect("reads").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BackupTags for FakeBackupNode<'_> {
+        async fn tag_export(&self, provider: &str) -> Result<Vec<u8>, CoreError> {
+            // A tag-owning pair run also waits for the owned tags (26-13): the
+            // backup answers with the master's export in the backup's shape
+            // (no live values, children reversed).
+            self.reads
+                .lock()
+                .expect("reads")
+                .push("GET tag_export".into());
+            use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
+            let bytes = Gw::tag_export(self.master, provider).await?;
+            let mut tree: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| CoreError::Internal(format!("the master export: {e}")))?;
+            fn shape(node: &mut serde_json::Value, in_types: bool) {
+                let in_types = in_types || node["name"] == "_types_";
+                if !in_types
+                    && node["tagType"] == "AtomicTag"
+                    && let Some(object) = node.as_object_mut()
+                {
+                    for key in ["value", "timestamp", "quality"] {
+                        object.remove(key);
+                    }
+                }
+                if let Some(children) = node.get_mut("tags").and_then(|t| t.as_array_mut()) {
+                    children.reverse();
+                    for child in children {
+                        shape(child, in_types);
+                    }
+                }
+            }
+            shape(&mut tree, false);
+            Ok(serde_json::to_vec(&tree).expect("json"))
+        }
+        async fn status(&self) -> Result<RedundancyStatusWire, CoreError> {
+            self.reads.lock().expect("reads").push("GET status".into());
+            Ok(serde_json::from_value(serde_json::json!({
+                "role": "Backup", "activityLevel": "Cold", "projectState": "Good",
+                "peerConnected": true, "syncPending": false,
+                "lastSyncTimestamp": 1794179312498i64
+            }))
+            .expect("a status"))
+        }
+        async fn sync_exhausted(&self, _since_ms: i64) -> Result<bool, CoreError> {
+            self.reads.lock().expect("reads").push("GET logs".into());
+            Ok(false)
+        }
+        async fn project_export(&self, project: &str) -> Result<Vec<u8>, CoreError> {
+            let n = {
+                let mut reads = self.reads.lock().expect("reads");
+                reads.push("GET project_export".into());
+                reads.len()
+            };
+            if self.drop_git_at_first_read && n == 1 {
+                std::fs::remove_dir_all(&self.backup_git).expect("the sync deletes .git");
+            }
+            if n > self.lag {
+                use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
+                let current = Gw::export_bytes(self.master, project).await?;
+                let mine = Gw::export_bytes(&self.gw, project).await?;
+                if canonical_digest(&current)?.sha256 != canonical_digest(&mine)?.sha256 {
+                    // The redundancy sync, on the backup's own side.
+                    Gw::project_import(&self.gw, project, current, true).await?;
+                }
+            }
+            ignition_core::actions::deploy_projects::ProjectGateway::export_bytes(&self.gw, project)
+                .await
+        }
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+
+    fn node_of<'a>(
+        git: &'a GitReport,
+        name: &str,
+    ) -> &'a ignition_core::actions::deploy_projects::git::NodeGitReport {
+        git.nodes
+            .iter()
+            .find(|n| n.node == name)
+            .unwrap_or_else(|| panic!("{name} is in data.git.nodes: {:?}", git.nodes))
+    }
+
+    /// A pair whose two clones are the same module clone.
+    fn pair() -> Rig {
+        let rig = Rig::new();
+        rig.add_backup();
+        rig
+    }
+
+    #[tokio::test]
+    async fn pair_both_managed_agree() {
+        let rig = pair();
+        let result = rig.check().await.expect("the check completes");
+        let git = git_of(&result);
+        assert_eq!(git.nodes.len(), 2, "{:?}", git.nodes);
+        assert_eq!(git.nodes[0].node, "nodes.master");
+        assert_eq!(git.nodes[1].node, "nodes.backup");
+        for node in &git.nodes {
+            assert_eq!(node.state, "managed", "{node:?}");
+            assert_eq!(node.branch.as_deref(), Some(BRANCH));
+            assert_eq!(node.head.as_deref(), Some(rig.f.c1.as_str()));
+            // The gates ran on both nodes against the live export.
+            assert_eq!(node.dirty, Some(Vec::new()), "{node:?}");
+            assert_eq!(node.dirty_source, Some("release_store"));
+        }
+        let json = serde_json::to_value(git).expect("json");
+        assert_eq!(json["nodes"][1]["node"], "nodes.backup");
+    }
+
+    #[tokio::test]
+    async fn pair_heads_differ_refuses() {
+        let rig = pair();
+        // The master gains a pushed commit the backup lacks.
+        let ahead = rig.f.designer_commit_changing(
+            "ignition/script-python/cap/util/extra_designer.py",
+            "x = 1\n",
+            true,
+        );
+        rig.sync_live();
+        let err = refusal(rig.check().await);
+        assert_eq!(reason_of(&err), "nodes_disagree");
+        let text = err.to_string();
+        assert!(text.contains(&ahead[..12]), "{text}");
+        assert!(text.contains(&rig.f.c1[..12]), "{text}");
+        assert!(
+            text.contains("nodes.master") && text.contains("nodes.backup"),
+            "{text}"
+        );
+        // The apply refuses alike, before anything is written.
+        let again = refusal(rig.apply().await);
+        assert_eq!(again.to_string(), text);
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert!(
+            rig.save_trees().is_empty() && rig.save_trees_in(&rig.f.backup_data_dir()).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_origin_differs_refuses() {
+        let rig = pair();
+        rig.f.git_in_backup(&[
+            "config",
+            "remote.capapp.url",
+            "https://user:hunter2@other.example.invalid/elsewhere.git",
+        ]);
+        let err = refusal(rig.check().await);
+        assert_eq!(reason_of(&err), "nodes_disagree");
+        let text = format!("{err} {err:?}");
+        assert!(text.contains("origin"), "{text}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("user:"),
+            "the URL is redacted: {text}"
+        );
+        assert!(text.contains("other.example.invalid"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn pair_branch_differs_refuses() {
+        let rig = pair();
+        rig.f.git_in_backup(&["branch", "-m", BRANCH, "staging"]);
+        let err = refusal(rig.check().await);
+        assert_eq!(reason_of(&err), "nodes_disagree");
+        let text = err.to_string();
+        assert!(
+            text.contains("branch") && text.contains("staging") && text.contains(BRANCH),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_backup_absent_independent() {
+        let rig = pair();
+        std::fs::remove_dir_all(rig.f.backup_git_dir()).expect("no .git on the backup");
+        let result = rig.check().await.expect("the check completes");
+        let git = git_of(&result);
+        assert_eq!(git.nodes.len(), 2);
+        assert_eq!(git.nodes[0].state, "managed");
+        assert_eq!(node_of(git, "nodes.backup").state, "absent");
+        assert!(node_of(git, "nodes.backup").restore.is_none());
+        // A run handles the master as a single node; the backup is untouched.
+        let backup = rig.backup_node(0);
+        let applied = rig
+            .apply_pair(&backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert_eq!(applied.outcome, ProjectOutcome::Imported);
+        assert!(applied.ok);
+        let git = git_of(&applied);
+        assert!(
+            git.nodes[0]
+                .restore
+                .as_ref()
+                .expect("master restore")
+                .advanced
+        );
+        assert_eq!(node_of(git, "nodes.backup").state, "absent");
+        assert!(
+            !rig.f.backup_git_dir().exists(),
+            "a node without .git stays without one"
+        );
+        assert!(
+            backup.reads().is_empty(),
+            "no wait for a node with nothing to hand over"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_master_absent_backup_managed() {
+        let rig = pair();
+        std::fs::remove_dir_all(rig.f.git_dir()).expect("no .git on the master");
+        let check = rig.check().await.expect("the check completes");
+        let git = git_of(&check);
+        assert_eq!(git.nodes[0].state, "absent");
+        assert_eq!(git.nodes[1].state, "managed");
+        assert_eq!(git.nodes[1].dirty, Some(Vec::new()));
+        // The run deploys the master as today and hands the backup's repo over.
+        let backup = rig.backup_node(1);
+        let result = rig
+            .apply_pair(&backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        let git = git_of(&result);
+        assert_eq!(git.nodes[0].state, "absent");
+        let restore = git.nodes[1].restore.as_ref().expect("the backup restore");
+        assert!(
+            restore.restored && restore.advanced && restore.verified,
+            "{restore:?}"
+        );
+        assert!(!rig.f.git_dir().exists(), "the master stays without a .git");
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+    }
+
+    #[tokio::test]
+    async fn pair_backup_unsupported_refuses() {
+        let rig = pair();
+        rig.f.git_in_backup(&["checkout", "-q", "--detach"]);
+        let err = refusal(rig.check().await);
+        assert_eq!(reason_of(&err), "detached_head");
+        let text = err.to_string();
+        assert!(text.contains("nodes.backup"), "{text}");
+        assert!(!text.contains("nodes.master"), "{text}");
+        let again = refusal(rig.apply().await);
+        assert_eq!(again.to_string(), text);
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_eq!(rig.run_dirs(), 0);
+    }
+
+    /// D-24 on the backup: both nodes hold the same unpushed Designer commit
+    /// (so they agree) that ign's store lacks, and the live project differs
+    /// from it; each node's dirty list is read through that node's own host.
+    #[tokio::test]
+    async fn pair_backup_dirty_from_its_objects() {
+        let mut rig = Rig::new();
+        let d = rig.f.designer_commit(false);
+        rig.f
+            .live_change("ignition/script-python/cap/util/live.py", "y = 2\n");
+        rig.sync_live();
+        rig.add_backup();
+        rig.discard = Some("pair rig".to_string());
+        let result = rig.check().await.expect("the check completes");
+        let git = git_of(&result);
+        for node in &git.nodes {
+            assert_eq!(node.head.as_deref(), Some(d.as_str()), "{node:?}");
+            assert_eq!(node.dirty_source, Some("gateway_objects"), "{node:?}");
+            assert!(
+                node.dirty
+                    .as_ref()
+                    .is_some_and(|l| l.iter().any(|p| p.ends_with("live.py"))),
+                "{node:?}"
+            );
+        }
+        let would = git.would_discard.as_ref().expect("would_discard");
+        assert_eq!(would.dirty, DiscardDirty::Listed);
+        // The backup's own objects are what its read uses: remove one of its
+        // loose objects and only its read fails, naming the node.
+        let loose = {
+            let objects = rig.f.backup_git_dir().join("objects");
+            let hex = &d[..2];
+            let rest = &d[2..];
+            objects.join(hex).join(rest)
+        };
+        if loose.exists() {
+            std::fs::remove_file(&loose).expect("drop the backup's commit object");
+        } else {
+            rig.f.git_in_backup(&["gc", "-q", "--prune=now"]);
+            let idx_pack: Vec<_> = std::fs::read_dir(rig.f.backup_git_dir().join("objects/pack"))
+                .expect("pack dir")
+                .flatten()
+                .map(|e| e.path())
+                .collect();
+            for path in idx_pack {
+                std::fs::remove_file(path).expect("drop the backup's packs");
+            }
+        }
+        let err = refusal(rig.check().await);
+        assert_eq!(preflight_checks(&err), ["git_gateway_objects"], "{err}");
+        assert!(err.to_string().contains("nodes.backup"), "{err}");
+    }
+
+    /// The 27-18 hand-off: hazards are read per node, through that node's own
+    /// host, so a flag only the backup's `git.yaml` sets refuses naming the
+    /// backup (and passes with the acknowledgement).
+    #[tokio::test]
+    async fn pair_hazards_come_from_each_nodes_own_git_yaml() {
+        let mut rig = pair();
+        put_file(
+            &rig.f.backup_data_dir(),
+            "git.yaml",
+            &format!(
+                "- ignition_projectName: {PROJECT}\n  {}: {}\n",
+                ENFORCE_FLAG.0, ENFORCE_FLAG.1
+            ),
+        );
+        let err = refusal(rig.check().await);
+        let (gate, keys, _) = gate_of(&err);
+        assert_eq!(gate, "git_sync_hazard");
+        assert_eq!(keys, ["nodes.backup:enforce_branch"]);
+        rig.hazard_ack = Some("pair rig".to_string());
+        let result = rig.check().await.expect("acknowledged");
+        let git = git_of(&result);
+        assert!(git.nodes[0].hazards.is_empty(), "{:?}", git.nodes[0]);
+        assert_eq!(git.nodes[1].hazards, ["enforce_branch"]);
+    }
+
+    #[tokio::test]
+    async fn pair_check_reads_only() {
+        let rig = pair();
+        let master = rig.git_manifest().await;
+        let backup = rig
+            .f
+            .backup_node()
+            .git_manifest(PROJECT)
+            .await
+            .expect("manifest");
+        let result = rig.check().await.expect("the check completes");
+        assert_eq!(result.outcome, ProjectOutcome::Checked);
+        let git = git_of(&result);
+        assert!(
+            git.nodes
+                .iter()
+                .all(|n| n.save.is_none() && n.restore.is_none())
+        );
+        assert_eq!(rig.git_manifest().await, master);
+        assert_eq!(
+            rig.f
+                .backup_node()
+                .git_manifest(PROJECT)
+                .await
+                .expect("manifest"),
+            backup
+        );
+        assert!(rig.save_trees().is_empty());
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+        assert_eq!(rig.run_dirs(), 0);
+        assert!(rig.gateway.import_calls().is_empty());
+    }
+
+    // ---- 27-22: the run on both nodes ----
+
+    #[tokio::test]
+    async fn pair_run_advances_both() {
+        let rig = pair();
+        let backup = rig.backup_node(2);
+        let result = rig
+            .apply_pair(&backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.ok && result.slug.is_none());
+        let git = git_of(&result);
+        for name in ["nodes.master", "nodes.backup"] {
+            let node = node_of(git, name);
+            let restore = node
+                .restore
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} restore"));
+            assert!(
+                restore.restored && restore.advanced && restore.verified,
+                "{name}: {restore:?}"
+            );
+            assert_eq!(restore.reason, None);
+            assert!(!restore.save_kept, "{name}: the save is removed");
+            assert_eq!(restore.post_status, Some("matched"), "{name}");
+        }
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert_eq!(
+            rig.f.status_paths(),
+            git.expected_drift.clone().expect("drift")
+        );
+        assert!(rig.save_trees().is_empty());
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+        assert!(
+            backup.reads().len() >= 3,
+            "it polled until the export equalled: {:?}",
+            backup.reads()
+        );
+        assert!(
+            backup.reads().iter().all(|r| r == "GET project_export"),
+            "GET only"
+        );
+        // Both nodes were saved before the import and the events name each one.
+        let events = rig.events(&result);
+        let saved: Vec<&str> = events
+            .iter()
+            .filter(|e| e["event"] == "git_saved")
+            .filter_map(|e| e["node"].as_str())
+            .collect();
+        assert_eq!(saved, ["nodes.master", "nodes.backup"], "{events:?}");
+        let order: Vec<&str> = events.iter().filter_map(|e| e["event"].as_str()).collect();
+        let import_at = order
+            .iter()
+            .position(|e| *e == "import_sent")
+            .expect("import event");
+        let backup_save_at = events
+            .iter()
+            .position(|e| e["event"] == "git_saved" && e["node"] == "nodes.backup")
+            .expect("backup save");
+        assert!(
+            backup_save_at < import_at,
+            "both saves precede the import: {order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_backup_unconverged() {
+        let rig = pair();
+        let backup = rig.backup_node(usize::MAX);
+        let result = rig
+            .apply_pair(&backup, std::time::Duration::from_millis(80))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let git = git_of(&result);
+        // The master is advanced and recorded.
+        let master = node_of(git, "nodes.master")
+            .restore
+            .as_ref()
+            .expect("master");
+        assert!(master.advanced && master.reason.is_none(), "{master:?}");
+        assert!(result.record_written);
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        // The backup names the reason and keeps and names its save.
+        let node = node_of(git, "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert_eq!(restore.reason.as_deref(), Some("backup_unsynced"));
+        assert!(restore.save_kept && !restore.advanced, "{restore:?}");
+        assert!(node.save.is_some(), "the save is reported");
+        assert_eq!(rig.save_trees_in(&rig.f.backup_data_dir()).len(), 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("backup_unsynced") && w.contains("git-save")),
+            "{:?}",
+            result.warnings
+        );
+        // The backup's repository was never written.
+        assert!(rig.f.backup_git_dir().exists());
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c1);
+    }
+
+    #[tokio::test]
+    async fn pair_rollback_restores_both_unchanged() {
+        let rig = Rig::tagged_pair(true);
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before_master = rig.git_manifest().await;
+        let before_backup = rig
+            .f
+            .backup_node()
+            .git_manifest(PROJECT)
+            .await
+            .expect("manifest");
+        let mut backup = rig.backup_node(0);
+        // The sync already removed the backup's `.git` when the content changed.
+        backup.drop_git_at_first_read = true;
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok);
+        let git = git_of(&result);
+        for name in ["nodes.master", "nodes.backup"] {
+            let restore = node_of(git, name)
+                .restore
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(restore.restored && !restore.advanced, "{name}: {restore:?}");
+            assert_eq!(restore.reason, None);
+            assert!(!restore.save_kept, "{name}");
+        }
+        assert_eq!(
+            rig.git_manifest().await,
+            before_master,
+            "the master is as saved"
+        );
+        assert_eq!(
+            rig.f
+                .backup_node()
+                .git_manifest(PROJECT)
+                .await
+                .expect("manifest"),
+            before_backup,
+            "the backup is as saved"
+        );
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c1);
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c1);
+        assert!(rig.save_trees().is_empty());
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+    }
+
+    /// `--rollback-run` on a pair (D-08): both repositories are saved before
+    /// the undo and put back as they were once the backup's project has
+    /// followed the master's rolled-back one.
+    #[tokio::test]
+    async fn pair_rollback_run_restores_both_unchanged() {
+        let rig = Rig::tagged_pair(true);
+        let backup = rig.backup_node(0);
+        let applied = rig.apply_pair(&backup, WAIT).await.expect("green");
+        assert_eq!(
+            applied.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            applied.warnings
+        );
+        let run_id = applied.run_id.clone().expect("a run id");
+        // Both repositories were advanced by the run.
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+        let before_master = rig.git_manifest().await;
+        let before_backup = rig
+            .f
+            .backup_node()
+            .git_manifest(PROJECT)
+            .await
+            .expect("manifest");
+
+        let checked = rig
+            .rollback_run_with(&run_id, true, Some((&backup, WAIT)))
+            .await
+            .expect("a check");
+        assert_eq!(node_of(git_of(&checked), "nodes.backup").state, "managed");
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+
+        let undo = rig
+            .rollback_run_with(&run_id, false, Some((&backup, WAIT)))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            undo.warnings
+        );
+        for name in ["nodes.master", "nodes.backup"] {
+            let restore = node_of(git_of(&undo), name)
+                .restore
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} restore"));
+            assert!(restore.restored && !restore.advanced, "{name}: {restore:?}");
+            assert!(!restore.save_kept, "{name}");
+        }
+        assert_eq!(rig.git_manifest().await, before_master);
+        assert_eq!(
+            rig.f
+                .backup_node()
+                .git_manifest(PROJECT)
+                .await
+                .expect("manifest"),
+            before_backup
+        );
+        assert!(rig.save_trees().is_empty());
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_preflight_both_nodes() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = pair();
+        let dir = rig.f.backup_project_dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let backup = rig.backup_node(0);
+        let outcome = rig.apply_pair(&backup, WAIT).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        if std::fs::write(dir.join(".ign-probe-root-check"), b"x").is_ok() {
+            // Running as a user that ignores directory modes: nothing to prove.
+            let _ = std::fs::remove_file(dir.join(".ign-probe-root-check"));
+            return;
+        }
+        let err = refusal(outcome);
+        assert_eq!(preflight_checks(&err), ["git_write_access"], "{err}");
+        assert!(err.to_string().contains("nodes.backup"), "{err}");
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert!(rig.gateway.import_calls().is_empty());
+        assert!(backup.reads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pair_backup_rest_get_only() {
+        let rig = pair();
+        let backup = rig.backup_node(1);
+        let result = rig
+            .apply_pair(&backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert!(result.ok, "{:?}", result.warnings);
+        // The only call the run made on the backup's REST handle is a GET of
+        // its project export; nothing else (and the trait has no write).
+        let reads = backup.reads();
+        assert!(!reads.is_empty());
+        assert!(reads.iter().all(|r| r.starts_with("GET ")), "{reads:?}");
+        // The source guard: the backup handle's trait has reads only.
+        let trait_src = include_str!("../src/deploy/tag_converge.rs");
+        let start = trait_src.find("pub trait BackupTags").expect("trait");
+        let end = start + trait_src[start..].find("\n}\n").expect("end of trait");
+        for write in ["post", "put", "delete", "import", "resync", "write"] {
+            assert!(
+                !trait_src[start..end]
+                    .to_lowercase()
+                    .contains(&format!("fn {write}")),
+                "the backup handle has a write method: {write}"
+            );
+        }
     }
 }

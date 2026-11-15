@@ -56,8 +56,10 @@ use crate::deploy::git_state::{GitFiles, GitHead, GitRefs, GitState, GitStateKin
 use crate::deploy::git_yaml::{Hazard, entry_for, hazards_for, parse_git_yaml, refuses};
 use crate::deploy::ledger::{LedgerRoot, git_save_location};
 use crate::deploy::project_artifact::CanonicalDigest;
+use crate::deploy::tag_converge::BackupTags;
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitStateWriter, ImportDir, git_entry_location,
+    GitEntry, GitHostRead, GitStateWriter, ImportDir, ProjectHost, git_entry_location,
+    git_state_writer_for_node, local_data_dir_for_node, project_host_for_node,
 };
 use crate::error::{CoreError, PreflightFailure};
 
@@ -93,7 +95,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
         "prepare_git_live via gate_node (27-12)",
     ),
     ("branch_required", "adoption in prepare_git_host (27-17)"),
-    ("nodes_disagree", "pair agreement in the prepare (27-22)"),
+    (
+        "nodes_disagree",
+        "prepare_git_pair, agreement of the two nodes' repositories (27-22)",
+    ),
     (
         "restore_failed",
         "git_handover::restore_and_advance (27-02)",
@@ -107,7 +112,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
         "git_handover::restore_and_advance via finish_advance (27-01, 27-02)",
     ),
     ("git_recreated", "git_handover::restore_and_advance (27-02)"),
-    ("backup_unsynced", "backup wait (27-22)"),
+    (
+        "backup_unsynced",
+        "git_after_backup, the wait for the backup's project (27-22)",
+    ),
     (
         "post_status_mismatch",
         "git_after_verify, post-advance disk status on a local node (27-12, D-25)",
@@ -129,6 +137,15 @@ pub const PRODUCED_HERE: &[&str] = &[
 /// The restore reason of a restore that was not attempted because a Designer
 /// was attached (D-07, checker W-4).
 pub const REASON_DESIGNER_ATTACHED: &str = "designer_attached";
+
+/// `nodes.master`, the first entry of `data.git.nodes`.
+pub const MASTER: &str = "nodes.master";
+/// `nodes.backup`, the second entry on a redundant pair (27-22).
+pub const BACKUP: &str = "nodes.backup";
+
+/// The restore reason of a backup whose project did not converge to the
+/// artifact within `--backup-timeout` (27-22, D-G5).
+pub const REASON_BACKUP_UNSYNCED: &str = "backup_unsynced";
 
 /// How long the Designer gate before a post-import `.git` write waits for an
 /// attached session to close when the run's own `--designers` mode is not
@@ -438,6 +455,8 @@ pub struct PreparedGit {
     pub discard: Option<DiscardPlan>,
     /// The published block.
     pub report: GitReport,
+    /// The node this repo belongs to: `nodes.master` or `nodes.backup`.
+    pub node: String,
     /// The `.git` entry kind (`directory`, ...), for refusals.
     kind: String,
     /// The gateway repo's `logs/HEAD` tail (untrusted text).
@@ -563,7 +582,19 @@ pub async fn prepare_git_host_with(
     findings: &mut Vec<String>,
 ) -> Result<HostPrep, CoreError> {
     let mut seen = HostSeen::default();
-    match prepare_git_host_inner(loaded, input, surfaces, entry, mode, &mut seen).await {
+    let git = surfaces.host.host_git();
+    match prepare_git_host_inner(
+        loaded,
+        input,
+        surfaces.host,
+        git,
+        entry,
+        mode,
+        &mut seen,
+        MASTER,
+    )
+    .await
+    {
         Ok(Some(prepared)) => Ok(HostPrep::Ready(Box::new(prepared))),
         Ok(None) => Ok(HostPrep::Absent),
         Err(err) if mode == GitMode::Report && is_refusal(&err) => {
@@ -725,30 +756,32 @@ fn record_finding(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_git_host_inner(
     loaded: &LoadedProject,
     input: &ProjectsInput,
-    surfaces: &ProjectsSurfaces<'_>,
+    host: &dyn ProjectHost,
+    git: HostGit,
     entry: GitEntry,
     git_mode: GitMode,
     seen: &mut HostSeen,
+    node: &str,
 ) -> Result<Option<PreparedGit>, CoreError> {
     if !entry.is_present() {
         return Ok(None);
     }
     let project = loaded.file.project.as_str();
     let kind = entry.as_str();
-    let Some(read) = surfaces.host.git() else {
+    let Some(read) = host.git() else {
         return Err(CoreError::TransportFailed {
             operation: "git".to_string(),
-            node: "nodes.master".to_string(),
+            node: node.to_string(),
             detail: format!(
                 "{} is present but this host cannot read it",
                 git_entry_location(project)
             ),
         });
     };
-    let git = surfaces.host.host_git();
     let found = read_state(read, &git, project).await?;
     seen.state = Some(state_word(found.state.kind));
     seen.branch.clone_from(&found.state.tracked);
@@ -812,7 +845,7 @@ async fn prepare_git_host_inner(
     let report = GitReport {
         release_commit: checkout.commit.clone(),
         nodes: vec![NodeGitReport {
-            node: "nodes.master".to_string(),
+            node: node.to_string(),
             state: state_word(found.state.kind),
             reason: None,
             branch: match &adopt {
@@ -857,6 +890,7 @@ async fn prepare_git_host_inner(
         hazard_ack: input.allow_git_sync_hazards.clone(),
         discard: None,
         report,
+        node: node.to_string(),
         kind: kind.to_string(),
         head_log_tail: found.files.head_log_tail,
     }))
@@ -1126,7 +1160,23 @@ pub async fn prepare_git_live(
     surfaces: &ProjectsSurfaces<'_>,
     warnings: &mut Vec<String>,
 ) -> Result<(), CoreError> {
-    match prepare_git_live_inner(prepared, live, action, loaded, surfaces, warnings).await {
+    let git = surfaces.host.host_git();
+    prepare_git_live_on(prepared, live, action, loaded, surfaces.host, git, warnings).await
+}
+
+/// [`prepare_git_live`] over an explicit host: the backup node's own read
+/// surface (27-22, the 27-18 hand-off: hazards and the D-24 object read go
+/// through the node that holds the repository) with ign's host git.
+pub async fn prepare_git_live_on(
+    prepared: &mut PreparedGit,
+    live: Option<&CanonicalDigest>,
+    action: ProjectAction,
+    loaded: &LoadedProject,
+    host: &dyn ProjectHost,
+    git: HostGit,
+    warnings: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    match prepare_git_live_inner(prepared, live, action, loaded, host, git, warnings).await {
         Err(err) if prepared.mode == GitMode::Report && is_refusal(&err) => {
             record_finding(prepared, warnings, loaded.file.project.as_str(), &err);
             Ok(())
@@ -1140,7 +1190,8 @@ async fn prepare_git_live_inner(
     live: Option<&CanonicalDigest>,
     action: ProjectAction,
     loaded: &LoadedProject,
-    surfaces: &ProjectsSurfaces<'_>,
+    host: &dyn ProjectHost,
+    git: HostGit,
     warnings: &mut Vec<String>,
 ) -> Result<(), CoreError> {
     let project = loaded.file.project.as_str();
@@ -1154,17 +1205,16 @@ async fn prepare_git_live_inner(
             ),
         ));
     };
-    let Some(read) = surfaces.host.git() else {
+    let Some(read) = host.git() else {
         return Err(CoreError::TransportFailed {
             operation: "git".to_string(),
-            node: "nodes.master".to_string(),
+            node: prepared.node.clone(),
             detail: format!(
                 "{} is present but this host cannot read it",
                 git_entry_location(project)
             ),
         });
     };
-    let git = surfaces.host.host_git();
     // The module start-sync hazards of the kept `.git` (27-18): `git.yaml` and
     // `tags/` were read in the prepare; the refusal needs the action.
     apply_hazards(prepared, action, project, warnings)?;
@@ -1408,48 +1458,70 @@ pub async fn git_preflight(
     prep: Option<&AdvancePrep>,
     probe_id: &str,
 ) -> Result<(), CoreError> {
+    git_preflight_on(MASTER, write, read, gateway, project, prep, probe_id).await
+}
+
+/// [`git_preflight`] for one node of a pair (27-22): the same probe and the
+/// same room check on that node's host, and a refusal that names a node other
+/// than the master.
+pub async fn git_preflight_on(
+    node: &str,
+    write: &dyn GitStateWriter,
+    read: &dyn GitHostRead,
+    gateway: &str,
+    project: &str,
+    prep: Option<&AdvancePrep>,
+    probe_id: &str,
+) -> Result<(), CoreError> {
+    let named = |detail: String| {
+        if node == MASTER {
+            detail
+        } else {
+            format!("{node}: {detail}")
+        }
+    };
     write.probe_write(project, probe_id).await.map_err(|err| {
         preflight(
             "git_write_access",
-            format!(
+            named(format!(
                 "the deploy account cannot write where the git restore needs to ({}); grant it \
                  write access on {} only (README: Write access and the grant)",
                 failure_text(&err),
                 git_entry_location(project).trim_end_matches("/.git"),
-            ),
+            )),
         )
     })?;
     let size = read.git_size(project).await.map_err(|err| {
         preflight(
             "git_free_space",
-            format!(
+            named(format!(
                 "the size of {} cannot be read ({})",
                 git_entry_location(project),
                 failure_text(&err)
-            ),
+            )),
         )
     })?;
     let need = git_free_need(size.bytes, prep);
     let free = read.free_bytes(gateway, project).await.map_err(|err| {
         preflight(
             "git_free_space",
-            format!(
+            named(format!(
                 "the free space for the save of {} cannot be read ({})",
                 git_entry_location(project),
                 failure_text(&err)
-            ),
+            )),
         )
     })?;
     if free < need {
         return Err(preflight(
             "git_free_space",
-            format!(
+            named(format!(
                 "{free} bytes are free for the save and the restore of {} and {need} are \
                  needed (2 x {} bytes of .git, the prepared pack and {} bytes of slack)",
                 git_entry_location(project),
                 size.bytes,
                 GIT_FREE_SLACK,
-            ),
+            )),
         ));
     }
     Ok(())
@@ -1479,6 +1551,7 @@ impl GitAfter {
 }
 
 /// The inputs of the post-import steps that are not the report.
+#[derive(Clone, Copy)]
 pub struct AfterInputs<'a> {
     /// The host's read surface.
     pub read: &'a dyn GitHostRead,
@@ -2254,6 +2327,636 @@ async fn disk_status_differs(
         .collect();
     differ.extend(lines.deleted.iter().cloned());
     Ok(differ.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Redundant pairs (Phase 27, 27-22, D-16, D-19, D-G5)
+// ---------------------------------------------------------------------------
+
+/// A refusal rewritten so it names `node`: the master's refusals stay exactly
+/// as they are. A reasoned `project_git_managed` names the node in its
+/// location, a failed preflight check in its detail, a gate in its keys and a
+/// transport failure in its node.
+pub fn on_node(err: CoreError, node: &str) -> CoreError {
+    if node == MASTER {
+        return err;
+    }
+    match err {
+        CoreError::ProjectGitManaged {
+            project,
+            location,
+            kind,
+            reason,
+        } => CoreError::ProjectGitManaged {
+            project,
+            location: format!("{node} {location}"),
+            kind,
+            reason,
+        },
+        CoreError::DeployPreflightFailed { failures } => CoreError::DeployPreflightFailed {
+            failures: failures
+                .iter()
+                .map(|f| PreflightFailure {
+                    check: f.check.clone(),
+                    detail: format!("{node}: {}", f.detail),
+                })
+                .collect(),
+        },
+        CoreError::DestructiveChangeRefused { gate, keys, count } => {
+            CoreError::DestructiveChangeRefused {
+                gate,
+                keys: keys.into_iter().map(|k| format!("{node}:{k}")).collect(),
+                count,
+            }
+        }
+        CoreError::TransportFailed {
+            operation, detail, ..
+        } => CoreError::TransportFailed {
+            operation,
+            node: node.to_string(),
+            detail,
+        },
+        other => other,
+    }
+}
+
+/// An entry of `data.git.nodes` for a node whose `.git` does not exist: the
+/// node is independent and deploys as it always did.
+fn absent_node(node: &str) -> NodeGitReport {
+    NodeGitReport {
+        node: node.to_string(),
+        state: "absent",
+        reason: None,
+        branch: None,
+        branch_source: None,
+        remote: None,
+        remote_url: None,
+        head: None,
+        adopted: false,
+        unpushed: Vec::new(),
+        not_merged: Vec::new(),
+        not_merged_count: 0,
+        dirty: None,
+        dirty_count: None,
+        dirty_source: None,
+        hazards: Vec::new(),
+        save: None,
+        restore: None,
+    }
+}
+
+/// The published `data.git` of a target, from each node's own single-node
+/// report. On a pair (`pair`) it holds the master, then the backup, an absent
+/// node as an `absent` entry (D-23: a node without `.git` stays without one).
+/// `None` when no node holds a repository. The block-level facts (`would_discard`,
+/// `discarded`, `hazards_acknowledged`, `expected_drift`) are the master's, or
+/// the backup's when the master holds no repository.
+pub fn pair_report(
+    master: Option<&GitReport>,
+    backup: Option<&GitReport>,
+    pair: bool,
+) -> Option<GitReport> {
+    let base = master.or(backup)?;
+    let mut report = base.clone();
+    if !pair {
+        return Some(report);
+    }
+    let node_of = |r: Option<&GitReport>, name: &str| {
+        r.and_then(|r| r.nodes.first().cloned())
+            .unwrap_or_else(|| absent_node(name))
+    };
+    report.nodes = vec![node_of(master, MASTER), node_of(backup, BACKUP)];
+    Some(report)
+}
+
+/// The three facts two nodes must share: origin, tracked branch and HEAD.
+struct NodeFacts {
+    origin_key: String,
+    origin: String,
+    branch: Option<String>,
+    head: Option<String>,
+}
+
+/// The agreement facts of `host`'s repository; `None` for a state that is
+/// neither managed nor adoptable (the node's own prepare refuses it with its
+/// own reason).
+async fn node_facts(
+    loaded: &LoadedProject,
+    host: &dyn ProjectHost,
+    git: &HostGit,
+) -> Result<Option<NodeFacts>, CoreError> {
+    let project = loaded.file.project.as_str();
+    let Some(read) = host.git() else {
+        return Ok(None);
+    };
+    let found = read_state(read, git, project).await?;
+    let adoptable = found.state.kind == GitStateKind::Adoptable;
+    if found.state.kind != GitStateKind::Managed && !adoptable {
+        return Ok(None);
+    }
+    let Some(remote) = found.state.remote.clone() else {
+        return Ok(None);
+    };
+    let branch = if adoptable {
+        // A partial repo is adopted onto an explicit branch; a node whose
+        // branch cannot be decided is left to its own prepare to refuse.
+        adoption_branch(loaded, read, git, project, "directory")
+            .await
+            .ok()
+            .map(|a| a.branch)
+    } else {
+        found.state.tracked.clone()
+    };
+    Ok(Some(NodeFacts {
+        origin_key: remote.url_key,
+        origin: remote.url_redacted,
+        branch,
+        head: head_commit(&found.state),
+    }))
+}
+
+fn short(id: &str) -> &str {
+    id.get(..12).unwrap_or(id)
+}
+
+/// Both nodes hold a repository and they differ in origin, tracked branch or
+/// HEAD: refused before any write (T-27-49). A fact that is unknown on one
+/// side (the HEAD of a partial repo) is not compared. The text names both
+/// nodes' values, with URLs redacted.
+fn nodes_disagree(project: &str, master: &NodeFacts, backup: &NodeFacts) -> Option<CoreError> {
+    let mut differ: Vec<String> = Vec::new();
+    if master.origin_key != backup.origin_key {
+        differ.push(format!(
+            "origin {MASTER} {} / {BACKUP} {}",
+            master.origin.escape_debug(),
+            backup.origin.escape_debug()
+        ));
+    }
+    if let (Some(a), Some(b)) = (&master.branch, &backup.branch)
+        && a != b
+    {
+        differ.push(format!(
+            "branch {MASTER} {} / {BACKUP} {}",
+            a.escape_debug(),
+            b.escape_debug()
+        ));
+    }
+    if let (Some(a), Some(b)) = (&master.head, &backup.head)
+        && a != b
+    {
+        differ.push(format!(
+            "HEAD {MASTER} {} / {BACKUP} {}",
+            short(a),
+            short(b)
+        ));
+    }
+    if differ.is_empty() {
+        return None;
+    }
+    Some(CoreError::ProjectGitManaged {
+        project: project.to_string(),
+        location: format!(
+            "{} differs between the nodes ({})",
+            git_entry_location(project),
+            differ.join("; ")
+        ),
+        kind: "directory".to_string(),
+        reason: "nodes_disagree".to_string(),
+    })
+}
+
+/// What the pair half of the prepare found.
+pub struct PairPrep {
+    /// The master's half, as [`prepare_git_host_with`] returns it.
+    pub master: HostPrep,
+    /// The backup's repository, prepared; `None` when the backup holds no
+    /// `.git` (or the target has no backup).
+    pub backup: Option<PreparedGit>,
+    /// The backup node's read host, kept for the live step.
+    pub backup_host: Option<Box<dyn ProjectHost>>,
+    /// The target declares `nodes.backup` and the gates apply to it.
+    pub pair: bool,
+}
+
+/// Step 1 on a target with `nodes.backup` (27-22, D-19): read the backup's
+/// `.git` through its own host exactly as the master's is read, refuse when
+/// both nodes hold a repository and they disagree, then prepare each node
+/// from its own refs. A target without `nodes.backup`, and a report-mode
+/// rehearsal, take the master's step alone. Nothing is written.
+pub async fn prepare_git_pair(
+    loaded: &LoadedProject,
+    input: &ProjectsInput,
+    surfaces: &ProjectsSurfaces<'_>,
+    master_entry: GitEntry,
+    mode: GitMode,
+    warnings: &mut Vec<String>,
+) -> Result<PairPrep, CoreError> {
+    let backup_node = loaded
+        .target
+        .nodes
+        .backup
+        .as_ref()
+        .filter(|_| mode == GitMode::Enforce);
+    // A backup with no `ssh` or `local` block is reached over REST only: its
+    // `.git` cannot be read, so it is not handled (as before this plan).
+    let backup_node = match backup_node {
+        Some(node) if node.ssh.is_none() && node.local.is_none() => {
+            if master_entry.is_present() {
+                warnings.push(format!(
+                    "project {}: {BACKUP} declares no ssh or local transport, so its git \
+                     repository cannot be read and was not handled",
+                    loaded.file.project
+                ));
+            }
+            None
+        }
+        other => other,
+    };
+    let Some(backup_node) = backup_node else {
+        let master =
+            prepare_git_host_with(loaded, input, surfaces, master_entry, mode, warnings).await?;
+        return Ok(PairPrep {
+            master,
+            backup: None,
+            backup_host: None,
+            pair: false,
+        });
+    };
+    let project = loaded.file.project.as_str();
+    let backup_host =
+        project_host_for_node(&input.targets, &loaded.target_file, BACKUP, backup_node)?;
+    let backup_entry = backup_host
+        .git_entry(project)
+        .await
+        .map_err(|e| on_node(e, BACKUP))?;
+    if master_entry.is_present() && backup_entry.is_present() {
+        let git = surfaces.host.host_git();
+        let master_facts = node_facts(loaded, surfaces.host, &git).await?;
+        let backup_facts = node_facts(loaded, backup_host.as_ref(), &git)
+            .await
+            .map_err(|e| on_node(e, BACKUP))?;
+        if let (Some(m), Some(b)) = (&master_facts, &backup_facts)
+            && let Some(err) = nodes_disagree(project, m, b)
+        {
+            return Err(err);
+        }
+    }
+    let master =
+        prepare_git_host_with(loaded, input, surfaces, master_entry, mode, warnings).await?;
+    let backup = prepare_git_host_inner(
+        loaded,
+        input,
+        backup_host.as_ref(),
+        surfaces.host.host_git(),
+        backup_entry,
+        mode,
+        &mut HostSeen::default(),
+        BACKUP,
+    )
+    .await
+    .map_err(|e| on_node(e, BACKUP))?;
+    Ok(PairPrep {
+        master,
+        backup,
+        backup_host: Some(backup_host),
+        pair: true,
+    })
+}
+
+/// Step 2 for the backup: the same gates against the live project the master
+/// serves (redundancy replicates it to the backup; a backup that lags is
+/// caught by the run's convergence wait), with the D-24 object read through
+/// the backup's own host.
+pub async fn prepare_backup_live(
+    backup: &mut PreparedGit,
+    host: &dyn ProjectHost,
+    git: HostGit,
+    live: Option<&CanonicalDigest>,
+    action: ProjectAction,
+    loaded: &LoadedProject,
+    warnings: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    prepare_git_live_on(backup, live, action, loaded, host, git, warnings)
+        .await
+        .map_err(|e| on_node(e, BACKUP))
+}
+
+/// What a wait for the backup's own copy of the project needs.
+#[derive(Clone, Copy)]
+pub struct BackupWait<'a> {
+    /// The backup's read-only REST handle (GET only).
+    pub backup: &'a dyn BackupTags,
+    /// `--backup-timeout` and the poll interval.
+    pub policy: crate::deploy::pair::BackupPolicy,
+}
+
+/// Poll the backup's project export until its canonical digest is `want`
+/// (D-G5: the backup's `data/projects/<p>` follows the gateway's project, so
+/// the export is read as the proxy for it), or the budget passes. The
+/// converged export bytes come back for the read-back of the handover; a wait
+/// that did not converge returns the reason text (a code or a count, never
+/// content).
+pub async fn wait_for_backup_project(
+    wait: &BackupWait<'_>,
+    project: &str,
+    want: &str,
+) -> Result<Vec<u8>, String> {
+    let start = std::time::Instant::now();
+    let mut last: String;
+    loop {
+        match wait.backup.project_export(project).await {
+            Ok(zip) => match crate::deploy::project_artifact::canonical_digest(&zip) {
+                Ok(digest) if !digest.members.is_empty() && digest.sha256 == want => {
+                    return Ok(zip);
+                }
+                Ok(_) => last = "the backup's project does not equal the release yet".to_string(),
+                Err(err) => {
+                    last = format!("the backup's export is unusable ({})", err.code());
+                }
+            },
+            Err(err) => {
+                last = format!("the backup's export could not be read ({})", err.code());
+            }
+        }
+        if start.elapsed() >= wait.policy.budget {
+            return Err(last);
+        }
+        tokio::time::sleep(wait.policy.interval).await;
+    }
+}
+
+/// Step 3b for the backup (27-22, D-G5): the master is verified and its
+/// repository handled; the backup's own project directory follows the
+/// gateway's, so its `.git` is restored and advanced only once its project
+/// export equals the artifact (`want`). The wait is bounded by
+/// `--backup-timeout`; a backup that does not converge ends the node
+/// `backup_unsynced` with its save kept and named, and the master is never
+/// undone for it. Past the wait the node takes the master's steps: the
+/// Designer gate, restore when absent, advance in place when present and equal
+/// to its saved state ([`git_after_verify`]); `report` holds the backup's
+/// single-node report.
+pub async fn git_after_backup(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    wait: &BackupWait<'_>,
+    want: &str,
+) -> GitAfter {
+    match wait_for_backup_project(wait, inputs.project, want).await {
+        Ok(zip) => {
+            let converged = AfterInputs {
+                export_zip: &zip,
+                ..*inputs
+            };
+            git_after_verify(prepared, report, saved, &converged).await
+        }
+        Err(detail) => failed_restore(
+            report,
+            &GitRestoreFailure {
+                reason: REASON_BACKUP_UNSYNCED,
+                restored: false,
+                paths: Vec::new(),
+                detail: format!(
+                    "the backup's project did not equal the release within {} s ({detail}); \
+                     its .git was not restored",
+                    wait.policy.budget.as_secs()
+                ),
+                save_path: saved.path.clone(),
+            },
+        ),
+    }
+}
+
+/// D-08 on the backup: its repository goes back unchanged once its project
+/// has followed the master's rolled-back project (`want` is the digest the
+/// master's project holds now; `None` when it could not be read, which fails
+/// closed). The wait comes first because the redundancy sync removes a
+/// module-cloned `.git` when the backup's content converges: a repository
+/// found present before that would be called equal, its save removed, and then
+/// lost. A backup that does not converge in the budget writes nothing, keeps
+/// its save and is a line in `left`.
+pub async fn git_rollback_backup(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+    wait: &BackupWait<'_>,
+    want: Option<&str>,
+) -> RollbackGit {
+    let unsynced = match want {
+        None => Some("the master's project digest could not be read".to_string()),
+        Some(want) => wait_for_backup_project(wait, inputs.project, want)
+            .await
+            .err(),
+    };
+    if let Some(detail) = unsynced {
+        let failure = GitRestoreFailure {
+            reason: REASON_BACKUP_UNSYNCED,
+            restored: false,
+            paths: Vec::new(),
+            detail: format!(
+                "the backup's project did not follow the rollback within {} s ({detail}); its \
+                 .git was not touched",
+                wait.policy.budget.as_secs()
+            ),
+            save_path: saved.path.clone(),
+        };
+        let after = failed_restore(report, &failure);
+        return RollbackGit {
+            after,
+            left: vec![format!(
+                "project {}: the backup's git repository was not put back ({REASON_BACKUP_UNSYNCED}); \
+                 the saved .git is at {} on {BACKUP}",
+                inputs.project, saved.path
+            )],
+        };
+    }
+    git_after_rollback(report, saved, inputs).await
+}
+
+/// The `record` action's advance on the backup (27-22): the project already is
+/// the artifact, so the backup is saved, then waited for (it may still be
+/// converging), then handled like the master's `record`: restored when the
+/// sync removed it, advanced in place otherwise.
+pub async fn git_record_backup(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    run_id: &str,
+    inputs: &AfterInputs<'_>,
+    wait: &BackupWait<'_>,
+    want: &str,
+) -> GitAfter {
+    let saved = match git_before_import(
+        prepared,
+        inputs.read,
+        inputs.write,
+        inputs.git,
+        inputs.gateway,
+        inputs.project,
+        run_id,
+    )
+    .await
+    {
+        Ok(saved) => saved,
+        Err(err) => {
+            let (reason, detail) = match &err {
+                CoreError::PlanStale { .. } => (
+                    "git_recreated",
+                    "the backup's git repository changed since the plan (HEAD, refs or \
+                     config); nothing was advanced"
+                        .to_string(),
+                ),
+                other => (
+                    "restore_failed",
+                    format!(
+                        "the backup's .git could not be saved before the advance ({}); nothing \
+                         was advanced",
+                        other.code()
+                    ),
+                ),
+            };
+            let node_name = report.master().node.clone();
+            report.master_mut().restore = Some(RestoreInfo {
+                restored: false,
+                advanced: false,
+                verified: false,
+                post_status: None,
+                post_status_note: None,
+                dropped: Vec::new(),
+                dropped_count: 0,
+                reason: Some(reason.to_string()),
+                save_kept: false,
+            });
+            let mut after = GitAfter::new();
+            after.failed = true;
+            after.warnings.push(format!(
+                "project {}: git {reason} on {node_name}: {detail}",
+                inputs.project
+            ));
+            after.events.push(ProjectsEvent::GitRestoreFailed {
+                node: node_name,
+                reason: reason.to_string(),
+                path: None,
+            });
+            return after;
+        }
+    };
+    report.set_save(&saved);
+    let mut after = git_after_backup(prepared, report, &saved, inputs, wait, want).await;
+    after.events.insert(
+        0,
+        ProjectsEvent::GitSaved {
+            node: report.master().node.clone(),
+            path: saved.path.clone(),
+            files: saved.manifest.files,
+            bytes: saved.manifest.bytes,
+        },
+    );
+    after
+}
+
+/// The backup's entry of a published pair report as a single-node report, so
+/// the per-node steps (written for the master's `nodes[0]`) run on it
+/// unchanged. `None` when the report holds no backup entry.
+pub fn backup_view(report: &GitReport) -> Option<GitReport> {
+    let node = report.nodes.get(1)?.clone();
+    Some(GitReport {
+        release_commit: report.release_commit.clone(),
+        nodes: vec![node],
+        expected_drift: None,
+        expected_drift_count: None,
+        expected_drift_complete: false,
+        would_discard: None,
+        discarded: None,
+        hazards_acknowledged: None,
+    })
+}
+
+/// Fold a single-node backup report back into the published pair report. The
+/// backup's drift becomes the block's only when the master advanced nothing
+/// (it holds no repository).
+pub fn merge_backup(report: &mut GitReport, single: GitReport) {
+    let Some(node) = single.nodes.into_iter().next() else {
+        return;
+    };
+    if let Some(slot) = report.nodes.get_mut(1) {
+        *slot = node;
+    }
+    if !report.expected_drift_complete && single.expected_drift_complete {
+        report.expected_drift = single.expected_drift;
+        report.expected_drift_count = single.expected_drift_count;
+        report.expected_drift_complete = true;
+    }
+}
+
+/// Record a finished save on the backup's entry of a pair report.
+pub fn set_backup_save(report: &mut GitReport, saved: &GitSaveReport) {
+    if let Some(node) = report.nodes.get_mut(1) {
+        node.save = Some(SaveInfo {
+            path: saved.path.clone(),
+            files: saved.manifest.files,
+            bytes: saved.manifest.bytes,
+        });
+    }
+}
+
+/// `--rollback-run` on a pair (27-22, D-08): the backup's `.git` is classified
+/// through its own host like the master's ([`check_rollback_run`]): an
+/// unsupported shape refuses naming the backup, a managed or adoptable repo is
+/// reported as `nodes[1]`. `None` when the backup holds none.
+pub async fn check_rollback_backup(
+    surfaces: &ProjectsSurfaces<'_>,
+    backup_host: &dyn ProjectHost,
+    project: &str,
+) -> Result<Option<GitReport>, CoreError> {
+    let entry = backup_host
+        .git_entry(project)
+        .await
+        .map_err(|e| on_node(e, BACKUP))?;
+    if !entry.is_present() {
+        return Ok(None);
+    }
+    let host_surfaces = ProjectsSurfaces {
+        gateway: surfaces.gateway,
+        host: backup_host,
+        tree: None,
+        apply_host: None,
+        deploy: None,
+        tag_delete: surfaces.tag_delete.clone(),
+    };
+    let mut report = check_rollback_run(&host_surfaces, project, entry)
+        .await
+        .map_err(|e| on_node(e, BACKUP))?;
+    report.master_mut().node = BACKUP.to_string();
+    Ok(Some(report))
+}
+
+/// The backup node's confined git writer, its post-advance mode and its host.
+pub type BackupParts = (
+    Box<dyn GitStateWriter>,
+    PostStatusMode,
+    Box<dyn ProjectHost>,
+);
+
+/// What a run builds for the backup, before any write, so a node that cannot
+/// take it refuses first: the confined git writer, the post-advance mode and
+/// the host read surface.
+pub fn backup_writer_and_mode(
+    loaded: &LoadedProject,
+    input_targets: &Path,
+) -> Result<Option<BackupParts>, CoreError> {
+    let Some(node) = loaded.target.nodes.backup.as_ref() else {
+        return Ok(None);
+    };
+    let writer = git_state_writer_for_node(input_targets, &loaded.target_file, BACKUP, node)?;
+    let mode = PostStatusMode::of(local_data_dir_for_node(
+        input_targets,
+        &loaded.target_file,
+        BACKUP,
+        node,
+    )?);
+    let host = project_host_for_node(input_targets, &loaded.target_file, BACKUP, node)?;
+    Ok(Some((writer, mode, host)))
 }
 
 #[cfg(test)]
