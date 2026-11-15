@@ -99,6 +99,8 @@ use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
 use ignition_core::session::Session;
 
+mod common;
+
 const DEFAULT_DATA_DIR: &str = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
 const KEY_ENV: &str = "IGN_WINCAP_KEY";
 /// The scratch tree below the account home; the only thing the write test
@@ -6223,8 +6225,7 @@ async fn wincap_record_replace_blocked_by_reader() {
 // `IGN_WINCAP_GATEWAY_NAME`, default `Ignition-ignwin836`). The guard
 // sends no gateway request, so no API token leaves the machine.
 
-#[path = "common/prod_shape.rs"]
-mod prod_shape;
+use common::prod_shape;
 
 const PROD_SHAPE_ENV: &str = "IGNITION_LIVE_PROD_SHAPE";
 /// Below the account home: the backup, the manifest, the tar and the stage.
@@ -7932,4 +7933,261 @@ async fn wincap_git_objects() {
         std::panic::resume_unwind(panic);
     }
     println!("LIVE-RAN wincap_git_objects");
+}
+
+// ---- the git handover at production shape (27-25, D-18, D-24, checker W-5) -----------
+//
+// ign's own ssh transports, built from a target file's `ssh` node exactly as the
+// CLI builds them (`project_host_for_node`, `git_state_writer_for_node`), save,
+// restore and advance the production-shape `.git` of the disposable project
+// `CapApp27` on the REAL gateway data directory as the non-admin deploy account
+// (the narrow grant of 27-07 on that one project directory; the grant is on the
+// directory the gateway creates with the project, so it is applied again after
+// `capture27-vm.sh project-up`). The restore is robocopy, the `.git` must come
+// back Hidden (G8). `project-down` and `scratch-down` clean up afterwards.
+//
+// ```text
+// set -o pipefail; set -a; . "$HOME/.config/ign-azure-win/env"; set +a
+// IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST="$IGN_WINVM_HOST" IGN_WINCAP_KEY="$IGN_WINVM_KEY" \
+//   IGN_WINCAP_PROFILE="$IGN_WINVM_PROFILE" PRODSHAPE_GIT_OUT=... \
+//   IGN_WINCAP_KNOWN_HOSTS=<pinned file with an entry for the host> \
+//   cargo test -p ignition-core --test live_transport_wincap wincap_git_handover \
+//     -- --ignored --nocapture --test-threads=1 2>&1 | tee 27-25-wincap.log
+// ```
+
+const HANDOVER_RUN: &str = "20261115T120000Z-w27h";
+
+/// Whether `name` is the `name` of an object anywhere in `value`.
+fn mentions_name(value: &serde_json::Value, name: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("name").and_then(|n| n.as_str()) == Some(name)
+                || map.values().any(|v| mentions_name(v, name))
+        }
+        serde_json::Value::Array(items) => items.iter().any(|v| mentions_name(v, name)),
+        _ => false,
+    }
+}
+
+/// One call of the installed `ign` at the gateway of the ssh host (port
+/// `IGN_WINVM_GATEWAY_PORT`, default 8088): exit code and JSON envelope.
+async fn guard_call(profile: &str, host: &str, args: &[&str]) -> (i32, serde_json::Value) {
+    let port = std::env::var("IGN_WINVM_GATEWAY_PORT").unwrap_or_else(|_| "8088".to_string());
+    let out = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new("ign")
+            .args(["--profile", profile, "--json"])
+            .args(args)
+            .env("IGNITION_URL", format!("http://{host}:{port}"))
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("ign answers in time")
+    .expect("ign runs");
+    let raw = if out.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    (
+        out.status.code().unwrap_or(-1),
+        serde_json::from_slice(raw).expect("ign printed a JSON envelope"),
+    )
+}
+
+/// The gateway-name guard of 27-07: gateway-info at the address of the ssh host
+/// names the expected test gateway, and the disposable project exists.
+async fn handover_guard(live: &Live) {
+    let profile = std::env::var("IGN_WINCAP_PROFILE").expect("IGN_WINCAP_PROFILE");
+    let expected = std::env::var("IGN_WINVM_GATEWAY_NAME")
+        .unwrap_or_else(|_| "Ignition-ignwin836".to_string());
+    let (code, info) = guard_call(
+        &profile,
+        &live.host,
+        &[
+            "api",
+            "call",
+            "--method",
+            "GET",
+            "--path",
+            "/data/api/v1/gateway-info",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "gateway-info answered exit {code}");
+    assert_eq!(
+        info["data"]["result"]["data"]["name"].as_str(),
+        Some(expected.as_str()),
+        "refusing: gateway-info does not name the {expected} test gateway"
+    );
+    let (code, list) = guard_call(&profile, &live.host, &["project", "list"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        mentions_name(&list, GIT_PROJECT),
+        "{GIT_PROJECT} is not on the gateway: run capture27-vm.sh project-up first"
+    );
+    println!("wincap_git_handover guard: gateway-info names {expected}; {GIT_PROJECT} is present");
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1, PRODSHAPE_GIT_OUT, capture27-vm.sh project-up and upload and the grant on CapApp27"]
+async fn wincap_git_handover() {
+    use common::vm_git_handover::{Budgets, Handover, finish, fixture_dir, note, release_checkout};
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, git_state_writer_for_node, project_host_for_node,
+    };
+
+    let Some(live) = live() else { return };
+    handover_guard(&live).await;
+    let started = Instant::now();
+    let fixture = fixture_dir();
+    let release = release_checkout(&fixture);
+
+    let repo_dir = repo(&live, "git27h", &live.data_dir, None);
+    let host_shell = shell_of(repo_dir.path(), "git27h");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let (target_file, _, node) = ssh_of(repo_dir.path(), "git27h");
+    let host = project_host_for_node(repo_dir.path(), &target_file, "nodes.master", &node)
+        .expect("the ssh project host");
+    let writer = git_state_writer_for_node(repo_dir.path(), &target_file, "nodes.master", &node)
+        .expect("the ssh git writer");
+
+    let project_dir = format!(
+        "{}\\projects\\{GIT_PROJECT}",
+        live.data_dir.trim_end_matches('\\')
+    );
+    let git_dir = format!("{project_dir}\\.git");
+    let src_git = format!("{home_native}\\{SCRATCH}\\git27\\src.git");
+    let saves = format!("{home_native}\\ign-deploy\\{GIT_GATEWAY}");
+    assert!(
+        project_dir.ends_with("\\projects\\CapApp27"),
+        "only the disposable project is touched"
+    );
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    note(
+        "wincap_git_handover",
+        &format!("host: PSEdition {} PSVersion {}", facts["e"], facts["v"]),
+    );
+    assert_eq!(facts["e"], "Desktop");
+    remove_tree(&host_shell, &saves).await;
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "{src_git} is missing: run capture27-vm.sh upload first"
+    );
+    assert_eq!(
+        host.git_entry(GIT_PROJECT).await.expect("entry"),
+        GitEntry::Absent,
+        "{GIT_PROJECT} holds a .git from an earlier run: run project-down and project-up"
+    );
+
+    // The production-shape `.git` goes into the project with the host copy
+    // tool, Hidden as the module's is.
+    let copied = Instant::now();
+    host_shell
+        .exec_powershell(&script(
+            "git_host_copy",
+            GIT_HOST_COPY,
+            serde_json::json!({ "s": src_git, "d": git_dir }),
+        ))
+        .await
+        .expect("copy src.git into the project (is the grant on the project directory?)");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_hide",
+            GIT_HOST_HIDE,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("hide");
+    note(
+        "wincap_git_handover",
+        &format!(
+            "robocopy into the project: {} ms",
+            copied.elapsed().as_millis()
+        ),
+    );
+
+    let handover = Handover {
+        label: "wincap_git_handover",
+        host: host.as_ref(),
+        writer: writer.as_ref(),
+        gateway: GIT_GATEWAY,
+        project: GIT_PROJECT,
+        run: HANDOVER_RUN,
+        budgets: Budgets::WINDOWS,
+    };
+    let body = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let before = handover.before_import(&release, "w27h").await;
+        // The import removes `.git`: one host command, on the disposable project.
+        assert!(remove_tree(&host_shell, &git_dir).await, ".git is removed");
+        let report = handover.after_import(&release, &before).await;
+
+        // G8: the restored `.git` is Hidden again.
+        let attrs = host_shell
+            .exec_powershell(&script(
+                "git_host_attr",
+                GIT_HOST_ATTR,
+                serde_json::json!({ "path": git_dir }),
+            ))
+            .await
+            .expect("attributes");
+        let attrs = attrs["a"].as_i64().expect("attributes");
+        note(
+            "wincap_git_handover",
+            &format!("restored .git attributes: {attrs}"),
+        );
+        assert_ne!(attrs & 2, 0, "the restored .git is Hidden (G8)");
+        let stage = format!("{project_dir}\\.ign-restore-{HANDOVER_RUN}");
+        assert!(
+            enumerate(&host_shell, &stage).await.is_none(),
+            "no restore stage is left behind"
+        );
+        assert_eq!(
+            host.git_entry(GIT_PROJECT).await.expect("entry"),
+            GitEntry::Directory
+        );
+        handover.remove_save().await;
+        assert!(
+            enumerate(
+                &host_shell,
+                &format!("{saves}\\projects\\{GIT_PROJECT}\\git-save\\{HANDOVER_RUN}")
+            )
+            .await
+            .is_none(),
+            "the save's run directory is gone"
+        );
+        report
+    }))
+    .await;
+
+    // Cleanup, also after a failure: the saves below `ign-deploy`.
+    let saves_gone = remove_tree(&host_shell, &saves).await;
+    host_shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    note(
+        "wincap_git_handover",
+        &format!("cleanup: saves gone {saves_gone}"),
+    );
+    if let Err(panic) = body {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(saves_gone);
+    println!(
+        "wincap_git_handover total: {} ms",
+        started.elapsed().as_millis()
+    );
+    finish();
+    println!("LIVE-RAN wincap_git_handover");
 }

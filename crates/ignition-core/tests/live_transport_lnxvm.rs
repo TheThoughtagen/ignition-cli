@@ -85,6 +85,8 @@ use ignition_core::deploy::transport::sftp::{
 };
 use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 
+mod common;
+
 const DEFAULT_DATA_DIR: &str = "/usr/local/bin/ignition/data";
 /// The scratch tree below the account home.
 const SCRATCH: &str = "ign-live-scratch";
@@ -1812,4 +1814,279 @@ async fn lnxvm_conformance_table_on_host() {
     assert!(gone);
     timed("lnxvm_conformance_table_on_host total", started, ());
     eprintln!("PASS lnxvm_conformance_table_on_host");
+}
+
+// ---- the git handover at production shape (27-25, D-18, D-24, checker W-5) -----------
+//
+// ign's own ssh transports, built from a target file's `ssh` node exactly as the
+// CLI builds them (`project_host_for_node`, `git_state_writer_for_node`), save,
+// restore and advance the production-shape `.git` of the disposable project
+// `CapApp27` on the REAL gateway data directory as the non-root deploy account
+// (the narrow grant of 27-07 on that one project directory). The gateway runs
+// as root on this VM, so the project directory is first handed to a non-root
+// stand-in account (the VM's administrator account, by an administrator): the
+// restore then takes the D-G1 path, `setfacl` for that account and `getfacl -n`
+// to prove the entry (27-19), and the gate reads the entry back. Needs
+// `capture27-vm.sh project-up` and `upload` (with `PRODSHAPE_GIT_OUT`) first;
+// `project-down` and `scratch-down` clean up after.
+//
+// ```text
+// set -o pipefail
+// export IGNITION_LIVE_LNXVM=1 IGN_LNXVM_HOST=... IGN_LNXVM_KEY_FILE=... \
+//   IGN_LNXVM_KNOWN_HOSTS=... IGN_LNXVM_PROFILE=azure-lnx PRODSHAPE_GIT_OUT=...
+// export IGNITION_CLI_CONFIG=... IGNITION_TOKEN_AZURE_LNX=...   # the profile's file and token
+// cargo test -p ignition-core --test live_transport_lnxvm lnxvm_git_handover \
+//   -- --ignored --nocapture --test-threads=1 2>&1 | tee 27-25-lnxvm.log
+// ```
+
+const HANDOVER_PROJECT: &str = "CapApp27";
+const HANDOVER_RUN: &str = "20261115T120000Z-l27h";
+
+/// `stat -c %u $1`.
+const OWNER_UID: &str = r##"echo "IGN-RESULT:{\"ok\":1,\"uid\":$(stat -c %u -- "$1")}""##;
+/// `cp -a $1 $2`: the production-shape `.git` into the project, by the deploy
+/// account.
+const COPY_GIT: &str = r##"cp -a -- "$1" "$2" && echo 'IGN-RESULT:{"ok":1}'"##;
+/// `rm -rf $1/.git`: the removal the import does, on the disposable project
+/// only (the caller checks the path).
+const REMOVE_PROJECT_GIT: &str = r##"rm -rf -- "$1/.git"; if [ -e "$1/.git" ]; then echo 'IGN-RESULT:{"ok":1,"gone":0}'; else echo 'IGN-RESULT:{"ok":1,"gone":1}'; fi"##;
+/// The `user:<uid>:` line of `getfacl -n -p $1`, and nothing else.
+const ACL_ENTRY: &str = r##"e=$(getfacl -n -p -- "$1" 2>/dev/null | grep "^user:$2:" | tr '\t' ' '); echo "IGN-RESULT:{\"ok\":1,\"e\":\"$e\"}""##;
+/// The first pack file below `$1/objects/pack`.
+const FIRST_PACK: &str = r##"p=$(find "$1/objects/pack" -name 'pack-*.pack' 2>/dev/null | LC_ALL=C sort | head -n 1); echo "IGN-RESULT:{\"ok\":1,\"p\":\"$p\"}""##;
+
+/// Whether `name` is the `name` of an object anywhere in `value`.
+fn mentions_name(value: &serde_json::Value, name: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("name").and_then(|n| n.as_str()) == Some(name)
+                || map.values().any(|v| mentions_name(v, name))
+        }
+        serde_json::Value::Array(items) => items.iter().any(|v| mentions_name(v, name)),
+        _ => false,
+    }
+}
+
+/// One call of the installed `ign` at the gateway of the ssh host (port
+/// `IGN_LNXVM_GATEWAY_PORT`, default 8088): exit code and JSON envelope.
+async fn guard_call(profile: &str, host: &str, args: &[&str]) -> (i32, serde_json::Value) {
+    let port = std::env::var("IGN_LNXVM_GATEWAY_PORT").unwrap_or_else(|_| "8088".to_string());
+    let out = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new("ign")
+            .args(["--profile", profile, "--json"])
+            .args(args)
+            .env("IGNITION_URL", format!("http://{host}:{port}"))
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("ign answers in time")
+    .expect("ign runs");
+    let raw = if out.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    (
+        out.status.code().unwrap_or(-1),
+        serde_json::from_slice(raw).expect("ign printed a JSON envelope"),
+    )
+}
+
+/// The gateway-name guard of 27-07: gateway-info at the address of the ssh host
+/// names the expected test gateway, and the disposable project exists.
+async fn handover_guard(live: &Live) {
+    let expected = std::env::var("IGN_LNXVM_GATEWAY_NAME")
+        .unwrap_or_else(|_| "Ignition-ign-lnx-836".to_string());
+    let (code, info) = guard_call(
+        &live.profile,
+        &live.host,
+        &[
+            "api",
+            "call",
+            "--method",
+            "GET",
+            "--path",
+            "/data/api/v1/gateway-info",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "gateway-info answered exit {code}");
+    assert_eq!(
+        info["data"]["result"]["data"]["name"].as_str(),
+        Some(expected.as_str()),
+        "refusing: gateway-info does not name the {expected} test gateway"
+    );
+    let (code, list) = guard_call(&live.profile, &live.host, &["project", "list"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        mentions_name(&list, HANDOVER_PROJECT),
+        "{HANDOVER_PROJECT} is not on the gateway: run capture27-vm.sh project-up first"
+    );
+    println!(
+        "lnxvm_git_handover guard: gateway-info names {expected}; {HANDOVER_PROJECT} is present"
+    );
+}
+
+#[tokio::test]
+#[ignore = "live: needs ign-lnx-836, IGNITION_LIVE_LNXVM=1, PRODSHAPE_GIT_OUT, capture27-vm.sh project-up and upload, the grant on CapApp27 and a non-root owner"]
+async fn lnxvm_git_handover() {
+    use common::vm_git_handover::{Budgets, Handover, finish, fixture_dir, note, release_checkout};
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, git_state_writer_for_node, project_host_for_node,
+    };
+
+    let Some(live) = live() else { return };
+    handover_guard(&live).await;
+    let started = Instant::now();
+    let fixture = fixture_dir();
+    let release = release_checkout(&fixture);
+
+    let repo = repo(&live, "git27h", &live.data_dir, None);
+    let shell = shell_of(repo.path(), "git27h");
+    let home = home_sftp(&shell).await;
+    let (target_file, target) = load_target(repo.path(), "git27h").expect("target");
+    let node = &target.nodes.master;
+    let host = project_host_for_node(repo.path(), &target_file, "nodes.master", node)
+        .expect("the ssh project host");
+    let writer = git_state_writer_for_node(repo.path(), &target_file, "nodes.master", node)
+        .expect("the ssh git writer");
+
+    let project_dir = format!(
+        "{}/projects/{HANDOVER_PROJECT}",
+        live.data_dir.trim_end_matches('/')
+    );
+    assert!(
+        project_dir.ends_with("/projects/CapApp27"),
+        "only the disposable project is touched"
+    );
+    let saves = format!("{home}/ign-deploy/{GATEWAY}");
+    remove_tree(&shell, &home, &saves).await;
+    assert_eq!(
+        host.git_entry(HANDOVER_PROJECT).await.expect("entry"),
+        GitEntry::Absent,
+        "{HANDOVER_PROJECT} holds a .git from an earlier run: run project-down and project-up"
+    );
+
+    // The gateway account: the owner of the project directory must be neither
+    // root nor the deploy account, so the restore takes the ACL path.
+    let me = sh_json(&shell, "umask", UMASK, &[]).await.expect("uid");
+    let owner = sh_json(&shell, "owner", OWNER_UID, &[&project_dir])
+        .await
+        .expect("owner");
+    let (deploy_uid, owner_uid) = (
+        me["uid"].as_u64().expect("uid"),
+        owner["uid"].as_u64().expect("owner uid"),
+    );
+    assert!(
+        owner_uid != 0 && owner_uid != deploy_uid,
+        "the project directory must belong to a non-root stand-in account (an administrator \
+         hands it over before this gate): owner uid {owner_uid}, deploy uid {deploy_uid}"
+    );
+    note(
+        "lnxvm_git_handover",
+        "gateway account: a non-root stand-in, not the deploy account",
+    );
+
+    let src = format!("{home}/ign-live-scratch/git27/src.git");
+    let dst = format!("{project_dir}/.git");
+    let copied = Instant::now();
+    sh_json(&shell, "copy", COPY_GIT, &[&src, &dst])
+        .await
+        .expect("the production-shape .git goes into the project");
+    note(
+        "lnxvm_git_handover",
+        &format!(
+            "cp -a into the project: {} ms",
+            copied.elapsed().as_millis()
+        ),
+    );
+
+    let handover = Handover {
+        label: "lnxvm_git_handover",
+        host: host.as_ref(),
+        writer: writer.as_ref(),
+        gateway: GATEWAY,
+        project: HANDOVER_PROJECT,
+        run: HANDOVER_RUN,
+        budgets: Budgets::LINUX,
+    };
+    let body = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let before = handover.before_import(&release, "l27h").await;
+        // The import removes `.git`: one host command, on the disposable project.
+        let removed = sh_json(&shell, "remove .git", REMOVE_PROJECT_GIT, &[&project_dir])
+            .await
+            .expect("remove .git");
+        assert_eq!(removed["gone"], 1, ".git is removed");
+        let report = handover.after_import(&release, &before).await;
+
+        // The D-G1 restore path with a non-root gateway account: the named
+        // entry is there with effective rw- on what the restore created, and
+        // on what the advance wrote (27-19: `getfacl -n` matches by uid).
+        for (what, path) in [
+            ("config (restored)", format!("{dst}/config")),
+            ("HEAD (restored)", format!("{dst}/HEAD")),
+            (
+                "branch ref (advance)",
+                format!("{dst}/refs/heads/production"),
+            ),
+        ] {
+            let acl = sh_json(&shell, "acl", ACL_ENTRY, &[&path, &owner_uid.to_string()])
+                .await
+                .expect("getfacl -n");
+            let entry = acl["e"].as_str().unwrap_or("").to_string();
+            note("lnxvm_git_handover", &format!("getfacl -n {what}: {entry}"));
+            assert!(
+                entry.starts_with(&format!("user:{owner_uid}:rw")),
+                "{what}: the gateway account has no named rw entry: {entry}"
+            );
+            assert!(
+                !entry.contains("#effective:r--") && !entry.contains("#effective:---"),
+                "{what}: the entry has no effective write access: {entry}"
+            );
+        }
+        let pack = sh_json(&shell, "first pack", FIRST_PACK, &[&dst])
+            .await
+            .expect("first pack");
+        if let Some(path) = pack["p"].as_str().filter(|p| !p.is_empty()) {
+            let acl = sh_json(&shell, "acl", ACL_ENTRY, &[path, &owner_uid.to_string()])
+                .await
+                .expect("getfacl -n");
+            note(
+                "lnxvm_git_handover",
+                &format!(
+                    "getfacl -n a restored pack: {}",
+                    acl["e"].as_str().unwrap_or("")
+                ),
+            );
+            assert!(
+                acl["e"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with(&format!("user:{owner_uid}:rw")),
+                "the restored pack carries the gateway account's entry"
+            );
+        }
+        assert_eq!(
+            host.git_entry(HANDOVER_PROJECT).await.expect("entry"),
+            GitEntry::Directory
+        );
+        handover.remove_save().await;
+        report
+    }))
+    .await;
+
+    // Cleanup, also after a failure: the saves below `ign-deploy`.
+    let gone = remove_tree(&shell, &home, &saves).await;
+    rmdir_deploy_root(&shell, &home).await;
+    note("lnxvm_git_handover", &format!("cleanup: saves gone {gone}"));
+    if let Err(panic) = body {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(gone);
+    timed("lnxvm_git_handover total", started, ());
+    finish();
+    println!("LIVE-RAN lnxvm_git_handover");
 }

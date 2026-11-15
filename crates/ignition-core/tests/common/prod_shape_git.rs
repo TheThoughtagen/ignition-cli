@@ -67,6 +67,9 @@ pub const OFFLINE_GATEWAY_OBJECTS: Duration = Duration::from_secs(15);
 /// ign's machine: resolve the gateway objects and digest the head (D-24).
 pub const OFFLINE_GATEWAY_DIGEST: Duration = Duration::from_secs(15);
 
+/// Linux host: read and parse the gateway `.git` state over ssh (the
+/// 27-06 table's read row; 27-25 times it on the VM).
+pub const HOST_LINUX_READ: Duration = Duration::from_secs(10);
 /// Linux host: save.
 pub const HOST_LINUX_SAVE: Duration = Duration::from_secs(60);
 /// Linux host: restore plus verify.
@@ -78,6 +81,8 @@ pub const HOST_LINUX_PREFLIGHT: Duration = Duration::from_secs(10);
 /// Linux host: gateway-object read for an unknown HEAD.
 pub const HOST_LINUX_GATEWAY_OBJECTS: Duration = Duration::from_secs(60);
 
+/// Windows host: read and parse the gateway `.git` state over ssh.
+pub const HOST_WINDOWS_READ: Duration = Duration::from_secs(20);
 /// Windows host: save.
 pub const HOST_WINDOWS_SAVE: Duration = Duration::from_secs(120);
 /// Windows host: restore plus verify.
