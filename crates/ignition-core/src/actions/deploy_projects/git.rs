@@ -1114,6 +1114,107 @@ pub async fn git_before_import(
     save(read, write, gateway, project, run_id).await
 }
 
+/// Slack the free-space need adds on top of the copies and the pack: room for
+/// the stage directory, logs and whatever the host writes meanwhile (D-22).
+pub const GIT_FREE_SLACK: u64 = 64 * 1024 * 1024;
+
+/// The free bytes the handover of one node needs: the save and the restore's
+/// stage are each a copy of the live `.git` (`2 x`), plus the bytes of the
+/// pack the advance writes (`pack` and `idx`), plus [`GIT_FREE_SLACK`].
+pub fn git_free_need(git_bytes: u64, prep: Option<&AdvancePrep>) -> u64 {
+    let pack = prep
+        .and_then(|prep| prep.pack.as_ref())
+        .map_or(0, |pack| (pack.pack.len() + pack.idx.len()) as u64);
+    git_bytes
+        .saturating_mul(2)
+        .saturating_add(pack)
+        .saturating_add(GIT_FREE_SLACK)
+}
+
+/// The text of a transport failure without the envelope wording: its detail
+/// alone (paths and causes, never content), or the whole message for another
+/// error.
+fn failure_text(err: &CoreError) -> String {
+    match err {
+        CoreError::TransportFailed { detail, .. } => detail.clone(),
+        other => crate::deploy::git_gate::detail_of(other),
+    }
+}
+
+/// D-22, step 0: before the run directory exists and before anything is
+/// written, prove on the node that the deploy account can write what the
+/// handover writes and that there is room for it.
+///
+/// 1. [`GitStateWriter::probe_write`] creates and removes a probe file in
+///    `projects/<project>` and in its `.git`; a refusal is
+///    `deploy_preflight_failed` check `git_write_access` naming the path the
+///    host reported. On a POSIX host whose gateway account is neither root nor
+///    the deploy account it also proves the ACL step of the restore can give
+///    that account write access (D-G1): an explicit named entry with an
+///    effective `rw-`, read back with `getfacl`.
+/// 2. [`GitHostRead::git_size`] (a listing, nothing hashed, checker W-5) and
+///    [`GitHostRead::free_bytes`] against [`git_free_need`]; too little room
+///    is check `git_free_space` with both figures.
+///
+/// It never calls `git_manifest`: the manifest hashes every non-object file,
+/// which the save and the restore verification already pay for inside their
+/// own budgets. `probe_id` names the probe file (`.ign-probe-<probe_id>`); it
+/// must be a fresh id that is not a run directory.
+pub async fn git_preflight(
+    write: &dyn GitStateWriter,
+    read: &dyn GitHostRead,
+    gateway: &str,
+    project: &str,
+    prep: Option<&AdvancePrep>,
+    probe_id: &str,
+) -> Result<(), CoreError> {
+    write.probe_write(project, probe_id).await.map_err(|err| {
+        preflight(
+            "git_write_access",
+            format!(
+                "the deploy account cannot write where the git restore needs to ({}); grant it \
+                 write access on {} only (README: Write access and the grant)",
+                failure_text(&err),
+                git_entry_location(project).trim_end_matches("/.git"),
+            ),
+        )
+    })?;
+    let size = read.git_size(project).await.map_err(|err| {
+        preflight(
+            "git_free_space",
+            format!(
+                "the size of {} cannot be read ({})",
+                git_entry_location(project),
+                failure_text(&err)
+            ),
+        )
+    })?;
+    let need = git_free_need(size.bytes, prep);
+    let free = read.free_bytes(gateway, project).await.map_err(|err| {
+        preflight(
+            "git_free_space",
+            format!(
+                "the free space for the save of {} cannot be read ({})",
+                git_entry_location(project),
+                failure_text(&err)
+            ),
+        )
+    })?;
+    if free < need {
+        return Err(preflight(
+            "git_free_space",
+            format!(
+                "{free} bytes are free for the save and the restore of {} and {need} are \
+                 needed (2 x {} bytes of .git, the prepared pack and {} bytes of slack)",
+                git_entry_location(project),
+                size.bytes,
+                GIT_FREE_SLACK,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// What a post-import step of the handover concluded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GitAfter {

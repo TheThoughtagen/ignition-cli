@@ -3215,6 +3215,73 @@ fn git_prodshape_handover() {
 /// does with git before any gateway write, timed together against
 /// [`OFFLINE_PREPARE`](shape_git::OFFLINE_PREPARE). Prints the time, never the
 /// shape.
+/// The write preflight (27-19, D-22) on the production-shape `.git`: the
+/// probe in the project directory and in `.git`, the size-only listing and
+/// the free-space read, with the prepared pack in the need. Within
+/// [`OFFLINE_PREFLIGHT`](shape_git::OFFLINE_PREFLIGHT) on the local transport;
+/// the host columns are carried by `git_prodshape_posix_size` and the Windows
+/// size row. The preflight never computes a manifest (checker W-5), which is
+/// what keeps it this cheap at 450 MB of `.git`.
+#[test]
+fn git_prodshape_preflight() {
+    use ignition_core::actions::deploy_projects::git::{git_free_need, git_preflight, read_state};
+    use ignition_core::deploy::git_advance::prepare_advance;
+    use shape_git::OFFLINE_PREFLIGHT;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let members = f.artifact_members();
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let node = f.node();
+        // Untimed: the prepare builds the advance input (and its pack) before
+        // the run's first write; the preflight only reads its size.
+        let found = read_state(&node, &host, PROJECT).await.expect("read state");
+        let refs = found.refs.clone().expect("refs");
+        let prep = prepare_advance(
+            &host,
+            &f.checkout,
+            &found.state,
+            &refs,
+            &f.release_head,
+            &members,
+        )
+        .await
+        .expect("advance prep");
+        let started = Instant::now();
+        git_preflight(
+            &node,
+            &node,
+            GATEWAY,
+            PROJECT,
+            Some(&prep),
+            "20261113T101500Z-pf01",
+        )
+        .await
+        .expect("the preflight passes on a writable host with room");
+        let took = started.elapsed();
+        // Correct before fast: the need is the one the rule gives, the probe
+        // left nothing behind, and `.git` is as it was.
+        let size = node.git_size(PROJECT).await.expect("size");
+        let need = git_free_need(size.bytes, Some(&prep));
+        assert!(need > 2 * size.bytes, "the need counts the slack");
+        for dir in [f.project.clone(), f.project.join(".git")] {
+            let left: Vec<String> = std::fs::read_dir(&dir)
+                .expect("read_dir")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".ign-probe-"))
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
+        eprintln!(
+            "git_prodshape_preflight: {} files, {} bytes of .git, need {} bytes",
+            size.files, size.bytes, need
+        );
+        prodshape_within("git_prodshape_preflight", took, OFFLINE_PREFLIGHT);
+    });
+}
+
 #[test]
 fn git_prodshape_prepare() {
     use ignition_core::actions::deploy_projects::git::read_state;

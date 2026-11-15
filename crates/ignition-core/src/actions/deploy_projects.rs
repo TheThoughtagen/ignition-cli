@@ -3979,6 +3979,24 @@ pub async fn deploy_projects_run(
         removals,
     )
     .await?;
+    // D-22 (Phase 27): the first write of a run is the probe, so a missing
+    // grant or a full disk refuses here, with no run directory, instead of
+    // after the import. `--check` never gets here: it builds no writer.
+    // The probe's name comes from an id that is not (and never becomes) a
+    // run directory.
+    if let Some(git_run) = git_run.as_ref()
+        && let Some(read) = surfaces.host.git()
+    {
+        git::git_preflight(
+            git_run.writer,
+            read,
+            &plan.gateway,
+            &loaded.file.project,
+            git_run.prepared.prep.as_ref(),
+            RunId::generate().as_str(),
+        )
+        .await?;
+    }
     let (run_id, run_dir) = RunDir::create_fresh(&opts.repo, &plan.gateway)?;
     let rel = run_dir_rel(&plan.gateway, &run_id);
     let outcome = execute(

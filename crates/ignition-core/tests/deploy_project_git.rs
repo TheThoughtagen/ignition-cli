@@ -2478,6 +2478,349 @@ mod published {
         assert_eq!(node.dirty_source, Some("gateway_objects"));
     }
 
+    // ---- 27-19: the write preflight (D-22, D-G1) ----
+
+    /// A git read that answers like the local transport, records which
+    /// operations were asked for, and answers `free_bytes` with a number of
+    /// the test's choosing.
+    struct Metered {
+        inner: LocalFsTransport,
+        free: Option<u64>,
+        calls: Calls,
+    }
+
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    impl Metered {
+        fn log(&self, op: &'static str) {
+            self.calls.lock().expect("calls").push(op);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitHostRead for Metered {
+        async fn read_git_state(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_state::GitFiles, CoreError> {
+            self.log("read_git_state");
+            self.inner.read_git_state(project).await
+        }
+        async fn git_manifest(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.log("git_manifest");
+            self.inner.git_manifest(project).await
+        }
+        async fn save_manifest(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.log("save_manifest");
+            self.inner.save_manifest(gateway, project, run_id).await
+        }
+        async fn git_file_digest(
+            &self,
+            project: &str,
+            name: &GitWriteName,
+        ) -> Result<Option<String>, CoreError> {
+            self.log("git_file_digest");
+            self.inner.git_file_digest(project, name).await
+        }
+        async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+            self.log("read_git_yaml");
+            self.inner.read_git_yaml().await
+        }
+        async fn project_dir_entry(
+            &self,
+            project: &str,
+            dir: ignition_core::deploy::transport::projects::ImportDir,
+        ) -> Result<ignition_core::deploy::transport::projects::GitEntry, CoreError> {
+            self.log("project_dir_entry");
+            self.inner.project_dir_entry(project, dir).await
+        }
+        async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+            self.log("free_bytes");
+            match self.free {
+                Some(free) => Ok(free),
+                None => self.inner.free_bytes(gateway, project).await,
+            }
+        }
+        async fn git_size(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitSize, CoreError> {
+            self.log("git_size");
+            self.inner.git_size(project).await
+        }
+        async fn list_git_objects(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_objects::GitObjectList, CoreError> {
+            self.log("list_git_objects");
+            self.inner.list_git_objects(project).await
+        }
+        async fn fetch_git_objects(
+            &self,
+            project: &str,
+            files: &[ignition_core::deploy::git_objects::GitObjectFile],
+            dest: &std::path::Path,
+        ) -> Result<(), CoreError> {
+            self.log("fetch_git_objects");
+            self.inner.fetch_git_objects(project, files, dest).await
+        }
+    }
+
+    /// A host that answers `free_bytes` with `free` (the local answer when
+    /// `None`) and records every git read it serves.
+    fn metered(rig: &Rig, free: Option<u64>) -> (StubHost, Calls) {
+        let calls = Calls::default();
+        let host = StubHost {
+            inner: rig.f.node(),
+            program: None,
+            read: Some(Box::new(Metered {
+                inner: rig.f.node(),
+                free,
+                calls: calls.clone(),
+            })),
+        };
+        (host, calls)
+    }
+
+    /// The failures of a `deploy_preflight_failed`, as `(check, detail)`.
+    fn preflight_details(err: &CoreError) -> Vec<(String, String)> {
+        match err {
+            CoreError::DeployPreflightFailed { failures } => failures
+                .iter()
+                .map(|f| (f.check.clone(), f.detail.clone()))
+                .collect(),
+            other => panic!("expected deploy_preflight_failed, got {other:?}"),
+        }
+    }
+
+    /// Whether this account ignores mode bits (root): the denial rows cannot
+    /// be set up then.
+    #[cfg(unix)]
+    fn ignores_modes(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = dir.join("ign-mode-probe");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        writable
+    }
+
+    /// No probe file is left in the project directory or in `.git`.
+    fn assert_no_probe_left(rig: &Rig) {
+        for dir in [rig.f.project_dir(), rig.f.git_dir()] {
+            let left: Vec<String> = std::fs::read_dir(&dir)
+                .expect("read_dir")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".ign-probe-"))
+                .collect();
+            assert!(left.is_empty(), "{left:?} left in {}", dir.display());
+        }
+    }
+
+    /// D-22: a project directory the deploy account cannot write refuses
+    /// before the run directory exists, naming the directory; nothing is
+    /// imported, saved or left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_preflight_refuses_no_run_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::new();
+        if ignores_modes(&rig.f.project_dir()) {
+            println!("running with privileges that ignore mode bits; skipped");
+            return;
+        }
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        std::fs::set_permissions(rig.f.project_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let _unlock = Unlock(rig.f.project_dir());
+        let err = refusal(rig.run_prepared(&host, &loaded, prepared, None).await);
+        let failures = preflight_details(&err);
+        assert_eq!(failures.len(), 1, "{err}");
+        assert_eq!(failures[0].0, "git_write_access", "{err}");
+        assert!(
+            failures[0].1.contains("projects/CapApp"),
+            "{}",
+            failures[0].1
+        );
+        assert!(
+            !failures[0].1.contains("projects/CapApp/.git"),
+            "the project directory is named, not .git: {}",
+            failures[0].1
+        );
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert!(!rig.repo.join(".ign").exists(), "no .ign directory");
+        assert!(rig.gateway.import_calls().is_empty(), "nothing imported");
+        assert!(rig.save_trees().is_empty(), "nothing saved");
+    }
+
+    /// A writable project directory over a read-only `.git` names `.git`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_preflight_git_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::new();
+        if ignores_modes(&rig.f.project_dir()) {
+            println!("running with privileges that ignore mode bits; skipped");
+            return;
+        }
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        std::fs::set_permissions(rig.f.git_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let _unlock = Unlock(rig.f.git_dir());
+        let err = refusal(rig.run_prepared(&host, &loaded, prepared, None).await);
+        let failures = preflight_details(&err);
+        assert_eq!(failures[0].0, "git_write_access", "{err}");
+        assert!(
+            failures[0].1.contains("projects/CapApp/.git"),
+            "{}",
+            failures[0].1
+        );
+        assert_eq!(rig.run_dirs(), 0);
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_no_probe_left(&rig);
+    }
+
+    /// `--check` builds no writer and never probes: a project directory the
+    /// apply refuses for is checked clean, and no size or free space is read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preflight_not_in_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::new();
+        if ignores_modes(&rig.f.project_dir()) {
+            println!("running with privileges that ignore mode bits; skipped");
+            return;
+        }
+        std::fs::set_permissions(rig.f.project_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let _unlock = Unlock(rig.f.project_dir());
+        let (host, calls) = metered(&rig, Some(0));
+        let (_, prepared) = rig.plan_with(&host).await.expect("the plan");
+        let result = prepared.into_check_result();
+        assert_eq!(result.outcome, ProjectOutcome::Checked);
+        let asked = calls.lock().expect("calls").clone();
+        assert!(
+            !asked.contains(&"free_bytes") && !asked.contains(&"git_size"),
+            "the check read no free space and no size: {asked:?}"
+        );
+        assert_eq!(rig.run_dirs(), 0);
+        assert_no_probe_left(&rig);
+    }
+
+    /// Free space below the need refuses with both numbers, before the run
+    /// directory and before any import.
+    #[tokio::test]
+    async fn free_space_refuses() {
+        let rig = Rig::new();
+        let (host, _calls) = metered(&rig, Some(1_048_576));
+        let err = refusal(rig.apply_with(&host).await);
+        let failures = preflight_details(&err);
+        assert_eq!(failures.len(), 1, "{err}");
+        assert_eq!(failures[0].0, "git_free_space", "{err}");
+        let detail = &failures[0].1;
+        assert!(detail.contains("1048576"), "free bytes named: {detail}");
+        let git = rig.f.node().git_size(PROJECT).await.expect("size").bytes;
+        assert!(
+            detail.contains(&format!("2 x {git} bytes")),
+            "the .git size is named: {detail}"
+        );
+        assert!(
+            detail.contains(" are needed"),
+            "the need is named: {detail}"
+        );
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert!(rig.gateway.import_calls().is_empty());
+        assert!(rig.save_trees().is_empty());
+        assert_no_probe_left(&rig);
+    }
+
+    /// The need counts the prepared pack: exactly `2 x .git + 64 MiB` is not
+    /// enough when the prepare holds a pack, and the full need passes.
+    #[tokio::test]
+    async fn free_space_counts_pack() {
+        let rig = Rig::new();
+        let git = rig.f.node().git_size(PROJECT).await.expect("size").bytes;
+        let floor = 2 * git + 64 * 1024 * 1024;
+        let (host, _) = metered(&rig, Some(floor));
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let ProjectsPrepared::Ready {
+            git: Some(held), ..
+        } = &prepared
+        else {
+            panic!("a managed plan is ready");
+        };
+        let pack = held
+            .prep
+            .as_ref()
+            .and_then(|p| p.pack.as_ref())
+            .map_or(0, |p| (p.pack.len() + p.idx.len()) as u64);
+        assert!(pack > 0, "the release needs a pack the gateway lacks");
+        let err = refusal(rig.run_prepared(&host, &loaded, prepared, None).await);
+        let failures = preflight_details(&err);
+        assert_eq!(failures[0].0, "git_free_space", "{err}");
+        assert!(
+            failures[0].1.contains(&(floor + pack).to_string()),
+            "the need is 2 x .git + pack + 64 MiB = {}: {}",
+            floor + pack,
+            failures[0].1
+        );
+        assert_eq!(rig.run_dirs(), 0);
+
+        // The full need is enough.
+        let (host, _) = metered(&rig, Some(floor + pack));
+        let result = rig.apply_with(&host).await.expect("enough space");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+    }
+
+    /// W-5: the preflight reads the size and the free space and never the
+    /// manifest (which hashes every non-object file).
+    #[tokio::test]
+    async fn preflight_size_only() {
+        let rig = Rig::new();
+        let (host, calls) = metered(&rig, None);
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let planned = calls.lock().expect("calls").len();
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, None)
+            .await
+            .expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let asked = calls.lock().expect("calls").clone();
+        let during = &asked[planned..];
+        let at = |op: &str| during.iter().position(|c| *c == op);
+        let size = at("git_size").expect("the preflight read the size");
+        let free = at("free_bytes").expect("the preflight read the free space");
+        // The run's own first read is the state, re-read right before the
+        // save: the preflight's reads all come before it.
+        let first_state = at("read_git_state").expect("the run re-reads the state");
+        assert!(size < first_state && free < first_state, "{during:?}");
+        // No manifest was computed before the preflight ended: the manifest
+        // and the save manifest belong to the save and the restore.
+        for op in ["git_manifest", "save_manifest"] {
+            if let Some(index) = at(op) {
+                assert!(index > first_state, "{op} ran inside the preflight");
+            }
+        }
+        assert_eq!(
+            during.iter().filter(|c| **c == "git_size").count(),
+            1,
+            "{during:?}"
+        );
+        assert_no_probe_left(&rig);
+    }
+
     // ---- 27-13: events, run.json, the record advance, K11, the Designer gate ----
 
     /// `--designers wait` for `timeout_ms`, polling every 5 ms.
