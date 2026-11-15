@@ -1224,6 +1224,8 @@ async fn rehearse_in(
                 run: None,
                 records: None,
                 release: None,
+                // A rehearsal never touches a gateway `.git`.
+                git: None,
             },
             route,
             &mut events,

@@ -213,6 +213,11 @@ pub struct FakeProjects {
     /// How many Designer reads still report one attached session once the run
     /// is past its verify (27-13, `with_designers_after_verify`).
     designers_after_verify: Mutex<u64>,
+    /// How many project exports the gateway has served before
+    /// `designers_after_verify` applies (2 by default: the prepare's and the
+    /// run's own first; 3 for a tag-owning run, which reads the project back
+    /// once more before a rollback).
+    designers_after_exports: Mutex<usize>,
     /// What `gateway-info` answers as the gateway's name.
     gateway_name: Mutex<Option<String>>,
     /// What the redundancy status answers as the gateway's role.
@@ -275,6 +280,9 @@ struct DiskMirror {
     gateway_form: Vec<String>,
     readonly_after: bool,
     extra_on_disk: Vec<String>,
+    /// A Designer opened while `.git` was absent (D-07, R-9): the module's
+    /// `setupLocalRepo` leaves its partial repository right after the import.
+    recreates_git: bool,
 }
 
 /// Take one of the `due` failures, if any is left. A compare-exchange loop
@@ -371,6 +379,7 @@ impl FakeProjects {
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
             designers_after_verify: Mutex::new(0),
+            designers_after_exports: Mutex::new(2),
             gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
             redundancy_role: Mutex::new(Some("Independent".to_string())),
             churn: Mutex::new(BTreeMap::new()),
@@ -409,6 +418,7 @@ impl FakeProjects {
             gateway_form: Vec::new(),
             readonly_after: false,
             extra_on_disk: Vec::new(),
+            recreates_git: false,
         });
         self
     }
@@ -448,6 +458,22 @@ impl FakeProjects {
             .expect("with_disk_mirror first")
             .extra_on_disk
             .push(path.to_string());
+        self
+    }
+
+    /// A Designer opens while the import has removed `.git` (D-07, R-9, Pitfall
+    /// 1): right after the import the project directory holds a fresh partial
+    /// repository, the shape the module's `setupLocalRepo` leaves (an unborn
+    /// `master` HEAD, one remote `origin`, no branch, no index; see
+    /// `GitFixture::partial_setup_local_repo`). Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_recreates_git(self) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .recreates_git = true;
         self
     }
 
@@ -495,6 +521,27 @@ impl FakeProjects {
             let target = dir.join(path);
             std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
             std::fs::write(target, b"extra\n").expect("write");
+        }
+        if mirror.recreates_git && !dir.join(".git").exists() {
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .expect("git runs");
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            };
+            git(&["init", "-q", "-b", "master"]);
+            git(&[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/capapp.git",
+            ]);
+            git(&["config", "http.sslVerify", "false"]);
         }
         #[cfg(unix)]
         if mirror.readonly_after {
@@ -889,6 +936,19 @@ impl FakeProjects {
         self
     }
 
+    /// [`Self::with_designers_after_verify`] for a run that has served `exports`
+    /// project exports (a tag-owning import reads the project back as its third
+    /// export, so `3` arms the session for the rollback that follows a failed
+    /// read-back, 27-21).
+    #[allow(dead_code)]
+    pub fn with_designers_after_exports(self, exports: usize, polls: u64) -> Self {
+        *self
+            .designers_after_exports
+            .lock()
+            .expect("designers after exports") = exports;
+        self.with_designers_after_verify(polls)
+    }
+
     /// Every Designer list read fails with `network_error`.
     pub fn with_designers_error(self) -> Self {
         self.designers.lock().expect("designers").fail = true;
@@ -1203,7 +1263,12 @@ impl ProjectGateway for FakeProjects {
             calls.designers += 1;
             (calls.designers - 1, calls.export.len())
         };
-        if exports >= 2 {
+        if exports
+            >= *self
+                .designers_after_exports
+                .lock()
+                .expect("designers after exports")
+        {
             let mut left = self
                 .designers_after_verify
                 .lock()

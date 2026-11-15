@@ -1633,6 +1633,15 @@ fn failed_restore(report: &mut GitReport, failure: &GitRestoreFailure) -> GitAft
             .collect();
         line.push_str(&format!(" ({})", shown.join(", ")));
     }
+    if failure.reason == "git_recreated" {
+        // Pitfall 1, D-07, D-09: a repository someone else created (a Designer
+        // open runs `setupLocalRepo` while `.git` is absent) is never
+        // overwritten; the save is the module's pre-run repository.
+        line.push_str(
+            "; the repository now at .git was created during the import and was left \
+             untouched",
+        );
+    }
     let mut after = GitAfter::new();
     after.failed = true;
     after.warnings.push(line);
@@ -1989,74 +1998,7 @@ pub async fn git_after_unverified(
         git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls).await;
     let mut after = match gate {
         Err(failure) => failed_restore(report, &failure),
-        Ok(()) => {
-            match restore_unchanged(
-                inputs.read,
-                inputs.write,
-                inputs.gateway,
-                inputs.project,
-                saved,
-            )
-            .await
-            {
-                Err(failure) => failed_restore(report, &failure),
-                Ok(done) => {
-                    let node_name = report.master().node.clone();
-                    report.master_mut().restore = Some(RestoreInfo {
-                        restored: done.restored,
-                        advanced: false,
-                        verified: done.verified,
-                        post_status: None,
-                        post_status_note: None,
-                        dropped: Vec::new(),
-                        dropped_count: 0,
-                        reason: None,
-                        save_kept: true,
-                    });
-                    let mut after = GitAfter::new();
-                    if done.restored {
-                        after
-                            .events
-                            .push(ProjectsEvent::GitRestored { node: node_name });
-                    }
-                    // The save is removed only when the repo now equals it.
-                    let equal = matches!(
-                        inputs.read.git_manifest(inputs.project).await,
-                        Ok(now) if now == saved.manifest
-                    );
-                    if equal {
-                        match inputs
-                            .write
-                            .remove_git_save(inputs.gateway, inputs.project, &saved.run_id)
-                            .await
-                        {
-                            Ok(()) => {
-                                if let Some(r) = report.master_mut().restore.as_mut() {
-                                    r.save_kept = false;
-                                }
-                                after.events.push(ProjectsEvent::GitSaveRemoved {
-                                    node: report.master().node.clone(),
-                                    path: saved.path.clone(),
-                                });
-                            }
-                            Err(err) => after.warnings.push(format!(
-                                "project {}: the saved .git at {} could not be removed ({})",
-                                inputs.project,
-                                saved.path,
-                                err.code()
-                            )),
-                        }
-                    } else {
-                        after.warnings.push(format!(
-                            "project {}: the import left a git repository that is not the one \
-                             saved; it was left as it is and the saved .git is at {}",
-                            inputs.project, saved.path
-                        ));
-                    }
-                    after
-                }
-            }
-        }
+        Ok(()) => put_back_unchanged(report, saved, inputs).await,
     };
     after.events.splice(
         0..0,
@@ -2065,6 +2007,213 @@ pub async fn git_after_unverified(
             .map(|open| ProjectsEvent::DesignersPoll { open }),
     );
     after
+}
+
+/// The restore of [`git_after_unverified`] and [`git_after_rollback`] once the
+/// Designer gate allowed it: the saved `.git` goes back exactly as saved if the
+/// project step removed it ([`restore_unchanged`]), and is never advanced. A
+/// repo that is still present is left untouched. The save is removed only when
+/// the repo equals it, else it is kept and named.
+async fn put_back_unchanged(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+) -> GitAfter {
+    let done = match restore_unchanged(
+        inputs.read,
+        inputs.write,
+        inputs.gateway,
+        inputs.project,
+        saved,
+    )
+    .await
+    {
+        Err(failure) => return failed_restore(report, &failure),
+        Ok(done) => done,
+    };
+    let node_name = report.master().node.clone();
+    report.master_mut().restore = Some(RestoreInfo {
+        restored: done.restored,
+        advanced: false,
+        verified: done.verified,
+        post_status: None,
+        post_status_note: None,
+        dropped: Vec::new(),
+        dropped_count: 0,
+        reason: None,
+        save_kept: true,
+    });
+    let mut after = GitAfter::new();
+    if done.restored {
+        after
+            .events
+            .push(ProjectsEvent::GitRestored { node: node_name });
+    }
+    // The save is removed only when the repo now equals it.
+    let equal = matches!(
+        inputs.read.git_manifest(inputs.project).await,
+        Ok(now) if now == saved.manifest
+    );
+    if equal {
+        remove_saved_copy(report, saved, inputs, &mut after).await;
+    } else {
+        after.warnings.push(format!(
+            "project {}: the git repository now in place is not the one saved; it was left \
+             as it is and the saved .git is at {}",
+            inputs.project, saved.path
+        ));
+    }
+    after
+}
+
+async fn remove_saved_copy(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+    after: &mut GitAfter,
+) {
+    match inputs
+        .write
+        .remove_git_save(inputs.gateway, inputs.project, &saved.run_id)
+        .await
+    {
+        Ok(()) => {
+            if let Some(r) = report.master_mut().restore.as_mut() {
+                r.save_kept = false;
+            }
+            after.events.push(ProjectsEvent::GitSaveRemoved {
+                node: report.master().node.clone(),
+                path: saved.path.clone(),
+            });
+        }
+        Err(err) => after.warnings.push(format!(
+            "project {}: the saved .git at {} could not be removed ({})",
+            inputs.project,
+            saved.path,
+            err.code()
+        )),
+    }
+}
+
+/// What the git step of a rollback concluded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackGit {
+    /// Warnings and events of the step, as for the other post-import steps.
+    pub after: GitAfter,
+    /// Lines for the rollback's `left` list: the repository was not put back
+    /// (a Designer attached, a failed restore) or a repository that is not the
+    /// saved one stands at `.git` and was left alone (D-08). Each names the
+    /// save path. A non-empty list makes a green rollback `rollback_failed`.
+    pub left: Vec<String>,
+}
+
+/// D-08: the project was rolled back (or the rollback found it untouched), so
+/// the repository goes back to what the run saved, unchanged, and is never
+/// advanced.
+///
+/// The `.git` is probed. Absent (the pre-image import removed it): the Designer
+/// gate runs first ([`git_restore_designer_gate`], D-07: while a session is
+/// attached nothing is written and the save is kept), then the save is
+/// restored ([`restore_unchanged`]). Present and equal to the save: left as it
+/// is and the save removed. Present and different (a Designer recreated it, or
+/// someone else changed it): left as it is, the save kept, and a `left` line
+/// names the save path; no path overwrites or deletes it.
+pub async fn git_after_rollback(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+) -> RollbackGit {
+    let mut polls = Vec::new();
+    let absent = matches!(
+        inputs.read.read_git_state(inputs.project).await,
+        Ok(files) if files.kind == GitEntry::Absent
+    );
+    let gate = if absent {
+        git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls).await
+    } else {
+        Ok(())
+    };
+    let mut after = match gate {
+        Err(failure) => failed_restore(report, &failure),
+        Ok(()) => put_back_unchanged(report, saved, inputs).await,
+    };
+    after.events.splice(
+        0..0,
+        polls
+            .into_iter()
+            .map(|open| ProjectsEvent::DesignersPoll { open }),
+    );
+    let restore = report.master().restore.as_ref();
+    let left = if let Some(reason) = restore.and_then(|r| r.reason.as_deref()) {
+        vec![format!(
+            "project {}: its git repository was not put back ({reason}); the saved .git is at {}",
+            inputs.project, saved.path
+        )]
+    } else if restore.is_some_and(|r| r.save_kept) {
+        vec![format!(
+            "project {}: the git repository now in place is not the one saved and was left as \
+             it is; the saved .git is at {}",
+            inputs.project, saved.path
+        )]
+    } else {
+        Vec::new()
+    };
+    RollbackGit { after, left }
+}
+
+/// `--rollback-run` over a project whose `.git` exists (D-08): classify it.
+/// An unsupported shape refuses `project_git_managed` with its reason before
+/// anything is written; a managed or adoptable repo is reported (state,
+/// branch, remote, head) so the run can save it, re-import the pre-image and
+/// restore it unchanged. There is no release in an undo, so `release_commit`
+/// is empty and nothing is advanced.
+pub async fn check_rollback_run(
+    surfaces: &ProjectsSurfaces<'_>,
+    project: &str,
+    entry: GitEntry,
+) -> Result<GitReport, CoreError> {
+    let kind = entry.as_str();
+    let Some(read) = surfaces.host.git() else {
+        return Err(managed(project, kind, kind));
+    };
+    let found = read_state(read, &surfaces.host.host_git(), project)
+        .await
+        .map_err(|_| managed(project, kind, kind))?;
+    if !matches!(
+        found.state.kind,
+        GitStateKind::Managed | GitStateKind::Adoptable
+    ) {
+        return Err(managed(project, kind, &reason_of(&found.state)));
+    }
+    Ok(GitReport {
+        release_commit: String::new(),
+        nodes: vec![NodeGitReport {
+            node: "nodes.master".to_string(),
+            state: state_word(found.state.kind),
+            reason: None,
+            branch: found.state.tracked.clone(),
+            branch_source: None,
+            remote: found.state.remote.as_ref().map(|r| r.name.clone()),
+            remote_url: found.state.remote.as_ref().map(|r| r.url_redacted.clone()),
+            head: head_commit(&found.state),
+            adopted: false,
+            unpushed: Vec::new(),
+            not_merged: Vec::new(),
+            not_merged_count: 0,
+            dirty: None,
+            dirty_count: None,
+            dirty_source: None,
+            hazards: Vec::new(),
+            save: None,
+            restore: None,
+        }],
+        expected_drift: None,
+        expected_drift_count: None,
+        expected_drift_complete: false,
+        would_discard: None,
+        discarded: None,
+        hazards_acknowledged: None,
+    })
 }
 
 /// The paths where a status over the project directory on disk differs from

@@ -335,9 +335,8 @@ use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::projects::{
     GitStateWriter, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
-    git_entry_location, git_state_writer_for_node, local_data_dir_for_node,
-    project_run_writer_for_node, release_writer_for_node, tag_record_names_problem,
-    tag_record_writer_for_node,
+    git_state_writer_for_node, local_data_dir_for_node, project_run_writer_for_node,
+    release_writer_for_node, tag_record_names_problem, tag_record_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
@@ -4454,6 +4453,7 @@ async fn execute(
                         run: writers.run,
                         records: None,
                         release: None,
+                        git: None,
                     },
                     route,
                     &mut events,
@@ -4657,6 +4657,7 @@ async fn execute(
                     run: writers.run,
                     records: None,
                     release: None,
+                    git: None,
                 },
                 route,
                 &mut events,
@@ -4759,6 +4760,7 @@ async fn execute(
                         run: writers.run,
                         records: None,
                         release: None,
+                        git: None,
                     },
                     route,
                     &mut events,
@@ -4832,6 +4834,7 @@ async fn execute(
                         run: writers.run,
                         records: None,
                         release: None,
+                        git: None,
                     },
                     route,
                     &mut events,
@@ -4897,6 +4900,7 @@ async fn execute(
                     run: writers.run,
                     records: None,
                     release: None,
+                    git: git_undo(&writers, git_saved.as_ref()),
                 },
                 route,
                 &mut events,
@@ -5088,6 +5092,7 @@ async fn execute(
                 run: writers.run,
                 records: None,
                 release: None,
+                git: git_undo(&writers, git_saved.as_ref()),
             },
             route,
             &mut events,
@@ -5475,6 +5480,29 @@ struct UndoWriters<'a> {
     /// The release record writer that puts the record before the run back
     /// (`--rollback-run` only, ultrareview U1).
     release: Option<&'a dyn ReleaseRecordWriter>,
+    /// The gateway `.git` the run (or the undo) saved, to be put back
+    /// unchanged once the project is rolled back (Phase 27, D-08).
+    git: Option<GitUndo<'a>>,
+}
+
+/// The saved gateway `.git` a rollback puts back (D-08).
+#[derive(Clone, Copy)]
+struct GitUndo<'a> {
+    /// The host's git writer for `nodes.master`.
+    writer: &'a dyn GitStateWriter,
+    /// What was saved before the project changed.
+    saved: &'a GitSaveReport,
+}
+
+/// The git step of a rollback of this run: set only once the `.git` was saved.
+fn git_undo<'a>(writers: &Writers<'a>, saved: Option<&'a GitSaveReport>) -> Option<GitUndo<'a>> {
+    match (writers.git, saved) {
+        (Some(run), Some(saved)) => Some(GitUndo {
+            writer: run.writer,
+            saved,
+        }),
+        _ => None,
+    }
 }
 
 /// What a run keeps on the gateway host (26-12): the pre-image set as
@@ -7407,6 +7435,37 @@ async fn roll_back(
         }
     }
 
+    // 1b. Phase 27 (D-08): the gateway `.git` goes back exactly as it was
+    // saved, right after the project step so the time without it is as short
+    // as the rollback allows. It is never advanced, and a `.git` that is not
+    // the saved one is never overwritten. A repository that is not put back is
+    // a line in `left`, so the rollback is `rollback_failed`, never green.
+    if let (Some(undo), Some(read), Some(report)) = (
+        undo_writers.git,
+        surfaces.host.git(),
+        result.git.as_deref_mut(),
+    ) {
+        let gateway_name = loaded.target.gateway.clone();
+        let step = git::git_after_rollback(
+            report,
+            undo.saved,
+            &git::UnverifiedInputs {
+                read,
+                write: undo.writer,
+                gateway: &gateway_name,
+                project: &project,
+                api: gateway,
+                designers: &opts.designers,
+            },
+        )
+        .await;
+        for event in step.after.events {
+            events.emit_late(event);
+        }
+        result.warnings.extend(step.after.warnings);
+        left.extend(step.left);
+    }
+
     // 2. The tags of every provider the run imported into.
     let empty = BTreeMap::new();
     for provider in sorted(&loaded.owned_tags) {
@@ -8756,17 +8815,16 @@ pub async fn deploy_projects_rollback_run(
     }
     let project = loaded.file.project.as_str();
     let gateway = surfaces.gateway;
-    // The project is restored by import, so a project the git module manages
-    // refuses as it does for a deploy.
-    let git = surfaces.host.git_entry(project).await?;
-    if git.is_present() {
-        return Err(CoreError::ProjectGitManaged {
-            project: project.to_string(),
-            location: git_entry_location(project),
-            kind: git.as_str().to_string(),
-            reason: git::refusal_reason(surfaces, project, git.as_str()).await,
-        });
-    }
+    // The project is restored by import, which removes a gateway `.git`. A
+    // repository the deploy can hand over is saved before the first write and
+    // put back unchanged afterwards (Phase 27, D-08); any other shape refuses
+    // as it does for a deploy, before anything is written.
+    let git_entry = surfaces.host.git_entry(project).await?;
+    let mut git_report = if git_entry.is_present() {
+        Some(git::check_rollback_run(surfaces, project, git_entry).await?)
+    } else {
+        None
+    };
     let set = read_host_set(loaded, input, surfaces.host, &target).await?;
     let mut writes = undo_writes(&set);
     let project_undo = match set.run.project_action.as_str() {
@@ -8826,6 +8884,7 @@ pub async fn deploy_projects_rollback_run(
     }
 
     if check {
+        result.git = git_report.take().map(Box::new);
         rollback_run_preview(
             gateway,
             loaded,
@@ -8879,6 +8938,24 @@ pub async fn deploy_projects_rollback_run(
             )?;
             built_release.as_ref()
         }
+    };
+    // The git writer, built with the others so a node that cannot take it
+    // refuses before anything is written.
+    let built_git;
+    let git_writer: Option<&dyn GitStateWriter> = match &git_report {
+        None => None,
+        Some(_) => match opts.git_writer {
+            Some(writer) => Some(writer),
+            None => {
+                built_git = git_state_writer_for_node(
+                    &opts.targets_root,
+                    &opts.target_file,
+                    "nodes.master",
+                    &opts.master,
+                )?;
+                Some(built_git.as_ref())
+            }
+        },
     };
     // The pre-checks read and write nothing.
     wrong_target_check(loaded, gateway, opts).await?;
@@ -8939,6 +9016,31 @@ pub async fn deploy_projects_rollback_run(
                 sessions: designers.seen.clone(),
             })?;
         }
+        // Phase 27 (D-08): the gateway `.git` is saved before the journal and
+        // before the first gateway write. A save that cannot be taken stops
+        // the undo with nothing written to the gateway.
+        let mut git_saved: Option<GitSaveReport> = None;
+        if let (Some(report), Some(writer), Some(read)) =
+            (git_report.as_mut(), git_writer, surfaces.host.git())
+        {
+            let saved = crate::deploy::git_handover::save(
+                read,
+                writer,
+                &loaded.target.gateway,
+                project,
+                rid.as_str(),
+            )
+            .await?;
+            report.set_save(&saved);
+            events.emit(ProjectsEvent::GitSaved {
+                node: "nodes.master".to_string(),
+                path: saved.path.clone(),
+                files: saved.manifest.files,
+                bytes: saved.manifest.bytes,
+            })?;
+            git_saved = Some(saved);
+        }
+        result.git = git_report.take().map(Box::new);
         // The journal says rolling_back before the first gateway write; a
         // host that cannot take it stops the undo with nothing written.
         let journal = ProjectJournal {
@@ -8979,6 +9081,10 @@ pub async fn deploy_projects_rollback_run(
                 run: Some(run_writer),
                 records: Some(tag_writer),
                 release: Some(release_writer),
+                git: match (git_writer, git_saved.as_ref()) {
+                    (Some(writer), Some(saved)) => Some(GitUndo { writer, saved }),
+                    _ => None,
+                },
             },
             &route,
             &mut events,

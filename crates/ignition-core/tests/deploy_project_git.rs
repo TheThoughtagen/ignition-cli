@@ -1500,6 +1500,8 @@ mod published {
     use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
     use ignition_core::error::CoreError;
 
+    const PROVIDER: &str = "PlantA";
+
     /// A host that answers like the local transport and runs `program` as
     /// host git (a stub, to prove git is never run or to make one step fail).
     pub struct StubHost {
@@ -1585,12 +1587,77 @@ mod published {
 
         /// A rig whose gateway is shaped by `shape` (a mirror knob).
         pub fn with(shape: impl FnOnce(FakeProjects) -> FakeProjects) -> Rig {
+            Rig::build(false, true, shape)
+        }
+
+        /// A rig whose project owns the tags of a provider (Phase 26), so a
+        /// failed project step rolls the run back. `registered` is whether the
+        /// git module manages the project (R-3: an import removes `.git`) or
+        /// not (R-6: it stays).
+        pub fn tagged(registered: bool) -> Rig {
+            Rig::build(true, registered, |g| g)
+        }
+
+        /// [`Rig::tagged`] with the gateway shaped by `shape`.
+        pub fn tagged_with(
+            registered: bool,
+            shape: impl FnOnce(FakeProjects) -> FakeProjects,
+        ) -> Rig {
+            Rig::build(true, registered, shape)
+        }
+
+        fn build(
+            owned: bool,
+            registered: bool,
+            shape: impl FnOnce(FakeProjects) -> FakeProjects,
+        ) -> Rig {
             let f = GitFixture::new();
+            let tag_line = if owned {
+                format!("tag_providers: [{PROVIDER}]\n")
+            } else {
+                String::new()
+            };
             put_file(
                 &f.checkout,
                 "deploy/project.yaml",
-                &format!("schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\n"),
+                &format!("schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\n{tag_line}"),
             );
+            if owned {
+                put_file(
+                    &f.checkout,
+                    &format!("deploy/tag-providers/{PROVIDER}.json"),
+                    r#"{"schema_version": 1, "enabled": true, "config": {}}"#,
+                );
+                put_file(
+                    &f.checkout,
+                    &format!("tags/{PROVIDER}/Line1/Count.json"),
+                    r#"{"dataType":"Int4","documentation":"new","tagType":"AtomicTag","value":1,"valueSource":"memory"}"#,
+                );
+                let record = ignition_core::deploy::tag_record::TagRecord {
+                    schema_version: 1,
+                    gateway: "capgw".to_string(),
+                    provider: PROVIDER.to_string(),
+                    project: PROJECT.to_string(),
+                    release: "v0.9.0".to_string(),
+                    run_id: "20261020T101500Z-ab12".to_string(),
+                    deployed_at: "2026-10-20T10:15:00Z".to_string(),
+                    tags_sha256: "ab".repeat(32),
+                    nodes: vec!["Line1".to_string()],
+                    groups: Vec::new(),
+                };
+                std::fs::create_dir_all(
+                    f.data_dir
+                        .join(format!("ign-deploy/capgw/tag-providers/{PROVIDER}")),
+                )
+                .expect("the tag record directory");
+                std::fs::write(
+                    f.data_dir.join(format!(
+                        "ign-deploy/capgw/tag-providers/{PROVIDER}/record.json"
+                    )),
+                    record.to_bytes(),
+                )
+                .expect("the tag record");
+            }
             put_file(&f.checkout, ".gitignore", ".ign/\n");
             put_file(
                 &f.data_dir,
@@ -1611,11 +1678,23 @@ mod published {
                 .iter()
                 .map(|(path, bytes)| (path.as_str(), bytes.clone()))
                 .collect();
-            let gateway = shape(
-                FakeProjects::new()
-                    .with_project(PROJECT, None, false, &borrowed)
-                    .with_disk_mirror(&f.data_dir, true),
-            );
+            let mut gateway = FakeProjects::new()
+                .with_project(PROJECT, None, false, &borrowed)
+                .with_disk_mirror(&f.data_dir, registered);
+            if owned {
+                gateway = gateway.with_tag_tree(
+                    PROVIDER,
+                    serde_json::json!({"name":"","tagType":"Provider","tags":[
+                        {"name":"_types_","tagType":"Folder"},
+                        {"name":"Line1","tagType":"Folder","tags":[
+                            {"name":"Count","tagType":"AtomicTag","dataType":"Int4",
+                             "valueSource":"memory","value":9,"defaultValue":1,
+                             "documentation":"old"}
+                        ]}
+                    ]}),
+                );
+            }
+            let gateway = shape(gateway);
             let repo = f.checkout.clone();
             Rig {
                 f,
@@ -1662,6 +1741,54 @@ mod published {
                 program: Some(program.as_os_str().to_os_string()),
                 read: None,
             }
+        }
+
+        /// `--rollback-run run_id` of this rig's project, as a fresh process
+        /// on another runner would make it (27-21, D-08).
+        pub async fn rollback_run(
+            &self,
+            run_id: &str,
+            check: bool,
+        ) -> Result<DeployProjectsResult, CoreError> {
+            let input = self.input();
+            let loaded = ignition_core::actions::deploy_projects::load_project_for_rollback(&input)
+                .expect("the checkout loads");
+            let host = self.host();
+            ignition_core::actions::deploy_projects::deploy_projects_rollback_run(
+                &loaded,
+                &input,
+                &ProjectsSurfaces {
+                    gateway: &self.gateway,
+                    host: &host,
+                    tree: None,
+                    apply_host: None,
+                    deploy: None,
+                    tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
+                },
+                &ProjectsRunOptions {
+                    repo: input.repo.clone(),
+                    targets_root: input.targets.clone(),
+                    target_file: loaded.target_file.clone(),
+                    master: loaded.target.nodes.master.clone(),
+                    record_writer: None,
+                    tag_record_writer: None,
+                    run_writer: None,
+                    git_writer: None,
+                    designers: Default::default(),
+                    children_settle: std::time::Duration::from_secs(1),
+                    children_poll: std::time::Duration::from_millis(5),
+                    tag_verify_settle: std::time::Duration::from_secs(1),
+                    tag_verify_poll: std::time::Duration::from_millis(5),
+                    backup: None,
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+                    tag_delete_ready: std::time::Duration::from_millis(50),
+                    tag_delete_poll: std::time::Duration::from_millis(5),
+                },
+                run_id,
+                check,
+                &NoProjectsObserver,
+            )
+            .await
         }
 
         /// Make the fake gateway hold what the project directory holds now.
@@ -3175,6 +3302,292 @@ mod published {
         // One read at the pre-check (fail mode, no poll event of its own is
         // logged for it by `wait`), then the gate's three reads.
         assert!(opens.ends_with(&[1, 1, 0]), "{opens:?}");
+    }
+
+    /// D-08: a tag-owning managed project whose project import reads back
+    /// different is rolled back; the saved pre-run `.git` is put back
+    /// unchanged and never advanced.
+    #[tokio::test]
+    async fn rollback_restores_git_unchanged() {
+        let rig = Rig::tagged(true);
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before = rig.git_manifest().await;
+        let result = rig.apply().await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert!(restore.restored && !restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None);
+        assert!(!restore.save_kept, "the save equals the repo and goes");
+        assert_eq!(rig.git_manifest().await, before, ".git is as it was saved");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c1);
+        assert!(rig.save_trees().is_empty());
+        assert!(!git_of(&result).expected_drift_complete);
+        assert_eq!(
+            rig.git_events(&result),
+            [
+                "git_state_read",
+                "git_saved",
+                "git_restored",
+                "git_save_removed"
+            ]
+        );
+    }
+
+    /// R-6: the project import did not remove `.git` (the module does not
+    /// manage the directory), so the rollback writes nothing to it.
+    #[tokio::test]
+    async fn rollback_git_still_present_left_alone() {
+        let rig = Rig::tagged(false);
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before = rig.git_manifest().await;
+        let result = rig.apply().await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        let restore = git_of(&result)
+            .master()
+            .restore
+            .clone()
+            .expect("restore reported");
+        assert!(!restore.restored && !restore.advanced, "{restore:?}");
+        assert!(!restore.save_kept);
+        assert_eq!(rig.git_manifest().await, before, "nothing was written");
+        assert!(rig.save_trees().is_empty());
+        assert!(
+            !rig.git_events(&result)
+                .contains(&"git_restored".to_string())
+        );
+    }
+
+    /// The project import is refused, nothing was applied: `.git` is intact,
+    /// the save is removed, nothing is restored.
+    #[tokio::test]
+    async fn rollback_import_refused_git_intact() {
+        let rig = Rig::tagged_with(true, |g| g.with_project_import_denied());
+        let before = rig.git_manifest().await;
+        let result = rig.apply().await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        let restore = git_of(&result)
+            .master()
+            .restore
+            .clone()
+            .expect("restore reported");
+        assert!(!restore.restored && !restore.advanced && !restore.save_kept);
+        assert_eq!(rig.git_manifest().await, before);
+        assert!(rig.save_trees().is_empty());
+    }
+
+    /// D-07, checker W-4: the restore of a rollback passes the Designer gate.
+    /// A session that stays attached leaves `.git` absent and the save kept,
+    /// and the rollback's `left` list names the save path with
+    /// `designer_attached`; a session that closes within the wait lets the
+    /// restore proceed.
+    #[tokio::test]
+    async fn rollback_waits_for_designer() {
+        let rig = Rig::tagged_with(true, |g| g.with_designers_after_exports(3, 100_000));
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let err = refusal(rig.apply_designers(wait_ms(60)).await);
+        let CoreError::RollbackFailed(failure) = &err else {
+            panic!("the rollback must end rollback_failed: {err:?}");
+        };
+        assert_eq!(err.code(), "rollback_failed");
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save is kept");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            failure.cause.contains("designer_attached") && failure.cause.contains(&save),
+            "the left list names the save path and the reason: {}",
+            failure.cause
+        );
+        assert!(!rig.f.git_dir().exists(), ".git is still absent");
+        // The run directory's events record the failed restore.
+        let run_dir = std::fs::read_dir(rig.repo.join(".ign/deploy/capgw"))
+            .expect("run dirs")
+            .next()
+            .expect("one run")
+            .expect("entry")
+            .path();
+        let events = std::fs::read_to_string(run_dir.join("events.ndjson")).expect("events");
+        assert!(events.contains("git_restore_failed"), "{events}");
+        assert!(!events.contains("git_save_removed"), "{events}");
+
+        // The session closes within the wait: the restore proceeds.
+        let rig = Rig::tagged_with(true, |g| g.with_designers_after_exports(3, 2));
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before = rig.git_manifest().await;
+        let result = rig
+            .apply_designers(wait_ms(2_000))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert!(restore.restored && restore.reason.is_none(), "{restore:?}");
+        assert_eq!(rig.git_manifest().await, before);
+    }
+
+    /// `--rollback-run` no longer refuses a managed `.git`: it saves it,
+    /// re-imports the pre-image and puts the repository back unchanged.
+    #[tokio::test]
+    async fn rollback_run_restores_git_unchanged() {
+        let rig = Rig::tagged(true);
+        let applied = rig.apply().await.expect("green");
+        assert_eq!(
+            applied.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            applied.warnings
+        );
+        let run_id = applied.run_id.clone().expect("a run id");
+        let before = rig.git_manifest().await;
+        let imports = rig.gateway.import_calls().len();
+
+        let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            undo.warnings
+        );
+        assert_eq!(rig.gateway.import_calls().len(), imports + 1, "pre-image");
+        assert_eq!(rig.git_manifest().await, before, ".git is unchanged");
+        let node = git_of(&undo).master();
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert!(restore.restored && !restore.advanced, "{restore:?}");
+        assert!(!restore.save_kept);
+        assert!(rig.save_trees().is_empty());
+        assert_eq!(
+            rig.git_events(&undo),
+            ["git_saved", "git_restored", "git_save_removed"]
+        );
+        // The check reports the repository without writing anything.
+        let checked = rig.rollback_run(&run_id, true).await.expect("a check");
+        assert_eq!(git_of(&checked).master().state, "managed");
+        assert!(git_of(&checked).master().save.is_none());
+        assert!(rig.save_trees().is_empty());
+    }
+
+    /// A shape the deploy cannot hand over still refuses `project_git_managed`
+    /// with its reason, before anything is written.
+    #[tokio::test]
+    async fn rollback_run_unsupported_refuses() {
+        let rig = Rig::tagged(true);
+        let applied = rig.apply().await.expect("green");
+        let run_id = applied.run_id.clone().expect("a run id");
+        rig.f.git_in_project(&["checkout", "-q", "--detach"]);
+        let before = rig.git_manifest().await;
+        let imports = rig.gateway.import_calls().len();
+        for check in [true, false] {
+            let err = refusal(rig.rollback_run(&run_id, check).await);
+            assert_eq!(reason_of(&err), "detached_head", "{err}");
+        }
+        assert_eq!(rig.gateway.import_calls().len(), imports, "nothing written");
+        assert_eq!(rig.git_manifest().await, before);
+        assert!(rig.save_trees().is_empty());
+    }
+
+    /// Pitfall 1, D-07, D-09: a Designer opened while the import had removed
+    /// `.git` and the module recreated one. It is never overwritten: the run
+    /// ends `git_restore_failed` with reason `git_recreated`, the recreated
+    /// repository byte-identical afterwards, the save kept and named.
+    #[tokio::test]
+    async fn designer_recreated_git_during_window() {
+        let rig = Rig::with(|g| g.with_disk_mirror_recreates_git());
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok && result.record_written, "the deploy stays");
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert_eq!(restore.reason.as_deref(), Some("git_recreated"));
+        assert!(!restore.advanced && restore.save_kept, "{restore:?}");
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(rig.f.data_dir.join(&save.path).is_dir(), "the save is kept");
+        // The recreated repository is the module's partial shape and is
+        // untouched: no branch ref, no index, still the unborn master.
+        let dot_git = rig.f.git_dir();
+        assert!(dot_git.is_dir());
+        assert!(!dot_git.join("index").exists(), "nothing was advanced");
+        assert_eq!(
+            rig.f.git_in_project(&["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+        assert_eq!(rig.f.git_in_project(&["for-each-ref", "refs/heads"]), "");
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("git_recreated"))
+            .expect("the refusal is reported");
+        assert!(
+            warning.contains(&save.path) && warning.contains("left untouched"),
+            "{warning}"
+        );
+        let events = rig.git_events(&result);
+        assert!(events.contains(&"git_restore_failed".to_string()));
+        assert!(!events.contains(&"git_advanced".to_string()));
+        assert!(!events.contains(&"git_save_removed".to_string()));
+    }
+
+    /// D-08 and the prohibition "no path overwrites a `.git` that differs from
+    /// the save": a repository the module recreated during the rollback's own
+    /// import is left exactly as it is, the save is kept and named, and the
+    /// rollback ends `rollback_failed` naming it.
+    #[tokio::test]
+    async fn rollback_recreated_git_is_left_alone() {
+        let rig = Rig::tagged_with(true, |g| g.with_disk_mirror_recreates_git());
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let err = refusal(rig.apply().await);
+        let CoreError::RollbackFailed(failure) = &err else {
+            panic!("the rollback must end rollback_failed: {err:?}");
+        };
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save is kept");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            failure.cause.contains(&save) && failure.cause.contains("not the one saved"),
+            "{}",
+            failure.cause
+        );
+        let dot_git = rig.f.git_dir();
+        assert!(dot_git.is_dir() && !dot_git.join("index").exists());
+        assert_eq!(
+            rig.f.git_in_project(&["symbolic-ref", "HEAD"]),
+            "refs/heads/master"
+        );
+        assert_eq!(rig.f.git_in_project(&["for-each-ref", "refs/heads"]), "");
     }
 
     #[tokio::test]
