@@ -40,9 +40,9 @@ use std::time::{Duration, Instant};
 
 use ignition_core::actions::deploy_projects::{
     CHILDREN_POLL_S, CHILDREN_SETTLE_S, DeployProjectsResult, GatewayProjects, NoProjectsObserver,
-    ProjectGateway, ProjectsInput, ProjectsRunOptions, ProjectsSurfaces, TAG_VERIFY_POLL_S,
-    TAG_VERIFY_SETTLE_S, TagDeleteSurface, deploy_projects_prepare, deploy_projects_run,
-    load_project,
+    ProjectGateway, ProjectsEvent, ProjectsInput, ProjectsObserver, ProjectsRunOptions,
+    ProjectsSurfaces, TAG_VERIFY_POLL_S, TAG_VERIFY_SETTLE_S, TagDeleteSurface,
+    deploy_projects_prepare, deploy_projects_run, load_project,
 };
 use ignition_core::actions::script::script_run;
 use ignition_core::actions::webdev::webdev_deploy_with;
@@ -51,17 +51,22 @@ use ignition_core::client::scan::ScanKind;
 use ignition_core::client::{DeployApi, GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{self, Config, Credential, Secret};
 use ignition_core::deploy::apply::preflight::DesignersPolicy;
-use ignition_core::deploy::git_advance::{AdvancePrep, prepare_advance};
+use ignition_core::deploy::git_advance::{AdvancePrep, GitWrite, prepare_advance};
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
-use ignition_core::deploy::git_state::{GitRefs, GitState, GitStateKind, classify};
+use ignition_core::deploy::git_state::{GitHead, GitRefs, GitState, GitStateKind, classify};
 use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupPolicy};
-use ignition_core::deploy::project_artifact::{Artifact, build_artifact};
+use ignition_core::deploy::project_artifact::{Artifact, build_artifact, canonical_digest};
 use ignition_core::deploy::transport::local::LocalFsTransport;
-use ignition_core::deploy::transport::projects::{GitEntry, GitHostRead, GitStateWriter};
+use ignition_core::deploy::transport::projects::{
+    GitEntry, GitHostRead, GitManifest, GitStateWriter,
+};
 use ignition_core::deploy::transport::{self, projects::project_host_for_node};
 use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
+
+mod common;
+use common::prod_shape_git::{HOST_LINUX_RESTORE_VERIFY, HOST_LINUX_SAVE, HOST_LINUX_UPLOAD};
 
 /// The only gateway this gate may talk to.
 const RIG_GATEWAY_NAME: &str = "ign-git27-rig";
@@ -1516,6 +1521,20 @@ struct DeployFlags {
     discard_gateway_changes: Option<String>,
     allow_git_sync_hazards: Option<String>,
     first_change: bool,
+    /// The reviewed `tags_sha256` of a project that owns tag providers.
+    tags_sha256: Option<String>,
+    /// A run that creates tags accepts that a rollback leaves them behind (the
+    /// rig has no tag-delete route).
+    allow_manual_undo: bool,
+}
+
+/// What an in-process run may add to the shipped wiring: an observer that
+/// hears every event, and a git writer that stands in for the one the run
+/// builds from the master (a timing wrapper over the same local transport).
+#[derive(Default)]
+struct Extras<'a> {
+    observer: Option<&'a dyn ProjectsObserver>,
+    git_writer: Option<&'a dyn GitStateWriter>,
 }
 
 /// A temp release checkout and targets root, alive for one run.
@@ -1593,6 +1612,19 @@ async fn deploy_in_process(
     flags: &DeployFlags,
     step: &str,
 ) -> Result<DeployProjectsResult, CoreError> {
+    deploy_in_process_with(rig, check, env, release, flags, step, &Extras::default()).await
+}
+
+/// [`deploy_in_process`] with an observer and a git writer (27-24).
+async fn deploy_in_process_with(
+    rig: &Rig,
+    check: bool,
+    env: &str,
+    release: &str,
+    flags: &DeployFlags,
+    step: &str,
+    extras: &Extras<'_>,
+) -> Result<DeployProjectsResult, CoreError> {
     let api = rig.api();
     let dep = deployment(rig, release);
     let input = ProjectsInput {
@@ -1605,9 +1637,9 @@ async fn deploy_in_process(
         discard_gateway_changes: flags.discard_gateway_changes.clone(),
         allow_git_sync_hazards: flags.allow_git_sync_hazards.clone(),
         allow_destructive: false,
-        allow_manual_undo: false,
+        allow_manual_undo: flags.allow_manual_undo,
         artifact_sha256: flags.artifact_sha256.clone(),
-        tags_sha256: None,
+        tags_sha256: flags.tags_sha256.clone(),
     };
     let loaded = load_project(&input)?;
     let host = project_host_for_node(
@@ -1655,7 +1687,7 @@ async fn deploy_in_process(
         tag_delete_poll: Duration::from_secs(
             ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
         ),
-        git_writer: None,
+        git_writer: extras.git_writer,
     };
     let prepared = deploy_projects_prepare(&loaded, &input, &surfaces).await?;
     let result = if check {
@@ -1667,7 +1699,7 @@ async fn deploy_in_process(
             &input,
             &surfaces,
             &opts,
-            &NoProjectsObserver,
+            extras.observer.unwrap_or(&NoProjectsObserver),
         )
         .await?
     };
@@ -1866,6 +1898,43 @@ fn write_git_yaml(rig: &Rig, production: bool, flag: Option<&str>) {
 /// What a managed deploy leaves, for the evidence and the captures.
 struct ManagedOutcome {
     evidence: serde_json::Value,
+    /// The canonical digest of the release's artifact.
+    artifact_sha256: String,
+    /// What JGit lists as uncommitted after the deploy.
+    jgit_paths: BTreeSet<String>,
+}
+
+/// What `managed_deploy` expects of the gateway's repository and of the run.
+#[derive(Clone, Copy)]
+struct Expect {
+    /// The class `--check` reads: `managed`, or `adoptable` for the partial
+    /// repo `setupLocalRepo` leaves (27-17).
+    state: &'static str,
+    /// The run's outcome word.
+    outcome: &'static str,
+    /// The project owns tag providers: the apply carries `--tags-sha256`.
+    tags: bool,
+}
+
+impl Expect {
+    /// A module-managed repo and a plain project import.
+    const MANAGED: Expect = Expect {
+        state: "managed",
+        outcome: "imported",
+        tags: false,
+    };
+    /// The partial repo `setupLocalRepo` leaves: adopted by the run.
+    const ADOPTABLE: Expect = Expect {
+        state: "adoptable",
+        outcome: "imported",
+        tags: false,
+    };
+    /// A managed repo and a project that owns tag providers (Phase 26).
+    const TAGS: Expect = Expect {
+        state: "managed",
+        outcome: "applied",
+        tags: true,
+    };
 }
 
 /// One managed deploy of `release` as the shipped path does it, with every
@@ -1880,6 +1949,7 @@ async fn managed_deploy(
     release: &str,
     first: bool,
     branch: &str,
+    expect: Expect,
 ) -> ManagedOutcome {
     let (_work, config) = script_config(api, &rig.url).await;
     let gitdir = rig.project_dir().join(".git");
@@ -1896,8 +1966,9 @@ async fn managed_deploy(
     let check_json = serde_json::to_value(&check).expect("check json");
     let git_node = &check_json["git"]["nodes"][0];
     assert_eq!(
-        git_node["state"], "managed",
-        "{label}: the module's repo is managed: {git_node}"
+        git_node["state"], expect.state,
+        "{label}: the module's repo is {}: {git_node}",
+        expect.state
     );
     assert!(
         check_json["git"]["expected_drift"].is_null()
@@ -1907,8 +1978,8 @@ async fn managed_deploy(
         check_json["git"]
     );
     eprintln!(
-        "LIVE-C4 {label} check: state=managed expected_drift=null count=null complete=false action={} dirty_count={} dirty_source={}",
-        check_json["action"], git_node["dirty_count"], git_node["dirty_source"]
+        "LIVE-C4 {label} check: state={} expected_drift=null count=null complete=false action={} dirty_count={} dirty_source={}",
+        expect.state, check_json["action"], git_node["dirty_count"], git_node["dirty_source"]
     );
     let manifest_after = dir_manifest(&gitdir);
     let changed: Vec<&String> = manifest_before
@@ -1931,9 +2002,23 @@ async fn managed_deploy(
     );
 
     // The apply, with the digest the check showed.
+    let tags_sha256 = if expect.tags {
+        Some(
+            check
+                .tags
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: the check reports no tags section"))
+                .tags_sha256
+                .clone(),
+        )
+    } else {
+        None
+    };
     let flags = DeployFlags {
         artifact_sha256: Some(check.artifact_sha256.clone()),
         first_change: first,
+        tags_sha256,
+        allow_manual_undo: expect.tags,
         ..DeployFlags::default()
     };
     let started = Instant::now();
@@ -1944,15 +2029,27 @@ async fn managed_deploy(
     let applied_json = serde_json::to_value(&applied).expect("apply json");
     assert_eq!(
         applied.outcome.as_str(),
-        "imported",
+        expect.outcome,
         "{label}: outcome (slug {}): {}",
         applied_json["slug"],
         applied_json["git"]
     );
     let node = &applied_json["git"]["nodes"][0];
     let restore = &node["restore"];
+    if expect.state == "adoptable" {
+        assert_eq!(node["adopted"], true, "{label}: the run adopted the repo");
+        assert_eq!(
+            node["branch_source"], "git_yaml",
+            "{label}: the branch comes from git.yaml"
+        );
+        eprintln!(
+            "LIVE-C4 {label} adoption: adopted=true branch={} branch_source=git_yaml remote={}",
+            node["branch"], node["remote"]
+        );
+    }
     eprintln!(
-        "LIVE-C4 {label} apply: outcome=imported ms={applied_ms} restored={} advanced={} verified={} post_status={} dropped={} reason={}",
+        "LIVE-C4 {label} apply: outcome={} ms={applied_ms} restored={} advanced={} verified={} post_status={} dropped={} reason={}",
+        expect.outcome,
         restore["restored"],
         restore["advanced"],
         restore["verified"],
@@ -1960,8 +2057,13 @@ async fn managed_deploy(
         restore["dropped"],
         restore["reason"]
     );
+    // The import left the partial repo in place (observed live in 27-24), so
+    // there was nothing to put back and `restored` is false for an adoption;
+    // the advance and its read-back are what the adoption must show.
     assert!(
-        restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true,
+        (restore["restored"] == true || expect.state == "adoptable")
+            && restore["advanced"] == true
+            && restore["verified"] == true,
         "{label}: the handover did not complete: {restore}"
     );
     assert_eq!(
@@ -2042,7 +2144,11 @@ async fn managed_deploy(
         "git_manifest_files": manifest_before.len(),
     });
     write_evidence(rig, &format!("{label}-summary"), &evidence);
-    ManagedOutcome { evidence }
+    ManagedOutcome {
+        evidence,
+        artifact_sha256: check.artifact_sha256.clone(),
+        jgit_paths: jg.paths,
+    }
 }
 
 /// Commit the drift through the module and push (production mode): the push
@@ -2151,6 +2257,7 @@ async fn git_deploy_managed_e2e() {
         "v1.1.0",
         true,
         "production",
+        Expect::MANAGED,
     )
     .await;
 
@@ -2167,6 +2274,7 @@ async fn git_deploy_managed_e2e() {
         "v1.2.0",
         false,
         "production",
+        Expect::MANAGED,
     )
     .await;
     let pushed = commit_drift_and_push(&rig, &api, "c4-production-v1.2.0").await;
@@ -2197,7 +2305,16 @@ async fn git_variants_e2e() {
         ("production", "c4-variant-production-v1.1.0"),
     ] {
         driver_reset(mode);
-        let outcome = managed_deploy(&rig, &api, label, "v1.1.0", true, "production").await;
+        let outcome = managed_deploy(
+            &rig,
+            &api,
+            label,
+            "v1.1.0",
+            true,
+            "production",
+            Expect::MANAGED,
+        )
+        .await;
         recorded.push(outcome.evidence);
     }
     write_evidence(
@@ -2428,4 +2545,807 @@ async fn git_refusals_live() {
             },
         }),
     );
+}
+
+// ------------------------------------------------------------------- 27-24
+//
+// C4 on the single-node rig, second half: the module's own `setupLocalRepo`
+// and the adoption that follows, a restart and a pull, production-shape timing,
+// an owned tag provider, and the evidence the one human Designer open is
+// checked against (D-15). A JGit-versus-`expected_drift` difference is a
+// cut-over blocker (D-25): no assertion here is loosened.
+
+/// One step of the rig driver (`capture27.sh SUB ...`); its stdout. The driver
+/// checks the loopback URL itself and never prints a token or the git.yaml
+/// credential.
+fn driver(args: &[&str]) -> String {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/live-rig-deploy/capture27.sh");
+    let out = Command::new("bash")
+        .arg(&script)
+        .args(args)
+        .output()
+        .expect("bash runs the rig driver");
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail: String = err
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        panic!(
+            "capture27.sh {args:?} failed ({}): {}",
+            out.status,
+            ignition_core::deploy::git_state::redact_text(&tail)
+        );
+    }
+    eprintln!("LIVE-DRIVER {} ok", args.join(" "));
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The commit CapApp's HEAD names, as ign's own host read shows it.
+async fn gateway_head(rig: &Rig) -> String {
+    let host = HostGit::new();
+    let (_state, refs) = gateway_state(rig, &host).await;
+    match refs.head {
+        GitHead::Branch {
+            commit: Some(commit),
+            ..
+        }
+        | GitHead::Detached { commit } => commit,
+        other => panic!("CapApp's HEAD names no commit: {other:?}"),
+    }
+}
+
+/// Paths JGit lists that the run did not predict, and the other way round.
+fn drift_difference(jg: &Jgit, predicted: &[String]) -> (Vec<String>, Vec<String>) {
+    let expected: BTreeSet<String> = predicted.iter().map(|file| module_path(file)).collect();
+    (
+        jg.paths.difference(&expected).cloned().collect(),
+        expected.difference(&jg.paths).cloned().collect(),
+    )
+}
+
+/// Print a row's time beside its budget and fail over it.
+fn within(row: &str, measured: Duration, budget: Duration) {
+    eprintln!(
+        "LIVE-SCALE {row}: measured {} ms budget {} ms",
+        measured.as_millis(),
+        budget.as_millis()
+    );
+    assert!(
+        measured <= budget,
+        "{row}: measured {} ms is over the budget of {} ms",
+        measured.as_millis(),
+        budget.as_millis()
+    );
+}
+
+/// The run's own git writer calls, timed: the same local transport the run
+/// would build from the master, wrapped so each save, restore and advance
+/// upload leaves its duration (the run's events carry no durations).
+struct TimedWriter {
+    inner: LocalFsTransport,
+    spans: std::sync::Mutex<Vec<(&'static str, Duration)>>,
+}
+
+impl TimedWriter {
+    fn new(inner: LocalFsTransport) -> TimedWriter {
+        TimedWriter {
+            inner,
+            spans: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn span(&self, name: &'static str) -> Option<Duration> {
+        let spans = self.spans.lock().expect("spans");
+        let mut hits = spans.iter().filter(|(n, _)| *n == name).map(|(_, d)| *d);
+        let first = hits.next()?;
+        Some(hits.fold(first, |sum, next| sum + next))
+    }
+
+    fn record(&self, name: &'static str, started: Instant) {
+        self.spans
+            .lock()
+            .expect("spans")
+            .push((name, started.elapsed()));
+    }
+}
+
+#[async_trait::async_trait]
+impl GitStateWriter for TimedWriter {
+    async fn save_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let started = Instant::now();
+        let out = self.inner.save_git(gateway, project, run_id).await;
+        self.record("save", started);
+        out
+    }
+
+    async fn restore_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let started = Instant::now();
+        let out = self.inner.restore_git(gateway, project, run_id).await;
+        self.record("restore", started);
+        out
+    }
+
+    async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
+        let started = Instant::now();
+        let out = self.inner.write_git_files(project, writes).await;
+        self.record("upload", started);
+        out
+    }
+
+    async fn remove_git_save(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError> {
+        self.inner.remove_git_save(gateway, project, run_id).await
+    }
+
+    async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+        self.inner.probe_write(project, run_id).await
+    }
+}
+
+/// Every event of a run with the time it was heard, names only.
+struct Timeline {
+    start: Instant,
+    seen: std::sync::Mutex<Vec<(u128, &'static str)>>,
+}
+
+impl Timeline {
+    fn new() -> Timeline {
+        Timeline {
+            start: Instant::now(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl ProjectsObserver for Timeline {
+    fn event(&self, event: &ProjectsEvent) {
+        self.seen
+            .lock()
+            .expect("timeline")
+            .push((self.start.elapsed().as_millis(), event.name()));
+    }
+}
+
+/// 27-24 Task 1 (D-15 automated half, D-13): the production incident's shape.
+/// The gateway is stopped, CapApp's `.git` is removed while it is stopped, the
+/// gateway starts, and the module's own `setupLocalRepo` runs through the same
+/// implementation the Designer hook reaches. The partial repo it leaves is
+/// adopted by the next deploy; JGit's status equals `expected_drift`; and the
+/// module's `system.git.pull` fast-forwards to a commit pushed afterwards.
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_adopt_partial_e2e() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_adopt_partial_e2e");
+    let api = rig.api();
+    let host = HostGit::new();
+    driver_reset("template");
+    driver(&["nogit27"]);
+    let triggered = driver(&["trigger27"]);
+    assert!(
+        triggered.contains("TRIGGER setupLocalRepo returned"),
+        "the module's setupLocalRepo did not answer: {triggered}"
+    );
+
+    // The partial shape G6 recorded: an unborn HEAD, one remote, no refs of its
+    // own, no index; the remote's branches are already fetched.
+    let (partial, heads, remotes) = classify_now(&rig, &host).await;
+    let files = rig
+        .node()
+        .read_git_state(APP)
+        .await
+        .expect("host read of .git");
+    eprintln!(
+        "LIVE-PARTIAL kind={} reason={:?} head={:?} remote={} refs_heads={heads} refs_remotes={remotes} index_present={}",
+        partial.kind.as_str(),
+        partial.reason,
+        partial.head,
+        partial
+            .remote
+            .as_ref()
+            .map(|r| r.name.as_str())
+            .unwrap_or("-"),
+        files.index_present
+    );
+    assert_eq!(
+        partial.kind,
+        GitStateKind::Adoptable,
+        "setupLocalRepo leaves an adoptable repo: {partial:?}"
+    );
+    assert!(
+        matches!(partial.head, Some(GitHead::Branch { commit: None, .. })),
+        "the HEAD is unborn: {:?}",
+        partial.head
+    );
+    assert_eq!(
+        partial.remote.as_ref().map(|r| r.name.as_str()),
+        Some("origin"),
+        "the Designer path names its remote origin"
+    );
+    assert_eq!(heads, 0, "no local branch");
+    assert!(remotes > 0, "the remote's branches are fetched");
+    assert!(!files.index_present, "no index");
+
+    // The next deploy adopts it (27-17): imported, adopted, the branch from
+    // git.yaml, JGit's status equal to expected_drift, post_status matched.
+    let adopted = managed_deploy(
+        &rig,
+        &api,
+        "c4-adopt-v1.1.0",
+        "v1.1.0",
+        true,
+        "production",
+        Expect::ADOPTABLE,
+    )
+    .await;
+    let release = gateway_head(&rig).await;
+    let (_keep, _checkout, c2) = release_checkout(&rig, "v1.1.0");
+    assert_eq!(release, c2, "HEAD is the release after the adoption");
+
+    // The module's pull fast-forwards a commit pushed by someone else.
+    let (_work, config) = script_config(&api, &rig.url).await;
+    let before = jgit(&api, &config).await;
+    assert_eq!(before.paths, adopted.jgit_paths, "the status moved");
+    let tip = push_release(&rig, "v1.2.0", "def f():\n    return 4\n");
+    module_pull(&api, &config, "adopted")
+        .await
+        .expect("the module's pull answers");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let head = gateway_head(&rig).await;
+    // The release is an ancestor of the pushed commit, so HEAD equal to the tip
+    // (not a merge commit of its own) is a fast-forward.
+    git(&rig.remote, &["merge-base", "--is-ancestor", &c2, &tip]);
+    eprintln!("LIVE-FF adopted head_is_tip={}", head == tip);
+    assert_eq!(head, tip, "the pull did not reach the pushed commit");
+    let after = jgit(&api, &config).await;
+    assert_eq!(after.paths, before.paths, "the pull changed the status");
+    assert_eq!(after.unpushed, 0, "unpushed after the pull");
+    assert_export_matches(&rig, &api, "adopted", &tip, "def f():\n    return 4\n").await;
+    eprintln!("LIVE-CHECK adopt_then_pull_fast_forwards tip={}", &tip[..7]);
+    write_evidence(
+        &rig,
+        "git_adopt_partial_e2e",
+        &serde_json::json!({
+            "partial_kind": partial.kind.as_str(),
+            "partial_remote": partial.remote.as_ref().map(|r| r.name.clone()),
+            "adopted": adopted.evidence,
+            "pulled_tip": tip,
+        }),
+    );
+}
+
+/// 27-24 Task 1 (C3): after a managed deploy a gateway restart runs the
+/// module's start sync without reverting the deploy, and `system.git.pull`
+/// fast-forwards to a newer remote commit.
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_restart_pull_e2e() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_restart_pull_e2e");
+    let api = rig.api();
+    driver_reset("template");
+    let deployed = managed_deploy(
+        &rig,
+        &api,
+        "c4-restart-v1.1.0",
+        "v1.1.0",
+        true,
+        "production",
+        Expect::MANAGED,
+    )
+    .await;
+    let (_keep, _checkout, c2) = release_checkout(&rig, "v1.1.0");
+    assert_eq!(gateway_head(&rig).await, c2, "HEAD is the release");
+    let (_work, config) = script_config(&api, &rig.url).await;
+    let status = jgit(&api, &config).await;
+
+    restart_gateway(&api).await;
+
+    // The start sync did not revert the deploy.
+    let (_work, config) = script_config(&api, &rig.url).await;
+    let export = GatewayProjects(&api)
+        .export_bytes(APP)
+        .await
+        .expect("export after the restart");
+    let live = canonical_digest(&export).expect("the export has members");
+    eprintln!(
+        "LIVE-C3 after restart: export_equals_artifact={} head_is_release={}",
+        live.sha256 == deployed.artifact_sha256,
+        gateway_head(&rig).await == c2
+    );
+    assert_eq!(
+        live.sha256, deployed.artifact_sha256,
+        "the restart changed the project"
+    );
+    assert_eq!(
+        gateway_head(&rig).await,
+        c2,
+        "the restart moved the repository's HEAD"
+    );
+    let after_restart = jgit(&api, &config).await;
+    assert_eq!(
+        after_restart.paths, status.paths,
+        "the restart changed JGit's status"
+    );
+    assert_eq!(after_restart.unpushed, status.unpushed);
+    assert_eq!(after_restart.branch, status.branch);
+
+    // A newer remote commit is fast-forwarded by the module's pull.
+    let tip = push_release(&rig, "v1.2.0", "def f():\n    return 4\n");
+    module_pull(&api, &config, "after-restart")
+        .await
+        .expect("the module's pull answers");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let head = gateway_head(&rig).await;
+    eprintln!("LIVE-FF after-restart head_is_tip={}", head == tip);
+    assert_eq!(head, tip, "the pull did not reach the pushed commit");
+    let after_pull = jgit(&api, &config).await;
+    assert_eq!(
+        after_pull.paths, status.paths,
+        "the pull changed the status"
+    );
+    assert_eq!(after_pull.unpushed, 0, "unpushed after the pull");
+    assert_export_matches(&rig, &api, "restart", &tip, "def f():\n    return 4\n").await;
+    eprintln!(
+        "LIVE-CHECK restart_then_pull_fast_forwards tip={}",
+        &tip[..7]
+    );
+    write_evidence(
+        &rig,
+        "git_restart_pull_e2e",
+        &serde_json::json!({
+            "deployed": deployed.evidence,
+            "export_equals_artifact_after_restart": true,
+            "pulled_tip": tip,
+        }),
+    );
+}
+
+/// 27-24 Task 1 (D-18): the rig remote was seeded by the production-shape
+/// generator (`capture27.sh seedprod27`) and the module cloned it. The deploy
+/// runs on that project and the handover's save, restore plus verify, and
+/// advance upload each finish inside the 27-06 Linux host budgets. No shape
+/// value is printed: only times, budgets, event names and difference counts.
+#[tokio::test]
+#[ignore = "needs the git-module rig seeded by seedprod27: IGNITION_LIVE_GIT=1"]
+async fn git_prodscale_rig() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_prodscale_rig");
+    let api = rig.api();
+    let host = HostGit::new();
+    let (state, refs) = gateway_state(&rig, &host).await;
+    assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
+    let (_keep, _checkout, release) = release_checkout(&rig, "v1.1.0");
+    assert!(
+        !refs.heads.values().any(|id| id == &release),
+        "the module's clone must sit behind the release (run seedprod27 first)"
+    );
+    let (_work, config) = script_config(&api, &rig.url).await;
+
+    let first = DeployFlags {
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let check = deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-scale-check")
+        .await
+        .unwrap_or_else(|err| panic!("scale check: {} ({err})", err.code()));
+    let check_json = serde_json::to_value(&check).expect("check json");
+    eprintln!(
+        "LIVE-SCALE check: state={} action={} dirty_source={}",
+        check_json["git"]["nodes"][0]["state"],
+        check_json["action"],
+        check_json["git"]["nodes"][0]["dirty_source"]
+    );
+    assert_eq!(check_json["git"]["nodes"][0]["state"], "managed");
+
+    let flags = DeployFlags {
+        artifact_sha256: Some(check.artifact_sha256.clone()),
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let timed = TimedWriter::new(rig.node());
+    let timeline = Timeline::new();
+    let extras = Extras {
+        observer: Some(&timeline),
+        git_writer: Some(&timed),
+    };
+    let started = Instant::now();
+    let applied = deploy_in_process_with(&rig, false, ENV, "v1.1.0", &flags, "c4-scale", &extras)
+        .await
+        .unwrap_or_else(|err| panic!("scale apply: {} ({err})", err.code()));
+    let total = started.elapsed();
+    let applied_json = serde_json::to_value(&applied).expect("apply json");
+    let restore = &applied_json["git"]["nodes"][0]["restore"];
+    eprintln!(
+        "LIVE-SCALE apply: outcome={} total_ms={} restored={} advanced={} verified={} post_status={} reason={}",
+        applied.outcome.as_str(),
+        total.as_millis(),
+        restore["restored"],
+        restore["advanced"],
+        restore["verified"],
+        restore["post_status"],
+        restore["reason"]
+    );
+    for (at, name) in timeline.seen.lock().expect("timeline").iter() {
+        eprintln!("LIVE-SCALE event {name} at {at} ms");
+    }
+    assert_eq!(
+        applied.outcome.as_str(),
+        "imported",
+        "scale outcome (slug {}): {}",
+        applied_json["slug"],
+        applied_json["git"]
+    );
+    assert!(
+        restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true,
+        "the handover did not complete: {restore}"
+    );
+    assert_eq!(restore["post_status"], "matched", "{restore}");
+
+    // The budgets (D-18): none is scaled and none is skipped.
+    within(
+        "save",
+        timed.span("save").expect("the run saved the repository"),
+        HOST_LINUX_SAVE,
+    );
+    within(
+        "restore_verify",
+        timed
+            .span("restore")
+            .expect("the import removed .git and the run restored it"),
+        HOST_LINUX_RESTORE_VERIFY,
+    );
+    within(
+        "upload",
+        timed.span("upload").expect("the run wrote the advance"),
+        HOST_LINUX_UPLOAD,
+    );
+
+    // JGit says what the run predicted (D-25): a difference blocks the cut-over.
+    // `data.git.expected_drift` is byte-sorted and capped; `expected_drift_count`
+    // is the full number (the published contract). So: every listed path is in
+    // JGit's list, the run's count equals an independent recomputation (the
+    // read-back export against the release's bytes), and JGit's list equals
+    // that recomputed full set.
+    assert_eq!(applied_json["git"]["expected_drift_complete"], true);
+    let predicted = strs(&applied_json["git"]["expected_drift"]);
+    let counted = applied_json["git"]["expected_drift_count"]
+        .as_u64()
+        .expect("the run reports the full drift count");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let jg = jgit(&api, &config).await;
+    // The listed part is capped, so JGit's list is the longer one: only the
+    // listed paths JGit lacks matter here.
+    let (_, missing) = drift_difference(&jg, &predicted);
+    let (_keep2, checkout, _c) = release_checkout(&rig, "v1.1.0");
+    let release_files = zip_members(&build_artifact(&checkout).expect("artifact builds").zip);
+    let live_files = zip_members(
+        &GatewayProjects(&api)
+            .export_bytes(APP)
+            .await
+            .expect("the project's export"),
+    );
+    let changed: BTreeSet<String> = release_files
+        .iter()
+        .filter(|(path, bytes)| live_files.get(*path).is_some_and(|live| live != *bytes))
+        .map(|(path, _)| path.clone())
+        .collect();
+    let full: BTreeSet<String> = changed.iter().map(|file| module_path(file)).collect();
+    let extra: Vec<&String> = jg.paths.difference(&full).collect();
+    let absent: Vec<&String> = full.difference(&jg.paths).collect();
+    eprintln!(
+        "LIVE-SCALE jgit: listed_paths_missing_from_jgit={} jgit_vs_recomputed extra={} missing={} run_count_equals_recomputed={} unpushed={} branch={}",
+        missing.len(),
+        extra.len(),
+        absent.len(),
+        counted == changed.len() as u64,
+        jg.unpushed,
+        jg.branch
+    );
+    assert!(
+        missing.is_empty(),
+        "CUT-OVER BLOCKER (D-25): {} listed path(s) are not in JGit's status",
+        missing.len()
+    );
+    assert!(
+        extra.is_empty() && absent.is_empty(),
+        "CUT-OVER BLOCKER (D-25): JGit differs from the full prediction: extra={} missing={}",
+        extra.len(),
+        absent.len()
+    );
+    assert_eq!(
+        counted,
+        changed.len() as u64,
+        "the run's drift count differs from the recomputed one"
+    );
+    assert_eq!(jg.unpushed, 0);
+    eprintln!("LIVE-CHECK prodscale_jgit_equals_expected_drift");
+    write_evidence(
+        &rig,
+        "git_prodscale_rig",
+        &serde_json::json!({
+            "outcome": applied.outcome.as_str(),
+            "total_ms": total.as_millis(),
+            "save_ms": timed.span("save").map(|d| d.as_millis()),
+            "restore_verify_ms": timed.span("restore").map(|d| d.as_millis()),
+            "upload_ms": timed.span("upload").map(|d| d.as_millis()),
+            "post_status": restore["post_status"],
+        }),
+    );
+}
+
+/// The provider an owned-tags release creates.
+const TAG_PROVIDER: &str = "CapTags";
+
+/// The atomic tags of a provider export, by count.
+fn atomic_tags(export: &serde_json::Value) -> usize {
+    match export {
+        serde_json::Value::Object(map) => {
+            usize::from(map.get("tagType").and_then(|t| t.as_str()) == Some("AtomicTag"))
+                + map.values().map(atomic_tags).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(atomic_tags).sum(),
+        _ => 0,
+    }
+}
+
+/// 27-24 Task 1 (checker W12): `capture27.sh seedtags27` put release v1.3.0 on
+/// the remote's production; it owns the tag provider `CapTags` (two neutral
+/// tags). The deploy goes through the Phase 26 owned path on top of the git
+/// handover: outcome `applied`, the provider listed with its two tags, JGit's
+/// status equal to `expected_drift` and `post_status` matched.
+#[tokio::test]
+#[ignore = "needs the git-module rig after seedtags27: IGNITION_LIVE_GIT=1"]
+async fn git_owned_tags_seed() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_owned_tags_seed");
+    let api = rig.api();
+    let tag = git(&rig.remote, &["tag", "--list", "v1.3.0"]);
+    assert_eq!(tag, "v1.3.0", "run `capture27.sh seedtags27` first");
+    let deployed = managed_deploy(
+        &rig,
+        &api,
+        "c4-tags-v1.3.0",
+        "v1.3.0",
+        true,
+        "production",
+        Expect::TAGS,
+    )
+    .await;
+    let gateway = GatewayProjects(&api);
+    let providers = gateway
+        .tag_provider_names()
+        .await
+        .expect("the gateway lists its tag providers");
+    assert!(
+        providers.iter().any(|p| p == TAG_PROVIDER),
+        "the gateway lists the provider {TAG_PROVIDER}: {providers:?}"
+    );
+    let export: serde_json::Value = serde_json::from_slice(
+        &gateway
+            .tag_export(TAG_PROVIDER)
+            .await
+            .expect("the provider's export"),
+    )
+    .expect("the export is JSON");
+    let tags = atomic_tags(&export);
+    eprintln!("LIVE-TAGS provider={TAG_PROVIDER} listed=true atomic_tags={tags}");
+    assert_eq!(tags, 2, "the provider holds the two neutral tags");
+    eprintln!("LIVE-CHECK owned_tags_applied provider={TAG_PROVIDER} tags=2");
+    write_evidence(
+        &rig,
+        "git_owned_tags_seed",
+        &serde_json::json!({
+            "deployed": deployed.evidence,
+            "provider": TAG_PROVIDER,
+            "atomic_tags": tags,
+        }),
+    );
+}
+
+/// Every file below a gateway `.git`: its path, then the sha256 of its bytes,
+/// or its size for a file below `objects/` (the definition of the manifest
+/// digest, so a difference can be named).
+fn git_file_map(git_dir: &Path) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    fn walk(root: &Path, rel: &str, out: &mut BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(root.join(rel)).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let kind = entry.file_type().expect("type");
+            assert!(!kind.is_symlink(), "{child} is a symlink");
+            if kind.is_dir() {
+                walk(root, &child, out);
+            } else if child.starts_with("objects/") {
+                out.insert(child, entry.metadata().expect("metadata").len().to_string());
+            } else {
+                let bytes = std::fs::read(root.join(&child)).unwrap_or_default();
+                out.insert(child, format!("{:x}", Sha256::digest(&bytes)));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(git_dir, "", &mut out);
+    out
+}
+
+/// The three values the human Designer open must leave unchanged (D-15): the
+/// project's `.git`, the project's export and the owned provider's export.
+async fn designer_snapshot(rig: &Rig, api: &ReqwestGatewayApi) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let manifest = rig
+        .node()
+        .git_manifest(APP)
+        .await
+        .expect("the project's .git manifest");
+    let files = git_file_map(&rig.project_dir().join(".git"));
+    let gateway = GatewayProjects(api);
+    let export = canonical_digest(
+        &gateway
+            .export_bytes(APP)
+            .await
+            .expect("the project's export"),
+    )
+    .expect("the export has members");
+    let providers = gateway.tag_provider_names().await.expect("providers");
+    assert!(
+        providers.iter().any(|p| p == TAG_PROVIDER),
+        "the gateway lists no provider {TAG_PROVIDER}: seedtags27 and git_owned_tags_seed come first"
+    );
+    let tags: serde_json::Value = serde_json::from_slice(
+        &gateway
+            .tag_export(TAG_PROVIDER)
+            .await
+            .expect("the provider's export"),
+    )
+    .expect("the export is JSON");
+    let canonical = serde_json::to_vec(&tags).expect("canonical json");
+    serde_json::json!({
+        "git_manifest": {
+            "files": manifest.files,
+            "bytes": manifest.bytes,
+            "digest": manifest.digest,
+        },
+        "git_files": files,
+        "project_export": {
+            "members": export.members.len(),
+            "digest": export.sha256,
+            "member_digests": export.members,
+        },
+        "cap_tags": {
+            "tags": atomic_tags(&tags),
+            "export_digest": format!("{:x}", Sha256::digest(&canonical)),
+        },
+    })
+}
+
+/// The names under `key` whose value differs between two JSON objects.
+fn differing(before: &serde_json::Value, after: &serde_json::Value, key: &str) -> Vec<String> {
+    let empty = serde_json::Map::new();
+    let b = before[key].as_object().unwrap_or(&empty);
+    let a = after[key].as_object().unwrap_or(&empty);
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for (name, value) in b {
+        if a.get(name) != Some(value) {
+            names.insert(name.clone());
+        }
+    }
+    for name in a.keys() {
+        if !b.contains_key(name) {
+            names.insert(name.clone());
+        }
+    }
+    names.into_iter().collect()
+}
+
+/// The first 16 characters of a digest, for a line a person reads.
+fn short(value: &serde_json::Value) -> String {
+    value.as_str().unwrap_or("-").chars().take(16).collect()
+}
+
+/// 27-24 Task 2 support (D-15): `capture27.sh designer-evidence before|after`.
+/// `before` records the snapshot right after a green deploy of the owned-tags
+/// release and refuses when `CapTags` holds fewer than two tags; `after`
+/// compares with it once a human has opened the project in the Designer.
+#[tokio::test]
+#[ignore = "needs the git-module rig after git_owned_tags_seed: IGNITION_LIVE_GIT=1"]
+async fn git_designer_evidence() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_designer_evidence");
+    let api = rig.api();
+    let mode = std::env::var("IGN_DESIGNER_EVIDENCE").unwrap_or_default();
+    let stored = rig.evidence.join("designer-evidence.before.json");
+    let now = designer_snapshot(&rig, &api).await;
+    let line = format!(
+        "git_manifest files={} digest={}; project_export members={} digest={}; CapTags tags={} export_digest={}",
+        now["git_manifest"]["files"],
+        short(&now["git_manifest"]["digest"]),
+        now["project_export"]["members"],
+        short(&now["project_export"]["digest"]),
+        now["cap_tags"]["tags"],
+        short(&now["cap_tags"]["export_digest"]),
+    );
+    match mode.as_str() {
+        "before" => {
+            assert!(
+                now["cap_tags"]["tags"].as_u64().unwrap_or(0) >= 2,
+                "CapTags holds fewer than two tags: the tag evidence would be vacuous"
+            );
+            std::fs::write(
+                &stored,
+                serde_json::to_vec_pretty(&now).expect("evidence json"),
+            )
+            .expect("evidence write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o600))
+                    .expect("owner-only evidence");
+            }
+            eprintln!("designer-evidence before: {line}");
+        }
+        "after" => {
+            let before: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&stored)
+                    .expect("no stored `before`: run designer-evidence before first"),
+            )
+            .expect("the stored evidence is JSON");
+            let mut changed: Vec<String> = Vec::new();
+            if before["git_manifest"] != now["git_manifest"] {
+                let files = differing(&before, &now, "git_files");
+                changed.push(format!(
+                    ".git manifest (files {} -> {}, differing: {files:?})",
+                    before["git_manifest"]["files"], now["git_manifest"]["files"]
+                ));
+            }
+            if before["project_export"]["digest"] != now["project_export"]["digest"] {
+                let members: Vec<String> = {
+                    let b = before["project_export"]["member_digests"].clone();
+                    let a = now["project_export"]["member_digests"].clone();
+                    let wrap = |v: serde_json::Value| serde_json::json!({ "m": v });
+                    differing(&wrap(b), &wrap(a), "m")
+                };
+                changed.push(format!("project export (differing members: {members:?})"));
+            }
+            if before["cap_tags"] != now["cap_tags"] {
+                changed.push(format!(
+                    "CapTags export (tags {} -> {})",
+                    before["cap_tags"]["tags"], now["cap_tags"]["tags"]
+                ));
+            }
+            eprintln!("designer-evidence after: {line}");
+            if changed.is_empty() {
+                eprintln!("designer-evidence: unchanged");
+            } else {
+                eprintln!("designer-evidence: changed: {}", changed.join("; "));
+                panic!("the Designer open changed: {}", changed.join("; "));
+            }
+        }
+        other => panic!("IGN_DESIGNER_EVIDENCE is before or after, not {other:?}"),
+    }
 }

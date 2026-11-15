@@ -44,6 +44,24 @@
 #                    advanced .git: SETTING restart|scan|status|imports-on; needs
 #                    the advanced state and ends with .git deleted or not
 #   g7               (27-04) reset27, then the git_pull_push_roundtrip gate
+#   seedprod27       (27-24) reset27 with the rig remote seeded from the 27-06
+#                    production-shape generator: PRODSHAPE_GIT_OUT holds the
+#                    emitted remote (emitted first through the deploy_prod_scale
+#                    git_prodshape_emit test when absent) and IGN_PROD_SHAPE_FILE
+#                    the private shape file; production sits at the gateway's
+#                    head, the release tag v1.1.0 one advance ahead, and the
+#                    module clones it. No shape value is printed.
+#   seedtags27       (27-24) push release v1.3.0 to the remote's production: its
+#                    deploy/project.yaml owns the tag provider CapTags and
+#                    tags/CapTags/ holds two neutral tags (Phase 26 layout)
+#   nogit27          (27-24) the production incident shape: the gateway stopped,
+#                    CapApp's .git removed with it stopped, the gateway started
+#   designer-evidence before|after   (27-24) the D-15 evidence: the .git
+#                    manifest digest, the project export canonical digest and
+#                    the CapTags export digest with its tag count; `before` is
+#                    taken right after a green deploy, `after` after a human
+#                    Designer open and prints designer-evidence: unchanged or
+#                    the differing items
 #   down27           remove the rig, its volumes and its state directory
 #
 # This script calls the `ign` on PATH (`ign rig up`, `ign script run`,
@@ -313,6 +331,97 @@ publish27() {
   echo "publish27: production on the remote is at v1.1.0; the module's clone is not touched"
 }
 
+# seed_prodshape27 (27-24): the rig remote built from the 27-06 production-shape
+# generator's output instead of the synthetic history. PRODSHAPE_GIT_OUT (a
+# directory outside this repository) holds the emitted `capapp.git` and the
+# gateway data directory; when it holds no emitted remote yet, the generator's
+# own emit test runs first with both variables passed through (the private shape
+# file is read there; no value of it is printed or recorded). The remote's
+# `production` is put back to the commit the generated gateway sits at, so the
+# module clones that and the release tag v1.1.0 stays `advance_commits` (plus the
+# one descriptor commit below) ahead on no branch, exactly as seed27 leaves
+# v1.1.0 (publish27 then moves production).
+seed_prodshape27() {
+  local out=${PRODSHAPE_GIT_OUT:-} bare=$STATE/repo/$BARE gh rel
+  [ -n "$out" ] || die "seedprod27: PRODSHAPE_GIT_OUT is not set"
+  [ -n "${IGN_PROD_SHAPE_FILE:-}" ] || die "seedprod27: IGN_PROD_SHAPE_FILE is not set"
+  case "$out" in
+    /*) ;;
+    *) die "seedprod27: PRODSHAPE_GIT_OUT is not an absolute path" ;;
+  esac
+  mkdir -p "$out"
+  out=$(cd "$out" && pwd -P)
+  case "$out/" in
+    "$REPO_REAL"/*) echo "REFUSING: PRODSHAPE_GIT_OUT $out is inside the repository" >&2; exit 2 ;;
+  esac
+  if [ ! -d "$out/capapp.git" ] || [ ! -f "$out/data/projects/$APP/.git/refs/heads/production" ]; then
+    mkdir -p "$STATE/evidence"
+    (
+      cd "$REPO"
+      PRODSHAPE_GIT_OUT=$out IGN_PROD_SHAPE_FILE=$IGN_PROD_SHAPE_FILE \
+        cargo test -p ignition-core --test deploy_prod_scale git_prodshape_emit -- --nocapture
+    ) > "$STATE/evidence/seedprod27-emit.log" 2>&1 \
+      || die "seedprod27: the generator's emit failed; see $STATE/evidence/seedprod27-emit.log"
+  fi
+  [ -d "$out/capapp.git" ] || die "seedprod27: no capapp.git below PRODSHAPE_GIT_OUT"
+  # The generated gateway's head, read from its loose ref file (a fast-import
+  # ref); git is not run on that tree.
+  [ -f "$out/data/projects/$APP/.git/refs/heads/production" ] || die "seedprod27: the generated gateway has no loose production ref"
+  gh=$(tr -d '[:space:]' < "$out/data/projects/$APP/.git/refs/heads/production")
+  [[ $gh =~ ^[0-9a-f]{40}$ ]] || die "seedprod27: the generated gateway head is not a commit id"
+  /bin/rm -rf "$STATE/seed-work" "$bare"
+  mkdir -p "$STATE/repo"
+  cp -R "$out/capapp.git" "$bare"
+  rel=$(seedgit -C "$bare" rev-parse 'v1.1.0^{commit}') || die "seedprod27: the emitted remote has no tag v1.1.0"
+  seedgit -C "$bare" cat-file -e "$gh^{commit}" || die "seedprod27: the gateway head is not in the emitted remote"
+  seedgit -C "$bare" merge-base --is-ancestor "$gh" "$rel" || die "seedprod27: v1.1.0 does not descend from the gateway head"
+  seedgit -C "$bare" update-ref refs/heads/production "$gh"
+  seedgit -C "$bare" config http.receivepack true
+  [ -z "$(seedgit -C "$bare" branch --list master)" ] || die "seedprod27: the remote has a master branch"
+  # The generator emits project files only. A release names its gateway project
+  # and environments in deploy/project.yaml, so one commit on top of the
+  # generator's release adds that one neutral file and the tag v1.1.0 moves to it
+  # (the only change to the generated history: one commit, one file).
+  local blob tree commit idx=$TMPD/prodshape.index
+  blob=$(printf 'schema_version: 1\nproject: %s\nenvironments: [rig]\n' "$APP" | seedgit -C "$bare" hash-object -w --stdin)
+  GIT_INDEX_FILE=$idx seedgit -C "$bare" read-tree "$rel"
+  GIT_INDEX_FILE=$idx seedgit -C "$bare" update-index --add --cacheinfo "100644,$blob,deploy/project.yaml"
+  tree=$(GIT_INDEX_FILE=$idx seedgit -C "$bare" write-tree)
+  commit=$(GIT_AUTHOR_NAME=rig GIT_AUTHOR_EMAIL=rig@example.invalid GIT_AUTHOR_DATE=2026-01-04T00:00:00Z \
+    GIT_COMMITTER_NAME=rig GIT_COMMITTER_EMAIL=rig@example.invalid GIT_COMMITTER_DATE=2026-01-04T00:00:00Z \
+    seedgit -C "$bare" -c commit.gpgsign=false commit-tree "$tree" -p "$rel" -m 'release deploy descriptor')
+  seedgit -C "$bare" update-ref refs/tags/v1.1.0 "$commit"
+  /bin/rm -f "$idx"
+  chmod -R a+rX "$bare"
+  echo "seed_prodshape27: $BARE seeded from the generator output (production at the gateway head, tag v1.1.0 ahead); no shape value is shown"
+}
+
+# seedtags27 (27-24, checker W12): release v1.3.0 on the remote's production, a
+# child of the current tip. Its deploy/project.yaml lists the owned tag
+# provider CapTags, deploy/tag-providers/CapTags.json holds its settings (the
+# STANDARD provider an empty settings object creates on 8.3.6) and tags/CapTags/
+# holds two neutral memory tags in the git module's layout (Phase 26).
+seedtags27() {
+  local bare=$STATE/repo/$BARE work=$STATE/seed-work-tags when=2026-01-05T00:00:00Z
+  [ -d "$bare" ] || die "seedtags27: no $BARE: run reset27 first"
+  [ -z "$(seedgit -C "$bare" tag --list v1.3.0)" ] || die "seedtags27: v1.3.0 exists already: run reset27 first"
+  /bin/rm -rf "$work"
+  seedgit clone -q --no-hardlinks -b production "$bare" "$work"
+  mkdir -p "$work/deploy/tag-providers" "$work/tags/CapTags"
+  printf 'schema_version: 1\nproject: %s\nenvironments: [rig]\ntag_providers: [CapTags]\n' "$APP" > "$work/deploy/project.yaml"
+  printf '{"schema_version":1,"enabled":true,"config":{"profile":{"type":"STANDARD","allowBackfill":false,"enableTagReferenceStore":false},"settings":{"defaultDatasourceName":null,"readPermissions":null,"readOnly":false,"writePermissions":null,"editPermissions":null,"valuePersistence":null}}}\n' \
+    > "$work/deploy/tag-providers/CapTags.json"
+  printf '{"dataType":"Int4","tagType":"AtomicTag","value":5,"valueSource":"memory"}\n' > "$work/tags/CapTags/Setpoint.json"
+  printf '{"dataType":"Float8","documentation":"level","tagType":"AtomicTag","value":1.5,"valueSource":"memory"}\n' > "$work/tags/CapTags/Level.json"
+  seedgit -C "$work" add -A
+  seed_commit "$work" 'release 1.3.0' "$when"
+  seed_tag "$work" v1.3.0 "$when"
+  seedgit -C "$work" push -q "$bare" HEAD:refs/heads/production refs/tags/v1.3.0
+  chmod -R a+rX "$bare"
+  /bin/rm -rf "$work"
+  echo "seedtags27: production on the remote is at v1.3.0, which owns the tag provider CapTags (two tags)"
+}
+
 # ---------------------------------------------------------------- git.yaml
 
 # yaml27 MODE: write $DATA/git.yaml IN PLACE (the inode stays). The credential
@@ -511,7 +620,11 @@ PY
 reset27() {
   token_env
   [ -n "$(cid)" ] || die "reset27: no running gw container: run up27 first"
-  seed27
+  case "${GIT27_SEED:-synthetic}" in
+    synthetic) seed27 ;;
+    prodshape) seed_prodshape27 ;;
+    *) die "reset27: GIT27_SEED is synthetic or prodshape" ;;
+  esac
   yaml27 "${GIT27_YAML_MODE:-template}"
   # A save a failed gate left behind would make the next save refuse.
   /bin/rm -rf "$DATA/ign-deploy"
@@ -571,6 +684,24 @@ live27() {
   [ "$rc" -eq 0 ] || { echo "live27: cargo test exited $rc" >&2; exit "$rc"; }
   [ "$missing" -eq 0 ] || exit 1
   echo "live27: every named gate printed its LIVE-RAN line; log $log"
+}
+
+# designer-evidence before|after (27-24, D-15): the gate git_designer_evidence
+# records, or compares with, the .git manifest digest (the definition of
+# GitManifest), the project export canonical digest and the CapTags export
+# digest with its tag count. `before` runs right after a green deploy and fails
+# when CapTags is absent or holds fewer than two tags; `after` runs once a human
+# has opened the project in the Designer and prints `designer-evidence:
+# unchanged` or the differing items. Digests, counts and file names only.
+designer_evidence() {
+  local mode=${1:-} log rc=0
+  case "$mode" in before | after) ;; *) die "designer-evidence: before or after" ;; esac
+  export IGN_DESIGNER_EVIDENCE=$mode
+  # live27 ends with `exit` on a failure: run it in a subshell to keep the status.
+  ( live27 "27-24-designer-$mode" git_designer_evidence ) > /dev/null 2>&1 || rc=$?
+  log=$STATE/evidence/27-24-designer-$mode.log
+  grep -E '^designer-evidence' "$log" || true
+  [ "$rc" -eq 0 ] || { echo "designer-evidence $mode: the gate failed (exit $rc); see $log" >&2; exit "$rc"; }
 }
 
 # --------------------------------------------------------------------- g2real
@@ -643,6 +774,28 @@ sm.setupLocalRepo("CapApp", "admin")
 print "TRIGGER setupLocalRepo returned"
 PY
   script27 "$py" | grep -E '^TRIGGER |^error' || true
+}
+
+# nogit27 (27-24): the production incident shape. The gateway is stopped, the
+# project's .git is removed while it is stopped (a throwaway container of the
+# gateway image as root; the gateway wrote some of it as another user), and the
+# gateway is started again. trigger27 then runs the module's own setupLocalRepo.
+nogit27() {
+  local c img
+  token_env
+  c=$(cid)
+  [ -n "$c" ] || die "nogit27: no running gw container: run up27 first"
+  img=$(docker inspect -f '{{.Config.Image}}' "$c")
+  [ -n "$img" ] || die "nogit27: the gw container has no image"
+  docker stop "$c" > /dev/null
+  docker run --rm --platform linux/amd64 --entrypoint sh -u root -v "$DATA/projects:/p" "$img" \
+    -c "rm -rf /p/$APP/.git" > /dev/null
+  [ ! -e "$PDIR/.git" ] || die "nogit27: $APP still has a .git on the host"
+  docker start "$c" > /dev/null
+  wait_running 600 || die "nogit27: the gateway is not RUNNING within 600 s"
+  wait_app 600 || die "nogit27: $APP did not answer find within 600 s"
+  sleep 45
+  echo "nogit27: the gateway ran again after $APP lost its .git while stopped"
 }
 
 # images27 ensure|list: the user images of the gateway, by name and count.
@@ -929,6 +1082,10 @@ case "${1:-}" in
   g2real) g2real "${2:-}" ;;
   files27) write_rig_files ;;
   trigger27) trigger27 ;;
+  nogit27) nogit27 ;;
+  seedprod27) GIT27_SEED=prodshape reset27 ;;
+  seedtags27) seedtags27 ;;
+  designer-evidence) designer_evidence "${2:-}" ;;
   images27) images27 "${2:-}" ;;
   shape27) shape27 "${2:-shape}" ;;
   g3) g3 ;;
@@ -936,5 +1093,5 @@ case "${1:-}" in
   g7) g7 ;;
   g9why) g9why "${2:-restart}" ;;
   down27) down27 ;;
-  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|trigger27|images27 ensure|list|shape27 LABEL|g3|g6|g7|g9why SETTING|down27" >&2; exit 64 ;;
+  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|trigger27|nogit27|seedprod27|seedtags27|designer-evidence before|after|images27 ensure|list|shape27 LABEL|g3|g6|g7|g9why SETTING|down27" >&2; exit 64 ;;
 esac
