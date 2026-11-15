@@ -59,6 +59,9 @@ pub const OFFLINE_INDEX: Duration = Duration::from_secs(5);
 pub const OFFLINE_DRIFT: Duration = Duration::from_secs(10);
 /// Offline: the write preflight (probe, size-only `.git` read, free space).
 pub const OFFLINE_PREFLIGHT: Duration = Duration::from_secs(5);
+/// Offline: the prepare's whole git step (read state, release checkout check,
+/// remote view, ancestry, dirty, advance preparation), 27-13.
+pub const OFFLINE_PREPARE: Duration = Duration::from_secs(30);
 /// Offline: the gateway-object read for an unknown HEAD (D-24).
 pub const OFFLINE_GATEWAY_OBJECTS: Duration = Duration::from_secs(15);
 /// ign's machine: resolve the gateway objects and digest the head (D-24).

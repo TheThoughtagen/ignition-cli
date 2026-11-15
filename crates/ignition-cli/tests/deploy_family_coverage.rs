@@ -250,6 +250,63 @@ fn backup_unsynced_verdict_exception_is_dated_and_documented() {
     );
 }
 
+/// 27-12 option-a, 27-13: `git_restore_failed` is a verdict of `deploy
+/// projects` (slug `deploy_git_restore_failed`, exit 6, the deploy kept and the
+/// copy named), documented in the verdict exceptions. Its slug is NOT an
+/// exit-table row, NOT a `CoreError` slug and NOT one of the `DEPLOY_SLUGS`,
+/// whose length stays at 24: the contract adds no error slug.
+#[test]
+fn git_restore_failed_verdict_is_documented_and_adds_no_slug() {
+    let exception = section("Output contract (for agents)");
+    assert!(
+        exception.contains("git_restore_failed") && exception.contains("deploy_git_restore_failed"),
+        "the verdict exceptions document the git-restore-failed outcome"
+    );
+    let start = exception
+        .find("**The git-restore-failed outcome")
+        .expect("the git-restore-failed paragraph");
+    let end = exception[start..]
+        .find("**The red rehearsal")
+        .map_or(exception.len(), |i| start + i);
+    let body = &exception[start..end];
+    for needle in [
+        "data.ok",
+        "data.slug",
+        "exit 6",
+        "`ok: true`",
+        "The deploy stays",
+        "saved copy is kept",
+        "designer_attached",
+    ] {
+        assert!(
+            body.contains(needle),
+            "the paragraph must mention {needle}: {body}"
+        );
+    }
+    assert!(
+        !section("Exit codes").contains("deploy_git_restore_failed"),
+        "`deploy_git_restore_failed` is a verdict slug, never an exit-table row"
+    );
+    assert!(
+        !CoreError::DEPLOY_SLUGS.contains(&"deploy_git_restore_failed"),
+        "the verdict slug is not a CoreError slug"
+    );
+    assert_eq!(
+        CoreError::DEPLOY_SLUGS.len(),
+        24,
+        "option-a at the 27-12 checkpoint: the contract adds no error slug"
+    );
+    // The new subsection replaced the cut-over runbook, and the sentence that
+    // the verb never deletes or renames a `.git` stays.
+    assert!(README.contains("#### Projects the git module manages"));
+    assert!(!README.contains("Cutting a project over from the git module"));
+    let flat = README.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("The verb never deletes or renames a `.git`, and offers no flag that does"),
+        "the README keeps the never-deletes sentence"
+    );
+}
+
 /// DPRJ-03, Decision A: the `deploy projects` unverified verdict exception is
 /// the SIXTH documented success-path exit exception, in a dated `###` section
 /// under `## Output contract (for agents)` that names the envelope fields, the

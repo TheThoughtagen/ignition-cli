@@ -3203,6 +3203,74 @@ fn git_prodshape_handover() {
     });
 }
 
+/// The prepare's whole git step at production shape (27-13): read and classify
+/// the gateway repo, check the release checkout, ask the `file://` remote for
+/// its heads, the ancestry and dirty gates over the shape's in-scope members,
+/// and the advance preparation (pack and blobs). Everything `deploy projects`
+/// does with git before any gateway write, timed together against
+/// [`OFFLINE_PREPARE`](shape_git::OFFLINE_PREPARE). Prints the time, never the
+/// shape.
+#[test]
+fn git_prodshape_prepare() {
+    use ignition_core::actions::deploy_projects::git::read_state;
+    use ignition_core::deploy::git_advance::prepare_advance;
+    use ignition_core::deploy::git_gate::{check_release_checkout, gate_node, remote_view};
+    use ignition_core::deploy::project_artifact::canonical_digest;
+    use shape_git::OFFLINE_PREPARE;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    // Untimed: the fixture's release checkout holds only the in-scope files, so
+    // it is completed to a clean full checkout (what `fetch-depth: 0` and a
+    // tag checkout give a real run), then what the live export reads as and
+    // the artifact's members.
+    run_git(&f.checkout, &["checkout-index", "-a", "-f"]);
+    let live = canonical_digest(&f.export_zip()).expect("live digest");
+    let members = f.artifact_members();
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let node = f.node();
+        let started = Instant::now();
+        let found = read_state(&node, &host, PROJECT).await.expect("read state");
+        let refs = found.refs.clone().expect("refs");
+        let remote = found.state.remote.clone().expect("the module's remote");
+        let checkout = check_release_checkout(&host, &f.checkout, &f.release_tag, &remote.url_key)
+            .await
+            .expect("the checkout is at the release");
+        let view = remote_view(&host, &checkout).await.expect("remote view");
+        let prep = prepare_advance(
+            &host,
+            &f.checkout,
+            &found.state,
+            &refs,
+            &checkout.commit,
+            &members,
+        )
+        .await
+        .expect("advance prep");
+        let gates = gate_node(
+            &host,
+            &checkout,
+            &view,
+            &found.state,
+            found.files.head_log_tail.as_deref(),
+            &live,
+        )
+        .await
+        .expect("gates");
+        let took = started.elapsed();
+        // Correct before fast: the shape is a clean, pushed, merged module
+        // clone, so nothing is unpushed, unmerged or dirty.
+        assert!(gates.unpushed.is_empty(), "{:?}", gates.unpushed);
+        assert_eq!(gates.not_merged_count, 0);
+        assert_eq!(gates.dirty_count, 0, "{:?}", gates.dirty);
+        assert!(gates.release_on_branch);
+        assert_eq!(checkout.commit, f.release_head);
+        drop(prep);
+        prodshape_within("git_prodshape_prepare", took, OFFLINE_PREPARE);
+    });
+}
+
 // ---- the same handover through the POSIX host scripts (plan 27-08) -----------
 //
 // The POSIX scripts of `SftpTransport` (save, restore, manifest, size) run
