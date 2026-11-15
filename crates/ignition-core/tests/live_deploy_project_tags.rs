@@ -986,6 +986,8 @@ impl TagRepo {
             release: release.to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             // The rig runs mostly without the tag-delete route; these runs
             // accept that a rollback leaves created tags behind.

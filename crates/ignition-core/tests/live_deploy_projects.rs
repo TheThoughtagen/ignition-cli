@@ -642,6 +642,8 @@ impl Repo {
             release: release.to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             allow_manual_undo: false,
             artifact_sha256: None,

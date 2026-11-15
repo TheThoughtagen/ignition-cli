@@ -1951,6 +1951,8 @@ async fn project_tags_run_through_fake_at_prod_scale() {
         release: "v1.0.0".to_string(),
         allow_downgrade: false,
         allow_first_change: None,
+        discard_gateway_changes: None,
+        allow_git_sync_hazards: None,
         allow_destructive: false,
         // No tag-delete route here: the run accepts that a rollback would
         // leave the tags it creates.
@@ -2370,6 +2372,8 @@ async fn project_tags_deletes_at_prod_scale() {
         release: "v1.0.0".to_string(),
         allow_downgrade: false,
         allow_first_change: None,
+        discard_gateway_changes: None,
+        allow_git_sync_hazards: None,
         allow_destructive: true,
         allow_manual_undo: false,
         artifact_sha256: None,

@@ -3835,6 +3835,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     release: release.unwrap_or_default(),
                     allow_downgrade,
                     allow_first_change,
+                    discard_gateway_changes: None,
+                    allow_git_sync_hazards: None,
                     allow_destructive,
                     allow_manual_undo,
                     artifact_sha256,

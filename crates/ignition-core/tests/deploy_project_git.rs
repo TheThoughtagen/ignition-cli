@@ -1619,6 +1619,8 @@ mod published {
                 release: self.release.clone(),
                 allow_downgrade: false,
                 allow_first_change: Some("first deploy of the rig".to_string()),
+                discard_gateway_changes: None,
+                allow_git_sync_hazards: None,
                 allow_destructive: false,
                 allow_manual_undo: false,
                 artifact_sha256: None,

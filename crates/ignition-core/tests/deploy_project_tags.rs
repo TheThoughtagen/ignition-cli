@@ -90,6 +90,8 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             // Most runs here create tags in the existing `PlantA` without a
             // tag-delete route: they accept the manual undo, so each keeps
@@ -8077,6 +8079,8 @@ async fn created_provider_needs_no_allow_manual_undo() {
     let gateway = without_provider(&repo).await;
     let input = ProjectsInput {
         allow_first_change: Some("a new provider".to_string()),
+        discard_gateway_changes: None,
+        allow_git_sync_hazards: None,
         ..no_manual_undo(&repo)
     };
 
