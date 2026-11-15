@@ -1505,6 +1505,8 @@ mod published {
     pub struct StubHost {
         pub inner: LocalFsTransport,
         pub program: Option<OsString>,
+        /// The remote token host git holds (`IGNITION_GIT_TOKEN` in a CI run).
+        pub token: Option<String>,
         /// Answers the host's git reads instead of the local transport.
         pub read: Option<Box<dyn GitHostRead>>,
     }
@@ -1551,8 +1553,8 @@ mod published {
         }
         fn host_git(&self) -> Git {
             match &self.program {
-                Some(program) => Git::with_program(program),
-                None => Git::new(),
+                Some(program) => Git::with_program(program).and_remote_token(self.token.clone()),
+                None => Git::with_remote_token(self.token.clone()),
             }
         }
     }
@@ -1646,6 +1648,7 @@ mod published {
         pub fn host(&self) -> StubHost {
             StubHost {
                 inner: self.f.node(),
+                token: None,
                 program: None,
                 read: None,
             }
@@ -1655,6 +1658,7 @@ mod published {
         pub fn host_with_program(&self, program: &std::path::Path) -> StubHost {
             StubHost {
                 inner: self.f.node(),
+                token: None,
                 program: Some(program.as_os_str().to_os_string()),
                 read: None,
             }
@@ -1975,6 +1979,7 @@ mod published {
         // A host git that cannot even start: any call to it fails the run.
         let host = StubHost {
             inner: rig.f.node(),
+            token: None,
             program: Some(OsString::from("/nonexistent/git-must-not-run")),
             read: None,
         };
@@ -2128,6 +2133,62 @@ mod published {
         let err = refused_alike(&rig).await;
         assert_eq!(preflight_checks(&err), ["git_checkout"]);
         assert!(err.to_string().contains("shallow"), "{err}");
+    }
+
+    /// 27-20 (checker W16): the token is scoped by ign from the matched
+    /// remote's own URL, so an ssh origin cannot take it: `--check` and the
+    /// apply refuse `git_remote` and say what to do, before the remote is
+    /// asked anything. Without a token the same fixture reaches the remote
+    /// step as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_token_origin_contract() {
+        const TOKEN: &str = "tok-7f3a91c2-not-a-real-token";
+        let rig = Rig::new();
+        let ssh = "git@git.example.test:org/capapp.git";
+        rig.f.git_in_project(&["remote", "set-url", REMOTE, ssh]);
+        rig.f.checkout_with_userinfo_remote(ssh);
+        let scratch = tempfile::tempdir().expect("scratch");
+        // The remote read fails like an unreachable host; nothing else does.
+        let (program, log) = git_wrapper(scratch.path(), "--heads");
+        let mut host = rig.host_with_program(&program);
+
+        // No token: the remote read runs (and fails) as in 27-05.
+        for err in [
+            refusal(rig.plan_with(&host).await),
+            refusal(rig.apply_with(&host).await),
+        ] {
+            assert_eq!(preflight_checks(&err), ["git_remote"], "{err}");
+            assert!(!err.to_string().contains("git token"), "{err}");
+        }
+        let calls = std::fs::read_to_string(&log).expect("the log");
+        assert_eq!(calls.matches("ls-remote --heads").count(), 2, "{calls}");
+
+        // A token: refused before the remote is read, naming the fix.
+        host.token = Some(TOKEN.to_string());
+        for err in [
+            refusal(rig.plan_with(&host).await),
+            refusal(rig.apply_with(&host).await),
+        ] {
+            assert_eq!(preflight_checks(&err), ["git_remote"], "{err}");
+            let text = format!("{err} {err:?}");
+            assert!(
+                text.contains(
+                    "a git token applies only to https remotes; this remote uses ssh: give the \
+                     machine running ign ssh access to it and leave git-token empty"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains(TOKEN), "{text}");
+        }
+        let calls = std::fs::read_to_string(&log).expect("the log");
+        assert_eq!(
+            calls.matches("ls-remote --heads").count(),
+            2,
+            "a refused token reads no remote:\n{calls}"
+        );
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_eq!(rig.run_dirs(), 0);
     }
 
     /// A host git that runs git, logs its arguments and fails on request.
@@ -2423,6 +2484,7 @@ mod published {
         rig.sync_live();
         let failing = StubHost {
             inner: rig.f.node(),
+            token: None,
             program: None,
             read: Some(Box::new(FailingFetch(rig.f.node()))),
         };
@@ -2580,6 +2642,7 @@ mod published {
         let calls = Calls::default();
         let host = StubHost {
             inner: rig.f.node(),
+            token: None,
             program: None,
             read: Some(Box::new(Metered {
                 inner: rig.f.node(),

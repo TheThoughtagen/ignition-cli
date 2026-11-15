@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::git_state::{GIT_SMALL_FILE_MAX, branch_name_problem, redact_text};
@@ -191,10 +192,55 @@ impl Done {
     }
 }
 
+/// The environment variable that carries the token for ign's own reads of
+/// the gateway's git remote (D-23, 27-20). The composite actions set it from
+/// their `git-token` input as a step environment variable and nowhere else.
+pub const GIT_TOKEN_ENV: &str = "IGNITION_GIT_TOKEN";
+
+/// Environment variables no git subprocess inherits. The last is the remote
+/// token: the two remote reads are given it explicitly, scoped to one host
+/// ([`remote_auth_env`]); no other git process, hook or ssh sees it.
+const SCRUBBED_ENV: [&str; 10] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_COMMON_DIR",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    GIT_TOKEN_ENV,
+];
+
 /// The host-git subprocess runner.
-#[derive(Debug, Clone)]
+///
+/// It may hold a read token for the gateway's remote ([`GIT_TOKEN_ENV`]). The
+/// token is private, never in `Debug` or an error, and reaches only the
+/// environment of ign's own remote reads ([`HostGit::ls_remote_heads`],
+/// [`HostGit::fetch_heads`]), scoped to the matched remote's host by
+/// [`remote_auth_env`]. No other git process sees it: [`HostGit::run`] removes
+/// the variable from every child.
+#[derive(Clone)]
 pub struct HostGit {
     program: OsString,
+    remote_token: Option<String>,
+}
+
+impl std::fmt::Debug for HostGit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token is never printed, not even its length.
+        struct Presence(bool);
+        impl std::fmt::Debug for Presence {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(if self.0 { "<set>" } else { "<unset>" })
+            }
+        }
+        f.debug_struct("HostGit")
+            .field("program", &self.program)
+            .field("remote_token", &Presence(self.remote_token.is_some()))
+            .finish()
+    }
 }
 
 impl Default for HostGit {
@@ -204,19 +250,44 @@ impl Default for HostGit {
 }
 
 impl HostGit {
-    /// The runner for `git` on `PATH`.
+    /// The runner for `git` on `PATH`, with the remote token of
+    /// [`GIT_TOKEN_ENV`] when it is set and not empty. The variable is read
+    /// once, here.
     pub fn new() -> HostGit {
         HostGit {
             program: OsString::from("git"),
+            remote_token: std::env::var(GIT_TOKEN_ENV)
+                .ok()
+                .filter(|token| !token.is_empty()),
         }
     }
 
     /// The runner for a named program (the test seam, as
-    /// `ignore_status_with`).
+    /// `ignore_status_with`). It holds no token: the environment is never
+    /// read.
     pub fn with_program(program: impl AsRef<OsStr>) -> HostGit {
         HostGit {
             program: program.as_ref().to_os_string(),
+            remote_token: None,
         }
+    }
+
+    /// The runner for `git` on `PATH` with `token` as the remote token and
+    /// the environment ignored (the test seam of [`GIT_TOKEN_ENV`]). An empty
+    /// token is no token.
+    pub fn with_remote_token(token: Option<String>) -> HostGit {
+        HostGit {
+            program: OsString::from("git"),
+            remote_token: None,
+        }
+        .and_remote_token(token)
+    }
+
+    /// This runner with `token` as the remote token (the test seam, for a
+    /// stub program).
+    pub fn and_remote_token(mut self, token: Option<String>) -> HostGit {
+        self.remote_token = token.filter(|t| !t.is_empty());
+        self
     }
 
     async fn run(&self, call: Call) -> Result<Done, CoreError> {
@@ -235,17 +306,7 @@ impl HostGit {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("LC_ALL", "C");
-        for var in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_NAMESPACE",
-            "GIT_COMMON_DIR",
-            "GIT_ASKPASS",
-            "SSH_ASKPASS",
-        ] {
+        for var in SCRUBBED_ENV {
             command.env_remove(var);
         }
         if call.isolate {
@@ -302,7 +363,13 @@ impl HostGit {
             writer.abort();
         }
         match result {
-            Ok(done) => done,
+            Ok(done) => done.map(|mut done| {
+                // Whatever git printed, the token is not in it.
+                if let Some(token) = &self.remote_token {
+                    done.stderr = scrub_token(&done.stderr, token);
+                }
+                done
+            }),
             Err(_) => Err(host_failure(format!(
                 "git did not finish within {} s",
                 call.timeout.as_secs()
@@ -1129,6 +1196,166 @@ where
 /// How many refs one `fetch` names.
 const FETCH_CHUNK: usize = 100;
 
+/// The environment and arguments a remote read adds for the token.
+#[derive(Default)]
+struct RemoteAuth {
+    envs: Vec<(String, String)>,
+    args: Vec<OsString>,
+}
+
+impl RemoteAuth {
+    fn apply(&self, mut call: Call) -> Call {
+        for (key, value) in &self.envs {
+            call = call.env(key, value);
+        }
+        call
+    }
+}
+
+/// `text` without the token, its base64 and the base64 of the credentials
+/// the extraheader carries: git's stderr is the only text of a child that
+/// reaches a message, and nothing there may be the token.
+fn scrub_token(text: &str, token: &str) -> String {
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut out = text.to_string();
+    for secret in [
+        token.to_string(),
+        engine.encode(token),
+        engine.encode(format!("x-access-token:{token}")),
+    ] {
+        if !secret.is_empty() {
+            out = out.replace(&secret, "***");
+        }
+    }
+    out
+}
+
+/// The text of a refusal to send the token over a remote that is not https.
+fn token_refusal(uses: &str) -> String {
+    if uses == "ssh" {
+        "a git token applies only to https remotes; this remote uses ssh: give the machine \
+         running ign ssh access to it and leave git-token empty"
+            .to_string()
+    } else {
+        format!(
+            "a git token applies only to https remotes; this remote uses {uses}: use an https \
+             remote, or leave git-token empty"
+        )
+    }
+}
+
+/// The `GIT_CONFIG_*` environment that gives one remote read the token as an
+/// `http.<scheme>://<host>[:<port>]/.extraheader`, scoped to exactly the
+/// scheme, host and port of `url` (the matched remote's own URL, userinfo
+/// dropped), never to any other host (T-27-41, T-27-74).
+///
+/// - No token (`None` or empty): nothing is added, for every kind of remote.
+/// - `https://`: the scoped extraheader, `AUTHORIZATION: basic
+///   base64(x-access-token:<token>)`, appended after `existing_count` entries
+///   already in the environment (`GIT_CONFIG_COUNT`), never replacing them.
+/// - `http://` to a loopback host (a local rig): the same, for `http`.
+/// - `http://` to any other host, `ssh://` and scp-like remotes, and any
+///   other transport: `Err` with the text that names the fix. The token is
+///   never sent in clear and never to a transport it cannot serve.
+/// - `file://` and local paths: nothing; the token has no use there.
+///
+/// The `Err` never holds the token or the URL.
+pub fn remote_auth_env(
+    url: &str,
+    token: Option<&str>,
+    existing_count: Option<usize>,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let url = url.trim();
+    let (scheme, rest) = match url.find("://") {
+        Some(at) => (url[..at].to_ascii_lowercase(), &url[at + 3..]),
+        None => match url.find(':') {
+            // `ext::command`, `transport::address`: a remote helper.
+            Some(colon) if url[colon..].starts_with("::") => {
+                return Err(token_refusal(&url[..colon].to_ascii_lowercase()));
+            }
+            // scp-like `user@host:path` (a one-letter head is a drive).
+            Some(colon) if colon > 1 && !url[..colon].contains('/') => {
+                return Err(token_refusal("ssh"));
+            }
+            // A local path.
+            _ => return Ok(Vec::new()),
+        },
+    };
+    match scheme.as_str() {
+        "file" => return Ok(Vec::new()),
+        "https" | "http" => {}
+        "ssh" | "git+ssh" | "ssh+git" => return Err(token_refusal("ssh")),
+        other => return Err(token_refusal(other)),
+    }
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let host_port = authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..])
+        .to_ascii_lowercase();
+    let host = split_host_port(&host_port)
+        .ok_or_else(|| "the remote's URL has no host a git token can be scoped to".to_string())?;
+    if scheme == "http" && !is_loopback_host(host) {
+        return Err(token_refusal(
+            "plain http to a host that is not a loopback address",
+        ));
+    }
+    let base = format!("{scheme}://{host_port}/");
+    let index = existing_count.unwrap_or(0);
+    let credentials =
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    Ok(vec![
+        (
+            format!("GIT_CONFIG_KEY_{index}"),
+            format!("http.{base}.extraheader"),
+        ),
+        (
+            format!("GIT_CONFIG_VALUE_{index}"),
+            format!("AUTHORIZATION: basic {credentials}"),
+        ),
+        ("GIT_CONFIG_COUNT".to_string(), (index + 1).to_string()),
+    ])
+}
+
+/// The host of a lowercase `host[:port]` (an IPv6 host in brackets). `None`
+/// for anything that could change what a config key means, a port that is not
+/// 1 to 5 digits, or no host at all.
+fn split_host_port(host_port: &str) -> Option<&str> {
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &host_port[..close + 2];
+        match &rest[close + 1..] {
+            "" => (host, None),
+            tail => (host, Some(tail.strip_prefix(':')?)),
+        }
+    } else {
+        match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        }
+    };
+    let host_ok = !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'[' | b']' | b':')
+        });
+    let port_ok =
+        port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
+    (host_ok && port_ok).then_some(host)
+}
+
+/// Whether `host` (lowercase, IPv6 in brackets) is this machine: `localhost`,
+/// an address in `127.0.0.0/8` or `::1`.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare == "localhost"
+        || bare.ends_with(".localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The remote and release-side operations of the break/fix gate (Phase 27,
 /// 27-05). Everything here reads or adds objects in ign's own checkout; none
 /// writes a ref, `FETCH_HEAD` or a config value. A remote is always named,
@@ -1306,12 +1533,16 @@ impl HostGit {
         remote: &str,
     ) -> Result<BTreeMap<String, String>, CoreError> {
         require_safe_name(remote, "remote")?;
+        let auth = self.remote_auth(checkout, remote).await?;
         let mut args = self.ssh_args(checkout).await?;
+        args.extend(auth.args.clone());
         args.extend(in_checkout(
             checkout,
             ["ls-remote", "--heads", "--", remote],
         ));
-        let done = self.run_ok("ls-remote", Call::new(args)).await?;
+        let done = self
+            .run_ok("ls-remote", auth.apply(Call::new(args)))
+            .await?;
         let mut heads = BTreeMap::new();
         for line in String::from_utf8_lossy(&done.stdout).lines() {
             let Some((id, name)) = line.split_once('\t') else {
@@ -1342,9 +1573,11 @@ impl HostGit {
         for branch in branches {
             require_safe_name(branch, "branch")?;
         }
+        let auth = self.remote_auth(checkout, remote).await?;
         let ssh = self.ssh_args(checkout).await?;
         for chunk in branches.chunks(FETCH_CHUNK) {
             let mut args = ssh.clone();
+            args.extend(auth.args.clone());
             args.extend(in_checkout(
                 checkout,
                 [
@@ -1369,9 +1602,53 @@ impl HostGit {
                     .iter()
                     .map(|b| OsString::from(format!("refs/heads/{b}"))),
             );
-            self.run_ok("fetch", Call::new(args)).await?;
+            self.run_ok("fetch", auth.apply(Call::new(args))).await?;
         }
         Ok(())
+    }
+
+    /// What the remote read of `remote` adds for the token: nothing when no
+    /// token is set (no extra process runs then), else the token as an
+    /// extraheader scoped to the named remote's own URL ([`remote_auth_env`]).
+    /// The URL is read from the checkout (with the operator's `insteadOf`
+    /// rewrites, which decide what git contacts), kept in memory, and never
+    /// put on an argument list or in a message.
+    async fn remote_auth(&self, checkout: &Path, remote: &str) -> Result<RemoteAuth, CoreError> {
+        let Some(token) = self.remote_token.as_deref() else {
+            return Ok(RemoteAuth::default());
+        };
+        let done = self
+            .run_ok(
+                "ls-remote --get-url",
+                Call::new(in_checkout(
+                    checkout,
+                    ["ls-remote", "--get-url", "--", remote],
+                )),
+            )
+            .await?;
+        let url = String::from_utf8_lossy(&done.stdout).trim().to_string();
+        let existing = match std::env::var("GIT_CONFIG_COUNT") {
+            Ok(count) => Some(count.trim().parse::<usize>().map_err(|_| {
+                host_failure(
+                    "the GIT_CONFIG_COUNT environment variable is not a number, so the git token \
+                     cannot be added to it: unset it",
+                )
+            })?),
+            Err(_) => None,
+        };
+        let envs = remote_auth_env(&url, Some(token), existing).map_err(host_failure)?;
+        // With a token, a redirect is never followed: git would send the
+        // header to wherever the remote points. A remote that moved needs its
+        // URL updated.
+        let args = if envs.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                OsString::from("-c"),
+                OsString::from("http.followRedirects=false"),
+            ]
+        };
+        Ok(RemoteAuth { envs, args })
     }
 
     /// Which of `ids` are commits in the checkout's object store, through
@@ -2950,5 +3227,406 @@ mod tests {
         let junk = scratch.root().join("junk.idx");
         std::fs::write(&junk, b"not an index").expect("junk");
         assert!(host.pack_ids(&scratch, &junk).await.is_err());
+    }
+
+    // ---- 27-20: the remote token, scoped to the matched remote's host ----
+
+    const TOKEN: &str = "tok-7f3a91c2-not-a-real-token";
+
+    fn env_map(pairs: Vec<(String, String)>) -> BTreeMap<String, String> {
+        pairs.into_iter().collect()
+    }
+
+    fn basic(token: &str) -> String {
+        format!(
+            "AUTHORIZATION: basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"))
+        )
+    }
+
+    #[test]
+    fn remote_auth_scoped_to_remote_host() {
+        let env = env_map(
+            remote_auth_env("https://github.com/org/capapp.git", Some(TOKEN), None)
+                .expect("an https remote"),
+        );
+        assert_eq!(env.len(), 3, "{env:?}");
+        assert_eq!(env["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(
+            env["GIT_CONFIG_KEY_0"],
+            "http.https://github.com/.extraheader"
+        );
+        assert_eq!(env["GIT_CONFIG_VALUE_0"], basic(TOKEN));
+
+        // Userinfo is dropped; the port stays; the host is lowercased.
+        let env = env_map(
+            remote_auth_env(
+                "https://user:pw@Git.Example.Test:8443/org/capapp.git",
+                Some(TOKEN),
+                None,
+            )
+            .expect("an https remote"),
+        );
+        assert_eq!(
+            env["GIT_CONFIG_KEY_0"],
+            "http.https://git.example.test:8443/.extraheader"
+        );
+        let text = format!("{env:?}");
+        assert!(!text.contains("pw") && !text.contains("user"), "{text}");
+
+        // The entries already in the environment are kept.
+        let env = env_map(
+            remote_auth_env("https://git.example.test/o/r", Some(TOKEN), Some(2))
+                .expect("an https remote"),
+        );
+        assert_eq!(env["GIT_CONFIG_COUNT"], "3");
+        assert_eq!(
+            env["GIT_CONFIG_KEY_2"],
+            "http.https://git.example.test/.extraheader"
+        );
+        assert_eq!(env["GIT_CONFIG_VALUE_2"], basic(TOKEN));
+        assert!(!env.contains_key("GIT_CONFIG_KEY_0"), "{env:?}");
+
+        // A loopback rig over plain http is scoped the same way.
+        let env = env_map(
+            remote_auth_env("http://127.0.0.1:18292/capapp.git", Some(TOKEN), None)
+                .expect("loopback"),
+        );
+        assert_eq!(
+            env["GIT_CONFIG_KEY_0"],
+            "http.http://127.0.0.1:18292/.extraheader"
+        );
+    }
+
+    #[test]
+    fn remote_auth_refuses_ssh_with_token() {
+        let want = "a git token applies only to https remotes; this remote uses ssh: give the \
+                    machine running ign ssh access to it and leave git-token empty";
+        for url in [
+            "git@git.example.test:org/capapp.git",
+            "git.example.test:org/capapp.git",
+            "ssh://git@git.example.test/org/capapp.git",
+            "SSH://git.example.test:2222/org/capapp.git",
+        ] {
+            let err = remote_auth_env(url, Some(TOKEN), None).expect_err(url);
+            assert_eq!(err, want, "{url}");
+            assert!(!err.contains(TOKEN) && !err.contains("example"), "{err}");
+        }
+        // Another transport names itself.
+        let err = remote_auth_env("git://git.example.test/org/capapp.git", Some(TOKEN), None)
+            .expect_err("git protocol");
+        assert!(err.contains("this remote uses git:"), "{err}");
+        let err = remote_auth_env("ext::sh -c evil", Some(TOKEN), None).expect_err("a helper");
+        assert!(err.contains("this remote uses ext:"), "{err}");
+    }
+
+    #[test]
+    fn remote_auth_refuses_plain_http_remote_host() {
+        for url in [
+            "http://git.example.test/org/capapp.git",
+            "http://127.0.0.1.example.test/capapp.git",
+            "http://10.0.0.5:8080/capapp.git",
+        ] {
+            let err = remote_auth_env(url, Some(TOKEN), None).expect_err(url);
+            assert!(
+                err.contains("plain http to a host that is not a loopback address"),
+                "{err}"
+            );
+            assert!(!err.contains(TOKEN) && !err.contains("example"), "{err}");
+        }
+        for url in [
+            "http://127.0.0.1:18292/capapp.git",
+            "http://127.1.2.3/capapp.git",
+            "http://localhost:18292/capapp.git",
+            "http://[::1]:18292/capapp.git",
+        ] {
+            let env = env_map(remote_auth_env(url, Some(TOKEN), None).expect(url));
+            assert!(
+                env["GIT_CONFIG_KEY_0"].starts_with("http.http://"),
+                "{env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_auth_refuses_a_host_that_is_not_one() {
+        for url in [
+            "https:///org/capapp.git",
+            "https://@/org/capapp.git",
+            "https://bad host/org/capapp.git",
+            "https://host:port/org/capapp.git",
+            "https://host:123456789/org/capapp.git",
+            "https://host\n[core]/org/capapp.git",
+        ] {
+            let err = remote_auth_env(url, Some(TOKEN), None).expect_err(url);
+            assert!(
+                err.contains("no host a git token can be scoped to"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_auth_none_without_token() {
+        for token in [None, Some("")] {
+            for url in [
+                "https://github.com/org/capapp.git",
+                "http://git.example.test/org/capapp.git",
+                "git@git.example.test:org/capapp.git",
+                "ssh://git@git.example.test/org/capapp.git",
+                "file:///srv/git/capapp.git",
+                "/srv/git/capapp.git",
+            ] {
+                assert_eq!(
+                    remote_auth_env(url, token, Some(3)),
+                    Ok(Vec::new()),
+                    "{url}"
+                );
+            }
+        }
+        // `file://` and a path ignore a token that is set.
+        for url in [
+            "file:///srv/git/capapp.git",
+            "/srv/git/capapp.git",
+            "../capapp.git",
+            "C:/repos/capapp.git",
+        ] {
+            assert_eq!(
+                remote_auth_env(url, Some(TOKEN), None),
+                Ok(Vec::new()),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_token_is_scrubbed_from_every_child() {
+        assert!(SCRUBBED_ENV.contains(&GIT_TOKEN_ENV));
+        assert_eq!(GIT_TOKEN_ENV, "IGNITION_GIT_TOKEN");
+    }
+
+    #[test]
+    fn debug_hides_the_token() {
+        let set = HostGit::with_remote_token(Some(TOKEN.to_string()));
+        let unset = HostGit::with_remote_token(Some(String::new()));
+        let text = format!("{set:?} {set:#?}");
+        assert!(text.contains("remote_token: <set>"), "{text}");
+        assert!(!text.contains(TOKEN) && !text.contains("tok-"), "{text}");
+        assert!(format!("{unset:?}").contains("remote_token: <unset>"));
+        assert!(format!("{:?}", HostGit::with_program("git")).contains("<unset>"));
+    }
+
+    /// A stub that logs argv and `GIT_CONFIG_*`, runs the two local queries
+    /// with the real git and answers the two remote reads with nothing.
+    #[cfg(unix)]
+    fn recording_git(dir: &Path) -> (PathBuf, PathBuf) {
+        let log = dir.join("calls.log");
+        let body = r#"{ printf 'ARGV:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; env | grep '^GIT_CONFIG_'; echo END; } >> 'LOG'
+case " $* " in
+  *" --get-url "*|*" config "*) exec git "$@" ;;
+esac
+exit 0"#
+            .replace("LOG", &log.display().to_string());
+        (stub(dir, "recording-git", &body), log)
+    }
+
+    /// The token reaches the two remote reads in their environment, scoped to
+    /// the remote's host, and nowhere else: no argument, no other call, no
+    /// `Debug`, no error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_never_on_argv_or_debug() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("checkout");
+        std::fs::create_dir(&repo).expect("mkdir");
+        git(&repo, &["init", "-q", "-b", "production"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://deploy:hunter2@git.example.test:8443/org/capapp.git",
+            ],
+        );
+        let (program, log) = recording_git(work.path());
+        let runner = HostGit::with_program(&program).and_remote_token(Some(TOKEN.to_string()));
+
+        assert!(
+            runner
+                .ls_remote_heads(&repo, "origin")
+                .await
+                .expect("ls")
+                .is_empty()
+        );
+        runner
+            .fetch_heads(&repo, "origin", &["production".to_string()])
+            .await
+            .expect("fetch");
+
+        let calls = std::fs::read_to_string(&log).expect("the log");
+        let blocks: Vec<&str> = calls.split("END\n").filter(|b| !b.is_empty()).collect();
+        let n = std::env::var("GIT_CONFIG_COUNT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{TOKEN}"));
+        let mut remote_reads = 0;
+        for block in &blocks {
+            for secret in [TOKEN, b64.as_str(), "hunter2", "deploy:"] {
+                let argv = block.lines().next().expect("argv line");
+                assert!(!argv.contains(secret), "{argv}");
+            }
+            let is_remote_read = block.starts_with("ARGV:")
+                && (block
+                    .lines()
+                    .next()
+                    .is_some_and(|l| l.contains("[ls-remote] [--heads]") || l.contains("[fetch]")));
+            if is_remote_read {
+                remote_reads += 1;
+                assert!(
+                    block.contains(&format!(
+                        "GIT_CONFIG_KEY_{n}=http.https://git.example.test:8443/.extraheader"
+                    )),
+                    "{block}"
+                );
+                assert!(
+                    block.contains(&format!("GIT_CONFIG_VALUE_{n}=AUTHORIZATION: basic {b64}")),
+                    "{block}"
+                );
+                assert!(
+                    block.contains(&format!("GIT_CONFIG_COUNT={}", n + 1)),
+                    "{block}"
+                );
+                assert!(
+                    block.contains("[-c] [http.followRedirects=false]"),
+                    "{block}"
+                );
+            } else {
+                // The local queries get no token entry at all.
+                assert!(!block.contains(&b64), "{block}");
+                assert!(
+                    !block.contains("extraheader"),
+                    "the token reached a local query: {block}"
+                );
+            }
+        }
+        assert_eq!(remote_reads, 2, "{calls}");
+
+        // The refusal for an ssh remote holds nothing of the token or the URL.
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "other",
+                "git@git.example.test:org/other.git",
+            ],
+        );
+        let err = runner
+            .ls_remote_heads(&repo, "other")
+            .await
+            .expect_err("ssh with a token");
+        let text = format!("{err} {err:?} {runner:?}");
+        assert!(!text.contains(TOKEN) && !text.contains(&b64), "{text}");
+        assert!(text.contains("this remote uses ssh"), "{text}");
+        assert_eq!(failed_check(&err), "git_host");
+        // And no remote read ran for it.
+        let after = std::fs::read_to_string(&log).expect("the log");
+        assert_eq!(
+            after.matches("[ls-remote] [--heads]").count(),
+            1,
+            "the refused remote was never read"
+        );
+    }
+
+    /// Without a token no extra process runs: the 27-05 calls are exactly
+    /// the same, an ssh remote is still read under `BatchMode`, and a token
+    /// with a `file://` remote changes nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_token_means_the_calls_are_unchanged() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("checkout");
+        std::fs::create_dir(&repo).expect("mkdir");
+        git(&repo, &["init", "-q", "-b", "production"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@git.example.test:org/capapp.git",
+            ],
+        );
+        let (program, log) = recording_git(work.path());
+        let runner = HostGit::with_program(&program);
+        runner.ls_remote_heads(&repo, "origin").await.expect("ls");
+        let calls = std::fs::read_to_string(&log).expect("the log");
+        assert!(!calls.contains("--get-url"), "{calls}");
+        assert!(!calls.contains("followRedirects"), "{calls}");
+        assert!(
+            calls.contains("core.sshCommand=ssh -o BatchMode=yes"),
+            "{calls}"
+        );
+
+        let file_remote = work.path().join("remote.git");
+        git(work.path(), &["init", "-q", "--bare", "remote.git"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "local",
+                &format!("file://{}", file_remote.display()),
+            ],
+        );
+        let tokened = HostGit::with_program(&program).and_remote_token(Some(TOKEN.to_string()));
+        tokened
+            .ls_remote_heads(&repo, "local")
+            .await
+            .expect("file remote");
+        let calls = std::fs::read_to_string(&log).expect("the log");
+        assert!(!calls.contains("extraheader"), "{calls}");
+        assert!(!calls.contains("followRedirects"), "{calls}");
+    }
+
+    /// A child that prints the token, in either form, into its error output
+    /// does not get it into the error text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_is_scrubbed_from_git_errors() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let repo = work.path().join("checkout");
+        std::fs::create_dir(&repo).expect("mkdir");
+        git(&repo, &["init", "-q", "-b", "production"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://git.example.test/org/capapp.git",
+            ],
+        );
+        let program = stub(
+            work.path(),
+            "leaky-git",
+            &format!(
+                "case \" $* \" in *\" --get-url \"*|*\" config \"*) exec git \"$@\";; esac\n\
+                 echo \"fatal: bad credentials {TOKEN} / $GIT_CONFIG_VALUE_0\" >&2\nexit 128"
+            ),
+        );
+        let runner = HostGit::with_program(&program).and_remote_token(Some(TOKEN.to_string()));
+        let err = runner
+            .ls_remote_heads(&repo, "origin")
+            .await
+            .expect_err("the stub fails");
+        let b64 =
+            base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{TOKEN}"));
+        let text = format!("{err} {err:?}");
+        assert!(text.contains("bad credentials"), "{text}");
+        assert!(!text.contains(TOKEN) && !text.contains(&b64), "{text}");
     }
 }
