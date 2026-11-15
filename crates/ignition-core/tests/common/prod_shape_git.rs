@@ -281,6 +281,18 @@ fn json_body(seed: u64, len: usize) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// A Perspective view of about `len` bytes. Its root names a component type, so
+/// a gateway loads it without an error; the padding sits in `custom`.
+fn view_body(seed: u64, len: usize) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut out = String::from("{\"custom\":{\"n\":[0");
+    while out.len() < len {
+        out.push_str(&format!(",{}", rng.next() % 1_000_000));
+    }
+    out.push_str("]},\"params\":{},\"props\":{},\"root\":{\"children\":[],\"type\":\"ia.container.flex\"}}\n");
+    out.into_bytes()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Body {
     /// Exact bytes.
@@ -314,7 +326,8 @@ impl FileSpec {
         match self.body {
             Body::Fixed => self.fixed.clone(),
             Body::Code | Body::Theme | Body::Doc => text_body(seed, size),
-            Body::View | Body::Tags => json_body(seed, size),
+            Body::View => view_body(seed, size),
+            Body::Tags => json_body(seed, size),
             Body::Binary => random_bytes(seed, size),
         }
     }
@@ -359,7 +372,9 @@ impl History {
             body: Body::Fixed,
             seed: 0,
             size: 0,
-            fixed: b"{\"title\":\"CapApp\"}\n".to_vec(),
+            // Every key the gateway fills in, so the gateway reads it back as
+            // written (a rig gate compares the live project with the repo).
+            fixed: b"{\"title\":\"CapApp\",\"enabled\":true,\"inheritable\":false}\n".to_vec(),
         }]];
         for r in 0..resources {
             let code = r % 2 == 0;
@@ -385,9 +400,13 @@ impl History {
             let size = 300 + (mix(2, r as u64) % 1_700) as usize;
             let helper = extra == 1 && r == 0;
             let listing = if helper {
-                format!("{{\"scope\":\"{scope}\",\"files\":[\"{member}\",\"helper.py\"]}}\n")
+                format!(
+                    "{{\"scope\":\"{scope}\",\"version\":1,\"restricted\":false,\"overridable\":true,\"files\":[\"{member}\",\"helper.py\"],\"attributes\":{{}}}}\n"
+                )
             } else {
-                format!("{{\"scope\":\"{scope}\",\"files\":[\"{member}\"]}}\n")
+                format!(
+                    "{{\"scope\":\"{scope}\",\"version\":1,\"restricted\":false,\"overridable\":true,\"files\":[\"{member}\"],\"attributes\":{{}}}}\n"
+                )
             };
             let mut unit = vec![
                 FileSpec {
