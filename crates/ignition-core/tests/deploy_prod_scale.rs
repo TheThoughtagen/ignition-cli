@@ -3599,6 +3599,14 @@ impl ignition_core::deploy::transport::projects::GitHostRead for SharedRead {
     async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, ignition_core::error::CoreError> {
         self.0.read_git_yaml().await
     }
+    async fn project_dir_entry(
+        &self,
+        project: &str,
+        dir: ignition_core::deploy::transport::projects::ImportDir,
+    ) -> Result<ignition_core::deploy::transport::projects::GitEntry, ignition_core::error::CoreError>
+    {
+        self.0.project_dir_entry(project, dir).await
+    }
     async fn free_bytes(
         &self,
         gateway: &str,

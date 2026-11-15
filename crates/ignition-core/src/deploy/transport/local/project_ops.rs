@@ -56,9 +56,9 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind};
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ProjectHost, ProjectRunWriter,
-    ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_entry_location,
-    git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
+    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir, ProjectHost,
+    ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write,
+    git_entry_location, git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
@@ -67,6 +67,13 @@ impl LocalFsTransport {
     /// What `<data_dir>/projects/<project>/.git` is, probed with
     /// `symlink_metadata` at every level (nothing is followed).
     fn git_entry_blocking(&self, project: &str) -> Result<GitEntry, CoreError> {
+        self.entry_blocking(project, ".git")
+    }
+
+    /// What `<data_dir>/projects/<project>/<entry>` is, probed with
+    /// `symlink_metadata` at every level (nothing is followed). `entry` is a
+    /// fixed name (`.git`, or an [`ImportDir`] name), never outside input.
+    fn entry_blocking(&self, project: &str, entry: &str) -> Result<GitEntry, CoreError> {
         if let Some(why) = component_problem(project) {
             return Err(self.fail(format!("the project name {why}")));
         }
@@ -112,8 +119,8 @@ impl LocalFsTransport {
             Ok(_) => {}
         }
 
-        let location = git_entry_location(project);
-        match std::fs::symlink_metadata(project_dir.join(".git")) {
+        let location = format!("projects/{project}/{entry}");
+        match std::fs::symlink_metadata(project_dir.join(entry)) {
             Ok(m) => {
                 let kind = m.file_type();
                 Ok(if kind.is_symlink() {
@@ -1992,6 +1999,18 @@ impl GitHostRead for LocalFsTransport {
     async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.read_git_yaml_blocking())
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
+    async fn project_dir_entry(
+        &self,
+        project: &str,
+        dir: ImportDir,
+    ) -> Result<GitEntry, CoreError> {
+        let this = self.clone();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || this.entry_blocking(&project, dir.name()))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }

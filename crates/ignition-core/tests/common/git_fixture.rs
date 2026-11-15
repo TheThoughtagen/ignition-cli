@@ -289,10 +289,35 @@ impl GitFixture {
             }
             text.push_str(&format!(
                 "  user_name: dummy-user\n  user_password: {GIT_YAML_SECRET}\n  \
-                 commissioning_importTags: \"true\"\n  unknown_future_key: [1, 2]\n"
+                 commissioning_importTags: \"false\"\n  unknown_future_key: [1, 2]\n"
             ));
         }
         put(&self.data_dir, "git.yaml", &text);
+    }
+
+    /// Write `<data_dir>/git.yaml` with one entry per `(project, flags)`:
+    /// each `(key, value)` of `flags` is written as `key: value`, beside the
+    /// same credential lines [`with_git_yaml`](Self::with_git_yaml) writes
+    /// (27-18: the module's start-sync flags).
+    pub fn with_git_yaml_flags(&self, entries: &[(&str, &[(&str, &str)])]) {
+        let mut text = String::new();
+        for (project, flags) in entries {
+            text.push_str(&format!("- ignition_projectName: {project}\n"));
+            text.push_str(&format!(
+                "  repo_uri: https://dummy-user:{GIT_YAML_SECRET}@git.example/org/capapp.git\n  \
+                 user_name: dummy-user\n  user_password: {GIT_YAML_SECRET}\n"
+            ));
+            for (key, value) in *flags {
+                text.push_str(&format!("  {key}: {value}\n"));
+            }
+        }
+        put(&self.data_dir, "git.yaml", &text);
+    }
+
+    /// Remove `tags/` from the project directory, as a gateway import leaves
+    /// it (G3: the overwrite import removes `tags/` and `images/`).
+    pub fn without_tags_dir(&self) {
+        let _ = std::fs::remove_dir_all(self.project_dir().join("tags"));
     }
 
     /// Point the partial repo's `origin` at `url`.

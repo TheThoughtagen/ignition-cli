@@ -129,9 +129,9 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ProjectHost, ProjectRunWriter,
-    ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_entry_location,
-    git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
+    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir, ProjectHost,
+    ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_probe_name,
+    project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
 use crate::deploy::transport::winps::{LONG_PATH_PREFIX, WinScript, windows_component_problem};
@@ -499,9 +499,15 @@ impl SftpTransport {
 
     /// The POSIX probe: one `stat` script over the exec channel.
     async fn git_entry_posix(&self, project: &str) -> Result<GitEntry, CoreError> {
+        self.entry_posix(project, ".git").await
+    }
+
+    /// The POSIX probe of `projects/<project>/<entry>`; `entry` is a fixed
+    /// name (`.git` or an [`ImportDir`] name).
+    async fn entry_posix(&self, project: &str, entry: &str) -> Result<GitEntry, CoreError> {
         let projects = self.abs(&["projects".to_string()]);
         let project_dir = format!("{projects}/{project}");
-        let git = format!("{project_dir}/.git");
+        let git = format!("{project_dir}/{entry}");
         let command = RemoteCommand::posix(&[
             "sh",
             "-c",
@@ -559,12 +565,18 @@ impl SftpTransport {
     /// The Windows probe: one `Get-Item -Force` script over the encoded
     /// PowerShell route.
     async fn git_entry_windows(&self, project: &str) -> Result<GitEntry, CoreError> {
+        self.entry_windows(project, ".git").await
+    }
+
+    /// The Windows probe of `projects\<project>\<entry>`; `entry` is a fixed
+    /// name (`.git` or an [`ImportDir`] name).
+    async fn entry_windows(&self, project: &str, entry: &str) -> Result<GitEntry, CoreError> {
         let projects = windows_native_path(&self.abs(&["projects".to_string()]));
         let project_dir = format!("{projects}\\{project}");
-        let git = format!("{project_dir}\\.git");
+        let git = format!("{project_dir}\\{entry}");
         let script = WinScript::git_entry(&projects, &project_dir, &git);
         let answer = self.shell.exec_powershell(&script).await?;
-        windows_git_entry(&answer, project).map_err(|why| self.fail(why))
+        windows_git_entry_of(&answer, project, entry).map_err(|why| self.fail(why))
     }
 
     /// An answer word the probe does not define is a failure, never a kind.
@@ -583,8 +595,14 @@ impl SftpTransport {
 /// The [`GitEntry`] of a [`winps::GIT_ENTRY`] result, or why it cannot be
 /// read. Anything the script does not define, a missing field included, is an
 /// error: the result is never guessed into `Absent`.
-fn windows_git_entry(answer: &serde_json::Value, project: &str) -> Result<GitEntry, String> {
-    let location = git_entry_location(project);
+///
+/// `entry` is `.git` or an [`ImportDir`] name, below `projects\<project>`.
+fn windows_git_entry_of(
+    answer: &serde_json::Value,
+    project: &str,
+    entry: &str,
+) -> Result<GitEntry, String> {
+    let location = format!("projects/{project}/{entry}");
     let bad = |why: String| format!("{location}: the .git probe result is unusable ({why})");
     if answer.get("ok").and_then(|v| v.as_i64()) != Some(1) {
         return Err(bad("ok is not 1".to_string()));
@@ -1620,6 +1638,20 @@ impl GitHostRead for SftpTransport {
 
     async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
         self.read_git_yaml_file().await
+    }
+
+    async fn project_dir_entry(
+        &self,
+        project: &str,
+        dir: ImportDir,
+    ) -> Result<GitEntry, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        if self.windows {
+            return self.entry_windows(project, dir.name()).await;
+        }
+        self.entry_posix(project, dir.name()).await
     }
 
     async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {

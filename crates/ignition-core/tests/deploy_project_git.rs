@@ -965,6 +965,13 @@ mod gateway_objects {
         async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
             self.inner.read_git_yaml().await
         }
+        async fn project_dir_entry(
+            &self,
+            project: &str,
+            dir: ignition_core::deploy::transport::projects::ImportDir,
+        ) -> Result<ignition_core::deploy::transport::projects::GitEntry, CoreError> {
+            self.inner.project_dir_entry(project, dir).await
+        }
         async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
             self.inner.free_bytes(gateway, project).await
         }
@@ -1561,6 +1568,8 @@ mod published {
         pub release: String,
         /// `--discard-gateway-changes`, when the run gives one (27-15).
         pub discard: Option<String>,
+        /// `--allow-git-sync-hazards`, when the run gives one (27-18).
+        pub hazard_ack: Option<String>,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1613,6 +1622,7 @@ mod published {
                 repo,
                 release: "v1.1.0".to_string(),
                 discard: None,
+                hazard_ack: None,
             }
         }
 
@@ -1625,7 +1635,7 @@ mod published {
                 allow_downgrade: false,
                 allow_first_change: Some("first deploy of the rig".to_string()),
                 discard_gateway_changes: self.discard.clone(),
-                allow_git_sync_hazards: None,
+                allow_git_sync_hazards: self.hazard_ack.clone(),
                 allow_destructive: false,
                 allow_manual_undo: false,
                 artifact_sha256: None,
@@ -2369,6 +2379,13 @@ mod published {
         }
         async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
             self.0.read_git_yaml().await
+        }
+        async fn project_dir_entry(
+            &self,
+            project: &str,
+            dir: ignition_core::deploy::transport::projects::ImportDir,
+        ) -> Result<ignition_core::deploy::transport::projects::GitEntry, CoreError> {
+            self.0.project_dir_entry(project, dir).await
         }
         async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
             self.0.free_bytes(gateway, project).await
@@ -3947,5 +3964,406 @@ mod published {
             "no branch ref was written"
         );
         assert!(!f.git_dir().join("index").exists(), "no index was written");
+    }
+
+    // ---- 27-18: the module's start-sync hazards (D-21, D-G3) ----
+
+    const TAGS_FLAG: (&str, &str) = ("commissioning_importTags", "true");
+    const STARTUP_FLAG: (&str, &str) = ("tags_importOnStartup", "true");
+    const IMAGES_FLAG: (&str, &str) = ("commissioning_importImages", "true");
+    const THEMES_FLAG: (&str, &str) = ("commissioning_importThemes", "true");
+    const ENFORCE_FLAG: (&str, &str) = ("commissioning_enforceBranch", "true");
+    const HAZARD_REASON: &str = "the module imports tags at the start on purpose (ticket 7)";
+
+    /// A rig whose `git.yaml` sets `flags` for the project (the clone's
+    /// `tags/` is present, as on a gateway before an import).
+    fn hazardous(flags: &[(&str, &str)]) -> Rig {
+        let rig = Rig::new();
+        rig.f.with_git_yaml_flags(&[(PROJECT, flags)]);
+        rig
+    }
+
+    fn warned(result: &DeployProjectsResult, needle: &str) -> bool {
+        result.warnings.iter().any(|w| w.contains(needle))
+    }
+
+    /// D-G3: a tag import flag with `tags/` present on the node refuses, for
+    /// both flags, in `--check` and in the apply, and nothing is written.
+    #[tokio::test]
+    async fn hazard_tags_refuses() {
+        for flag in [TAGS_FLAG, STARTUP_FLAG] {
+            let rig = hazardous(&[flag]);
+            assert!(rig.f.project_dir().join("tags").is_dir());
+            let before = rig.git_manifest().await;
+            for err in [refusal(rig.check().await), refusal(rig.apply().await)] {
+                let (gate, keys, count) = gate_of(&err);
+                assert_eq!(gate, "git_sync_hazard", "{flag:?}");
+                assert_eq!(keys, ["import_tags".to_string()], "{flag:?}");
+                assert_eq!(count, 1);
+                assert_eq!(err.code(), "destructive_change_refused");
+            }
+            assert_eq!(rig.git_manifest().await, before, "nothing was written");
+            assert!(rig.save_trees().is_empty());
+        }
+    }
+
+    /// The acknowledgement passes the refusal, is recorded in `data.git`,
+    /// `run.json` and a warning that does not echo it, and `--check` shows it
+    /// too.
+    #[tokio::test]
+    async fn hazard_ack_passes() {
+        let mut rig = hazardous(&[TAGS_FLAG]);
+        rig.hazard_ack = Some(HAZARD_REASON.to_string());
+        let checked = rig.check().await.expect("the check completes");
+        assert_eq!(checked.outcome, ProjectOutcome::Checked);
+        assert_eq!(
+            git_of(&checked).hazards_acknowledged.as_deref(),
+            Some(HAZARD_REASON)
+        );
+        assert_eq!(git_of(&checked).master().hazards, ["import_tags"]);
+
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert!(result.ok && result.slug.is_none());
+        let git = git_of(&result);
+        assert_eq!(git.hazards_acknowledged.as_deref(), Some(HAZARD_REASON));
+        assert_eq!(git.master().hazards, ["import_tags"]);
+        let json = serde_json::to_value(git).expect("json");
+        assert_eq!(json["hazards_acknowledged"], HAZARD_REASON);
+        assert_eq!(json["nodes"][0]["hazards"][0], "import_tags");
+        assert_eq!(
+            run_json(&rig, &result)["allow_git_sync_hazards"],
+            HAZARD_REASON
+        );
+        assert!(warned(&result, "import_tags"));
+        assert!(warned(&result, "acknowledged"));
+        assert!(
+            !result.warnings.iter().any(|w| w.contains(HAZARD_REASON)),
+            "the operator's text is data, not part of a message"
+        );
+        assert_secret_free(&rig, &result);
+    }
+
+    /// The acknowledgement of a run with nothing to acknowledge is not
+    /// recorded as one.
+    #[tokio::test]
+    async fn hazard_ack_without_a_hazard_is_not_recorded() {
+        let mut rig = Rig::new();
+        rig.hazard_ack = Some(HAZARD_REASON.to_string());
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert!(git_of(&result).hazards_acknowledged.is_none());
+        assert_eq!(
+            run_json(&rig, &result)["allow_git_sync_hazards"],
+            HAZARD_REASON,
+            "run.json records what the operator passed"
+        );
+    }
+
+    /// D-G3: with `tags/` absent on the node the true flag is reported and
+    /// the run goes on (ign's own import removes `tags/`).
+    #[tokio::test]
+    async fn hazard_tags_absent_reports() {
+        let rig = hazardous(&[TAGS_FLAG, STARTUP_FLAG]);
+        rig.f.without_tags_dir();
+        let checked = rig.check().await.expect("the check completes");
+        let node = git_of(&checked).master();
+        assert_eq!(node.hazards, ["import_tags"]);
+        assert!(git_of(&checked).hazards_acknowledged.is_none());
+        assert!(warned(&checked, "tags/ is absent on the node"));
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert_eq!(git_of(&result).master().hazards, ["import_tags"]);
+        assert!(git_of(&result).hazards_acknowledged.is_none());
+    }
+
+    /// D-G3: `commissioning_importImages` and `commissioning_importThemes`
+    /// are advisory: reported, warned about, never refused, with their
+    /// directories present or not.
+    #[tokio::test]
+    async fn hazard_harmless_flag_warns() {
+        let rig = hazardous(&[IMAGES_FLAG, THEMES_FLAG]);
+        assert!(rig.f.project_dir().join("images").is_dir());
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let git = git_of(&result);
+        assert_eq!(git.master().hazards, ["import_images", "import_themes"]);
+        assert!(git.hazards_acknowledged.is_none());
+        assert!(warned(&result, "git.yaml sets import_images"));
+        assert!(warned(&result, "git.yaml sets import_themes"));
+
+        let rig = hazardous(&[IMAGES_FLAG]);
+        let _ = std::fs::remove_dir_all(rig.f.project_dir().join("images"));
+        let checked = rig.check().await.expect("the check completes");
+        assert_eq!(git_of(&checked).master().hazards, ["import_images"]);
+    }
+
+    /// G6: `commissioning_enforceBranch: true` refuses whatever the node
+    /// holds, and the acknowledgement passes it.
+    #[tokio::test]
+    async fn hazard_enforce_branch() {
+        let mut rig = hazardous(&[ENFORCE_FLAG]);
+        rig.f.without_tags_dir();
+        let err = refusal(rig.check().await);
+        let (gate, keys, _) = gate_of(&err);
+        assert_eq!(gate, "git_sync_hazard");
+        assert_eq!(keys, ["enforce_branch".to_string()]);
+        rig.hazard_ack = Some(HAZARD_REASON.to_string());
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert_eq!(
+            git_of(&result).hazards_acknowledged.as_deref(),
+            Some(HAZARD_REASON)
+        );
+    }
+
+    /// Every refusing hazard is named in one refusal, in hazard order.
+    #[tokio::test]
+    async fn hazard_refusal_names_every_refusing_word() {
+        let rig = hazardous(&[ENFORCE_FLAG, TAGS_FLAG, IMAGES_FLAG]);
+        let err = refusal(rig.check().await);
+        let (gate, keys, count) = gate_of(&err);
+        assert_eq!(gate, "git_sync_hazard");
+        assert_eq!(
+            keys,
+            ["import_tags".to_string(), "enforce_branch".to_string()]
+        );
+        assert_eq!(count, 2);
+    }
+
+    /// No `git.yaml`: the hazards are unknown, a warning and no refusal.
+    #[tokio::test]
+    async fn hazard_unknown_without_git_yaml() {
+        let rig = Rig::new();
+        let result = rig.check().await.expect("the check completes");
+        assert!(git_of(&result).master().hazards.is_empty());
+        assert!(
+            warned(&result, "git.yaml is absent"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(warned(&result, "hazards are unknown"));
+        let applied = rig.apply().await.expect("the apply completes");
+        assert_eq!(applied.outcome, ProjectOutcome::Imported);
+    }
+
+    /// A `git.yaml` that does not parse leaves the hazards unknown too, and
+    /// no word of it reaches a message.
+    #[tokio::test]
+    async fn hazard_unreadable_git_yaml_warns() {
+        use common::git_fixture::GIT_YAML_SECRET;
+        let rig = Rig::new();
+        put_file(
+            &rig.f.data_dir,
+            "git.yaml",
+            &format!(
+                "- ignition_projectName: [{GIT_YAML_SECRET}\n  commissioning_importTags: true\n"
+            ),
+        );
+        let result = rig.check().await.expect("the check completes");
+        assert!(git_of(&result).master().hazards.is_empty());
+        assert!(
+            warned(&result, "git.yaml is unreadable"),
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.warnings.join("\n").contains(GIT_YAML_SECRET));
+    }
+
+    /// An entry for another project does not count; a file that names this
+    /// project as well as another reads only this project's.
+    #[tokio::test]
+    async fn hazard_other_project_ignored() {
+        let rig = Rig::new();
+        rig.f.with_git_yaml_flags(&[
+            ("Other", &[TAGS_FLAG, ENFORCE_FLAG]),
+            (PROJECT, &[("commissioning_importImages", "false")]),
+        ]);
+        let result = rig.check().await.expect("the check completes");
+        assert!(git_of(&result).master().hazards.is_empty());
+        assert!(!warned(&result, "hazards are unknown"));
+        assert!(!warned(&result, "git.yaml sets"));
+    }
+
+    /// A `record` hands the kept `.git` over like an import, so it refuses
+    /// too; a `skip` hands nothing over, so it only warns.
+    #[tokio::test]
+    async fn hazard_record_refuses_and_skip_warns() {
+        let rig = Rig::new();
+        rig.make_live_equal_artifact().await;
+        rig.f.with_git_yaml_flags(&[(PROJECT, &[ENFORCE_FLAG])]);
+        let err = refusal(rig.check().await);
+        assert_eq!(gate_of(&err).0, "git_sync_hazard");
+
+        // A green apply with the acknowledgement, then the same plan again is
+        // a `skip` (the repo and the record name the release): no refusal.
+        let mut rig = rig;
+        rig.hazard_ack = Some(HAZARD_REASON.to_string());
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Recorded);
+        rig.hazard_ack = None;
+        let again = rig.check().await.expect("a skip does not refuse");
+        assert_eq!(
+            serde_json::to_value(&again).expect("json")["action"],
+            "skip"
+        );
+        assert!(warned(&again, "git.yaml sets enforce_branch"));
+        assert!(git_of(&again).hazards_acknowledged.is_none());
+    }
+
+    /// An adopted partial repo is kept too: the same hazards apply.
+    #[tokio::test]
+    async fn hazard_adopted_repo_refuses() {
+        let rig = adopting();
+        rig.f
+            .with_git_yaml_flags(&[(PROJECT, &[("repo_branch", ADOPT_BRANCH), ENFORCE_FLAG])]);
+        let err = refusal(rig.check().await);
+        assert_eq!(gate_of(&err).0, "git_sync_hazard");
+        assert_eq!(gate_of(&err).1, ["enforce_branch".to_string()]);
+    }
+
+    /// A git writer that records what the run asked for.
+    struct RecordingWriter {
+        inner: LocalFsTransport,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for RecordingWriter {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push("save_git".to_string());
+            self.inner.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push("restore_git".to_string());
+            self.inner.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(
+            &self,
+            project: &str,
+            writes: &[GitWrite],
+        ) -> Result<(), CoreError> {
+            {
+                let mut calls = self.calls.lock().expect("lock");
+                calls.extend(
+                    writes
+                        .iter()
+                        .map(|w| format!("write .git/{}", w.name.rel())),
+                );
+            }
+            self.inner.write_git_files(project, writes).await
+        }
+        async fn remove_git_save(&self, g: &str, p: &str, r: &str) -> Result<(), CoreError> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push("remove_git_save".to_string());
+            self.inner.remove_git_save(g, p, r).await
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.calls
+                .lock()
+                .expect("lock")
+                .push("probe_write".to_string());
+            self.inner.probe_write(project, run_id).await
+        }
+    }
+
+    /// D-21: the run restores nothing but `.git`. The git writer's surface
+    /// can only name `.git`, and no call it receives names `tags/`, `images/`
+    /// or `themes/`; the files below those directories after the run are
+    /// among those before it.
+    #[tokio::test]
+    async fn no_tags_restored() {
+        let mut rig = hazardous(&[TAGS_FLAG, IMAGES_FLAG, THEMES_FLAG]);
+        rig.hazard_ack = Some(HAZARD_REASON.to_string());
+        let project_dir = rig.f.project_dir();
+        let list = |dirs: &[&str]| -> std::collections::BTreeSet<PathBuf> {
+            let mut found = Vec::new();
+            for dir in dirs {
+                files_below(&project_dir.join(dir), &mut found);
+            }
+            found.into_iter().collect()
+        };
+        let before = list(&["tags", "images", "themes"]);
+        assert!(!before.is_empty(), "tags/ and images/ are present before");
+        let host = rig.host();
+        let writer = RecordingWriter {
+            inner: rig.f.node(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let calls = writer.calls.lock().expect("lock").clone();
+        assert!(calls.iter().any(|c| c == "save_git"), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("write .git/")),
+            "{calls:?}"
+        );
+        for call in &calls {
+            for dir in ["tags", "images", "themes"] {
+                assert!(!call.contains(&format!("{dir}/")), "{call}");
+            }
+            assert!(
+                matches!(
+                    call.as_str(),
+                    "save_git" | "restore_git" | "remove_git_save" | "probe_write"
+                ) || call.starts_with("write .git/"),
+                "{call}"
+            );
+        }
+        let after = list(&["tags", "images", "themes"]);
+        assert!(
+            after.is_subset(&before),
+            "the run created files below tags/, images/ or themes/: {:?}",
+            after.difference(&before).collect::<Vec<_>>()
+        );
+    }
+
+    /// The refusal text and the hint name the flag and the git.yaml fix.
+    #[test]
+    fn git_sync_hazard_hint_names_the_flag() {
+        let err = CoreError::DestructiveChangeRefused {
+            gate: "git_sync_hazard".to_string(),
+            keys: vec!["import_tags".to_string(), "enforce_branch".to_string()],
+            count: 2,
+        };
+        let text = err.to_string();
+        assert!(text.contains("--allow-git-sync-hazards <reason>"), "{text}");
+        assert!(text.contains("import_tags, enforce_branch"), "{text}");
+        let hint = err.hint().expect("hint");
+        for needle in [
+            "--allow-git-sync-hazards",
+            "git.yaml",
+            "set the flag false",
+            "import_tags",
+            "enforce_branch",
+            "data.git.hazards_acknowledged",
+            "run.json",
+            "Nothing was written",
+        ] {
+            assert!(hint.contains(needle), "{needle}: {hint}");
+        }
+        assert!(!text.contains("--allow-destructive"));
     }
 }

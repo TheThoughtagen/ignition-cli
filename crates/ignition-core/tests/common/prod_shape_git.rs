@@ -1165,6 +1165,15 @@ impl<R: GitHostRead> GitHostRead for TimedRead<R> {
         self.inner.read_git_yaml().await
     }
 
+    async fn project_dir_entry(
+        &self,
+        project: &str,
+        dir: ignition_core::deploy::transport::projects::ImportDir,
+    ) -> Result<ignition_core::deploy::transport::projects::GitEntry, ignition_core::error::CoreError>
+    {
+        self.inner.project_dir_entry(project, dir).await
+    }
+
     async fn free_bytes(
         &self,
         gateway: &str,

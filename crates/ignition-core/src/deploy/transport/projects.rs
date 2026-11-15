@@ -97,6 +97,30 @@ pub fn git_entry_location(project: &str) -> String {
     format!("projects/{project}/.git")
 }
 
+/// A directory the git module's start sync imports from, directly below
+/// `projects/<project>` (Phase 27, 27-18). A fixed set of names, so no path is
+/// ever built from outside input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportDir {
+    /// `tags/`: tag providers the module imports at the start.
+    Tags,
+    /// `images/`.
+    Images,
+    /// `themes/`.
+    Themes,
+}
+
+impl ImportDir {
+    /// The directory's name below the project directory.
+    pub fn name(self) -> &'static str {
+        match self {
+            ImportDir::Tags => "tags",
+            ImportDir::Images => "images",
+            ImportDir::Themes => "themes",
+        }
+    }
+}
+
 /// The read-only host surface of `deploy projects`.
 ///
 /// There is deliberately no method that writes, deletes or renames: the
@@ -306,6 +330,15 @@ pub trait GitHostRead: Send + Sync {
     /// unreadable host is [`CoreError::TransportFailed`]. The bytes may hold a
     /// credential: they are held in memory only and never logged or stored.
     async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// What `<data_dir>/projects/<project>/<dir>` is (27-18, D-G3): whether
+    /// the module's start sync would find content to import. Probed like
+    /// [`ProjectHost::git_entry`], one level deeper: nothing is followed or
+    /// read, [`GitEntry::Absent`] only when the project directory or the entry
+    /// does not exist, and any other failure is
+    /// [`CoreError::TransportFailed`], never `Absent`.
+    async fn project_dir_entry(&self, project: &str, dir: ImportDir)
+    -> Result<GitEntry, CoreError>;
 
     /// Free bytes on the file system that holds the save root of `gateway`'s
     /// `project` (the nearest existing ancestor of

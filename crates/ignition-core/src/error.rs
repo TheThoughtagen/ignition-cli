@@ -1317,6 +1317,13 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
              projects to overwrite it"
         );
     }
+    // The module's start-sync hazards (27-18): the kept `.git` re-arms them.
+    if gate == "git_sync_hazard" {
+        return format!(
+            "{entries}; the gateway's git module would run these imports at its next start: \
+             pass --allow-git-sync-hazards <reason> to deploy projects to acknowledge them"
+        );
+    }
     let (flag, verb) = match gate {
         "drift" => ("--allow-drift <reason>", "apply"),
         // The wiped files are destructive entries too (ultrareview C3).
@@ -2251,6 +2258,16 @@ impl CoreError {
                      directory, the abandoned commits under refs/ign-discarded/<run-id> in the \
                      gateway repo, and the saved repository; the reason is recorded in run.json. \
                      Nothing was written"
+                    .to_string(),
+                "git_sync_hazard" => "keeping the project's .git re-arms the git module's \
+                     start sync, and git.yaml sets the flags named above: import_tags imports \
+                     tag providers from tags/ over the gateway's at the next start (and tags/ \
+                     is present on the node); enforce_branch stashes uncommitted work, \
+                     switches the repository to the tracked branch and pulls. To remove the \
+                     hazard, set the flag false for the project in git.yaml (data directory); \
+                     to deploy anyway, rerun with --allow-git-sync-hazards and a reason of 1 \
+                     to 500 characters, which is recorded in data.git.hazards_acknowledged \
+                     and run.json. Nothing was written"
                     .to_string(),
                 "provider_emptied" => "the plan would remove every tag this project's record \
                      lists for the provider; drop the provider from tag_providers in \

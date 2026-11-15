@@ -3109,7 +3109,9 @@ mod git_rows {
     use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
     use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
     use ignition_core::deploy::git_state::GitFiles;
-    use ignition_core::deploy::transport::projects::{GitEntry, GitHostRead, GitStateWriter};
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, GitHostRead, GitStateWriter, ImportDir,
+    };
     use ignition_core::error::CoreError;
 
     const RUN: &str = "20261114T101500Z-ab12";
@@ -3485,6 +3487,45 @@ mod git_rows {
         std::os::unix::fs::symlink("real.yaml", &yaml).expect("symlink");
         let err = c.read.read_git_yaml().await.expect_err("symlink");
         assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        // the module's import directories (27-18): a directory, absent, and a
+        // symlink that is reported and never followed
+        let project = c.fx.project_dir();
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::Tags)
+                .await
+                .expect("tags"),
+            GitEntry::Directory
+        );
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::Themes)
+                .await
+                .expect("themes"),
+            GitEntry::Absent
+        );
+        std::os::unix::fs::symlink("/", project.join("themes")).expect("symlink");
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::Themes)
+                .await
+                .expect("themes link"),
+            GitEntry::Symlink
+        );
+        std::fs::remove_file(project.join("themes")).expect("rm");
+        assert_eq!(
+            c.read
+                .project_dir_entry("NoSuchProject", ImportDir::Tags)
+                .await
+                .expect("no project"),
+            GitEntry::Absent
+        );
+        let err = c
+            .read
+            .project_dir_entry("../escape", ImportDir::Tags)
+            .await
+            .expect_err("a name that is not one component");
+        assert!(is_transport_failed(&err), "{err:?}");
     }
 
     /// Every file a listing names, as a fetch takes them.

@@ -4264,6 +4264,9 @@ async fn execute(
             // Phase 27 (D-05): the operator's reason, as data; null without
             // the override.
             "discard_gateway_changes": input.discard_gateway_changes,
+            // Phase 27 (D-21): the operator's acknowledgement of the module's
+            // start-sync hazards, as data; null without the flag.
+            "allow_git_sync_hazards": input.allow_git_sync_hazards,
             "allow_manual_undo": input.allow_manual_undo,
             "tag_providers": loaded.file.tag_providers,
             "designers": designers.mode,

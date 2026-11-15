@@ -53,11 +53,11 @@ use crate::deploy::git_handover::{
 use crate::deploy::git_objects::dirty_from_gateway;
 use crate::deploy::git_remote::HostGit;
 use crate::deploy::git_state::{GitFiles, GitHead, GitRefs, GitState, GitStateKind, classify};
-use crate::deploy::git_yaml::{entry_for, parse_git_yaml};
+use crate::deploy::git_yaml::{Hazard, entry_for, hazards_for, parse_git_yaml, refuses};
 use crate::deploy::ledger::{LedgerRoot, git_save_location};
 use crate::deploy::project_artifact::CanonicalDigest;
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitStateWriter, git_entry_location,
+    GitEntry, GitHostRead, GitStateWriter, ImportDir, git_entry_location,
 };
 use crate::error::{CoreError, PreflightFailure};
 
@@ -391,6 +391,20 @@ pub struct Adoption {
     pub source: &'static str,
 }
 
+/// What `git.yaml` says about the module's start sync for one node (27-18,
+/// D-21): words and flags only, never a value of the file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HazardFacts {
+    /// The flags `git.yaml` sets true for the project, in [`Hazard`] order.
+    pub found: Vec<Hazard>,
+    /// `tags/` exists below the project directory on the node (D-G3). Probed
+    /// only when a tag import flag is set; false otherwise.
+    pub tags_present: bool,
+    /// Why the hazards are unknown: `absent` (no `git.yaml`) or `unreadable`
+    /// (it could not be read or parsed). `None` when the file was read.
+    pub unknown: Option<&'static str>,
+}
+
 /// Everything the prepare learned about one managed gateway repo.
 #[derive(Debug, Clone)]
 pub struct PreparedGit {
@@ -415,6 +429,10 @@ pub struct PreparedGit {
     pub adopt: Option<Adoption>,
     /// The `--discard-gateway-changes` reason, when given (27-15).
     pub discard_reason: Option<String>,
+    /// The module start-sync hazards `git.yaml` sets for the project (27-18).
+    pub hazards: HazardFacts,
+    /// The `--allow-git-sync-hazards` reason, when given (27-18).
+    pub hazard_ack: Option<String>,
     /// What the override discards, once [`prepare_git_live`] found something
     /// the gates would otherwise refuse; `None` otherwise (27-15).
     pub discard: Option<DiscardPlan>,
@@ -604,6 +622,7 @@ pub async fn prepare_git_host(
     )
     .await
     .map_err(|e| preflight("git_host", crate::deploy::git_gate::detail_of(&e)))?;
+    let hazards = read_hazards(read, project).await?;
     let report = GitReport {
         release_commit: checkout.commit.clone(),
         nodes: vec![NodeGitReport {
@@ -627,7 +646,7 @@ pub async fn prepare_git_host(
             dirty: None,
             dirty_count: None,
             dirty_source: None,
-            hazards: Vec::new(),
+            hazards: hazards.found.iter().map(|h| h.word().to_string()).collect(),
             save: None,
             restore: None,
         }],
@@ -648,6 +667,8 @@ pub async fn prepare_git_host(
         gates: None,
         adopt,
         discard_reason: input.discard_gateway_changes.clone(),
+        hazards,
+        hazard_ack: input.allow_git_sync_hazards.clone(),
         discard: None,
         report,
         kind: kind.to_string(),
@@ -695,6 +716,122 @@ async fn adoption_branch(
         )
     })?;
     Ok(Adoption { branch, source })
+}
+
+/// The module start-sync hazards of one node (27-18, D-21): `git.yaml` read
+/// through its allow-list for the flags the module's next start would act on
+/// ([`hazards_for`]), and, only when a tag import flag is set, whether `tags/`
+/// is present below the project directory (D-G3: the next start overwrites the
+/// gateway's tag providers only when there is a `tags/` to import).
+///
+/// A `git.yaml` that is absent, cannot be read or does not parse leaves the
+/// hazards unknown: a warning, never a refusal, and never an echo of the file
+/// (its error text names `git.yaml` and at most a line). A failed probe of
+/// `tags/` is a transport failure (fail closed: presence is never guessed).
+async fn read_hazards(read: &dyn GitHostRead, project: &str) -> Result<HazardFacts, CoreError> {
+    let unknown = |why: &'static str| HazardFacts {
+        unknown: Some(why),
+        ..HazardFacts::default()
+    };
+    let entries = match read.read_git_yaml().await {
+        Ok(Some(bytes)) => match parse_git_yaml(&bytes) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(unknown("unreadable")),
+        },
+        Ok(None) => return Ok(unknown("absent")),
+        Err(_) => return Ok(unknown("unreadable")),
+    };
+    let found = hazards_for(&entries, project);
+    let tags_present = if found.contains(&Hazard::ImportTags) {
+        read.project_dir_entry(project, ImportDir::Tags)
+            .await?
+            .is_present()
+    } else {
+        false
+    };
+    Ok(HazardFacts {
+        found,
+        tags_present,
+        unknown: None,
+    })
+}
+
+/// The warning that reports a hazard that does not refuse (27-18). Fixed text
+/// and words: no value of `git.yaml` and no operator text.
+fn hazard_warning(project: &str, hazard: Hazard, tags_present: bool) -> String {
+    let word = hazard.word();
+    match hazard {
+        Hazard::ImportTags if !tags_present => format!(
+            "project {project}: git.yaml sets {word}; tags/ is absent on the node, so the git \
+             module's next start imports no tags"
+        ),
+        _ => format!(
+            "project {project}: git.yaml sets {word}; at its next start the git module will {}",
+            hazard.effect()
+        ),
+    }
+}
+
+/// Report the hazards and refuse the damaging ones (27-18, D-21, D-G3).
+///
+/// Every flag `git.yaml` sets is in `data.git.nodes[].hazards` (the prepare
+/// put the words there). Of those, the ones G3 recorded damage for
+/// ([`refuses`]) refuse `destructive_change_refused` gate `git_sync_hazard`
+/// (keys: the hazard words) unless `--allow-git-sync-hazards <reason>` is
+/// given; the reason is then recorded in `data.git.hazards_acknowledged`. The
+/// others, and the unknown state of an absent or unreadable `git.yaml`, are
+/// warnings. Only an `import` or a `record` hands the kept `.git` over, so a
+/// `skip` and a report-only mode warn and never refuse.
+fn apply_hazards(
+    prepared: &mut PreparedGit,
+    action: ProjectAction,
+    project: &str,
+    warnings: &mut Vec<String>,
+) -> Result<(), CoreError> {
+    if let Some(why) = prepared.hazards.unknown {
+        warnings.push(format!(
+            "project {project}: git.yaml is {why}, so the git module's start-sync hazards are \
+             unknown"
+        ));
+    }
+    let tags = prepared.hazards.tags_present;
+    let (refusing, advisory): (Vec<Hazard>, Vec<Hazard>) = prepared
+        .hazards
+        .found
+        .iter()
+        .copied()
+        .partition(|h| refuses(*h, tags));
+    for hazard in &advisory {
+        warnings.push(hazard_warning(project, *hazard, tags));
+    }
+    if refusing.is_empty() {
+        return Ok(());
+    }
+    let enforce = prepared.mode == GitMode::Enforce
+        && matches!(action, ProjectAction::Import | ProjectAction::Record);
+    if !enforce {
+        for hazard in &refusing {
+            warnings.push(hazard_warning(project, *hazard, tags));
+        }
+        return Ok(());
+    }
+    match &prepared.hazard_ack {
+        Some(reason) => {
+            for hazard in &refusing {
+                warnings.push(format!(
+                    "{} (acknowledged with --allow-git-sync-hazards)",
+                    hazard_warning(project, *hazard, tags)
+                ));
+            }
+            prepared.report.hazards_acknowledged = Some(reason.clone());
+            Ok(())
+        }
+        None => Err(CoreError::DestructiveChangeRefused {
+            gate: "git_sync_hazard".to_string(),
+            count: refusing.len(),
+            keys: refusing.iter().map(|h| h.word().to_string()).collect(),
+        }),
+    }
 }
 
 /// What `--discard-gateway-changes <reason>` discards, from the gates' facts
@@ -807,6 +944,9 @@ pub async fn prepare_git_live(
         });
     };
     let git = surfaces.host.host_git();
+    // The module start-sync hazards of the kept `.git` (27-18): `git.yaml` and
+    // `tags/` were read in the prepare; the refusal needs the action.
+    apply_hazards(prepared, action, project, warnings)?;
     if let Some(adopt) = prepared.adopt.clone() {
         return prepare_adoption_live(prepared, &adopt, action, project, &git, warnings).await;
     }

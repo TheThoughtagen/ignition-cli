@@ -7706,6 +7706,13 @@ impl ignition_core::deploy::transport::projects::GitHostRead for TimedNode<'_> {
     async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
         self.node.read_git_yaml().await
     }
+    async fn project_dir_entry(
+        &self,
+        project: &str,
+        dir: ignition_core::deploy::transport::projects::ImportDir,
+    ) -> Result<ignition_core::deploy::transport::projects::GitEntry, CoreError> {
+        self.node.project_dir_entry(project, dir).await
+    }
     async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
         self.node.free_bytes(gateway, project).await
     }

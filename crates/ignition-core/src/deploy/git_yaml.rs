@@ -220,6 +220,148 @@ pub fn entry_for<'a>(entries: &'a [GitYamlEntry], project: &str) -> Option<&'a G
     }
 }
 
+/// A module start-sync action the kept `.git` re-arms (Phase 27, 27-18,
+/// D-21): the words `--check` reports in `data.git.nodes[].hazards` and a
+/// refusal names as its keys. Words only: a hazard never carries a value of
+/// `git.yaml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Hazard {
+    /// `commissioning_importImages: true`.
+    ImportImages,
+    /// `commissioning_importTags: true` or `tags_importOnStartup: true`.
+    ImportTags,
+    /// `commissioning_importThemes: true`.
+    ImportThemes,
+    /// `commissioning_enforceBranch: true`.
+    EnforceBranch,
+}
+
+impl Hazard {
+    /// The published word.
+    pub fn word(self) -> &'static str {
+        match self {
+            Hazard::ImportImages => "import_images",
+            Hazard::ImportTags => "import_tags",
+            Hazard::ImportThemes => "import_themes",
+            Hazard::EnforceBranch => "enforce_branch",
+        }
+    }
+
+    /// What the module does at its next start with this flag set, as one
+    /// clause that follows "the git module will ...".
+    pub fn effect(self) -> &'static str {
+        match self {
+            Hazard::ImportImages => {
+                "import the project's images/ directory (it warns that it replaces the gateway's \
+                 images)"
+            }
+            Hazard::ImportTags => {
+                "import tag providers from the project's tags/ directory over the gateway's"
+            }
+            Hazard::ImportThemes => "import the project's themes/ directory",
+            Hazard::EnforceBranch => {
+                "stash uncommitted work, switch the repository to the tracked branch and pull"
+            }
+        }
+    }
+}
+
+/// The `git.yaml` flags of one entry that are true, in [`Hazard`] order. Both
+/// `commissioning_importTags` and `tags_importOnStartup` read as
+/// [`Hazard::ImportTags`].
+pub fn hazards(entry: &GitYamlEntry) -> Vec<Hazard> {
+    let mut found = Vec::new();
+    if entry.import_images == Some(true) {
+        found.push(Hazard::ImportImages);
+    }
+    if entry.import_tags == Some(true) || entry.tags_import_on_startup == Some(true) {
+        found.push(Hazard::ImportTags);
+    }
+    if entry.import_themes == Some(true) {
+        found.push(Hazard::ImportThemes);
+    }
+    if entry.enforce_branch == Some(true) {
+        found.push(Hazard::EnforceBranch);
+    }
+    found
+}
+
+/// The hazards of every entry that names `project` (an exact match), once
+/// each. A file that names the project twice is read as the union: the file
+/// does not say which entry the module applies, so none is assumed harmless.
+pub fn hazards_for(entries: &[GitYamlEntry], project: &str) -> Vec<Hazard> {
+    let mut found: Vec<Hazard> = entries
+        .iter()
+        .filter(|e| e.project.as_deref() == Some(project))
+        .flat_map(hazards)
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// What G3 observed a hazard to do at a gateway start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Damage {
+    /// Damage whatever the node holds: the run refuses unless acknowledged.
+    Refuse,
+    /// Damage only when `tags/` is present on the node (D-G3): the next start
+    /// would overwrite tag providers a Phase 26 owned-tag deploy manages.
+    RefuseWithTags,
+    /// No damage observed: reported as a warning only.
+    Advisory,
+}
+
+/// Which hazards refuse, filled from the G3 and G6 captures (27-LIVE-CAPTURES,
+/// `## G3 sync hazards`, `## G6 branch and remote shapes`, and the user
+/// decision D-G3, 2026-11-13). Synthetic rig observations only: Ignition
+/// 8.3.6 with the module's start sync, one flag true at a time. The quoted
+/// effect lines are the `G3-EFFECT` lines of that capture.
+pub const G3_DAMAGE: &[(Hazard, Damage)] = &[
+    // `importImages images absent tags absent -> images unchanged (count=2 ...)`
+    // and `importImages images present tags present -> images count=2 ... ->
+    // count=3 ...`: the module logged that it deletes all gateway images, but
+    // its delete loop found no legacy ImageRecord rows, so nothing was lost
+    // and a present images/ only added its image. Advisory (D-G3); a gateway
+    // upgraded from an older version was not tested.
+    (Hazard::ImportImages, Damage::Advisory),
+    // `importTags images present tags present -> ... tag exists=False ->
+    // exists=True` and `tags_importOnStartup images present tags present ->
+    // ... tag exists=False -> exists=True`: with tags/ present the start
+    // imports it into the gateway's provider. With tags/ absent both lines
+    // read `tag exists=False; project content unchanged` (nothing changed).
+    // D-G3: refuse only when tags/ is present on the node.
+    (Hazard::ImportTags, Damage::RefuseWithTags),
+    // `importThemes images absent tags absent -> ... project content
+    // unchanged; .git unchanged` and the same with images and tags present:
+    // the import logged and changed nothing observable. No themes/ directory
+    // was present in either variant, so a present one was not tried.
+    // Advisory.
+    (Hazard::ImportThemes, Damage::Advisory),
+    // G6: `commissioning_enforceBranch: true at a gateway start stashes the
+    // dirty working tree (a stash entry remains, refs/stash), switches the
+    // branch and pulls (HEAD moved to the remote tip)`. D-G3: a hazard.
+    (Hazard::EnforceBranch, Damage::Refuse),
+];
+
+/// The damage G3 recorded for `hazard`.
+pub fn damage_of(hazard: Hazard) -> Damage {
+    G3_DAMAGE
+        .iter()
+        .find(|(h, _)| *h == hazard)
+        .map_or(Damage::Refuse, |(_, damage)| *damage)
+}
+
+/// Whether `hazard` refuses the run, given whether `tags/` is present on the
+/// node. A hazard with no G3 row refuses (fail closed).
+pub fn refuses(hazard: Hazard, tags_present: bool) -> bool {
+    match damage_of(hazard) {
+        Damage::Refuse => true,
+        Damage::RefuseWithTags => tags_present,
+        Damage::Advisory => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +511,91 @@ mod tests {
         )
         .expect("parses");
         assert!(entry_for(&same, "CapApp").is_some());
+    }
+
+    fn entries(text: &str) -> Vec<GitYamlEntry> {
+        parse_git_yaml(text.as_bytes()).expect("parses")
+    }
+
+    #[test]
+    fn hazards_read_the_true_flags_only() {
+        let all = entries(
+            "- ignition_projectName: A\n  commissioning_importImages: true\n  \
+             commissioning_importTags: false\n  tags_importOnStartup: true\n  \
+             commissioning_importThemes: \"true\"\n  commissioning_enforceBranch: true\n",
+        );
+        assert_eq!(
+            hazards(&all[0]),
+            vec![
+                Hazard::ImportImages,
+                Hazard::ImportTags,
+                Hazard::ImportThemes,
+                Hazard::EnforceBranch
+            ]
+        );
+        let none = entries(
+            "- ignition_projectName: A\n  commissioning_importImages: false\n  \
+             repo_branch: main\n",
+        );
+        assert!(hazards(&none[0]).is_empty());
+    }
+
+    #[test]
+    fn hazard_words_are_the_published_ones() {
+        let words: Vec<&str> = [
+            Hazard::ImportImages,
+            Hazard::ImportTags,
+            Hazard::ImportThemes,
+            Hazard::EnforceBranch,
+        ]
+        .iter()
+        .map(|h| h.word())
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "import_images",
+                "import_tags",
+                "import_themes",
+                "enforce_branch"
+            ]
+        );
+    }
+
+    #[test]
+    fn hazards_for_ignores_other_projects_and_unions_duplicates() {
+        let e = entries(
+            "- ignition_projectName: Other\n  commissioning_enforceBranch: true\n\
+             - ignition_projectName: A\n  commissioning_importTags: true\n\
+             - ignition_projectName: A\n  commissioning_importImages: true\n",
+        );
+        assert_eq!(
+            hazards_for(&e, "A"),
+            vec![Hazard::ImportImages, Hazard::ImportTags]
+        );
+        assert_eq!(hazards_for(&e, "Other"), vec![Hazard::EnforceBranch]);
+        assert!(hazards_for(&e, "Third").is_empty());
+    }
+
+    /// D-G3: tags refuse only with `tags/` on the node, images and themes
+    /// never, enforceBranch always; every hazard has a G3 row.
+    #[test]
+    fn g3_damage_rules() {
+        assert_eq!(G3_DAMAGE.len(), 4);
+        assert!(!refuses(Hazard::ImportImages, true));
+        assert!(!refuses(Hazard::ImportImages, false));
+        assert!(refuses(Hazard::ImportTags, true));
+        assert!(!refuses(Hazard::ImportTags, false));
+        assert!(!refuses(Hazard::ImportThemes, true));
+        assert!(refuses(Hazard::EnforceBranch, false));
+        assert!(refuses(Hazard::EnforceBranch, true));
+        for hazard in [
+            Hazard::ImportImages,
+            Hazard::ImportTags,
+            Hazard::ImportThemes,
+            Hazard::EnforceBranch,
+        ] {
+            assert!(!hazard.effect().is_empty());
+        }
     }
 }
