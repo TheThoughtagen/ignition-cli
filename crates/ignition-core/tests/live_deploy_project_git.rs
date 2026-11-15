@@ -2206,3 +2206,226 @@ async fn git_variants_e2e() {
         &serde_json::json!({ "variants": recorded }),
     );
 }
+
+/// Make the gateway's live project differ from its repository the way a
+/// Designer save does: the file is written on disk and the gateway scans.
+async fn live_edit(rig: &Rig, api: &ReqwestGatewayApi, rel: &str, body: &str) {
+    std::fs::write(rig.project_dir().join(rel), body).expect("live edit write");
+    scan_and_wait(
+        api,
+        ScanKind::Projects,
+        PollConfig {
+            subject: "project scan".to_string(),
+            interval: Duration::from_millis(500),
+            max: Duration::from_secs(2),
+            deadline: Duration::from_secs(180),
+        },
+    )
+    .await
+    .unwrap_or_else(|err| panic!("project scan: {}", err.code()));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+}
+
+/// Restores the template `git.yaml` when the gate ends, even by a panic.
+struct YamlGuard<'a>(&'a Rig);
+
+impl Drop for YamlGuard<'_> {
+    fn drop(&mut self) {
+        write_git_yaml(self.0, false, None);
+    }
+}
+
+/// 27-23 Task 2: the live refusals match the engine (D-01, D-21), and an
+/// override over a never-pushed Designer-style commit lists what it would
+/// discard from the gateway's own objects (D-24).
+#[tokio::test]
+#[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
+async fn git_refusals_live() {
+    let Some(rig) = rig().await else { return };
+    eprintln!("LIVE-RAN git_refusals_live");
+    let api = rig.api();
+    let host = HostGit::new();
+    let (state, refs) = gateway_state(&rig, &host).await;
+    assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
+    let (_keep, _checkout, c1) = release_checkout(&rig, "v1.0.0");
+    assert!(
+        refs.heads.values().any(|id| id == &c1),
+        "the module's clone must sit at v1.0.0 (run reset27 first)"
+    );
+    let (_work, config) = script_config(&api, &rig.url).await;
+    let mut seen = Vec::new();
+
+    // Baseline: a clean pushed repository behind the release is not a refusal.
+    let first = DeployFlags {
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let baseline = deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-refusals-baseline")
+        .await
+        .unwrap_or_else(|err| panic!("baseline check: {} ({err})", err.code()));
+    let baseline_json = serde_json::to_value(&baseline).expect("json");
+    eprintln!(
+        "LIVE-C4 refusals baseline: action={} dirty_count={} dirty_source={}",
+        baseline_json["action"],
+        baseline_json["git"]["nodes"][0]["dirty_count"],
+        baseline_json["git"]["nodes"][0]["dirty_source"]
+    );
+    assert_eq!(baseline_json["git"]["nodes"][0]["dirty_count"], 0);
+
+    // git_sync_hazard (D-21): importTags with a tags/ directory present
+    // refuses; importImages is advisory (G3 recorded no wipe, D-G3).
+    let yaml_guard = YamlGuard(&rig);
+    write_git_yaml(&rig, false, Some("importTags"));
+    let (gate, keys) = refusal(
+        deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-refusals-hazard").await,
+        "importTags hazard",
+    );
+    eprintln!("LIVE-REFUSAL git_sync_hazard gate={gate} keys={keys:?}");
+    assert_eq!(gate, "git_sync_hazard");
+    assert!(keys.iter().any(|k| k == "import_tags"), "{keys:?}");
+    seen.push(format!("{gate}:{}", keys.join(",")));
+    write_git_yaml(&rig, false, Some("importImages"));
+    let advisory = deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-refusals-images")
+        .await
+        .unwrap_or_else(|err| panic!("importImages must not refuse: {} ({err})", err.code()));
+    let warnings = serde_json::to_value(&advisory).expect("json")["warnings"].clone();
+    eprintln!("LIVE-C4 refusals importImages is advisory: warnings={warnings}");
+    assert!(
+        strs(&warnings)
+            .iter()
+            .any(|w| w.to_ascii_lowercase().contains("image")),
+        "the importImages hazard is a warning: {warnings}"
+    );
+    drop(yaml_guard);
+
+    // git_dirty: a live change that is not committed.
+    let edited = "def f():\n    return 11\n";
+    live_edit(&rig, &api, CODE_PY, edited).await;
+    let (gate, keys) = refusal(
+        deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-refusals-dirty").await,
+        "git_dirty",
+    );
+    eprintln!("LIVE-REFUSAL git_dirty gate={gate} keys={keys:?}");
+    assert_eq!(gate, "git_dirty");
+    assert!(keys.iter().any(|k| k == CODE_PY), "{keys:?}");
+    seen.push(format!("{gate}:{}", keys.join(",")));
+
+    // git_unpushed: the module commits the edit and does not push.
+    let committed = module_commit(
+        &api,
+        &config,
+        &["ignition/script-python/cap/util".to_string()],
+        "designer break fix",
+    )
+    .await;
+    eprintln!("LIVE-COMMIT break-fix {committed:?}");
+    committed.expect("the module's commit answers");
+    let head = git(&rig.project_dir(), &["rev-parse", "HEAD"]);
+    let (gate, keys) = refusal(
+        deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-refusals-unpushed").await,
+        "git_unpushed",
+    );
+    eprintln!("LIVE-REFUSAL git_unpushed gate={gate} keys={keys:?}");
+    assert_eq!(gate, "git_unpushed");
+    assert!(
+        keys.iter()
+            .any(|k| head.starts_with(k.as_str()) || k.starts_with(&head[..7])),
+        "the refusal names the unpushed commit {}: {keys:?}",
+        &head[..7]
+    );
+    seen.push(format!("{gate}:{}", &head[..7]));
+
+    // D-24: with the override over the unpushed commit and a second live
+    // change after it, --check lists the dirty paths read from the gateway's
+    // own objects (the commit is on no remote).
+    live_edit(&rig, &api, CODE_PY, "def f():\n    return 12\n").await;
+    let over = DeployFlags {
+        discard_gateway_changes: Some(REASON.to_string()),
+        ..first.clone()
+    };
+    let would = deploy_in_process(&rig, true, ENV, "v1.1.0", &over, "c4-refusals-override")
+        .await
+        .unwrap_or_else(|err| panic!("override check: {} ({err})", err.code()));
+    let would_json = serde_json::to_value(&would).expect("json");
+    let wd = &would_json["git"]["would_discard"];
+    let node = &would_json["git"]["nodes"][0];
+    eprintln!(
+        "LIVE-C4 refusals D-24: would_discard.dirty={} dirty_source={} paths={} commits={}",
+        wd["dirty"], node["dirty_source"], wd["paths"], wd["commits"]
+    );
+    assert_eq!(wd["dirty"], "listed", "{wd}");
+    assert_eq!(node["dirty_source"], "gateway_objects", "{node}");
+    assert!(
+        strs(&wd["paths"]).iter().any(|p| p == CODE_PY),
+        "the live change's path is listed: {wd}"
+    );
+    assert!(
+        strs(&wd["commits"])
+            .iter()
+            .any(|c| head.starts_with(c.as_str()) || c.starts_with(&head[..7])),
+        "the unpushed commit is listed: {wd}"
+    );
+
+    // git_not_merged: the commit reaches a branch the release lacks.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = dir.path().join("w");
+    let remote = rig.remote.to_str().expect("utf8");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-hardlinks",
+            remote,
+            work.to_str().expect("utf8"),
+        ],
+    );
+    git(
+        &work,
+        &[
+            "-c",
+            "safe.directory=*",
+            "fetch",
+            "-q",
+            rig.project_dir().to_str().expect("utf8"),
+            "refs/heads/production:refs/heads/gateway-break-fix",
+        ],
+    );
+    git(
+        &work,
+        &[
+            "push",
+            "-q",
+            remote,
+            "refs/heads/gateway-break-fix:refs/heads/hotfix",
+        ],
+    );
+    let _ = Command::new("chmod")
+        .args(["-R", "a+rX", remote])
+        .status()
+        .expect("chmod");
+    let (gate, keys) = refusal(
+        deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "c4-refusals-not-merged").await,
+        "git_not_merged",
+    );
+    eprintln!("LIVE-REFUSAL git_not_merged gate={gate} keys={keys:?}");
+    assert_eq!(gate, "git_not_merged");
+    assert!(
+        keys.iter()
+            .any(|k| head.starts_with(k.as_str()) || k.starts_with(&head[..7])),
+        "the refusal names the commit the release lacks: {keys:?}"
+    );
+    seen.push(format!("{gate}:{}", &head[..7]));
+
+    write_evidence(
+        &rig,
+        "git_refusals_live",
+        &serde_json::json!({
+            "refusals": seen,
+            "d24": {
+                "would_discard": wd,
+                "dirty_source": node["dirty_source"],
+            },
+        }),
+    );
+}
