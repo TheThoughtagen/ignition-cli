@@ -624,8 +624,16 @@ async fn git_present_refuses_before_gateway() {
                 project,
                 location,
                 kind: found,
+                reason,
             } => {
                 assert_eq!(project, PROJECT, "{kind}");
+                // 27-12: the refusal names why the repo cannot be handed over.
+                let want = match kind {
+                    "directory" => "no_head",
+                    "file" => "not_directory",
+                    _ => "symlink",
+                };
+                assert_eq!(reason, want, "{kind}: the reason is named");
                 assert_eq!(found, kind, "{kind}: the kind is named");
                 assert!(
                     location.contains("projects/CapApp/.git"),
@@ -1219,6 +1227,7 @@ async fn run_observed(
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
             tag_delete_ready: std::time::Duration::from_millis(50),
             tag_delete_poll: std::time::Duration::from_millis(5),
+            git_writer: None,
         },
         observer,
     )
@@ -2293,6 +2302,7 @@ async fn sweep_only_reads() {
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
             tag_delete_ready: std::time::Duration::from_millis(50),
             tag_delete_poll: std::time::Duration::from_millis(5),
+            git_writer: None,
         },
         &NoProjectsObserver,
     )

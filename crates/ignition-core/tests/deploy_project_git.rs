@@ -1398,3 +1398,397 @@ mod gateway_objects {
         }
     }
 }
+
+/// 27-12: the published path of `ign deploy projects` over a project the git
+/// module manages, driven through `deploy_projects_prepare` and
+/// `deploy_projects_run` against `FakeProjects` with a disk mirror (R-3) and a
+/// real gateway repo built by host git (`GitFixture`).
+mod published {
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use common::fake_projects::FakeProjects;
+    use common::git_fixture::members_of;
+    use ignition_core::actions::deploy_projects::git::GitReport;
+    use ignition_core::actions::deploy_projects::{
+        DeployProjectsResult, GIT_RESTORE_FAILED_SLUG, LoadedProject, NoProjectsObserver,
+        ProjectOutcome, ProjectsInput, ProjectsPrepared, ProjectsRunOptions, ProjectsSurfaces,
+        TagDeleteSurface, deploy_projects_prepare, deploy_projects_run, load_project,
+    };
+    use ignition_core::deploy::git_remote::HostGit as Git;
+    use ignition_core::deploy::transport::local::LocalFsTransport;
+    use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
+    use ignition_core::error::CoreError;
+
+    /// A host that answers like the local transport and runs `program` as
+    /// host git (a stub, to prove git is never run or to make one step fail).
+    pub struct StubHost {
+        pub inner: LocalFsTransport,
+        pub program: Option<OsString>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectHost for StubHost {
+        async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
+            self.inner.git_entry(project).await
+        }
+        async fn read_release_record(
+            &self,
+            gateway: &str,
+            project: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.read_release_record(gateway, project).await
+        }
+        async fn read_tag_record(
+            &self,
+            gateway: &str,
+            provider: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.read_tag_record(gateway, provider).await
+        }
+        async fn read_journal(
+            &self,
+            gateway: &str,
+            project: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            ProjectHost::read_journal(&self.inner, gateway, project).await
+        }
+        async fn read_pre_image(
+            &self,
+            gateway: &str,
+            project: &str,
+            name: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.read_pre_image(gateway, project, name).await
+        }
+        fn git(&self) -> Option<&dyn GitHostRead> {
+            ProjectHost::git(&self.inner)
+        }
+        fn host_git(&self) -> Git {
+            match &self.program {
+                Some(program) => Git::with_program(program),
+                None => Git::new(),
+            }
+        }
+    }
+
+    /// Fixture, targets root and the fake gateway.
+    pub struct Rig {
+        pub f: GitFixture,
+        pub targets: tempfile::TempDir,
+        pub gateway: FakeProjects,
+    }
+
+    pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
+        put(root, rel, body);
+    }
+
+    impl Rig {
+        pub fn new() -> Rig {
+            Rig::with(|g| g)
+        }
+
+        /// A rig whose gateway is shaped by `shape` (a mirror knob).
+        pub fn with(shape: impl FnOnce(FakeProjects) -> FakeProjects) -> Rig {
+            let f = GitFixture::new();
+            put_file(
+                &f.checkout,
+                "deploy/project.yaml",
+                &format!("schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\n"),
+            );
+            put_file(&f.checkout, ".gitignore", ".ign/\n");
+            put_file(
+                &f.data_dir,
+                "config/resources/core/ignition/system-properties/config.json",
+                r#"{"systemName":"capgw"}"#,
+            );
+            let targets = tempfile::tempdir().expect("targets root");
+            put_file(
+                targets.path(),
+                "targets/dev.yaml",
+                &format!(
+                    "schema_version: 1\ngateway: capgw\nmode: dev\nnodes:\n  master:\n    profile: dev\n    local:\n      data_dir: '{}'\n",
+                    f.data_dir.display()
+                ),
+            );
+            let members = members_of(&f.project_dir());
+            let borrowed: Vec<(&str, Vec<u8>)> = members
+                .iter()
+                .map(|(path, bytes)| (path.as_str(), bytes.clone()))
+                .collect();
+            let gateway = shape(
+                FakeProjects::new()
+                    .with_project(PROJECT, None, false, &borrowed)
+                    .with_disk_mirror(&f.data_dir, true),
+            );
+            Rig {
+                f,
+                targets,
+                gateway,
+            }
+        }
+
+        pub fn input(&self) -> ProjectsInput {
+            ProjectsInput {
+                repo: self.f.checkout.clone(),
+                targets: self.targets.path().to_path_buf(),
+                env: "dev".to_string(),
+                release: "v1.1.0".to_string(),
+                allow_downgrade: false,
+                allow_first_change: Some("first deploy of the rig".to_string()),
+                allow_destructive: false,
+                allow_manual_undo: false,
+                artifact_sha256: None,
+                tags_sha256: None,
+            }
+        }
+
+        pub fn host(&self) -> StubHost {
+            StubHost {
+                inner: self.f.node(),
+                program: None,
+            }
+        }
+
+        pub async fn plan_with(
+            &self,
+            host: &StubHost,
+        ) -> Result<(LoadedProject, ProjectsPrepared), CoreError> {
+            let input = self.input();
+            let loaded = load_project(&input).expect("the checkout loads");
+            let prepared = deploy_projects_prepare(
+                &loaded,
+                &input,
+                &ProjectsSurfaces {
+                    gateway: &self.gateway,
+                    host,
+                    tree: None,
+                    apply_host: None,
+                    deploy: None,
+                    tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
+                },
+            )
+            .await?;
+            Ok((loaded, prepared))
+        }
+
+        pub async fn plan(&self) -> Result<(LoadedProject, ProjectsPrepared), CoreError> {
+            self.plan_with(&self.host()).await
+        }
+
+        pub async fn check(&self) -> Result<DeployProjectsResult, CoreError> {
+            Ok(self.plan().await?.1.into_check_result())
+        }
+
+        pub async fn run_prepared(
+            &self,
+            host: &StubHost,
+            loaded: &LoadedProject,
+            prepared: ProjectsPrepared,
+            git_writer: Option<&dyn GitStateWriter>,
+        ) -> Result<DeployProjectsResult, CoreError> {
+            let input = self.input();
+            deploy_projects_run(
+                prepared,
+                loaded,
+                &input,
+                &ProjectsSurfaces {
+                    gateway: &self.gateway,
+                    host,
+                    tree: None,
+                    apply_host: None,
+                    deploy: None,
+                    tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
+                },
+                &ProjectsRunOptions {
+                    repo: input.repo.clone(),
+                    targets_root: input.targets.clone(),
+                    target_file: loaded.target_file.clone(),
+                    master: loaded.target.nodes.master.clone(),
+                    record_writer: None,
+                    tag_record_writer: None,
+                    run_writer: None,
+                    git_writer,
+                    designers: Default::default(),
+                    children_settle: std::time::Duration::from_secs(1),
+                    children_poll: std::time::Duration::from_millis(5),
+                    tag_verify_settle: std::time::Duration::from_secs(1),
+                    tag_verify_poll: std::time::Duration::from_millis(5),
+                    backup: None,
+                    backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
+                    tag_delete_ready: std::time::Duration::from_millis(50),
+                    tag_delete_poll: std::time::Duration::from_millis(5),
+                },
+                &NoProjectsObserver,
+            )
+            .await
+        }
+
+        pub async fn apply(&self) -> Result<DeployProjectsResult, CoreError> {
+            let host = self.host();
+            let (loaded, prepared) = self.plan_with(&host).await?;
+            self.run_prepared(&host, &loaded, prepared, None).await
+        }
+
+        /// Directories named `repo` below the project's `git-save` folder.
+        pub fn save_trees(&self) -> Vec<PathBuf> {
+            let root = self
+                .f
+                .data_dir
+                .join("ign-deploy/capgw/projects")
+                .join(PROJECT)
+                .join("git-save");
+            let mut found = Vec::new();
+            fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if path.file_name().is_some_and(|n| n == "repo") {
+                            out.push(path.clone());
+                        }
+                        walk(&path, out);
+                    }
+                }
+            }
+            walk(&root, &mut found);
+            found
+        }
+
+        pub fn run_dirs(&self) -> usize {
+            std::fs::read_dir(self.f.checkout.join(".ign/deploy/capgw"))
+                .map(|d| d.count())
+                .unwrap_or(0)
+        }
+
+        pub async fn git_manifest(
+            &self,
+        ) -> ignition_core::deploy::transport::projects::GitManifest {
+            self.f.node().git_manifest(PROJECT).await.expect("manifest")
+        }
+    }
+
+    pub fn git_of(result: &DeployProjectsResult) -> &GitReport {
+        result.git.as_deref().expect("data.git is present")
+    }
+
+    /// The expected failure of an `Err` result.
+    pub fn refusal<T: std::fmt::Debug>(r: Result<T, CoreError>) -> CoreError {
+        r.expect_err("the run must refuse")
+    }
+
+    #[allow(dead_code)]
+    fn _keep() {
+        let _ = refusal::<()>;
+    }
+
+    /// W4: every published reason word has a producer row, and the words
+    /// of the host classification and of the restore are all listed.
+    #[test]
+    fn reason_words_have_producers() {
+        use ignition_core::actions::deploy_projects::git::{PRODUCED_HERE, REASON_PRODUCERS};
+        use ignition_core::deploy::git_handover::RESTORE_REASONS;
+        use ignition_core::deploy::git_state::HOST_REASONS;
+        let listed: Vec<&str> = REASON_PRODUCERS.iter().map(|(w, _)| *w).collect();
+        for word in HOST_REASONS
+            .iter()
+            .chain(RESTORE_REASONS)
+            .chain(PRODUCED_HERE)
+        {
+            assert!(listed.contains(word), "{word} has no producer row");
+        }
+        for word in [
+            "remote_mismatch",
+            "release_not_on_branch",
+            "branch_required",
+            "nodes_disagree",
+            "backup_unsynced",
+            "post_status_mismatch",
+            "designer_attached",
+        ] {
+            assert!(listed.contains(&word), "{word} is published without a row");
+        }
+        assert!(REASON_PRODUCERS.iter().all(|(_, p)| !p.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn published_managed_deploy_advances() {
+        let rig = Rig::new();
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert!(result.ok && result.slug.is_none());
+        let git = git_of(&result);
+        assert_eq!(git.release_commit, rig.f.c2);
+        let node = git.master();
+        assert_eq!(node.state, "managed");
+        assert_eq!(node.branch.as_deref(), Some(BRANCH));
+        assert!(!node.adopted);
+        assert_eq!(node.dirty, Some(Vec::new()));
+        assert_eq!(node.dirty_source, Some("release_store"));
+        let restore = node.restore.as_ref().expect("restore reported");
+        assert!(restore.restored && restore.advanced && restore.verified);
+        assert_eq!(restore.post_status, Some("matched"));
+        assert_eq!(restore.reason, None);
+        assert!(!restore.save_kept);
+        assert!(git.expected_drift_complete);
+        let drift = git
+            .expected_drift
+            .clone()
+            .expect("drift known after advance");
+        assert_eq!(git.expected_drift_count, Some(drift.len()));
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert_eq!(rig.f.status_paths(), drift);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        // The release record names the release (the deploy stays).
+        assert!(result.record_written);
+    }
+
+    #[tokio::test]
+    async fn check_reports_git_and_writes_nothing() {
+        let rig = Rig::new();
+        let before = rig.git_manifest().await;
+        let result = rig.check().await.expect("the check completes");
+        assert_eq!(result.outcome, ProjectOutcome::Checked);
+        let git = git_of(&result);
+        assert_eq!(git.expected_drift, None);
+        assert_eq!(git.expected_drift_count, None);
+        assert!(!git.expected_drift_complete);
+        let node = git.master();
+        assert_eq!(node.state, "managed");
+        assert_eq!(node.dirty, Some(Vec::new()));
+        assert_eq!(node.dirty_count, Some(0));
+        assert_eq!(node.dirty_source, Some("release_store"));
+        assert!(node.save.is_none() && node.restore.is_none());
+        assert!(rig.save_trees().is_empty());
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert_eq!(rig.git_manifest().await, before, ".git is byte-identical");
+        assert!(rig.gateway.import_calls().is_empty());
+        let json = serde_json::to_value(git).expect("json");
+        assert!(json["expected_drift"].is_null());
+        assert_eq!(json["expected_drift_complete"], false);
+    }
+
+    #[tokio::test]
+    async fn no_git_unchanged() {
+        let rig = Rig::new();
+        std::fs::remove_dir_all(rig.f.git_dir()).expect("no .git");
+        // A host git that cannot even start: any call to it fails the run.
+        let host = StubHost {
+            inner: rig.f.node(),
+            program: Some(OsString::from("/nonexistent/git-must-not-run")),
+        };
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, None)
+            .await
+            .expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert!(result.git.is_none());
+        let json = serde_json::to_value(&result).expect("json");
+        assert!(json["git"].is_null());
+        let _ = GIT_RESTORE_FAILED_SLUG;
+    }
+}

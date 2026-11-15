@@ -110,6 +110,22 @@
 //! `with_created_value` stores a different `value` (a runtime write between
 //! the import and the verify).
 //!
+//! Disk mirror (27-12). `with_disk_mirror(data_dir, registered)` makes an
+//! import also write the project directory the git module watches,
+//! `<data_dir>/projects/<project>/`, the way the captures show a gateway
+//! does: R-3 (a project registered with the git module is replaced whole,
+//! its `.git` included, so every name below the directory is removed
+//! first), R-6 (a project that is not registered keeps its `.git` and
+//! the files outside the artifact's roots), and G2 (the bytes on disk equal
+//! the bytes of the next export, so the mirror writes what an export
+//! carries). `with_disk_mirror_gateway_form(paths)` keeps those
+//! `resource.json` members pretty-printed in the store, so the disk and
+//! every later export carry the gateway's own serialisation (R-1).
+//! `with_disk_mirror_readonly_after_import()` makes the project directory
+//! read-only once written, so a restore of `.git` fails;
+//! `with_disk_mirror_extra_on_disk(path)` writes one file to disk that no
+//! export ever shows.
+//!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
 //! on a gateway surface the verb is forbidden to have (DPRJ-04).
@@ -245,6 +261,17 @@ pub struct FakeProjects {
     /// How many imports after a provider create answer 422 "provider not
     /// found", and how many are still due per provider.
     provider_starting: (AtomicU64, Mutex<BTreeMap<String, u64>>),
+    /// The project directory an import also writes (27-12).
+    mirror: Mutex<Option<DiskMirror>>,
+}
+
+/// The disk side of an import (27-12, module doc).
+struct DiskMirror {
+    data_dir: std::path::PathBuf,
+    registered: bool,
+    gateway_form: Vec<String>,
+    readonly_after: bool,
+    extra_on_disk: Vec<String>,
 }
 
 /// Take one of the `due` failures, if any is left. A compare-exchange loop
@@ -362,6 +389,113 @@ impl FakeProjects {
             reads_failing_after_create: (AtomicU64::new(0), AtomicU64::new(0)),
             exports_failing_after_import: (AtomicU64::new(0), AtomicU64::new(0)),
             provider_starting: (AtomicU64::new(0), Mutex::new(BTreeMap::new())),
+            mirror: Mutex::new(None),
+        }
+    }
+
+    /// An import also writes `<data_dir>/projects/<project>/` (module doc).
+    /// `registered`: the git module manages the project (R-3), so the
+    /// directory is emptied first, `.git` included; else (R-6) `.git` and
+    /// the files outside the artifact's roots stay.
+    #[allow(dead_code)]
+    pub fn with_disk_mirror(self, data_dir: &std::path::Path, registered: bool) -> Self {
+        *self.mirror.lock().expect("mirror") = Some(DiskMirror {
+            data_dir: data_dir.to_path_buf(),
+            registered,
+            gateway_form: Vec::new(),
+            readonly_after: false,
+            extra_on_disk: Vec::new(),
+        });
+        self
+    }
+
+    /// These `resource.json` members are stored, written and exported
+    /// pretty-printed (R-1). Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_gateway_form(self, paths: &[&str]) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .gateway_form = paths.iter().map(|p| (*p).to_string()).collect();
+        self
+    }
+
+    /// The project directory is read-only once an import wrote it.
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_readonly_after_import(self) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .readonly_after = true;
+        self
+    }
+
+    /// An import also leaves this file on disk, which no export shows.
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_extra_on_disk(self, path: &str) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .extra_on_disk
+            .push(path.to_string());
+        self
+    }
+
+    /// Write the stored project below the mirror's data directory.
+    fn mirror_write(&self, name: &str, stored: &StoredProject) {
+        let guard = self.mirror.lock().expect("mirror");
+        let Some(mirror) = guard.as_ref() else {
+            return;
+        };
+        let dir = mirror.data_dir.join("projects").join(name);
+        let artifact_root = |entry: &str| {
+            entry == "project.json"
+                || entry == "ignition"
+                || entry.starts_with("com.inductiveautomation.")
+        };
+        if mirror.registered {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).expect("the mirror empties the directory");
+            }
+        } else if dir.exists() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let file = path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .to_string();
+                if !artifact_root(&file) {
+                    continue;
+                }
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).expect("rm dir");
+                } else {
+                    std::fs::remove_file(&path).expect("rm file");
+                }
+            }
+        }
+        std::fs::create_dir_all(&dir).expect("the mirror creates the directory");
+        for (path, bytes) in &stored.members {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+            std::fs::write(target, self.exported_bytes(stored, path, bytes)).expect("write");
+        }
+        for path in &mirror.extra_on_disk {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+            std::fs::write(target, b"extra\n").expect("write");
+        }
+        #[cfg(unix)]
+        if mirror.readonly_after {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         }
     }
 
@@ -1438,7 +1572,18 @@ impl ProjectGateway for FakeProjects {
                 endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/import/{name}")),
             });
         }
-        let members = adopt(&zip);
+        let mut members = adopt(&zip);
+        if let Some(mirror) = self.mirror.lock().expect("mirror").as_ref() {
+            for path in &mirror.gateway_form {
+                if let Some(bytes) = members.get_mut(path)
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+                {
+                    let mut pretty = serde_json::to_vec_pretty(&value).expect("pretty");
+                    pretty.push(b'\n');
+                    *bytes = pretty;
+                }
+            }
+        }
         let mut record = projects
             .get(name)
             .map(|p| p.record.clone())
@@ -1475,6 +1620,9 @@ impl ProjectGateway for FakeProjects {
                 .map(str::to_string);
         }
         projects.insert(name.to_string(), StoredProject { record, members });
+        if let Some(stored) = projects.get(name) {
+            self.mirror_write(name, stored);
+        }
         let changes = if self.empty_changes.load(Ordering::SeqCst) {
             serde_json::json!([])
         } else {

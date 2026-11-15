@@ -992,6 +992,7 @@ pub async fn deploy_projects_rehearse(
         backup_policy: BackupPolicy::default(),
         tag_delete_ready: opts.tag_delete_ready,
         tag_delete_poll: opts.tag_delete_poll,
+        git_writer: None,
     };
     let rsurfaces = &rehearsal.surfaces;
     // The run's route gate, against the rehearsal gateway's route.

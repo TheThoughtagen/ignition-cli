@@ -997,7 +997,7 @@ pub enum CoreError {
     /// location below the data directory and the kind (`directory`, `file`,
     /// `symlink`, `other`) only.
     #[error(
-        "project {project} is still managed by the git module: {location} is present ({kind}); an administrator removes it before this project is deployed"
+        "project {project}: its git repository at {location} cannot be handed over by this deploy ({reason}; the entry is a {kind})"
     )]
     ProjectGitManaged {
         /// The gateway project name.
@@ -1006,6 +1006,11 @@ pub enum CoreError {
         location: String,
         /// What the entry is.
         kind: String,
+        /// Why the repository cannot be handed over: one of the reason
+        /// words of the 27-12 contract (`git_state::HOST_REASONS`,
+        /// `remote_mismatch`, `release_not_on_branch`, `branch_required`,
+        /// `nodes_disagree`).
+        reason: String,
     },
 
     /// `deploy projects` refused a project whose parent cannot be used
@@ -1302,6 +1307,13 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
         return format!(
             "{entries}; deploy projects never removes every tag a provider's record \
              lists, and no flag permits it"
+        );
+    }
+    // The git gates (27-12): the gateway holds work this release does not.
+    if matches!(gate, "git_unpushed" | "git_not_merged" | "git_dirty") {
+        return format!(
+            "{entries}; the gateway's own work is not in this release: push it and merge it \
+             into the release first"
         );
     }
     let (flag, verb) = match gate {
@@ -2228,6 +2240,12 @@ impl CoreError {
                      tag-delete route, which webdev deploy --with-tag-delete installs; nothing \
                      was written"
                     .to_string(),
+                "git_unpushed" | "git_not_merged" | "git_dirty" => "the gateway's git \
+                     module holds work the release lacks (commits that are not on the remote, \
+                     not merged into the release, or live changes not committed); push and \
+                     merge it into the release first, then run the check again; nothing was \
+                     written"
+                    .to_string(),
                 "provider_emptied" => "the plan would remove every tag this project's record \
                      lists for the provider; drop the provider from tag_providers in \
                      deploy/project.yaml, or keep at least one of its nodes in the repo; \
@@ -2305,10 +2323,26 @@ impl CoreError {
                  in the message by hand"
                     .to_string(),
             ),
-            Self::ProjectGitManaged { .. } => Some(
-                "follow the README cutover runbook: remove this project's .git on the \
-                 gateway (the deploy tool never deletes it), then run the check again"
-                    .to_string(),
+            Self::ProjectGitManaged { reason, .. } => Some(
+                match reason.as_str() {
+                    "remote_mismatch" => {
+                        "add a remote to the release checkout whose URL is the gateway \
+                         repo's origin, then run the check again"
+                    }
+                    "release_not_on_branch" => {
+                        "merge or tag the release on the tracked branch of the remote, then \
+                         run the check again"
+                    }
+                    "mid_operation" | "locked" => {
+                        "finish or abort the git operation on the gateway, then run the \
+                         check again"
+                    }
+                    _ => {
+                        "the README section `Projects the git module manages` lists what \
+                         each reason needs; the deploy tool never deletes or renames a .git"
+                    }
+                }
+                .to_string(),
             ),
             Self::ProjectParentInvalid { reason, .. } => Some(
                 match reason.as_str() {
@@ -3091,6 +3125,7 @@ mod tests {
                     project: "CapApp".into(),
                     location: "projects/CapApp/.git".into(),
                     kind: "directory".into(),
+                    reason: "locked".into(),
                 },
                 6,
                 "project_git_managed",
@@ -4081,6 +4116,7 @@ mod tests {
                     project: "CapApp".into(),
                     location: "projects/CapApp/.git".into(),
                     kind: "directory".into(),
+                    reason: "locked".into(),
                 },
                 6,
             ),
@@ -4294,6 +4330,7 @@ mod tests {
             project: "CapApp".into(),
             location: "projects/CapApp/.git".into(),
             kind: "directory".into(),
+            reason: "remote_mismatch".into(),
         };
         assert_eq!(err.code(), "project_git_managed");
         assert_eq!(err.exit_code(), 6);
@@ -4302,13 +4339,25 @@ mod tests {
             "CapApp",
             "projects/CapApp/.git",
             "directory",
-            "administrator",
+            "remote_mismatch",
         ] {
             assert!(message.contains(needle), "{needle}: {message}");
         }
         let hint = err.hint().expect("hint required");
         assert!(!hint.contains("ign "), "{hint}");
-        assert!(hint.contains(".git"), "{hint}");
+        assert!(hint.contains("remote"), "{hint}");
+        // Every reason has a hint that never tells anyone to delete the repo.
+        for reason in ["release_not_on_branch", "locked", "detached_head", "x"] {
+            let hint = CoreError::ProjectGitManaged {
+                project: "CapApp".into(),
+                location: "projects/CapApp/.git".into(),
+                kind: "directory".into(),
+                reason: reason.into(),
+            }
+            .hint()
+            .expect("hint required");
+            assert!(!hint.contains("remove this project"), "{reason}: {hint}");
+        }
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_git_managed"));
     }
 

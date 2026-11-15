@@ -97,7 +97,7 @@ impl std::fmt::Display for GitGateFailure {
 }
 
 /// The text of a host-git [`CoreError`] without the envelope wording.
-pub(super) fn detail_of(err: &CoreError) -> String {
+pub fn detail_of(err: &CoreError) -> String {
     match err {
         CoreError::DeployPreflightFailed { failures } => failures
             .iter()

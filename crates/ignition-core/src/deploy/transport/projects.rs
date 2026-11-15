@@ -179,6 +179,14 @@ pub trait ProjectHost: Send + Sync {
     fn git(&self) -> Option<&dyn GitHostRead> {
         None
     }
+
+    /// The git program ign runs on its own machine for the release checkout
+    /// and for the advance of a gateway `.git` (Phase 27, 27-12). The
+    /// default is `git` on `PATH`; a test host answers a stub program. It
+    /// never runs on the gateway host (D-02).
+    fn host_git(&self) -> crate::deploy::git_remote::HostGit {
+        crate::deploy::git_remote::HostGit::new()
+    }
 }
 
 /// The host writes of a tag-owning `deploy projects` run besides its records
@@ -661,6 +669,23 @@ pub fn git_host_for_node(
             data_dir,
             windows,
         } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
+}
+
+/// The node's data directory on the runner's own filesystem when its target
+/// block is a `local` one, else `None` (an `ssh` node, POSIX or Windows).
+/// Phase 27 (27-12, D-25): only a `local` node gets the post-advance status
+/// over the disk, because only there does ign read the project directory
+/// without a gateway host between.
+pub fn local_data_dir_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Option<std::path::PathBuf>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Some(data_dir)),
+        NodeAccess::Ssh { .. } => Ok(None),
     }
 }
 

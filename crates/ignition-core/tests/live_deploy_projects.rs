@@ -737,6 +737,7 @@ async fn deploy(
             tag_delete_poll: Duration::from_secs(
                 ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
             ),
+            git_writer: None,
         },
         &NoProjectsObserver,
     )

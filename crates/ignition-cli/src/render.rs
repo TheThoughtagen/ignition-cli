@@ -4057,6 +4057,7 @@ mod tests {
             missing_tags_unavailable: None,
             missing_tags_limit: ignition_core::deploy::project_tags::MISSING_TAGS_LIMIT,
             tags: None,
+            git: None,
             outcome: ProjectOutcome::Checked,
             ok: true,
             slug: None,

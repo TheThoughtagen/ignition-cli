@@ -79,6 +79,9 @@ pub struct GitRestoreReport {
 pub struct GitRestoreFailure {
     /// One of [`RESTORE_REASONS`].
     pub reason: &'static str,
+    /// The save had already been copied back to `.git` when the handover
+    /// stopped.
+    pub restored: bool,
     /// The paths the reason names (the differing paths of a
     /// `status_unexpected`), at most 200, byte-sorted.
     pub paths: Vec<String>,
@@ -167,8 +170,10 @@ pub async fn restore_and_advance(
     prep: &AdvancePrep,
     export_zip: &[u8],
 ) -> Result<GitRestoreReport, GitRestoreFailure> {
+    let restored_now = std::sync::atomic::AtomicBool::new(false);
     let fail = |reason: &'static str, paths: Vec<String>, detail: String| GitRestoreFailure {
         reason,
+        restored: restored_now.load(std::sync::atomic::Ordering::Relaxed),
         paths,
         detail: redact_text(&detail),
         save_path: save.path.clone(),
@@ -227,6 +232,7 @@ pub async fn restore_and_advance(
                 ));
             }
             restored = true;
+            restored_now.store(true, std::sync::atomic::Ordering::Relaxed);
             let now = classify_live(read, git, project)
                 .await
                 .map_err(|e| core("restore_failed", "the restored .git cannot be read", e))?;

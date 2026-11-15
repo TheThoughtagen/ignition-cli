@@ -1085,6 +1085,7 @@ async fn run_projects_with(
         tag_delete_poll: Duration::from_secs(
             ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
         ),
+        git_writer: None,
     };
     if let Some(run) = rollback_run {
         return deploy_projects_rollback_run(

@@ -284,6 +284,7 @@ use crate::deploy::apply::rollback::live_changes;
 use crate::deploy::apply::run_store::{EventLog, RunDir, RunId, run_dir_rel};
 use crate::deploy::apply::{BACKUP_UNSYNCED_SLUG, ROLLED_BACK_SLUG};
 use crate::deploy::exclude;
+use crate::deploy::git_handover::GitSaveReport;
 use crate::deploy::ledger::{
     LedgerRoot, journal_location, pre_image_location, project_journal_location,
     release_record_location, tag_record_location,
@@ -333,7 +334,8 @@ use crate::deploy::tag_plan::{
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::projects::{
-    ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, git_entry_location,
+    GitStateWriter, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
+    git_entry_location, git_state_writer_for_node, local_data_dir_for_node,
     project_run_writer_for_node, release_writer_for_node, tag_record_names_problem,
     tag_record_writer_for_node,
 };
@@ -345,6 +347,7 @@ use crate::error::{
     APPLY_LIST_SHOWN, CoreError, DeployFinding, PreflightFailure, RollbackFailure, RollbackScope,
 };
 
+pub mod git;
 mod rehearse;
 
 pub use rehearse::{
@@ -1069,6 +1072,13 @@ pub enum ProjectOutcome {
     /// false, slug `deploy_backup_unsynced`, exit 6, the reason in
     /// `data.tags.backup`.
     AppliedBackupUnsynced,
+    /// The project was imported and verified, and the gateway repo's `.git`
+    /// could not be restored or advanced (Phase 27, D-09). The deploy and
+    /// its release record stay; the host copy of the `.git` is kept and its
+    /// path named. A verdict: `data.ok` false, slug
+    /// [`GIT_RESTORE_FAILED_SLUG`], exit 6, the reason in
+    /// `data.git.nodes[0].restore.reason`.
+    GitRestoreFailed,
 }
 
 impl ProjectOutcome {
@@ -1085,6 +1095,7 @@ impl ProjectOutcome {
             ProjectOutcome::TagsRolledBack => "tags_rolled_back",
             ProjectOutcome::RolledBack => "rolled_back",
             ProjectOutcome::AppliedBackupUnsynced => "applied_backup_unsynced",
+            ProjectOutcome::GitRestoreFailed => "git_restore_failed",
         }
     }
 }
@@ -1095,6 +1106,14 @@ impl ProjectOutcome {
 /// [`CoreError`], is not in [`CoreError::DEPLOY_SLUGS`] and is not an
 /// exit-table row.
 pub const PROJECT_UNVERIFIED_SLUG: &str = "deploy_project_unverified";
+
+/// The verdict slug of an import that verified while the gateway repo's
+/// `.git` could not be restored or advanced (Phase 27, D-09). It rides the
+/// success payload as `data.slug` beside `data.ok: false` and the process
+/// then exits 6, like [`PROJECT_UNVERIFIED_SLUG`]. It is not a
+/// [`CoreError`], is not in [`CoreError::DEPLOY_SLUGS`] and is not an
+/// exit-table row.
+pub const GIT_RESTORE_FAILED_SLUG: &str = "deploy_git_restore_failed";
 
 /// `ign deploy projects` output model.
 #[derive(Debug, Clone, Serialize)]
@@ -1192,6 +1211,9 @@ pub struct DeployProjectsResult {
     /// `deploy/project.yaml` lists no `tag_providers`. Boxed: the report is
     /// large and absent for most projects.
     pub tags: Option<Box<TagsReport>>,
+    /// The gateway repo the git module manages (Phase 27); null when no node
+    /// holds a `.git`.
+    pub git: Option<Box<git::GitReport>>,
     /// How the run ended.
     pub outcome: ProjectOutcome,
     /// False only for a verdict exit (never in a check).
@@ -1253,6 +1275,7 @@ impl DeployProjectsResult {
                 | ProjectOutcome::TagsRolledBack
                 | ProjectOutcome::RolledBack
                 | ProjectOutcome::AppliedBackupUnsynced
+                | ProjectOutcome::GitRestoreFailed
         )
         .then_some(6)
     }
@@ -1720,6 +1743,9 @@ pub enum ProjectsPrepared {
         /// project that owns none or a first deploy. The run re-plans with
         /// them.
         tag_records: std::collections::BTreeMap<String, TagRecord>,
+        /// The gateway repo the git module manages, prepared (Phase 27);
+        /// `None` for a project whose master has no `.git`.
+        git: Option<Box<git::PreparedGit>>,
     },
     /// Nothing to do (`skip`): outcome `skipped`. Returned before any session
     /// write, and no `.ign/` directory is created.
@@ -1976,14 +2002,13 @@ pub async fn deploy_projects_prepare(
         return Err(CoreError::TagsNotStorable(not_storable));
     }
 
-    let git = surfaces.host.git_entry(project).await?;
-    if git.is_present() {
-        return Err(CoreError::ProjectGitManaged {
-            project: project.clone(),
-            location: git_entry_location(project),
-            kind: git.as_str().to_string(),
-        });
-    }
+    // The `.git` probe (DPRJ-04, K9) and, for a repo the git module manages,
+    // the host half of the handover (Phase 27): the state, the release
+    // checkout, the remote and the advance input, all before any gateway
+    // read and any write. A `.git` that cannot be handed over refuses
+    // `project_git_managed` with its reason.
+    let git_entry = surfaces.host.git_entry(project).await?;
+    let mut prepared_git = git::prepare_git_host(loaded, input, surfaces, git_entry).await?;
 
     // The release record (V5): absent means this tool has not deployed the
     // project here; a record that cannot be trusted refuses and is never read
@@ -2114,6 +2139,20 @@ pub async fn deploy_projects_prepare(
         },
         Some(_) => ProjectAction::Import,
     };
+    // The git gates against the live project (Phase 27): the itemised dirty
+    // list and the refusals, before the first-deploy gate and long before any
+    // write.
+    if let Some(prepared) = prepared_git.as_mut() {
+        git::prepare_git_live(
+            prepared,
+            live.as_ref(),
+            action,
+            loaded,
+            surfaces,
+            &mut warnings,
+        )
+        .await?;
+    }
     // The first `ign` deploy of a project must not change what the gateway
     // runs without a stated reason (D-12, V3).
     if action == ProjectAction::Import && record.is_none() && input.allow_first_change.is_none() {
@@ -2292,6 +2331,7 @@ pub async fn deploy_projects_prepare(
         missing_tags_unavailable,
         missing_tags_limit: MISSING_TAGS_LIMIT,
         tags,
+        git: prepared_git.as_ref().map(|p| Box::new(p.report.clone())),
         outcome,
         ok: true,
         slug: None,
@@ -2303,6 +2343,7 @@ pub async fn deploy_projects_prepare(
             prose: plan_prose(&plan),
             plan,
             tag_records,
+            git: prepared_git.map(Box::new),
         }
     })
 }
@@ -3289,6 +3330,10 @@ pub struct ProjectsRunOptions<'a> {
     /// CLI always passes `None`.
     #[doc(hidden)]
     pub run_writer: Option<&'a dyn ProjectRunWriter>,
+    /// A git state writer (Phase 27) standing in for the one built from
+    /// `master`. For the engine tests only: the CLI always passes `None`.
+    #[doc(hidden)]
+    pub git_writer: Option<&'a dyn GitStateWriter>,
     /// `--designers`, `--designers-timeout` and the poll interval (25-14).
     pub designers: DesignersPolicy,
     /// The longest the children sweep waits for the children's exports to
@@ -3646,11 +3691,14 @@ pub async fn deploy_projects_run(
     if let Some(journal) = planned.tags.as_ref().and_then(|t| t.journal.as_ref()) {
         return Err(project_journal_present(loaded, &input.env, &journal.run_id));
     }
-    let (mut plan, tag_records) = match prepared {
+    let (mut plan, tag_records, prepared_git) = match prepared {
         ProjectsPrepared::Unchanged(result) => return Ok(result),
         ProjectsPrepared::Ready {
-            plan, tag_records, ..
-        } => (plan, tag_records),
+            plan,
+            tag_records,
+            git,
+            ..
+        } => (plan, tag_records, git),
     };
     let removals = removal_gate(&plan, loaded, input, surfaces)?;
     // The record writers are built before anything is written, so a node
@@ -3681,6 +3729,39 @@ pub async fn deploy_projects_run(
             )?;
             Some(built_tags.as_ref())
         }
+    };
+    // The git writer (Phase 27), for an import over a gateway repo the git
+    // module manages: built here with the other writers, so a node that
+    // cannot take it refuses before anything is written.
+    let built_git;
+    let git_writer: Option<&dyn GitStateWriter> = match (&prepared_git, plan.action) {
+        (Some(_), ProjectAction::Import) => match opts.git_writer {
+            Some(writer) => Some(writer),
+            None => {
+                built_git = git_state_writer_for_node(
+                    &opts.targets_root,
+                    &opts.target_file,
+                    "nodes.master",
+                    &opts.master,
+                )?;
+                Some(built_git.as_ref())
+            }
+        },
+        _ => None,
+    };
+    let git_run = match (&prepared_git, git_writer) {
+        (Some(prepared), Some(writer)) => Some(GitRun {
+            prepared: prepared.as_ref(),
+            writer,
+            host_git: surfaces.host.host_git(),
+            post_status: git::PostStatusMode::of(local_data_dir_for_node(
+                &opts.targets_root,
+                &opts.target_file,
+                "nodes.master",
+                &opts.master,
+            )?),
+        }),
+        _ => None,
     };
     // The host journal and pre-image writer (26-12), for a tag-owning plan.
     let built_run;
@@ -3755,6 +3836,7 @@ pub async fn deploy_projects_run(
             release: writer,
             tags: tag_writer,
             run: run_writer,
+            git: git_run.as_ref(),
         },
         &run_dir,
         &run_id,
@@ -4350,6 +4432,73 @@ async fn execute(
         }
     }
 
+    // Phase 27: right before the import, the gateway repo is read again (any
+    // change since the plan is `plan_stale`) and its `.git` is saved to a
+    // host-local path no import reaches. The `.git` stays in place until the
+    // import removes it (D-07).
+    let mut git_saved: Option<GitSaveReport> = None;
+    if let Some(git_run) = writers.git
+        && let Some(read) = surfaces.host.git()
+    {
+        match git::git_before_import(
+            git_run.prepared,
+            read,
+            git_run.writer,
+            &git_run.host_git,
+            &plan.gateway,
+            project,
+            run_id.as_str(),
+        )
+        .await
+        {
+            Ok(saved) => {
+                if let Some(report) = result.git.as_mut() {
+                    report.set_save(&saved);
+                }
+                git_saved = Some(saved);
+            }
+            Err(err) if tags_wrote => {
+                let failure = TagFailure {
+                    cause: RollbackCause::ProjectImportFailed,
+                    what: format!(
+                        "the gateway repo could not be kept before the project import ({})",
+                        err.code()
+                    ),
+                    writes: step.writes,
+                };
+                return roll_back(
+                    failure,
+                    Some(ProjectUndo { pre: pre_zip }),
+                    result,
+                    loaded,
+                    input,
+                    surfaces,
+                    opts,
+                    run_id,
+                    rel,
+                    UndoWriters {
+                        run: writers.run,
+                        records: None,
+                        release: None,
+                    },
+                    route,
+                    &mut events,
+                )
+                .await;
+            }
+            Err(err) => {
+                return Err(unwritten(
+                    err,
+                    loaded,
+                    writers.run,
+                    step.writes.host.as_ref(),
+                    &mut events,
+                )
+                .await);
+            }
+        }
+    }
+
     // The gateway changed when tags were written: from then on a log failure
     // is remembered, never an error.
     if tag_owning {
@@ -4429,9 +4578,14 @@ async fn execute(
         }
     }
 
+    let mut readback: Option<Vec<u8>> = None;
     let equal = match retry_transient(|| gateway.export_bytes(project)).await {
         Ok(zip) => match live_digest(project, &zip) {
-            Ok(live) => Some(live.sha256 == artifact.sha256),
+            Ok(live) => {
+                let equal = live.sha256 == artifact.sha256;
+                readback = Some(zip);
+                Some(equal)
+            }
             Err(err) => {
                 result.warnings.push(format!(
                     "could not verify the import: the project read back is unusable ({})",
@@ -4513,6 +4667,45 @@ async fn execute(
         } else {
             ProjectOutcome::Created
         };
+        // Phase 27: the project is verified and its record written. The
+        // `.git` is put back and advanced now; a failure keeps the deploy
+        // and ends the run as `git_restore_failed` (D-09).
+        if let (Some(git_run), Some(saved), Some(zip), Some(read), Some(report)) = (
+            writers.git,
+            git_saved.as_ref(),
+            readback.as_deref(),
+            surfaces.host.git(),
+            result.git.as_mut(),
+        ) {
+            // Interim for D-07 until 27-13's `git_restore_designer_gate`: the
+            // `.git` is never put back while a Designer is attached.
+            let designers_attached = match gateway.designers().await {
+                Ok(list) => Ok(list.len()),
+                Err(err) => Err(err.code().to_string()),
+            };
+            let after = git::git_after_verify(
+                git_run.prepared,
+                report,
+                &git::AfterInputs {
+                    read,
+                    write: git_run.writer,
+                    git: &git_run.host_git,
+                    gateway: &plan.gateway,
+                    project,
+                    saved,
+                    export_zip: zip,
+                    post_status: &git_run.post_status,
+                    designers_attached,
+                },
+            )
+            .await;
+            result.warnings.extend(after.warnings);
+            if after.failed {
+                result.outcome = ProjectOutcome::GitRestoreFailed;
+                result.ok = false;
+                result.slug = Some(GIT_RESTORE_FAILED_SLUG.to_string());
+            }
+        }
     } else if tags_wrote {
         // 26-11, D-07: the tags were applied and the project is not what was
         // reviewed: both are rolled back (this replaces K11 for such a run).
@@ -4574,7 +4767,9 @@ async fn execute(
     // projects that inherit from it. Reads only, and nothing in it can change
     // the outcome, the exit code or the gateway.
     let swept = match result.outcome {
-        ProjectOutcome::Imported | ProjectOutcome::ImportedUnverified => true,
+        ProjectOutcome::Imported
+        | ProjectOutcome::ImportedUnverified
+        | ProjectOutcome::GitRestoreFailed => true,
         ProjectOutcome::Applied => overwrite,
         _ => false,
     };
@@ -4645,6 +4840,22 @@ struct Writers<'a> {
     tags: Option<&'a dyn TagRecordWriter>,
     /// The host journal and pre-image (26-12), for a tag-owning plan.
     run: Option<&'a dyn ProjectRunWriter>,
+    /// The handover of a gateway `.git` around the import (Phase 27), for a
+    /// plan that imports over a repo the git module manages.
+    git: Option<&'a GitRun<'a>>,
+}
+
+/// Everything a run needs to keep and advance a gateway `.git` (Phase 27):
+/// built before anything is written.
+struct GitRun<'a> {
+    /// What the prepare learned.
+    prepared: &'a git::PreparedGit,
+    /// The host's git writer for `nodes.master`.
+    writer: &'a dyn GitStateWriter,
+    /// Host git on ign's machine.
+    host_git: crate::deploy::git_remote::HostGit,
+    /// How the post-advance status is proved (D-25).
+    post_status: git::PostStatusMode,
 }
 
 /// One export of every owned provider, flattened, keyed by the provider.
@@ -7928,6 +8139,7 @@ fn rollback_run_result(
         missing_tags_unavailable: None,
         missing_tags_limit: MISSING_TAGS_LIMIT,
         tags: Some(Box::new(report)),
+        git: None,
         outcome: if check {
             ProjectOutcome::Checked
         } else {
@@ -8173,6 +8385,7 @@ pub async fn deploy_projects_rollback_run(
             project: project.to_string(),
             location: git_entry_location(project),
             kind: git.as_str().to_string(),
+            reason: git::refusal_reason(surfaces, project, git.as_str()).await,
         });
     }
     let set = read_host_set(loaded, input, surfaces.host, &target).await?;
@@ -9167,6 +9380,7 @@ pub(crate) fn sample_result() -> DeployProjectsResult {
         missing_tags_unavailable: None,
         missing_tags_limit: MISSING_TAGS_LIMIT,
         tags: None,
+        git: None,
         outcome: ProjectOutcome::Checked,
         ok: true,
         slug: None,

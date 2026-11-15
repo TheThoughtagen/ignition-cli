@@ -4180,6 +4180,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     tag_delete_poll: std::time::Duration::from_secs(
                         ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
                     ),
+                    git_writer: None,
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {

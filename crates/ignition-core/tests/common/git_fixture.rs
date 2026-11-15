@@ -593,6 +593,16 @@ impl GitFixture {
     }
 }
 
+/// The in-scope files of `dir` (skipping `.git`) as `(path, bytes)`, byte
+/// sorted: what a gateway export of that project directory holds.
+pub fn members_of(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    collect(dir, "", &mut files);
+    files.retain(|(rel, _)| in_scope(rel));
+    files.sort();
+    files
+}
+
 /// A project zip of the in-scope files below `dir` (skipping `.git`), the
 /// way the fake gateway answers an export.
 pub fn live_export_from(dir: &Path) -> Vec<u8> {
