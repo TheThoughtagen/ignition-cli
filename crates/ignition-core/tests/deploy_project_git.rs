@@ -1426,6 +1426,8 @@ mod published {
     pub struct StubHost {
         pub inner: LocalFsTransport,
         pub program: Option<OsString>,
+        /// Answers the host's git reads instead of the local transport.
+        pub read: Option<Box<dyn GitHostRead>>,
     }
 
     #[async_trait::async_trait]
@@ -1463,7 +1465,10 @@ mod published {
             self.inner.read_pre_image(gateway, project, name).await
         }
         fn git(&self) -> Option<&dyn GitHostRead> {
-            ProjectHost::git(&self.inner)
+            match &self.read {
+                Some(read) => Some(read.as_ref()),
+                None => ProjectHost::git(&self.inner),
+            }
         }
         fn host_git(&self) -> Git {
             match &self.program {
@@ -1478,6 +1483,10 @@ mod published {
         pub f: GitFixture,
         pub targets: tempfile::TempDir,
         pub gateway: FakeProjects,
+        /// The release checkout the run deploys from.
+        pub repo: PathBuf,
+        /// The release tag.
+        pub release: String,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1522,19 +1531,22 @@ mod published {
                     .with_project(PROJECT, None, false, &borrowed)
                     .with_disk_mirror(&f.data_dir, true),
             );
+            let repo = f.checkout.clone();
             Rig {
                 f,
                 targets,
                 gateway,
+                repo,
+                release: "v1.1.0".to_string(),
             }
         }
 
         pub fn input(&self) -> ProjectsInput {
             ProjectsInput {
-                repo: self.f.checkout.clone(),
+                repo: self.repo.clone(),
                 targets: self.targets.path().to_path_buf(),
                 env: "dev".to_string(),
-                release: "v1.1.0".to_string(),
+                release: self.release.clone(),
                 allow_downgrade: false,
                 allow_first_change: Some("first deploy of the rig".to_string()),
                 allow_destructive: false,
@@ -1548,6 +1560,23 @@ mod published {
             StubHost {
                 inner: self.f.node(),
                 program: None,
+                read: None,
+            }
+        }
+
+        /// A host whose host git is `program`.
+        pub fn host_with_program(&self, program: &std::path::Path) -> StubHost {
+            StubHost {
+                inner: self.f.node(),
+                program: Some(program.as_os_str().to_os_string()),
+                read: None,
+            }
+        }
+
+        /// Make the fake gateway hold what the project directory holds now.
+        pub fn sync_live(&self) {
+            for (path, bytes) in members_of(&self.f.project_dir()) {
+                self.gateway.change_live(PROJECT, &path, &bytes);
             }
         }
 
@@ -1626,9 +1655,12 @@ mod published {
         }
 
         pub async fn apply(&self) -> Result<DeployProjectsResult, CoreError> {
-            let host = self.host();
-            let (loaded, prepared) = self.plan_with(&host).await?;
-            self.run_prepared(&host, &loaded, prepared, None).await
+            self.apply_with(&self.host()).await
+        }
+
+        pub async fn apply_with(&self, host: &StubHost) -> Result<DeployProjectsResult, CoreError> {
+            let (loaded, prepared) = self.plan_with(host).await?;
+            self.run_prepared(host, &loaded, prepared, None).await
         }
 
         /// Directories named `repo` below the project's `git-save` folder.
@@ -1659,7 +1691,7 @@ mod published {
         }
 
         pub fn run_dirs(&self) -> usize {
-            std::fs::read_dir(self.f.checkout.join(".ign/deploy/capgw"))
+            std::fs::read_dir(self.repo.join(".ign/deploy/capgw"))
                 .map(|d| d.count())
                 .unwrap_or(0)
         }
@@ -1779,6 +1811,7 @@ mod published {
         let host = StubHost {
             inner: rig.f.node(),
             program: Some(OsString::from("/nonexistent/git-must-not-run")),
+            read: None,
         };
         let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
         let result = rig
@@ -1790,5 +1823,486 @@ mod published {
         let json = serde_json::to_value(&result).expect("json");
         assert!(json["git"].is_null());
         let _ = GIT_RESTORE_FAILED_SLUG;
+    }
+
+    // ---- Task 3: refusals, preflight refusals and the D-09 outcomes ----
+
+    /// A check and an apply refuse alike and write nothing: no import, no run
+    /// directory, no save.
+    async fn refused_alike(rig: &Rig) -> CoreError {
+        let first = refusal(rig.check().await);
+        let second = refusal(rig.apply().await);
+        assert_eq!(first.code(), second.code(), "check and apply agree");
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "nothing was imported"
+        );
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert!(rig.save_trees().is_empty(), "no save");
+        first
+    }
+
+    fn gate_of(err: &CoreError) -> (&str, &[String], usize) {
+        match err {
+            CoreError::DestructiveChangeRefused { gate, keys, count } => {
+                (gate.as_str(), keys.as_slice(), *count)
+            }
+            other => panic!("expected destructive_change_refused, got {other:?}"),
+        }
+    }
+
+    fn preflight_checks(err: &CoreError) -> Vec<String> {
+        match err {
+            CoreError::DeployPreflightFailed { failures } => {
+                failures.iter().map(|f| f.check.clone()).collect()
+            }
+            other => panic!("expected deploy_preflight_failed, got {other:?}"),
+        }
+    }
+
+    fn reason_of(err: &CoreError) -> &str {
+        match err {
+            CoreError::ProjectGitManaged { reason, .. } => reason.as_str(),
+            other => panic!("expected project_git_managed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_unpushed() {
+        let rig = Rig::new();
+        let d = rig.f.designer_commit(false);
+        rig.sync_live();
+        let err = refused_alike(&rig).await;
+        let (gate, keys, count) = gate_of(&err);
+        assert_eq!(gate, "git_unpushed");
+        assert!(keys.contains(&d), "{keys:?}");
+        assert_eq!(count, keys.len());
+    }
+
+    #[tokio::test]
+    async fn refuses_not_merged() {
+        let rig = Rig::new();
+        let g = rig.f.breakfix_on_production();
+        rig.sync_live();
+        let err = refused_alike(&rig).await;
+        let (gate, keys, count) = gate_of(&err);
+        assert_eq!(gate, "git_not_merged");
+        assert_eq!(keys, std::slice::from_ref(&g));
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn refuses_dirty_naming_paths() {
+        let rig = Rig::new();
+        let view = "com.inductiveautomation.perspective/views/V/view.json";
+        rig.f.live_change(view, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        let err = refused_alike(&rig).await;
+        let (gate, keys, count) = gate_of(&err);
+        assert_eq!(gate, "git_dirty");
+        assert_eq!(keys, [view.to_string()]);
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn refuses_release_not_on_branch() {
+        let mut rig = Rig::new();
+        rig.f.tag_release_on("feature", "v1.2.0");
+        rig.release = "v1.2.0".to_string();
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "release_not_on_branch");
+        assert!(err.hint().expect("hint").contains("tracked branch"));
+    }
+
+    #[tokio::test]
+    async fn accepts_newer_remote_tip() {
+        let rig = Rig::new();
+        rig.f.push_to_production(
+            "ignition/script-python/cap/util/code.py",
+            "def f():\n    return 3\n",
+        );
+        let result = rig.apply().await.expect("a newer tip is accepted");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+    }
+
+    #[tokio::test]
+    async fn refuses_remote_mismatch() {
+        let rig = Rig::new();
+        rig.f
+            .checkout_with_userinfo_remote("https://user:hunter2@example.invalid/other/repo.git");
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "remote_mismatch");
+        let text = format!("{err} {err:?}");
+        assert!(
+            !text.contains("hunter2") && !text.contains("user:"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_detached_head() {
+        let rig = Rig::new();
+        rig.f.git_in_project(&["checkout", "-q", "--detach"]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "detached_head");
+    }
+
+    #[tokio::test]
+    async fn refuses_shallow_checkout() {
+        let mut rig = Rig::new();
+        let shallow = rig.f.shallow_checkout();
+        put_file(
+            &shallow,
+            "deploy/project.yaml",
+            &format!("schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\n"),
+        );
+        put_file(&shallow, ".gitignore", ".ign/\n");
+        rig.repo = shallow;
+        let err = refused_alike(&rig).await;
+        assert_eq!(preflight_checks(&err), ["git_checkout"]);
+        assert!(err.to_string().contains("shallow"), "{err}");
+    }
+
+    /// A host git that runs git, logs its arguments and fails on request.
+    #[cfg(unix)]
+    fn git_wrapper(dir: &std::path::Path, fail_on: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("git-calls.log");
+        let program = dir.join("git-wrapper");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nfor a in \"$@\"; do\n  case \"$a\" in\n    {fail_on}) echo 'stub: refused' >&2; exit 3;;\n  esac\ndone\nexec git \"$@\"\n",
+            log = log.display(),
+        );
+        std::fs::write(&program, script).expect("script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (program, log)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn advance_prep_failure_refuses_before_write() {
+        let rig = Rig::new();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (program, _log) = git_wrapper(scratch.path(), "pack-objects");
+        let host = rig.host_with_program(&program);
+        // `--check` and the apply share one prepare, which builds the advance
+        // input (B5): a failure there refuses before any write in both.
+        let err = refusal(rig.plan_with(&host).await);
+        assert_eq!(preflight_checks(&err), ["git_host"], "{err}");
+        let err = refusal(rig.apply_with(&host).await);
+        assert_eq!(preflight_checks(&err), ["git_host"], "{err}");
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_eq!(rig.run_dirs(), 0);
+        assert!(rig.save_trees().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_repo_between_check_and_save() {
+        let rig = Rig::new();
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        // The gateway's HEAD moves after the plan was drawn.
+        rig.f
+            .git_in_project(&["commit", "-q", "--allow-empty", "-m", "moved"]);
+        let err = refusal(rig.run_prepared(&host, &loaded, prepared, None).await);
+        assert_eq!(err.code(), "plan_stale");
+        assert!(err.to_string().contains(PROJECT), "{err}");
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "nothing was imported"
+        );
+        assert!(rig.save_trees().is_empty());
+    }
+
+    /// Makes a directory writable again so the temp dir can be removed.
+    struct Unlock(PathBuf);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_failure_outcome() {
+        let rig = Rig::with(|g| g.with_disk_mirror_readonly_after_import());
+        let _unlock = Unlock(rig.f.project_dir());
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert!(!result.ok);
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        assert!(result.record_written, "the deploy and its record stay");
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore");
+        assert_eq!(restore.reason.as_deref(), Some("restore_failed"));
+        assert!(!restore.advanced && restore.save_kept);
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(save.path.contains("git-save"), "{}", save.path);
+        assert!(rig.f.data_dir.join(&save.path).is_dir(), "the save is kept");
+    }
+
+    /// A git writer that lets the restore through and fails the advance.
+    struct FailAdvance(LocalFsTransport);
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for FailAdvance {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(&self, _: &str, _: &[GitWrite]) -> Result<(), CoreError> {
+            Err(CoreError::TransportFailed {
+                operation: "write".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "the write was refused".to_string(),
+            })
+        }
+        async fn remove_git_save(&self, g: &str, p: &str, r: &str) -> Result<(), CoreError> {
+            self.0.remove_git_save(g, p, r).await
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.0.probe_write(project, run_id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_failure_outcome() {
+        let rig = Rig::new();
+        let host = rig.host();
+        let writer = FailAdvance(rig.f.node());
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert!(!result.ok && result.record_written);
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore");
+        assert_eq!(restore.reason.as_deref(), Some("advance_failed"));
+        assert!(restore.restored && !restore.advanced && restore.save_kept);
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+    }
+
+    #[tokio::test]
+    async fn post_advance_status_mismatch_fails() {
+        let extra = "ignition/script-python/cap/extra.txt";
+        let rig = Rig::with(|g| g.with_disk_mirror_extra_on_disk(extra));
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        assert!(result.record_written);
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert!(restore.advanced && restore.verified);
+        assert_eq!(restore.post_status, Some("mismatch"));
+        assert_eq!(restore.reason.as_deref(), Some("post_status_mismatch"));
+        assert!(restore.save_kept);
+        let note = restore.post_status_note.expect("the paths are named");
+        assert!(note.contains(extra) && note.contains("D-25"), "{note}");
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+    }
+
+    #[test]
+    fn post_advance_status_not_checked_on_ssh() {
+        use ignition_core::actions::deploy_projects::git::{PostStatusMode, RestoreInfo};
+        let (word, note) = PostStatusMode::of(None)
+            .not_checked_words()
+            .expect("an ssh node is not checked");
+        let info = RestoreInfo {
+            restored: true,
+            advanced: true,
+            verified: true,
+            post_status: Some(word),
+            post_status_note: Some(note.to_string()),
+            dropped: Vec::new(),
+            dropped_count: 0,
+            reason: None,
+            save_kept: false,
+        };
+        let json = serde_json::to_value(&info).expect("json");
+        assert_eq!(json["post_status"], "not_checked");
+        assert!(
+            json["post_status_note"]
+                .as_str()
+                .is_some_and(|n| !n.is_empty())
+        );
+        assert!(
+            PostStatusMode::of(Some(PathBuf::from("/data")))
+                .not_checked_words()
+                .is_none(),
+            "a local node runs the disk status"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_advance_status_never_uses_gateway_git_dir() {
+        let rig = Rig::new();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (program, log) = git_wrapper(scratch.path(), "never-matches-anything");
+        let host = rig.host_with_program(&program);
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, None)
+            .await
+            .expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let calls = std::fs::read_to_string(&log).expect("the log");
+        assert!(
+            calls.contains("--work-tree="),
+            "the disk status ran:\n{calls}"
+        );
+        let gateway_git = rig.f.git_dir().display().to_string();
+        assert!(
+            !calls.contains(&gateway_git),
+            "host git was pointed at the gateway .git:\n{calls}"
+        );
+        // The checkout is the git dir of every status.
+        assert!(calls.contains("--git-dir="), "{calls}");
+    }
+
+    /// A git read whose object fetch fails.
+    struct FailingFetch(LocalFsTransport);
+
+    #[async_trait::async_trait]
+    impl GitHostRead for FailingFetch {
+        async fn read_git_state(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_state::GitFiles, CoreError> {
+            self.0.read_git_state(project).await
+        }
+        async fn git_manifest(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.git_manifest(project).await
+        }
+        async fn save_manifest(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_manifest(gateway, project, run_id).await
+        }
+        async fn git_file_digest(
+            &self,
+            project: &str,
+            name: &GitWriteName,
+        ) -> Result<Option<String>, CoreError> {
+            self.0.git_file_digest(project, name).await
+        }
+        async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+            self.0.read_git_yaml().await
+        }
+        async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+            self.0.free_bytes(gateway, project).await
+        }
+        async fn git_size(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitSize, CoreError> {
+            self.0.git_size(project).await
+        }
+        async fn list_git_objects(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_objects::GitObjectList, CoreError> {
+            self.0.list_git_objects(project).await
+        }
+        async fn fetch_git_objects(
+            &self,
+            _project: &str,
+            _files: &[ignition_core::deploy::git_objects::GitObjectFile],
+            _dest: &std::path::Path,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::TransportFailed {
+                operation: "read".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "the object read was refused".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_objects_failure_refuses() {
+        let rig = Rig::new();
+        rig.f.designer_commit(false);
+        rig.sync_live();
+        let failing = StubHost {
+            inner: rig.f.node(),
+            program: None,
+            read: Some(Box::new(FailingFetch(rig.f.node()))),
+        };
+        // `--check` and the apply refuse before any write, before the gates
+        // are mapped.
+        for _ in 0..2 {
+            let err = refusal(rig.plan_with(&failing).await);
+            assert_eq!(preflight_checks(&err), ["git_gateway_objects"], "{err}");
+        }
+        assert!(rig.gateway.import_calls().is_empty());
+        assert_eq!(rig.run_dirs(), 0);
+
+        // With a working read the same fixture refuses `git_unpushed`, and the
+        // prepared report's dirty list came from the gateway's objects.
+        use ignition_core::actions::deploy_projects::git::{prepare_git_host, prepare_git_live};
+        use ignition_core::deploy::projects::ProjectAction;
+        let host = rig.host();
+        let input = rig.input();
+        let loaded = load_project(&input).expect("loads");
+        let surfaces = ProjectsSurfaces {
+            gateway: &rig.gateway,
+            host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
+        };
+        let mut prepared = prepare_git_host(&loaded, &input, &surfaces, GitEntry::Directory)
+            .await
+            .expect("the host half")
+            .expect("a managed repo");
+        let zip = ignition_core::actions::deploy_projects::ProjectGateway::export_bytes(
+            &rig.gateway,
+            PROJECT,
+        )
+        .await
+        .expect("export");
+        let live = canonical_digest(&zip).expect("digest");
+        let mut warnings = Vec::new();
+        let err = prepare_git_live(
+            &mut prepared,
+            Some(&live),
+            ProjectAction::Import,
+            &loaded,
+            &surfaces,
+            &mut warnings,
+        )
+        .await
+        .expect_err("unpushed refuses");
+        assert_eq!(gate_of(&err).0, "git_unpushed");
+        let node = prepared.report.master();
+        assert_eq!(node.dirty, Some(Vec::new()));
+        assert_eq!(node.dirty_source, Some("gateway_objects"));
     }
 }

@@ -928,7 +928,8 @@ async fn projects_check_git_dir_refuses() {
     let err = error_of(&out);
     assert_eq!(err["error"]["code"], "project_git_managed");
     let message = err["error"]["message"].as_str().expect("message");
-    for needle in ["CapApp", "projects/CapApp/.git", "directory"] {
+    // 27-12: the refusal names the reason word (an empty `.git` has no HEAD).
+    for needle in ["CapApp", "projects/CapApp/.git", "no_head"] {
         assert!(message.contains(needle), "{needle}: {message}");
     }
     assert!(
@@ -939,7 +940,10 @@ async fn projects_check_git_dir_refuses() {
 
 #[tokio::test]
 async fn projects_check_git_file_and_symlink_refuse_with_their_kind() {
-    for (kind, make) in [("file", false), ("symlink", true)] {
+    for (kind, make, reason) in [
+        ("file", false, "not_directory"),
+        ("symlink", true, "symlink"),
+    ] {
         let fx = fixture();
         let project = fx.data.join("projects/CapApp");
         std::fs::create_dir_all(&project).expect("project dir");
@@ -960,7 +964,7 @@ async fn projects_check_git_file_and_symlink_refuse_with_their_kind() {
             err["error"]["message"]
                 .as_str()
                 .expect("message")
-                .contains(&format!("({kind})")),
+                .contains(&format!("({reason})")),
             "{err}"
         );
         assert!(methods(&server).await.is_empty(), "{kind}");
@@ -1049,8 +1053,9 @@ async fn projects_check_human_git_refusal_names_the_entry() {
     assert_eq!(out.status.code(), Some(6));
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(stderr.contains("projects/CapApp/.git"), "{stderr}");
-    assert!(stderr.contains("administrator"), "{stderr}");
+    assert!(stderr.contains("no_head"), "{stderr}");
     assert!(stderr.contains("hint:"), "{stderr}");
+    assert!(!stderr.contains("remove this project"), "{stderr}");
     assert!(methods(&server).await.is_empty());
 }
 

@@ -2105,6 +2105,12 @@ impl ProjectHost for RecordingHost {
             .push(format!("read_pre_image:{name}"));
         self.inner.read_pre_image(gateway, project, name).await
     }
+
+    /// 27-12: the git surface is the inner transport's, so a project the git
+    /// module manages is read through the recording host too.
+    fn git(&self) -> Option<&dyn ignition_core::deploy::transport::projects::GitHostRead> {
+        ProjectHost::git(&self.inner)
+    }
 }
 
 /// A [`TagRecordWriter`] that remembers which providers it wrote.

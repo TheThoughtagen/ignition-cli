@@ -997,7 +997,7 @@ pub enum CoreError {
     /// location below the data directory and the kind (`directory`, `file`,
     /// `symlink`, `other`) only.
     #[error(
-        "project {project}: its git repository at {location} cannot be handed over by this deploy ({reason}; the entry is a {kind})"
+        "project {project}: its git repository at {location} cannot be handed over by this deploy ({reason})"
     )]
     ProjectGitManaged {
         /// The gateway project name.
@@ -4335,12 +4335,7 @@ mod tests {
         assert_eq!(err.code(), "project_git_managed");
         assert_eq!(err.exit_code(), 6);
         let message = err.to_string();
-        for needle in [
-            "CapApp",
-            "projects/CapApp/.git",
-            "directory",
-            "remote_mismatch",
-        ] {
+        for needle in ["CapApp", "projects/CapApp/.git", "remote_mismatch"] {
             assert!(message.contains(needle), "{needle}: {message}");
         }
         let hint = err.hint().expect("hint required");
