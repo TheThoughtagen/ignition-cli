@@ -1313,7 +1313,8 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
     if matches!(gate, "git_unpushed" | "git_not_merged" | "git_dirty") {
         return format!(
             "{entries}; the gateway's own work is not in this release: push it and merge it \
-             into the release first"
+             into the release first, or pass --discard-gateway-changes <reason> to deploy \
+             projects to overwrite it"
         );
     }
     let (flag, verb) = match gate {
@@ -2243,8 +2244,13 @@ impl CoreError {
                 "git_unpushed" | "git_not_merged" | "git_dirty" => "the gateway's git \
                      module holds work the release lacks (commits that are not on the remote, \
                      not merged into the release, or live changes not committed); push and \
-                     merge it into the release first, then run the check again; nothing was \
-                     written"
+                     merge it into the release first, then run the check again. To overwrite \
+                     it on purpose, rerun with --discard-gateway-changes and a reason of 1 to \
+                     500 characters: --check then lists what would go as data.git.would_discard, \
+                     and the run keeps the live project as the pre-image export in its run \
+                     directory, the abandoned commits under refs/ign-discarded/<run-id> in the \
+                     gateway repo, and the saved repository; the reason is recorded in run.json. \
+                     Nothing was written"
                     .to_string(),
                 "provider_emptied" => "the plan would remove every tag this project's record \
                      lists for the provider; drop the provider from tag_providers in \
