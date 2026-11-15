@@ -1998,6 +1998,7 @@ fn git_lines(
             }
         }
     }
+    lines.extend(git_discard_lines(result, git));
     lines.push(if git.expected_drift_complete {
         format!(
             "expected drift: {} (after import)",
@@ -2006,6 +2007,82 @@ fn git_lines(
     } else {
         "expected drift: unknown until the import".to_string()
     });
+    lines
+}
+
+/// The `--discard-gateway-changes` lines (27-15, D-05, D-24): `would discard:`
+/// in a check and `discarded:` after a run, then the dirty paths. The reason
+/// is operator text and the paths and ids come from the gateway, so all of it
+/// is escaped. When a node's dirty paths were read from the gateway's own git
+/// objects (its HEAD is not on the remote) the count says so.
+fn git_discard_lines(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+    git: &ignition_core::actions::deploy_projects::git::GitReport,
+) -> Vec<String> {
+    let (label, paths, paths_count, commits, evidence, keep_ref) =
+        match (&git.discarded, &git.would_discard) {
+            (Some(d), _) => (
+                "discarded",
+                &d.paths,
+                d.paths_count,
+                &d.commits,
+                &d.evidence,
+                d.keep_ref.as_deref(),
+            ),
+            (None, Some(w)) => (
+                "would discard",
+                &w.paths,
+                w.paths_count,
+                &w.commits,
+                &w.evidence,
+                None,
+            ),
+            (None, None) => return Vec::new(),
+        };
+    let from_objects = git
+        .nodes
+        .iter()
+        .any(|n| n.dirty_source == Some("gateway_objects"));
+    let dirty_part = match (paths_count, from_objects) {
+        (0, _) => "no dirty paths".to_string(),
+        (n, true) => format!(
+            "{n} dirty path(s) (read from the gateway's own git objects; the commit is not on the remote)"
+        ),
+        (n, false) => format!("{n} dirty path(s)"),
+    };
+    let commit_part = if commits.is_empty() {
+        "no commits".to_string()
+    } else {
+        format!("commits {}", git_names(commits, commits.len(), true))
+    };
+    let evidence_path = match &result.run_dir {
+        Some(dir) if label == "discarded" => {
+            format!("{}/{}", escape_control(dir), escape_control(evidence))
+        }
+        _ => format!("{} in the run directory", escape_control(evidence)),
+    };
+    let mut lines = vec![format!(
+        "{label}: {dirty_part}; {commit_part}; the live project is kept as {evidence_path}"
+    )];
+    if !paths.is_empty() {
+        lines.push(format!("  dirty: {}", git_names(paths, paths_count, false)));
+    }
+    match (label, keep_ref) {
+        ("discarded", Some(name)) => lines.push(format!(
+            "  kept: {} (recover a commit with `git branch <name> <commit>` in the project repository)",
+            escape_control(name)
+        )),
+        ("discarded", None) => lines.push(
+            "  kept: no keep-alive ref (no commit was abandoned)".to_string(),
+        ),
+        _ => lines.push(
+            "  kept: abandoned commits under refs/ign-discarded/<run-id>, and the saved repository"
+                .to_string(),
+        ),
+    }
+    if let Some(d) = &git.discarded {
+        lines.push(format!("  reason: {}", escape_control(&d.reason)));
+    }
     lines
 }
 
@@ -5223,6 +5300,129 @@ mod tests {
         result.git = Some(git_report(node));
         let text = deploy_projects_human_lines(&result).join("\n");
         assert!(text.contains("restore: restored unchanged"), "{text}");
+    }
+
+    fn would_discard() -> ignition_core::actions::deploy_projects::git::WouldDiscard {
+        use ignition_core::actions::deploy_projects::git::{DiscardDirty, WouldDiscard};
+        WouldDiscard {
+            dirty: DiscardDirty::Listed,
+            paths: vec![
+                "ignition/script-python/a\u{1b}[2J.py".into(),
+                "project.json".into(),
+            ],
+            paths_count: 2,
+            commits: vec!["a".repeat(40)],
+            evidence: "export/CapApp.zip".into(),
+        }
+    }
+
+    #[test]
+    fn would_discard_line_lists_paths_commits_and_evidence_in_a_check() {
+        let mut report = git_report(git_node("managed"));
+        report.would_discard = Some(would_discard());
+        let mut result = projects_result();
+        result.git = Some(report);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "would discard: 2 dirty path(s); commits aaaaaaaaaaaa;",
+            "export/CapApp.zip in the run directory",
+            "  dirty: ignition/script-python/a\\u{1b}[2J.py, project.json",
+            "refs/ign-discarded/<run-id>",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(
+            !text.contains("discarded:"),
+            "a check has not discarded: {text}"
+        );
+        assert!(!text.contains("reason:"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+
+        // Nothing to discard, no override: no lines at all.
+        result.git = Some(git_report(git_node("managed")));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            !text.contains("would discard") && !text.contains("discarded:"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn discarded_line_names_the_evidence_the_ref_and_escapes_the_reason() {
+        use ignition_core::actions::deploy_projects::git::{DiscardDirty, DiscardedReport};
+        let mut report = git_report(git_node("managed"));
+        report.discarded = Some(DiscardedReport {
+            reason: "drop it\u{1b}[31m\nsecond $(id)".into(),
+            dirty: DiscardDirty::Listed,
+            paths: vec!["project.json".into()],
+            paths_count: 1,
+            commits: vec!["b".repeat(40)],
+            keep_ref: Some("refs/ign-discarded/20261114T101500Z-ab12".into()),
+            evidence: "export/CapApp.zip".into(),
+        });
+        let mut result = projects_result();
+        result.check = false;
+        result.run_id = Some("20261114T101500Z-ab12".into());
+        result.run_dir = Some(".ign/deploy/gw/20261114T101500Z-ab12".into());
+        result.git = Some(report);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        for needle in [
+            "discarded: 1 dirty path(s); commits bbbbbbbbbbbb;",
+            ".ign/deploy/gw/20261114T101500Z-ab12/export/CapApp.zip",
+            "  dirty: project.json",
+            "kept: refs/ign-discarded/20261114T101500Z-ab12",
+            "  reason: drop it\\u{1b}[31m\\nsecond $(id)",
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("would discard"), "{text}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "no raw control character reaches the terminal: {text:?}"
+        );
+
+        // A discard with no abandoned commit has no keep-alive ref.
+        if let Some(d) = report_discarded_mut(&mut result) {
+            d.commits.clear();
+            d.keep_ref = None;
+        }
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(text.contains("no commits;"), "{text}");
+        assert!(text.contains("kept: no keep-alive ref"), "{text}");
+    }
+
+    fn report_discarded_mut(
+        result: &mut ignition_core::actions::deploy_projects::DeployProjectsResult,
+    ) -> Option<&mut ignition_core::actions::deploy_projects::git::DiscardedReport> {
+        result.git.as_mut()?.discarded.as_mut()
+    }
+
+    /// D-24: dirty paths read from the gateway's own objects (an unpushed
+    /// HEAD) are listed, and the line says where they came from.
+    #[test]
+    fn would_discard_line_says_when_the_dirty_paths_came_from_gateway_objects() {
+        let mut node = git_node("managed");
+        node.dirty_source = Some("gateway_objects");
+        node.unpushed = vec!["a".repeat(40)];
+        let mut report = git_report(node);
+        report.would_discard = Some(would_discard());
+        let mut result = projects_result();
+        result.git = Some(report);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains(
+                "would discard: 2 dirty path(s) (read from the gateway's own git objects; the commit is not on the remote);"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("  dirty: "),
+            "the paths are still listed: {text}"
+        );
+        assert!(!text.contains("dirty: unknown"), "{text}");
     }
 
     #[test]
