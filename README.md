@@ -4899,8 +4899,10 @@ refusals as the check first (`.git`, parent, downgrade, first deploy), then:
    `plan_stale` ("live project changed since the plan", exit 6) and imports
    nothing. The export holds the live project's files and is never printed or
    copied into any other file; keep the directory private.
-5. **The import** goes to the master node's gateway only (`nodes.backup` is
-   never contacted: the redundancy sync carries the project to it). An
+5. **The import** goes to the master node's gateway only (the project is never
+   imported on `nodes.backup`: the redundancy sync carries it there; when the
+   backup holds a git repository, see **Redundant pairs** under [Projects the
+   git module manages](#projects-the-git-module-manages)). An
    existing project is replaced (`overwrite=true`); an absent one is created
    (`overwrite=false`).
 6. **The verify.** The project is exported again and its canonical digest is
@@ -6109,12 +6111,12 @@ word is a change to the repository, the checkout or the target file:
 | `remote_mismatch` | the release checkout's `origin` is not the gateway repository's remote | add a remote with that URL to the release checkout |
 | `release_not_on_branch` | the release is not on the branch the repository tracks (or, for an adoption, on the adoption branch) | release from that branch, or merge the release into it |
 | `branch_required` | a partial repository was found and no branch is named for it | set `repo_branch` for the project in the gateway's `git.yaml`, or `git_branch` in the target file |
-| `nodes_disagree` | on a redundant pair, the two nodes' repositories are not in the same state | bring the backup's repository to the master's state |
+| `nodes_disagree` | on a redundant pair, the two nodes' repositories differ in origin, tracked branch or HEAD (the message names both) | bring the backup's repository to the master's state, then check again |
 | `restore_failed` | the saved `.git` could not be put back | restore the copy `data.git.nodes[].save.path` names |
 | `advance_failed` | the advance could not be built or written | the run's warning names the cause; fix it and deploy again (the saved copy is kept) |
 | `status_unexpected` | the status over the read-back export differs from the prediction; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
 | `git_recreated` | the `.git` after the import is not the one prepared against | check the repository, then deploy again; it was left as it is |
-| `backup_unsynced` | the backup node did not converge before its `.git` was handled | wait for the pair to converge, then deploy again |
+| `backup_unsynced` | the backup's project did not equal the release within `--backup-timeout`, so its `.git` was not touched | wait for the pair to converge; the saved copy is `data.git.nodes[1].save.path` on the backup host |
 | `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |
 | `designer_attached` | a Designer session was attached at the check before a `.git` write | close the Designer session, deploy again |
 
@@ -6171,6 +6173,43 @@ consistent with the project it ends with, or says exactly where it is not.
   works again; the saved copy can be removed when you are done with it. In CI,
   `git_restore_failed` fails the job and the job must not be run again before
   this is done (see **Failures** under the composite actions).
+
+**Redundant pairs.** On a target with `nodes.backup` (declared with `local` or
+`ssh`), the backup's repository is treated like the master's. `--check` and
+the apply read the backup host's `.git` through the backup's own host, gate it
+the same way (unpushed, not merged, release on the branch, dirty against the
+live project, `git.yaml` hazards read from the backup's own `git.yaml`) and
+report it as `data.git.nodes[1]`; a node without a `.git` is listed with state
+`absent` and stays without one. When both nodes hold a repository and they
+differ in origin, tracked branch or HEAD, the run refuses `project_git_managed`
+reason `nodes_disagree` before anything is written; the message names both
+nodes' values (URLs without userinfo). A backup repository that cannot be
+handed over refuses with its own reason, naming the backup. What a live pair
+showed (capture G5): once the master's import changes the project, the
+redundancy sync deletes the module-cloned `.git` from the backup a few seconds
+after its content converges, and a `.git` put back afterwards is left alone.
+So the run writes the probe and saves the backup's `.git` on the backup's host
+before the import, as it does for the master. After the master is verified,
+restored and advanced, it waits up to `--backup-timeout` (default 300 s) for
+the backup's project export to equal the release, then restores the backup's
+`.git` (when the sync deleted it) or advances it in place (when it is still the
+repository that was saved), and proves the result as for the master. A backup
+that does not converge, or whose restore or advance fails, ends the run
+`git_restore_failed` (exit 6, `data.ok` false) with
+`data.git.nodes[1].restore.reason` (`backup_unsynced` for the wait) and the
+saved copy named in `data.git.nodes[1].save.path`; the master is never undone
+for it, and the saved copy is kept. A rollback, and `--rollback-run`, put both
+nodes' repositories back unchanged, the backup once its project has followed the
+master's. A run on a pair needs the backup's REST session only to read: its
+only call is the project export, a GET. The only things written on the backup
+node are below `data/projects/<project>/.git` and its ledger root
+(`ign-deploy/`); nothing is written to the backup's `config/resources`, and the
+project itself is never imported there. A backup with no `ssh` or `local` block
+cannot be read, so its repository is not handled (a warning says so). Known
+limits: the published `would_discard` and `discarded` blocks describe the master
+(or the backup when the master holds no repository); the override passes the
+backup's gates with the same reason and its saved copy is kept when commits
+were abandoned.
 
 **Rehearsals and CI.** `--rehearse` keeps working for a project whose
 production gateway holds a module-managed `.git`. It reads that repository

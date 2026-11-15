@@ -1077,7 +1077,12 @@ pub enum DeployCommand {
         /// and the wait repeats once. Only used for a project that lists
         /// tag_providers on a target with nodes.backup, whose session is
         /// only read. A backup that does not converge ends a green run
-        /// `applied_backup_unsynced` (exit 6) with the master left applied
+        /// `applied_backup_unsynced` (exit 6) with the master left applied.
+        /// It also bounds the wait for the backup's own copy of a project
+        /// whose gateway git repository the git module manages: the backup's
+        /// project export must equal the release before its repository is
+        /// restored and advanced; a backup that does not converge ends the
+        /// run `git_restore_failed` (reason `backup_unsynced`, exit 6)
         #[arg(
             long,
             value_name = "SECS",
