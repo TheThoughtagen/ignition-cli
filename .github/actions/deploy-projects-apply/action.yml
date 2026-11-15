@@ -49,6 +49,10 @@ inputs:
   targets-token:
     description: Token with contents read on targets-repository only.
     required: true
+  git-token:
+    description: "A token with read access to the project repo's remote over https, used only by ign's own git reads of that remote (the gateway repo's origin); ign scopes it to that remote's host. Leave it empty for an ssh remote, where the runner needs ssh access instead. It reaches ign only as the step environment variable IGNITION_GIT_TOKEN."
+    required: false
+    default: ''
   repo-dir:
     description: Project repo root, relative to the project checkout.
     required: false
@@ -199,6 +203,7 @@ runs:
         GIT_CONFIG_VALUE_0: 'false'
       with:
         path: project
+        fetch-depth: 0
         persist-credentials: false
 
     - name: Checkout targets
@@ -412,6 +417,7 @@ runs:
         IGN_SSH_KEY: ${{ inputs.ssh-key }}
         IGN_MASTER_TOKEN: ${{ inputs.master-token }}
         IGN_BACKUP_TOKEN: ${{ inputs.backup-token }}
+        IGNITION_GIT_TOKEN: ${{ inputs.git-token }}
         IGN_ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
         IGN_TAGS_SHA256: ${{ inputs.tags-sha256 }}
         IGN_DESIGNERS_TIMEOUT: ${{ inputs.designers-timeout }}

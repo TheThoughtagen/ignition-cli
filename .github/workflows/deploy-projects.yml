@@ -136,6 +136,9 @@ on:
       IGN_TARGETS_TOKEN:
         description: Same-org token with read access to targets-repository only (contents read).
         required: true
+      IGN_GIT_TOKEN:
+        description: "Optional. A token with read access to the project repo's remote over https, for ign's own git reads of the gateway repo's origin in both jobs; ign scopes it to that remote's host. Read access only. Leave it unset for an ssh remote, where the runner needs ssh access instead."
+        required: false
     outputs:
       artifact_sha256:
         description: Canonical artifact_sha256 of the checkout, as checked and as applied.
@@ -233,6 +236,7 @@ jobs:
           check-token: ${{ secrets.IGN_CHECK_TOKEN }}
           check-ssh-key: ${{ secrets.IGN_CHECK_SSH_KEY }}
           targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+          git-token: ${{ secrets.IGN_GIT_TOKEN }}
 
   apply:
     needs: check
@@ -343,3 +347,4 @@ jobs:
           backup-token: ${{ secrets.IGN_BACKUP_TOKEN }}
           ssh-key: ${{ secrets.IGN_SSH_KEY }}
           targets-token: ${{ secrets.IGN_TARGETS_TOKEN }}
+          git-token: ${{ secrets.IGN_GIT_TOKEN }}

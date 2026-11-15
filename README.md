@@ -6075,7 +6075,7 @@ Otherwise it has `release_commit`, `nodes` (one per node, `master` first),
 `expected_drift`, `expected_drift_count`, `expected_drift_complete`,
 `would_discard` and `discarded` (both `null` unless `--discard-gateway-changes`
 is given) and `hazards_acknowledged` (the `--allow-git-sync-hazards` reason, or
-`null`). Each node has `state` (`absent`, `managed` or `adoptable`), `branch`, `branch_source`,
+`null`). Each node has `state` (`absent`, `managed` or `adoptable`; `unsupported` only in a rehearsal's report), `branch`, `branch_source`,
 `remote_url` (without userinfo), `head`, `adopted`, `unpushed`, `not_merged`,
 `not_merged_count`, `dirty`, `dirty_count`, `dirty_source`, `hazards`, `save`
 (`path`, `files`, `bytes`) and `restore` (`restored`, `advanced`, `verified`,
@@ -6121,6 +6121,44 @@ word is a change to the repository, the checkout or the target file:
 When a restore or the advance fails the run ends `git_restore_failed` (slug
 `deploy_git_restore_failed`, exit 6): see [the verdict
 exception](#the-git-restore-failed-outcome-of-a-git-managed-project-2026-11-15).
+
+**Rehearsals and CI.** `--rehearse` keeps working for a project whose
+production gateway holds a module-managed `.git`. It reads that repository
+the way `--check` does, but in report mode: every finding that would refuse
+the apply (a gate such as `git_dirty`, a sync hazard, a `project_git_managed`
+reason, a failed `git_host`, `git_checkout` or `git_remote` check) is a warning
+that starts "the apply would refuse", and `data.git` carries the same facts as
+`--check` with the refusal word in `nodes[0].reason`. A repository the deploy
+cannot hand over has `state: unsupported` there (a state only a rehearsal
+reports) and the reason word. A failed host read is still `transport_failed`,
+never reported away. The rehearsal never writes to the production host, saves
+or restores a `.git`, or advances one.
+
+CI needs two things for the git checks: the project checkout with its full
+history (both composite actions check the project out with `fetch-depth: 0`),
+and read access to the remote the gateway repository's `origin` names.
+
+- An **https** remote: pass a token with read access to that repository as the
+  `git-token` input (the reusable workflow takes the optional `IGN_GIT_TOKEN`
+  secret). The action hands it to the `ign` step only as the step environment
+  variable `IGNITION_GIT_TOKEN`, never in a script and never on disk. `ign`
+  applies it to its own two remote reads only (the branch heads and the
+  object fetch), as an `Authorization` header scoped to exactly the scheme,
+  host and port of the matched remote's URL, so the same token works for any
+  https host and goes to no other. It is not sent to the gateway, and no other
+  `git` process `ign` starts sees it. While a token is set, a redirect is not
+  followed (git would send the header on); point the remote at its final URL.
+  Any userinfo in the remote's URL is dropped from the scope and never shown.
+  The token never appears in the output, the run files, an event or an error.
+- An **ssh** remote (`git@host:org/repo.git` or `ssh://`): leave `git-token`
+  empty and give the runner ssh access to the remote. A token with an ssh
+  remote is refused (`deploy_preflight_failed`, check `git_remote`: "a git
+  token applies only to https remotes; this remote uses ssh: give the machine
+  running ign ssh access to it and leave git-token empty"), so a token is never
+  silently ignored.
+- Plain `http` is accepted with a token only to a loopback host (a local rig);
+  to any other host it is refused the same way.
+- A `file://` or path remote ignores the token.
 
 **Moving a project from the module to this verb.** Pick the release the
 module last pulled for the project (the production module is driven by `v*`
@@ -6732,6 +6770,7 @@ apply job's own `environment:` resolves the environment secrets.
 | `IGN_SSH_KEY` | apply jobs only, as `ssh-key` | a secret of the GitHub environment | the private key of the deploy account, exported under the `ssh-key-env` name, for an ssh target |
 | `IGN_BACKUP_TOKEN` | apply jobs only, as `backup-token` | a secret of the GitHub environment | a gateway API token of the backup node, for a target that declares `nodes.backup`; read access is enough (a tag-owning run reads the backup with GET requests only and never writes it). Not needed for a single-node target |
 | `IGN_TARGETS_TOKEN` | both | a repository or organization secret | a token with read access (contents) to the targets repository only. Required |
+| `IGN_GIT_TOKEN` | both, as `git-token` | a repository or organization secret | optional: a token with read access to the project repo's git remote, for a gateway repository whose `origin` is an https URL; see the CI paragraph of [Projects the git module manages](#projects-the-git-module-manages). Read access only. Leave it unset for an ssh remote |
 
 Add required reviewers to each environment. The rules that keep the write
 secrets behind the approval:
@@ -6825,6 +6864,7 @@ Inputs of the `deploy-projects-check` action:
 | `master-profile`, `master-url` | yes | | profile name and gateway URL of the master |
 | `check-token` | yes | | the read-only gateway token (`IGN_CHECK_TOKEN_<ENV>`); never the write token |
 | `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
+| `git-token` | no | empty | a token with read access to the project repo's remote over https, for `ign`'s own git reads (`IGNITION_GIT_TOKEN` in the `ign` step's environment). Empty for an ssh remote. The project checkout is always `fetch-depth: 0` |
 | `check-ssh-key` | no | empty | the check's ssh private key text (`IGN_CHECK_SSH_KEY`); never the apply key |
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `check-ssh-key`. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |
 | `repo-dir` | no | `.` | the project repo root, relative to the project checkout |
@@ -6843,6 +6883,7 @@ Inputs of the `deploy-projects-apply` action:
 | `master-token` | yes | | the write-capable gateway token: the environment's `IGN_MASTER_TOKEN` |
 | `backup-profile`, `backup-url`, `backup-token` | for a pair target | empty | the backup node's profile name (the one `nodes.backup` names), its gateway URL, and its token (the environment's `IGN_BACKUP_TOKEN`; read access is enough). All three or none. A tag-owning run on a target that declares `nodes.backup` reads the backup to wait for the owned tags there; without these inputs the action fails before `ign` runs, with nothing written. Leave them empty for a single-node target, which then runs exactly as before. The check action never reads the backup and takes none of them |
 | `targets-token` | yes | | `IGN_TARGETS_TOKEN` |
+| `git-token` | no | empty | as for the check action |
 | `ssh-key` | no | empty | the apply's ssh private key text: the environment's `IGN_SSH_KEY`. Required when `ssh-key-env` is set |
 | `artifact-suffix` | no | empty | a discriminator for the deploy-records artifact name `ign-deploy-projects-<env>[-<suffix>]-<run id>-<attempt>`. Set a different one for each apply of the same `env` in one workflow run (two projects, two `repo-dir`s, a matrix): the artifact upload rejects a second artifact with the same name. Empty, or 1 to 40 letters, digits, `.`, `_` or `-`, starting with a letter or digit |
 | `ssh-key-env` | no | empty | the env var NAME that the target's `nodes.*.ssh.key_env` names, for example `DEPLOY_SSH_KEY`; it receives `ssh-key`. It must not be `PATH`, `HOME`, `BASH_ENV`, `ENV`, `IFS`, `SHELLOPTS`, `PS4`, `CDPATH`, or a name starting with `GITHUB_`, `RUNNER_`, `ACTIONS_`, `IGNITION_`, `IGN_`, `LD_` or `DYLD_` |

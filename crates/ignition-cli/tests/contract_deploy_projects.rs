@@ -3698,6 +3698,222 @@ fn apply_action_classifies_provider_emptied_and_tag_plan_stale() {
 }
 
 // ---------------------------------------------------------------------------
+// 27-20 (D-23, checker W16): the composite actions and the git token.
+// ---------------------------------------------------------------------------
+
+/// The text of a file below the repo root.
+fn repo_file(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// The two composite actions, as `(path, text)`.
+fn deploy_actions() -> [(&'static str, String); 2] {
+    [
+        (
+            ".github/actions/deploy-projects-check/action.yml",
+            repo_file(".github/actions/deploy-projects-check/action.yml"),
+        ),
+        (
+            ".github/actions/deploy-projects-apply/action.yml",
+            repo_file(".github/actions/deploy-projects-apply/action.yml"),
+        ),
+    ]
+}
+
+/// The steps of a composite action or workflow job as text, each from its
+/// `- name:` line (a six-space-or-less list item below `steps:`) to the next.
+fn steps_of(text: &str) -> Vec<String> {
+    let mut steps: Vec<String> = Vec::new();
+    let mut in_steps = false;
+    for line in text.lines() {
+        if line.trim_end() == "  steps:" || line.trim_end() == "    steps:" {
+            in_steps = true;
+            continue;
+        }
+        if !in_steps {
+            continue;
+        }
+        let item = line.starts_with("    - ") || line.starts_with("      - ");
+        if item {
+            steps.push(String::new());
+        }
+        if let Some(step) = steps.last_mut() {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    steps
+}
+
+/// The `run:` block of a step: the lines under `run: |` that are indented
+/// deeper than the key.
+fn run_block(step: &str) -> Option<String> {
+    let mut lines = step.lines();
+    let key = lines.find(|l| l.trim_start().starts_with("run: |"))?;
+    let indent = key.len() - key.trim_start().len();
+    let mut block = String::new();
+    for line in lines {
+        let here = line.len() - line.trim_start().len();
+        if !line.trim().is_empty() && here <= indent {
+            break;
+        }
+        block.push_str(line);
+        block.push('\n');
+    }
+    Some(block)
+}
+
+fn step_named<'a>(steps: &'a [String], name: &str) -> &'a str {
+    steps
+        .iter()
+        .find(|s| {
+            s.lines()
+                .next()
+                .is_some_and(|l| l.contains(&format!("name: {name}")))
+        })
+        .unwrap_or_else(|| panic!("no step named {name:?}"))
+}
+
+/// Both actions check the project out with its full history, keep the
+/// checkout credential-free and declare the optional `git-token` input.
+#[test]
+fn actions_fetch_full_history() {
+    for (path, text) in deploy_actions() {
+        let steps = steps_of(&text);
+        let checkout = step_named(&steps, "Checkout project");
+        assert!(checkout.contains("path: project"), "{path}: {checkout}");
+        assert!(checkout.contains("fetch-depth: 0"), "{path}: {checkout}");
+        assert!(
+            checkout.contains("persist-credentials: false"),
+            "{path}: {checkout}"
+        );
+        // The targets checkout stays sparse and shallow.
+        let targets = step_named(&steps, "Checkout targets");
+        assert!(!targets.contains("fetch-depth"), "{path}: {targets}");
+
+        let inputs = text.split("\noutputs:").next().expect("inputs come first");
+        let at = inputs
+            .find("\n  git-token:\n")
+            .unwrap_or_else(|| panic!("{path} declares no git-token input"));
+        let declared = &inputs[at..];
+        let block: String = declared
+            .lines()
+            .skip(2)
+            .take_while(|l| l.starts_with("    "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block.contains("required: false"), "{path}: {block}");
+        assert!(block.contains("default: ''"), "{path}: {block}");
+        assert!(block.contains("https"), "{path}: {block}");
+        assert!(block.contains("ssh"), "{path}: {block}");
+    }
+}
+
+/// The token never appears in `run:` text, in either action or in the
+/// reusable workflow: it is handed over as step environment only (a
+/// `${{ }}` expression in a script is script injection and a log leak).
+#[test]
+fn actions_token_not_in_run_text() {
+    let mut files: Vec<(&str, String)> = deploy_actions().into_iter().collect();
+    files.push((
+        ".github/workflows/deploy-projects.yml",
+        repo_file(".github/workflows/deploy-projects.yml"),
+    ));
+    for (path, text) in &files {
+        let mut runs = 0;
+        for step in steps_of(text) {
+            if let Some(run) = run_block(&step) {
+                runs += 1;
+                for needle in [
+                    "git-token",
+                    "IGNITION_GIT_TOKEN",
+                    "IGN_GIT_TOKEN",
+                    "extraheader",
+                ] {
+                    assert!(
+                        !run.contains(needle),
+                        "{path}: a run: block names {needle}:\n{run}"
+                    );
+                }
+            }
+        }
+        assert!(runs >= 3, "{path}: the run: blocks were not found ({runs})");
+    }
+}
+
+/// Checker W16: no action or workflow decides where the token is sent. ign
+/// derives the scope from the matched remote; the actions hand it over as one
+/// step environment variable and add no git configuration for it.
+#[test]
+fn actions_token_scope_not_hardcoded() {
+    let workflow = repo_file(".github/workflows/deploy-projects.yml");
+    for (path, text) in deploy_actions()
+        .iter()
+        .map(|(p, t)| (*p, t.as_str()))
+        .chain([(".github/workflows/deploy-projects.yml", workflow.as_str())])
+    {
+        assert!(
+            !text.to_ascii_lowercase().contains("extraheader"),
+            "{path} names an extraheader scope"
+        );
+        for line in text.lines().filter(|l| l.contains("GIT_CONFIG_VALUE_")) {
+            assert!(
+                !line.contains("token"),
+                "{path}: a GIT_CONFIG_VALUE_ entry reads a token: {line}"
+            );
+        }
+    }
+    for (path, text) in deploy_actions() {
+        // `inputs.git-token` is used exactly once: the ign step's
+        // environment, under the one name ign reads.
+        let uses: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("inputs.git-token"))
+            .collect();
+        assert_eq!(uses.len(), 1, "{path}: {uses:?}");
+        assert_eq!(
+            uses[0].trim(),
+            "IGNITION_GIT_TOKEN: ${{ inputs.git-token }}",
+            "{path}"
+        );
+        let steps = steps_of(&text);
+        let ign: Vec<&String> = steps
+            .iter()
+            .filter(|s| s.contains("IGNITION_GIT_TOKEN: ${{ inputs.git-token }}"))
+            .collect();
+        assert_eq!(ign.len(), 1, "{path}");
+        assert!(ign[0].contains("id: run"), "{path}: {}", ign[0]);
+        let env_at = ign[0].find("      env:").expect("the step has an env");
+        let run_at = ign[0].find("      run:").expect("the step runs");
+        let line_at = ign[0]
+            .find("IGNITION_GIT_TOKEN: ${{ inputs.git-token }}")
+            .expect("mapped");
+        assert!(
+            env_at < line_at && line_at < run_at,
+            "{path}: env of the ign step"
+        );
+        // The step that runs ign is the one that checks git is on PATH.
+        assert!(ign[0].contains("\"$IGN_BIN\" deploy projects"), "{path}");
+    }
+    // The reusable workflow passes one optional secret through, by name.
+    assert!(
+        workflow.contains("IGN_GIT_TOKEN:\n"),
+        "the secret is declared"
+    );
+    assert_eq!(
+        workflow
+            .lines()
+            .filter(|l| l.trim() == "git-token: ${{ secrets.IGN_GIT_TOKEN }}")
+            .count(),
+        2,
+        "both jobs pass it"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 27-16 (D-05): `--discard-gateway-changes <REASON>`.
 // ---------------------------------------------------------------------------
 
