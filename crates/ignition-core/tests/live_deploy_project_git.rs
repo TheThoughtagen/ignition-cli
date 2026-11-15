@@ -3864,3 +3864,140 @@ async fn git_pair_e2e() {
         "findings of the pair run: {problems:#?}"
     );
 }
+
+// ---- 27-25 Task 3: the D-20 normalization of a real project repository ----------
+//
+// `capture27.sh g2norm <out-dir>` (never run by hand without its guards). The
+// release tag of a LOCAL clone of the real project repository is built into an
+// artifact exactly as the deploy builds it, imported into the local rig as a
+// throwaway project, read back, and compared byte for byte (the definition of
+// `data.git.expected_drift`: artifact bytes against the read-back export). The
+// files the gateway rewrote are written to `<out-dir>/drift-files.txt`, with
+// `<out-dir>/normalize.patch` that replaces each with the gateway-form bytes
+// against the release tag. The output directory is outside this repository (the
+// private repository); nothing is committed anywhere. Output here is counts
+// only: no path, no name and no byte of the real repository is printed.
+
+const NORM_PROJECT: &str = "G2Norm";
+
+#[tokio::test]
+#[ignore = "needs the git-module rig and a local clone of the real project repository: IGNITION_LIVE_GIT=1, G2_REAL_REPO, G2_NORM_OUT, G2_NORM_TAG"]
+async fn git_g2norm() {
+    let Some(rig) = rig().await else { return };
+    let real = PathBuf::from(require_env("G2_REAL_REPO"));
+    let out = PathBuf::from(require_env("G2_NORM_OUT"));
+    let tag = require_env("G2_NORM_TAG");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repo root")
+        .canonicalize()
+        .expect("repo root resolves");
+    assert!(
+        !out.canonicalize()
+            .expect("the output directory resolves")
+            .starts_with(&repo_root),
+        "the output directory is inside the repository"
+    );
+    assert!(
+        !real
+            .canonicalize()
+            .expect("the real repository resolves")
+            .starts_with(&repo_root),
+        "the real repository is inside this repository"
+    );
+
+    // A scratch clone of the local repository (never a fetch), at the tag.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let work = scratch.path().join("release");
+    git(
+        scratch.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-hardlinks",
+            real.to_str().expect("utf8"),
+            work.to_str().expect("utf8"),
+        ],
+    );
+    git(&work, &["checkout", "-q", &tag]);
+    let tracked = git(&work, &["ls-files"]).lines().count();
+    let artifact = build_artifact(&work).expect("the release builds an artifact");
+    let released = zip_members(&artifact.zip);
+
+    // Import as a throwaway project, read back, delete.
+    let api = rig.api();
+    if GatewayApi::project_find(&api, NORM_PROJECT).await.is_ok() {
+        GatewayApi::project_delete(&api, NORM_PROJECT)
+            .await
+            .expect("an earlier throwaway project is removed");
+    }
+    GatewayApi::project_import(&api, NORM_PROJECT, artifact.zip.clone(), false)
+        .await
+        .unwrap_or_else(|err| panic!("the throwaway import failed: {}", err.code()));
+    // The gateway loads the imported project before its export is complete.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let export = GatewayProjects(&api)
+        .export_bytes(NORM_PROJECT)
+        .await
+        .map(|bytes| zip_members(&bytes));
+    GatewayApi::project_delete(&api, NORM_PROJECT)
+        .await
+        .expect("the throwaway project is removed");
+    let exported = export.expect("the read-back export");
+
+    // The drift: members whose bytes the gateway changed.
+    let drift: Vec<(&String, &Vec<u8>)> = exported
+        .iter()
+        .filter(|(path, bytes)| released.get(*path).is_some_and(|rel| rel != *bytes))
+        .collect();
+    let dropped = released
+        .keys()
+        .filter(|path| !exported.contains_key(*path))
+        .count();
+    let extra = exported
+        .keys()
+        .filter(|path| !released.contains_key(*path))
+        .count();
+
+    // The files and the patch: the release tree with the gateway-form bytes.
+    for (path, bytes) in &drift {
+        let file = work.join(path);
+        assert!(
+            file.is_file(),
+            "a drift member is a file of the release tree"
+        );
+        std::fs::write(&file, bytes).expect("gateway-form bytes");
+    }
+    let patch = Command::new("git")
+        .args([
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.safecrlf=false",
+            "diff",
+            "--binary",
+        ])
+        .current_dir(&work)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git diff runs");
+    assert!(patch.status.success(), "git diff failed");
+    let mut names: Vec<&str> = drift.iter().map(|(path, _)| path.as_str()).collect();
+    names.sort_unstable();
+    let mut listing = names.join("\n");
+    if !listing.is_empty() {
+        listing.push('\n');
+    }
+    std::fs::write(out.join("drift-files.txt"), listing).expect("the file list");
+    std::fs::write(out.join("normalize.patch"), &patch.stdout).expect("the patch");
+    println!(
+        "LIVE-G2NORM tracked={tracked} artifact_members={} export_members={} drift={} dropped={dropped} extra={extra} patch_bytes={}",
+        released.len(),
+        exported.len(),
+        drift.len(),
+        patch.stdout.len()
+    );
+    println!("LIVE-RAN git_g2norm");
+}

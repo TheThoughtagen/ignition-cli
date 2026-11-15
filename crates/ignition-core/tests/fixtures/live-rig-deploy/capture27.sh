@@ -28,6 +28,16 @@
 #                    test printed its LIVE-RAN line
 #   g2real TAG       static counts of a real repository at a release tag
 #                    (G2_REAL_REPO, a local clone outside this repository)
+#   g2norm OUT-DIR   (27-25, D-20) the gateway-form normalization of a real
+#                    project repository, produced on this local rig: the
+#                    release tag's artifact is imported as a throwaway project,
+#                    read back, and the files the gateway rewrote are listed
+#                    with a patch that replaces each with the gateway-form
+#                    bytes. OUT-DIR must be outside this repository (the
+#                    private repository); nothing is committed anywhere and
+#                    only counts are printed. G2_REAL_REPO is a local clone
+#                    (never fetched here); G2_NORM_TAG picks the release tag
+#                    (default: the newest v* tag, else HEAD)
 #   files27          write the rig compose file and the git server files only
 #                    (the pair driver reuses the git server build context)
 #   trigger27        remove CapApp's .git, then run the module's own
@@ -725,6 +735,41 @@ g2real() {
   printf 'g2real: tracked=%s in_scope=%s out_of_scope=%s\n' "$total" "$in_scope" "$(( total - in_scope ))"
 }
 
+# g2norm OUT-DIR: see the header. The gate git_g2norm does the work; this
+# function guards the paths, picks the tag and reports counts.
+g2norm() {
+  local out=${1:?OUT-DIR} src real out_real tag
+  src=${G2_REAL_REPO:-}
+  [ -n "$src" ] || die "g2norm: set G2_REAL_REPO to a local clone"
+  [ -d "$src" ] || die "g2norm: G2_REAL_REPO is not a directory"
+  real=$(cd "$src" && pwd -P)
+  case "$real/" in
+    "$REPO_REAL"/*) die "REFUSING: G2_REAL_REPO is inside this repository" ;;
+  esac
+  case "$out" in
+    /*) ;;
+    *) die "REFUSING: the output directory is not an absolute path" ;;
+  esac
+  mkdir -p "$out"
+  out_real=$(cd "$out" && pwd -P)
+  case "$out_real/" in
+    "$REPO_REAL"/*) die "REFUSING: the output directory is inside this repository" ;;
+  esac
+  chmod 700 "$out_real"
+  tag=${G2_NORM_TAG:-}
+  if [ -z "$tag" ]; then
+    tag=$(seedgit -C "$real" tag --list 'v*' --sort=-v:refname | head -n 1)
+  fi
+  [ -n "$tag" ] || tag=HEAD
+  ( export G2_REAL_REPO=$real G2_NORM_OUT=$out_real G2_NORM_TAG=$tag; live27 27-25-g2norm git_g2norm ) > /dev/null 2>&1 || {
+    echo "g2norm: the gate failed; see $STATE/evidence/27-25-g2norm.log (counts only)" >&2
+    exit 1
+  }
+  grep -o 'LIVE-G2NORM.*' "$STATE/evidence/27-25-g2norm.log" || true
+  printf 'g2norm: drift-files %s lines, patch %s bytes (%s)\n' \
+    "$(wc -l < "$out_real/drift-files.txt" | tr -d ' ')" "$(wc -c < "$out_real/normalize.patch" | tr -d ' ')" "private output directory"
+}
+
 down27() {
   if [ -f "$STATE/compose.yml" ]; then
     dc down -v --remove-orphans
@@ -1080,6 +1125,7 @@ case "${1:-}" in
   status27) status27 ;;
   live27) shift; live27 "$@" ;;
   g2real) g2real "${2:-}" ;;
+  g2norm) g2norm "${2:-}" ;;
   files27) write_rig_files ;;
   trigger27) trigger27 ;;
   nogit27) nogit27 ;;
@@ -1093,5 +1139,5 @@ case "${1:-}" in
   g7) g7 ;;
   g9why) g9why "${2:-restart}" ;;
   down27) down27 ;;
-  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|trigger27|nogit27|seedprod27|seedtags27|designer-evidence before|after|images27 ensure|list|shape27 LABEL|g3|g6|g7|g9why SETTING|down27" >&2; exit 64 ;;
+  *) echo "usage: capture27.sh up27|seed27|reset27|publish27|yaml27 MODE|mint27|restart27|script27 FILE|status27|live27 LOG TEST...|g2real TAG|g2norm OUT-DIR|trigger27|nogit27|seedprod27|seedtags27|designer-evidence before|after|images27 ensure|list|shape27 LABEL|g3|g6|g7|g9why SETTING|down27" >&2; exit 64 ;;
 esac
