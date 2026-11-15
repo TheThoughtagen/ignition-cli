@@ -3037,6 +3037,17 @@ pub(crate) fn describe_projects_event(
             "git {}: .git saved ({files} file(s), {bytes} byte(s))",
             escape_control(node.trim_start_matches("nodes."))
         ),
+        ProjectsEvent::GitDiscarded {
+            node,
+            evidence,
+            commits,
+            paths,
+        } => format!(
+            "git {}: discarding {paths} live path(s) and {commits} commit(s); the evidence is \
+             at {}",
+            escape_control(node.trim_start_matches("nodes.")),
+            escape_control(evidence)
+        ),
         ProjectsEvent::GitRestored { node } => format!(
             "git {}: .git put back from the save",
             escape_control(node.trim_start_matches("nodes."))

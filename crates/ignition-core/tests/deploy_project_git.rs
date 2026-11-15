@@ -51,6 +51,7 @@ async fn handover(
         &saved,
         &prep,
         &f.export_zip(),
+        None,
     )
     .await
 }
@@ -211,6 +212,7 @@ async fn handover_extra_member_fails() {
         &saved,
         &prep,
         &f.export_zip(),
+        None,
     )
     .await
     .expect_err("an export member the artifact lacks");
@@ -1557,6 +1559,8 @@ mod published {
         pub repo: PathBuf,
         /// The release tag.
         pub release: String,
+        /// `--discard-gateway-changes`, when the run gives one (27-15).
+        pub discard: Option<String>,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1608,6 +1612,7 @@ mod published {
                 gateway,
                 repo,
                 release: "v1.1.0".to_string(),
+                discard: None,
             }
         }
 
@@ -1619,7 +1624,7 @@ mod published {
                 release: self.release.clone(),
                 allow_downgrade: false,
                 allow_first_change: Some("first deploy of the rig".to_string()),
-                discard_gateway_changes: None,
+                discard_gateway_changes: self.discard.clone(),
                 allow_git_sync_hazards: None,
                 allow_destructive: false,
                 allow_manual_undo: false,
@@ -2814,5 +2819,538 @@ mod published {
         assert_eq!(proceed.timeout.as_secs(), GIT_RESTORE_DESIGNER_WAIT_S);
         let waiting = restore_policy(&wait_ms(1234));
         assert_eq!(waiting.timeout, std::time::Duration::from_millis(1234));
+    }
+
+    // ---- 27-15: `discard_gateway_changes` (D-05) ----
+
+    const VIEW_MEMBER: &str = "com.inductiveautomation.perspective/views/V/view.json";
+    const REASON: &str = "the break/fix on the gateway is abandoned (ticket 42)";
+
+    /// A rig whose run gives `--discard-gateway-changes`.
+    fn discarding() -> Rig {
+        let mut rig = Rig::new();
+        rig.discard = Some(REASON.to_string());
+        rig
+    }
+
+    /// The gateway repo's refs, as `git for-each-ref` prints them.
+    fn refs_of(rig: &Rig) -> String {
+        rig.f
+            .git_in_project(&["for-each-ref", "--format=%(refname) %(objectname)"])
+    }
+
+    /// The discarded block, which must be present.
+    fn discarded_of(result: &DeployProjectsResult) -> &DiscardedReport {
+        git_of(result)
+            .discarded
+            .as_ref()
+            .expect("data.git.discarded is present")
+    }
+
+    use ignition_core::actions::deploy_projects::git::{DiscardDirty, DiscardedReport};
+
+    fn discarded_json(rig: &Rig, result: &DeployProjectsResult) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(rig.run_path(result).join("git/discarded.json"))
+                .expect("git/discarded.json exists"),
+        )
+        .expect("discarded.json parses")
+    }
+
+    #[tokio::test]
+    async fn check_would_discard() {
+        // Without the override the gate still refuses.
+        let rig = Rig::new();
+        let d = rig.f.designer_commit(false);
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        let err = refusal(rig.check().await);
+        assert_eq!(gate_of(&err).0, "git_unpushed");
+
+        // With it, --check reports what would go and writes nothing.
+        let mut rig = rig;
+        rig.discard = Some(REASON.to_string());
+        let before = rig.git_manifest().await;
+        let result = rig.check().await.expect("the check completes");
+        assert_eq!(result.outcome, ProjectOutcome::Checked);
+        let git = git_of(&result);
+        let would = git.would_discard.as_ref().expect("would_discard");
+        assert_eq!(would.dirty, DiscardDirty::Listed);
+        assert_eq!(would.paths, [VIEW_MEMBER.to_string()]);
+        assert_eq!(would.paths_count, 1);
+        assert_eq!(would.commits, [d]);
+        assert_eq!(would.evidence, "export/CapApp.zip");
+        assert!(git.discarded.is_none());
+        let json = serde_json::to_value(git).expect("json");
+        assert_eq!(json["would_discard"]["dirty"], "listed");
+        assert!(json["discarded"].is_null());
+        assert_eq!(rig.run_dirs(), 0, "no run directory");
+        assert!(rig.save_trees().is_empty());
+        assert_eq!(rig.git_manifest().await, before, ".git is byte-identical");
+        assert!(rig.gateway.import_calls().is_empty());
+    }
+
+    /// B5: an unpushed gateway HEAD is unknown to ign's checkout. The pack is
+    /// built in the prepare from the ids ign's store holds, the repo ends at
+    /// the release, and the abandoned HEAD stays reachable.
+    #[tokio::test]
+    async fn override_unpushed_advances_and_keeps_head() {
+        let rig = discarding();
+        let d = rig.f.designer_commit(false);
+        rig.sync_live();
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let ProjectsPrepared::Ready { git, .. } = &prepared else {
+            panic!("a changed project is Ready");
+        };
+        let bases = &git
+            .as_ref()
+            .and_then(|g| g.prep.as_ref())
+            .expect("the advance was prepared")
+            .pack_bases;
+        assert!(!bases.contains(&d), "the unpushed HEAD is never a base");
+        assert!(bases.contains(&rig.f.c1), "{bases:?}");
+
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, None)
+            .await
+            .expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.ok);
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        rig.f.git_in_project(&["fsck", "--connectivity-only"]);
+        let run_id = result.run_id.clone().expect("run id");
+        assert!(
+            refs_of(&rig).contains(&format!("refs/ign-discarded/{run_id} {d}")),
+            "{}",
+            refs_of(&rig)
+        );
+        rig.f.git_in_project(&["cat-file", "-e", &d]);
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore");
+        assert!(restore.advanced && restore.verified && restore.save_kept);
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.commits, std::slice::from_ref(&d));
+        assert_eq!(
+            discarded.keep_ref.as_deref(),
+            Some(format!("refs/ign-discarded/{run_id}").as_str())
+        );
+        assert!(
+            git_of(&result).would_discard.is_none(),
+            "the result says what happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn override_not_merged_lists_commits() {
+        let rig = discarding();
+        let b = rig.f.breakfix_on_production();
+        rig.sync_live();
+        let check = rig.check().await.expect("the check completes");
+        let would = git_of(&check)
+            .would_discard
+            .as_ref()
+            .expect("would_discard");
+        assert_eq!(would.commits, std::slice::from_ref(&b));
+        assert_eq!(would.dirty, DiscardDirty::None);
+        assert!(would.paths.is_empty() && would.paths_count == 0);
+
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.commits, std::slice::from_ref(&b));
+        assert_eq!(discarded.dirty, DiscardDirty::None);
+        let run_id = result.run_id.clone().expect("run id");
+        assert!(
+            refs_of(&rig).contains(&format!("refs/ign-discarded/{run_id} {b}")),
+            "{}",
+            refs_of(&rig)
+        );
+        rig.f.git_in_project(&["cat-file", "-e", &b]);
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+    }
+
+    #[tokio::test]
+    async fn override_does_not_pass_release_not_on_branch() {
+        let mut rig = discarding();
+        rig.f.designer_commit(false);
+        rig.f.tag_release_on("feature", "v1.2.0");
+        rig.release = "v1.2.0".to_string();
+        rig.sync_live();
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "release_not_on_branch");
+    }
+
+    #[tokio::test]
+    async fn override_does_not_pass_project_git_managed() {
+        let rig = discarding();
+        rig.f.git_in_project(&["checkout", "-q", "--detach"]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "detached_head");
+    }
+
+    #[tokio::test]
+    async fn override_does_not_pass_a_preflight_failure() {
+        let mut rig = discarding();
+        rig.f.designer_commit(false);
+        rig.sync_live();
+        let shallow = rig.f.shallow_checkout();
+        put_file(
+            &shallow,
+            "deploy/project.yaml",
+            &format!("schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\n"),
+        );
+        put_file(&shallow, ".gitignore", ".ign/\n");
+        rig.repo = shallow;
+        let err = refused_alike(&rig).await;
+        assert_eq!(preflight_checks(&err), ["git_checkout"]);
+    }
+
+    #[tokio::test]
+    async fn clean_run_has_no_discard() {
+        let rig = discarding();
+        let check = rig.check().await.expect("the check completes");
+        assert!(git_of(&check).would_discard.is_none());
+        assert!(git_of(&check).discarded.is_none());
+
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(result.outcome, ProjectOutcome::Imported);
+        let git = git_of(&result);
+        assert!(git.would_discard.is_none() && git.discarded.is_none());
+        let json = serde_json::to_value(git).expect("json");
+        assert!(json["would_discard"].is_null() && json["discarded"].is_null());
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert!(!git.master().restore.as_ref().expect("restore").save_kept);
+        assert!(
+            !refs_of(&rig).contains("ign-discarded"),
+            "{}",
+            refs_of(&rig)
+        );
+        assert!(
+            !rig.run_path(&result).join("git/discarded.json").exists(),
+            "no evidence of nothing"
+        );
+        assert!(
+            !rig.git_events(&result)
+                .contains(&"git_discarded".to_string())
+        );
+    }
+
+    /// D-24: an unpushed Designer commit that ign's store lacks, plus an
+    /// uncommitted live change: the dirty paths are listed from the gateway's
+    /// own objects.
+    #[tokio::test]
+    async fn override_unpushed_dirty_listed() {
+        let rig = discarding();
+        let d = rig
+            .f
+            .designer_commit_changing(CODE, "def f():\n    return 7\n", false);
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+
+        let check = rig.check().await.expect("the check completes");
+        let git = git_of(&check);
+        let would = git.would_discard.as_ref().expect("would_discard");
+        assert_eq!(would.dirty, DiscardDirty::Listed);
+        assert_eq!(would.paths, [VIEW_MEMBER.to_string()]);
+        assert_eq!(would.paths_count, 1);
+        assert_eq!(would.commits, std::slice::from_ref(&d));
+        assert_eq!(would.evidence, "export/CapApp.zip");
+        let node = git.master();
+        assert_eq!(
+            node.dirty.as_deref(),
+            Some([VIEW_MEMBER.to_string()].as_slice())
+        );
+        assert_eq!(node.dirty_source, Some("gateway_objects"));
+
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.dirty, DiscardDirty::Listed);
+        assert_eq!(discarded.paths, [VIEW_MEMBER.to_string()]);
+        assert_eq!(
+            serde_json::to_value(discarded.dirty).expect("json"),
+            "listed"
+        );
+
+        // Task 2: the evidence names the same paths and the pre-image holds
+        // the live content.
+        let evidence = discarded_json(&rig, &result);
+        assert_eq!(evidence["dirty"], "listed");
+        assert_eq!(evidence["paths"], serde_json::json!([VIEW_MEMBER]));
+        assert_eq!(evidence["paths_count"], 1);
+        assert_eq!(evidence["pre_image"], "export/CapApp.zip");
+        assert_eq!(evidence["commits"], serde_json::json!([d]));
+        let pre = std::fs::read(rig.run_path(&result).join("export/CapApp.zip"))
+            .expect("the pre-image export");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(pre)).expect("the pre-image is a zip");
+        let mut member = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name(VIEW_MEMBER).expect("the changed member"),
+            &mut member,
+        )
+        .expect("member text");
+        assert!(member.contains("\"live\":true"), "{member}");
+    }
+
+    // ---- 27-15 task 2: evidence, run.json, event and hints ----
+
+    #[tokio::test]
+    async fn override_passes_dirty() {
+        let rig = discarding();
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.reason, REASON);
+        assert_eq!(discarded.dirty, DiscardDirty::Listed);
+        assert_eq!(discarded.paths, [VIEW_MEMBER.to_string()]);
+        assert_eq!(discarded.paths_count, 1);
+        assert!(discarded.commits.is_empty() && discarded.keep_ref.is_none());
+        assert_eq!(discarded.evidence, "export/CapApp.zip");
+
+        let path = rig.run_path(&result).join("git/discarded.json");
+        let evidence = discarded_json(&rig, &result);
+        assert_eq!(evidence["reason"], REASON);
+        assert_eq!(evidence["branch"], BRANCH);
+        assert_eq!(evidence["abandoned_head"], rig.f.c1.as_str());
+        assert_eq!(evidence["dirty"], "listed");
+        assert_eq!(evidence["paths"], serde_json::json!([VIEW_MEMBER]));
+        assert_eq!(evidence["commits"], serde_json::json!([]));
+        assert_eq!(evidence["pre_image"], "export/CapApp.zip");
+        let save_path = evidence["save_path"].as_str().expect("save path");
+        assert!(save_path.contains("git-save"), "{save_path}");
+        // Ids, paths and the reason: no file content and no commit message.
+        let text = std::fs::read_to_string(&path).expect("evidence text");
+        assert!(
+            !text.contains("\"live\"") && !text.contains("designer") && !text.contains("init"),
+            "{text}"
+        );
+        let mut keys: Vec<&str> = evidence
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "abandoned_head",
+                "branch",
+                "commits",
+                "dirty",
+                "paths",
+                "paths_count",
+                "pre_image",
+                "reason",
+                "save_path"
+            ]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p).expect("meta").permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().expect("git dir")), 0o700);
+            assert_eq!(
+                mode(&rig.run_path(&result).join("export/CapApp.zip")),
+                0o600
+            );
+        }
+        // Dirty work alone abandons no commit: the save is removed.
+        assert!(rig.save_trees().is_empty());
+        assert!(!refs_of(&rig).contains("ign-discarded"));
+    }
+
+    #[tokio::test]
+    async fn override_evidence_before_save() {
+        let rig = discarding();
+        rig.f.designer_commit(false);
+        rig.sync_live();
+        let result = rig.apply().await.expect("the apply completes");
+        let events = rig.events(&result);
+        let position = |name: &str| {
+            events
+                .iter()
+                .position(|e| e["event"] == name)
+                .unwrap_or_else(|| panic!("{name} is logged"))
+        };
+        assert!(position("pre_image_exported") < position("git_discarded"));
+        assert!(position("git_discarded") < position("git_saved"));
+        assert!(position("git_discarded") < position("import_sent"));
+        let event = &events[position("git_discarded")];
+        assert_eq!(event["evidence"], "git/discarded.json");
+        assert_eq!(event["commits"], 1);
+        assert!(
+            rig.run_path(&result)
+                .join(event["evidence"].as_str().expect("path"))
+                .exists()
+        );
+        // The reason is operator text: it is in run.json and the evidence,
+        // never in an event.
+        let log =
+            std::fs::read_to_string(rig.run_path(&result).join("events.ndjson")).expect("events");
+        assert!(!log.contains(REASON), "{log}");
+        assert_eq!(
+            rig.git_events(&result),
+            [
+                "git_state_read",
+                "git_discarded",
+                "git_saved",
+                "git_restored",
+                "git_advanced"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn override_recorded_in_run_json() {
+        let rig = discarding();
+        rig.f.designer_commit(false);
+        rig.sync_live();
+        let result = rig.apply().await.expect("the apply completes");
+        let run = run_json(&rig, &result);
+        assert_eq!(run["discard_gateway_changes"], REASON);
+        assert_eq!(run["git"].as_object().map(|o| o.len()), Some(3));
+
+        // Without the override the key is null.
+        let plain = Rig::new();
+        let result = plain.apply().await.expect("the apply completes");
+        assert!(run_json(&plain, &result)["discard_gateway_changes"].is_null());
+    }
+
+    /// The reason is data: whatever it holds is stored as a JSON string and
+    /// reaches no shell, no event and no message.
+    #[tokio::test]
+    async fn override_reason_is_data() {
+        let mut rig = Rig::new();
+        let reason =
+            "x\"; touch /tmp/ign-27-15-pwned; $(touch /tmp/ign-27-15-pwned) `id` \u{1b}[31m\nline2";
+        rig.discard = Some(reason.to_string());
+        rig.f.designer_commit(false);
+        rig.sync_live();
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(discarded_of(&result).reason, reason);
+        assert_eq!(discarded_json(&rig, &result)["reason"], reason);
+        assert_eq!(run_json(&rig, &result)["discard_gateway_changes"], reason);
+        let log =
+            std::fs::read_to_string(rig.run_path(&result).join("events.ndjson")).expect("events");
+        assert!(!log.contains("pwned") && !log.contains('\u{1b}'), "{log}");
+        for warning in &result.warnings {
+            assert!(!warning.contains("pwned"), "{warning}");
+        }
+        assert!(!std::path::Path::new("/tmp/ign-27-15-pwned").exists());
+    }
+
+    #[tokio::test]
+    async fn override_record_keeps_commits_reachable() {
+        let rig = discarding();
+        let d = rig.f.designer_commit(false);
+        rig.make_live_equal_artifact().await;
+        let result = rig.apply().await.expect("the record completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Recorded,
+            "{:?}",
+            result.warnings
+        );
+        assert!(rig.gateway.import_calls().is_empty(), "no import");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), rig.f.c2);
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.commits, std::slice::from_ref(&d));
+        assert_eq!(discarded.dirty, DiscardDirty::None);
+        let run_id = result.run_id.clone().expect("run id");
+        assert!(refs_of(&rig).contains(&format!("refs/ign-discarded/{run_id} {d}")));
+        rig.f.git_in_project(&["fsck", "--connectivity-only"]);
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+        assert!(rig.run_path(&result).join("git/discarded.json").exists());
+    }
+
+    /// K11 with the override: the import replaced the live content (the
+    /// pre-image has it) but the repo is put back as saved, so no commit was
+    /// abandoned and no keep-alive ref exists.
+    #[tokio::test]
+    async fn override_unverified_import_abandons_no_commit() {
+        let rig = discarding();
+        let d = rig.f.designer_commit(false);
+        rig.sync_live();
+        rig.gateway.mutate_child_after_import(PROJECT, 1000);
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+        let discarded = discarded_of(&result);
+        assert!(discarded.commits.is_empty() && discarded.keep_ref.is_none());
+        assert!(
+            !refs_of(&rig).contains("ign-discarded"),
+            "{}",
+            refs_of(&rig)
+        );
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), d);
+        assert!(rig.run_path(&result).join("git/discarded.json").exists());
+        assert!(rig.run_path(&result).join("export/CapApp.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn git_gate_hint_names_override() {
+        let rig = Rig::new();
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        let err = refusal(rig.check().await);
+        assert_eq!(gate_of(&err).0, "git_dirty");
+        for gate in ["git_unpushed", "git_not_merged", "git_dirty"] {
+            let err = CoreError::DestructiveChangeRefused {
+                gate: gate.to_string(),
+                keys: vec!["a".to_string()],
+                count: 1,
+            };
+            let text = err.to_string();
+            let hint = err.hint().expect("hint");
+            assert!(
+                text.contains("--discard-gateway-changes <reason>"),
+                "{text}"
+            );
+            assert!(hint.contains("--discard-gateway-changes"), "{hint}");
+            for kept in [
+                "pre-image",
+                "refs/ign-discarded/<run-id>",
+                "saved repository",
+            ] {
+                assert!(hint.contains(kept), "{gate}: {kept} is not named: {hint}");
+            }
+            assert!(hint.contains("push and merge it"), "{hint}");
+        }
+        // The gate no override passes keeps its own wording.
+        let err = CoreError::DestructiveChangeRefused {
+            gate: "downgrade".to_string(),
+            keys: vec!["P".to_string()],
+            count: 1,
+        };
+        assert!(!err.to_string().contains("--discard-gateway-changes"));
     }
 }

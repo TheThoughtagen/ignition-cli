@@ -45,11 +45,12 @@ use crate::deploy::git_gate::{
     gate_node, remote_view,
 };
 use crate::deploy::git_handover::{
-    GitRestoreFailure, GitSaveReport, restore_and_advance, restore_unchanged, save,
+    Discarding, GitRestoreFailure, GitSaveReport, restore_and_advance, restore_unchanged, save,
 };
 use crate::deploy::git_objects::dirty_from_gateway;
 use crate::deploy::git_remote::HostGit;
 use crate::deploy::git_state::{GitFiles, GitHead, GitRefs, GitState, GitStateKind, classify};
+use crate::deploy::ledger::{LedgerRoot, git_save_location};
 use crate::deploy::project_artifact::CanonicalDigest;
 use crate::deploy::transport::projects::{
     GitEntry, GitHostRead, GitStateWriter, git_entry_location,
@@ -272,10 +273,12 @@ pub struct GitReport {
     pub expected_drift_count: Option<usize>,
     /// True once `expected_drift` is the post-import prediction.
     pub expected_drift_complete: bool,
-    /// What an override would discard (27-15); null until then.
-    pub would_discard: Option<serde_json::Value>,
-    /// What an override discarded (27-15); null until then.
-    pub discarded: Option<serde_json::Value>,
+    /// What `--discard-gateway-changes` would discard (27-15, D-05): reported
+    /// by a `--check` and by the plan; null when the override is not given or
+    /// nothing would go. An apply's result carries `discarded` instead.
+    pub would_discard: Option<WouldDiscard>,
+    /// What the run discarded (27-15, D-05); null when nothing was.
+    pub discarded: Option<DiscardedReport>,
     /// The `--allow-git-sync-hazards` reason (27-18); null until then.
     pub hazards_acknowledged: Option<String>,
 }
@@ -301,6 +304,80 @@ impl GitReport {
     }
 }
 
+/// Whether the dirty list of a discard names paths (D-05, D-24): the word is
+/// `none` for a clean repo and `listed` when the paths are in the list. No
+/// third word exists: the paths are always known, from ign's store or from
+/// the gateway's own objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscardDirty {
+    /// No live change since the gateway HEAD is lost.
+    None,
+    /// The paths of the live changes are listed.
+    Listed,
+}
+
+/// `data.git.would_discard`: what the override passes, before anything is
+/// written (27-15, D-05). Paths and commit ids only: never a commit message,
+/// file content or URL userinfo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WouldDiscard {
+    /// `none` or `listed`.
+    pub dirty: DiscardDirty,
+    /// The live paths that changed since the gateway HEAD, byte-sorted and
+    /// capped at 200.
+    pub paths: Vec<String>,
+    /// The full number of dirty paths.
+    pub paths_count: usize,
+    /// The commits the branch move abandons: unpushed ones, then the ones not
+    /// merged into the release (newest first, capped).
+    pub commits: Vec<String>,
+    /// The run-directory file that holds the live content (the pre-image
+    /// export), relative to the run directory.
+    pub evidence: String,
+}
+
+/// `data.git.discarded`: what the run discarded (27-15, D-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiscardedReport {
+    /// The operator's reason (operator text: data, never a command).
+    pub reason: String,
+    /// `none` or `listed`.
+    pub dirty: DiscardDirty,
+    /// The live paths the import replaced, as in `would_discard`.
+    pub paths: Vec<String>,
+    /// The full number of dirty paths.
+    pub paths_count: usize,
+    /// The commits the advance abandoned; empty until the advance wrote.
+    pub commits: Vec<String>,
+    /// `refs/ign-discarded/<run-id>` once the advance wrote it, else null.
+    #[serde(rename = "ref")]
+    pub keep_ref: Option<String>,
+    /// The run-directory file holding the live content, relative to the run
+    /// directory.
+    pub evidence: String,
+}
+
+/// What an apply with `--discard-gateway-changes` discards, decided in
+/// [`prepare_git_live`] (27-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscardPlan {
+    /// The operator's reason.
+    pub reason: String,
+    /// The tracked branch.
+    pub branch: Option<String>,
+    /// The gateway HEAD before the run. The keep-alive ref names it when
+    /// commits are abandoned; it is always known then.
+    pub abandoned_head: Option<String>,
+    /// What is reported beforehand.
+    pub would: WouldDiscard,
+}
+
+/// The keep-alive ref's name for a run.
+pub fn discard_ref_name(run_id: &str) -> String {
+    format!("refs/ign-discarded/{run_id}")
+}
+
 /// Everything the prepare learned about one managed gateway repo.
 #[derive(Debug, Clone)]
 pub struct PreparedGit {
@@ -319,6 +396,11 @@ pub struct PreparedGit {
     pub prep: Option<AdvancePrep>,
     /// The gate facts, once [`prepare_git_live`] ran.
     pub gates: Option<NodeGates>,
+    /// The `--discard-gateway-changes` reason, when given (27-15).
+    pub discard_reason: Option<String>,
+    /// What the override discards, once [`prepare_git_live`] found something
+    /// the gates would otherwise refuse; `None` otherwise (27-15).
+    pub discard: Option<DiscardPlan>,
     /// The published block.
     pub report: GitReport,
     /// The `.git` entry kind (`directory`, ...), for refusals.
@@ -520,10 +602,73 @@ pub async fn prepare_git_host(
         view,
         prep: Some(prep),
         gates: None,
+        discard_reason: input.discard_gateway_changes.clone(),
+        discard: None,
         report,
         kind: kind.to_string(),
         head_log_tail: found.files.head_log_tail,
     }))
+}
+
+/// What `--discard-gateway-changes <reason>` discards, from the gates' facts
+/// (27-15, D-05): the dirty paths (itemised for every managed node, D-24), the
+/// unpushed commits, then the commits not merged into the release. The pre-image
+/// export is the evidence of the live content. A `record` leaves the project
+/// as it is, so it discards commits only.
+///
+/// Fails closed with `deploy_preflight_failed` check `git_gateway_objects`
+/// when an import's dirty list was never itemised, and with `git_host` when
+/// commits would be abandoned but the gateway HEAD that keeps them reachable
+/// is unknown: nothing is discarded that cannot be listed and kept.
+fn discard_plan(
+    reason: &str,
+    gates: &NodeGates,
+    action: ProjectAction,
+    project: &str,
+    state: &GitState,
+) -> Result<DiscardPlan, CoreError> {
+    let (paths, paths_count) = if action == ProjectAction::Import {
+        let Some(list) = gates.dirty.clone() else {
+            return Err(preflight(
+                "git_gateway_objects",
+                "the live changes since the gateway HEAD could not be itemised, so they cannot \
+                 be listed before they are discarded",
+            ));
+        };
+        (list, gates.dirty_count)
+    } else {
+        (Vec::new(), 0)
+    };
+    let mut commits = gates.unpushed.clone();
+    for id in &gates.not_merged {
+        if !commits.contains(id) {
+            commits.push(id.clone());
+        }
+    }
+    let abandoned_head = gates.head.clone();
+    if !commits.is_empty() && abandoned_head.is_none() {
+        return Err(preflight(
+            "git_host",
+            "the gateway HEAD commit is unknown, so the commits the override would discard \
+             cannot be kept reachable",
+        ));
+    }
+    Ok(DiscardPlan {
+        reason: reason.to_string(),
+        branch: state.tracked.clone(),
+        abandoned_head,
+        would: WouldDiscard {
+            dirty: if paths_count == 0 {
+                DiscardDirty::None
+            } else {
+                DiscardDirty::Listed
+            },
+            paths,
+            paths_count,
+            commits,
+            evidence: format!("export/{project}.zip"),
+        },
+    })
 }
 
 /// Step 2: the gate facts against the live project, and the refusals.
@@ -539,6 +684,12 @@ pub async fn prepare_git_host(
 /// unpushed, not-merged and off-branch findings but not for dirty work. A
 /// `skip` whose HEAD is not the release adds a warning. `expected_drift` stays null
 /// (W-6).
+///
+/// With `--discard-gateway-changes <reason>` the three gates `git_unpushed`,
+/// `git_not_merged` and `git_dirty` do not refuse: they become the
+/// [`WouldDiscard`] of `data.git` and a [`DiscardPlan`] the run acts on
+/// (27-15, D-05). `release_not_on_branch`, `project_git_managed` and every
+/// preflight failure still refuse (D-11).
 pub async fn prepare_git_live(
     prepared: &mut PreparedGit,
     live: Option<&CanonicalDigest>,
@@ -613,29 +764,46 @@ pub async fn prepare_git_live(
     let enforce = prepared.mode == GitMode::Enforce
         && matches!(action, ProjectAction::Import | ProjectAction::Record);
     if enforce {
+        // `release_not_on_branch` (like `project_git_managed` and every
+        // preflight failure) has no override (D-11).
         if !gates.release_on_branch {
             return Err(managed(project, &kind, "release_not_on_branch"));
         }
-        if !gates.unpushed.is_empty() {
-            return Err(CoreError::DestructiveChangeRefused {
-                gate: "git_unpushed".to_string(),
-                count: gates.unpushed.len(),
-                keys: gates.unpushed.clone(),
-            });
-        }
-        if gates.not_merged_count > 0 {
-            return Err(CoreError::DestructiveChangeRefused {
-                gate: "git_not_merged".to_string(),
-                count: gates.not_merged_count,
-                keys: gates.not_merged.clone(),
-            });
-        }
-        if action == ProjectAction::Import && gates.dirty_count > 0 {
-            return Err(CoreError::DestructiveChangeRefused {
-                gate: "git_dirty".to_string(),
-                count: gates.dirty_count,
-                keys: gates.dirty.clone().unwrap_or_default(),
-            });
+        let dirty_refuses = action == ProjectAction::Import && gates.dirty_count > 0;
+        let refuses = !gates.unpushed.is_empty() || gates.not_merged_count > 0 || dirty_refuses;
+        match (&prepared.discard_reason, refuses) {
+            // `--discard-gateway-changes` passes exactly the three C1 refusals
+            // and turns them into what `--check` reports (27-15, D-05).
+            (Some(reason), true) => {
+                let plan = discard_plan(reason, &gates, action, project, &prepared.state)?;
+                prepared.report.would_discard = Some(plan.would.clone());
+                prepared.discard = Some(plan);
+            }
+            // The override has nothing to pass: a clean repo is a plain run.
+            (Some(_), false) => {}
+            (None, _) => {
+                if !gates.unpushed.is_empty() {
+                    return Err(CoreError::DestructiveChangeRefused {
+                        gate: "git_unpushed".to_string(),
+                        count: gates.unpushed.len(),
+                        keys: gates.unpushed.clone(),
+                    });
+                }
+                if gates.not_merged_count > 0 {
+                    return Err(CoreError::DestructiveChangeRefused {
+                        gate: "git_not_merged".to_string(),
+                        count: gates.not_merged_count,
+                        keys: gates.not_merged.clone(),
+                    });
+                }
+                if dirty_refuses {
+                    return Err(CoreError::DestructiveChangeRefused {
+                        gate: "git_dirty".to_string(),
+                        count: gates.dirty_count,
+                        keys: gates.dirty.clone().unwrap_or_default(),
+                    });
+                }
+            }
         }
     }
     prepared.gates = Some(gates);
@@ -720,6 +888,43 @@ fn capped_paths(mut paths: Vec<String>) -> (Vec<String>, usize) {
     let count = paths.len();
     paths.truncate(LIST_CAP);
     (paths, count)
+}
+
+impl DiscardPlan {
+    /// The content of `git/discarded.json` (27-15, D-05): the operator's
+    /// reason, the branch, the abandoned HEAD, the dirty paths, the commit ids,
+    /// the pre-image that holds the live content and where the saved `.git`
+    /// will be. Ids, paths and the operator's text only: no commit message and
+    /// no file content.
+    pub fn evidence_json(&self, gateway: &str, project: &str, run_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "reason": self.reason,
+            "branch": self.branch,
+            "abandoned_head": self.abandoned_head,
+            "dirty": self.would.dirty,
+            "paths": self.would.paths,
+            "paths_count": self.would.paths_count,
+            "commits": self.would.commits,
+            "pre_image": self.would.evidence,
+            "save_path": git_save_location(LedgerRoot::DataDir, gateway, project, run_id),
+        })
+    }
+
+    /// Record on `report` that the run is discarding what the plan names: the
+    /// `discarded` block (the commits and the keep-alive ref follow once the
+    /// advance wrote them) replaces `would_discard`.
+    pub fn begin(&self, report: &mut GitReport) {
+        report.would_discard = None;
+        report.discarded = Some(DiscardedReport {
+            reason: self.reason.clone(),
+            dirty: self.would.dirty,
+            paths: self.would.paths.clone(),
+            paths_count: self.would.paths_count,
+            commits: Vec::new(),
+            keep_ref: None,
+            evidence: self.would.evidence.clone(),
+        });
+    }
 }
 
 /// The Designer policy the gate before a post-import `.git` write uses
@@ -961,6 +1166,17 @@ async fn advance_after(
             },
         );
     };
+    // Commits the override abandons stay reachable through a ref the advance
+    // writes next to the branch (27-15, D-05, Pitfall 7).
+    let discarding = prepared
+        .discard
+        .as_ref()
+        .filter(|plan| !plan.would.commits.is_empty())
+        .and_then(|plan| plan.abandoned_head.as_deref())
+        .map(|abandoned_head| Discarding {
+            run_id: saved.run_id.as_str(),
+            abandoned_head,
+        });
     let done = match restore_and_advance(
         inputs.read,
         inputs.write,
@@ -970,12 +1186,20 @@ async fn advance_after(
         saved,
         prep,
         inputs.export_zip,
+        discarding,
     )
     .await
     {
         Ok(done) => done,
         Err(failure) => return failed_restore(report, &failure),
     };
+    if done.keep_save
+        && let (Some(plan), Some(discarded)) =
+            (prepared.discard.as_ref(), report.discarded.as_mut())
+    {
+        discarded.commits.clone_from(&plan.would.commits);
+        discarded.keep_ref = Some(discard_ref_name(&saved.run_id));
+    }
 
     let (dropped, dropped_count) = capped_paths(done.dropped.clone());
     let (drift, drift_count) = capped_paths(done.expected_drift.clone());
@@ -1063,6 +1287,15 @@ async fn advance_after(
             reason: REASON_POST_STATUS_MISMATCH.to_string(),
             path: Some(save_path),
         });
+    } else if done.keep_save {
+        // Gateway commits were abandoned: the saved repository is the whole
+        // gateway repo as the module left it, so it stays (27-15, D-05).
+        after.warnings.push(format!(
+            "project {}: gateway commits were discarded; they stay reachable at {} in the \
+             gateway repo and the saved .git is kept at {save_path}",
+            inputs.project,
+            discard_ref_name(&saved.run_id)
+        ));
     } else {
         remove_save(report, saved, inputs, &mut after).await;
     }
@@ -1315,6 +1548,37 @@ mod tests {
         let local = PostStatusMode::of(Some(PathBuf::from("/data")));
         assert!(local.not_checked_words().is_none());
         assert!(matches!(local, PostStatusMode::Disk(_)));
+    }
+
+    /// D-24: the dirty word of a discard has exactly two values; `unknown`
+    /// is not an outcome.
+    #[test]
+    fn discard_dirty_words() {
+        assert_eq!(
+            serde_json::to_value(DiscardDirty::None).expect("json"),
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(DiscardDirty::Listed).expect("json"),
+            serde_json::json!("listed")
+        );
+        // Nothing else can be built: an exhaustive match names every variant.
+        let words: Vec<&str> = [DiscardDirty::None, DiscardDirty::Listed]
+            .into_iter()
+            .map(|d| match d {
+                DiscardDirty::None => "none",
+                DiscardDirty::Listed => "listed",
+            })
+            .collect();
+        assert_eq!(words, ["none", "listed"]);
+    }
+
+    #[test]
+    fn discard_ref_is_named_for_the_run() {
+        assert_eq!(
+            discard_ref_name("20261113T101500Z-ab12cd"),
+            "refs/ign-discarded/20261113T101500Z-ab12cd"
+        );
     }
 
     #[test]

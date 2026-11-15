@@ -3210,6 +3210,19 @@ pub enum ProjectsEvent {
         /// How many paths the module will list as uncommitted.
         expected_drift: usize,
     },
+    /// `--discard-gateway-changes` is discarding gateway work, and its evidence
+    /// is on disk (27-15, D-05). Names and counts only: the reason is operator
+    /// text and stays in `run.json` and `git/discarded.json`.
+    GitDiscarded {
+        /// The node.
+        node: String,
+        /// The evidence file, relative to the run directory.
+        evidence: String,
+        /// How many commits the advance will abandon.
+        commits: usize,
+        /// How many live paths the import will replace.
+        paths: usize,
+    },
     /// The save was removed because everything held.
     GitSaveRemoved {
         /// The node.
@@ -3273,6 +3286,7 @@ impl ProjectsEvent {
             ProjectsEvent::BackupVerdict { .. } => "backup_verdict",
             ProjectsEvent::GitStateRead { .. } => "git_state_read",
             ProjectsEvent::GitSaved { .. } => "git_saved",
+            ProjectsEvent::GitDiscarded { .. } => "git_discarded",
             ProjectsEvent::GitRestored { .. } => "git_restored",
             ProjectsEvent::GitAdvanced { .. } => "git_advanced",
             ProjectsEvent::GitSaveRemoved { .. } => "git_save_removed",
@@ -3397,6 +3411,14 @@ impl ProjectsEvent {
                 bytes,
             } => serde_json::json!({
                 "node": node, "path": path, "files": files, "bytes": bytes
+            }),
+            ProjectsEvent::GitDiscarded {
+                node,
+                evidence,
+                commits,
+                paths,
+            } => serde_json::json!({
+                "node": node, "evidence": evidence, "commits": commits, "paths": paths
             }),
             ProjectsEvent::GitRestored { node } => serde_json::json!({ "node": node }),
             ProjectsEvent::GitAdvanced {
@@ -4162,6 +4184,48 @@ async fn sweep_children(
     sweep
 }
 
+/// Phase 27 (D-05): a run with `--discard-gateway-changes` that has something
+/// to discard puts the evidence on disk before the first write: the
+/// `git/discarded.json` file (0600: ids, paths and the operator's reason, no
+/// commit message and no file content), the `git_discarded` event naming it,
+/// and the `discarded` block of `data.git`. The live content itself is the
+/// pre-image export. Nothing is done without a [`git::DiscardPlan`].
+fn write_discard_evidence(
+    git: Option<&GitRun<'_>>,
+    run_dir: &RunDir,
+    run_id: &RunId,
+    gateway: &str,
+    project: &str,
+    result: &mut DeployProjectsResult,
+    events: &mut RunEvents<'_>,
+) -> Result<(), CoreError> {
+    let Some(plan) = git.and_then(|g| g.prepared.discard.as_ref()) else {
+        return Ok(());
+    };
+    let evidence = plan.evidence_json(gateway, project, run_id.as_str());
+    let mut file = run_dir.create_private_file_in("git", "discarded.json")?;
+    let bytes = serde_json::to_vec_pretty(&evidence).map_err(|e| {
+        CoreError::Internal(format!("the discard evidence did not serialise ({e})"))
+    })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .map_err(|e| CoreError::DeployRunInvalid {
+            run_id: run_id.as_str().to_string(),
+            problem: format!("could not write the discard evidence ({:?})", e.kind()),
+        })?;
+    events.emit(ProjectsEvent::GitDiscarded {
+        node: "nodes.master".to_string(),
+        evidence: "git/discarded.json".to_string(),
+        commits: plan.would.commits.len(),
+        paths: plan.would.paths_count,
+    })?;
+    if let Some(report) = result.git.as_mut() {
+        plan.begin(report);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     plan: &DeployProjectsResult,
@@ -4197,6 +4261,9 @@ async fn execute(
             "live_sha256": plan.live_sha256,
             "allow_downgrade": input.allow_downgrade,
             "allow_first_change": input.allow_first_change,
+            // Phase 27 (D-05): the operator's reason, as data; null without
+            // the override.
+            "discard_gateway_changes": input.discard_gateway_changes,
             "allow_manual_undo": input.allow_manual_undo,
             "tag_providers": loaded.file.tag_providers,
             "designers": designers.mode,
@@ -4272,6 +4339,28 @@ async fn execute(
             return Err(stale_live(artifact.sha256.clone(), live.sha256));
         }
         events.emit(ProjectsEvent::Verified { equal: true })?;
+        // Phase 27 (D-05): a `record` that abandons gateway commits keeps its
+        // evidence before the first write; the project already is the
+        // artifact, so the live export is the pre-image.
+        if writers.git.is_some_and(|g| g.prepared.discard.is_some()) {
+            let mut file = run_dir.create_private_file_in("export", &format!("{project}.zip"))?;
+            file.write_all(&zip)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| CoreError::DeployRunInvalid {
+                    run_id: run_id.as_str().to_string(),
+                    problem: format!("could not write the pre-image export ({:?})", e.kind()),
+                })?;
+            events.emit(ProjectsEvent::PreImageExported { bytes: zip.len() })?;
+            write_discard_evidence(
+                writers.git,
+                run_dir,
+                run_id,
+                &plan.gateway,
+                project,
+                &mut result,
+                &mut events,
+            )?;
+        }
         // D-07: the owned tags go first, then the records. A tag step that
         // fails after its first write is rolled back (26-11).
         let step = match deploy_owned_tags(
@@ -4461,6 +4550,17 @@ async fn execute(
                 live.sha256,
             ));
         }
+        // Phase 27 (D-05): what the override discards is on disk, with the
+        // pre-image just written, before the first write of the run.
+        write_discard_evidence(
+            writers.git,
+            run_dir,
+            run_id,
+            &plan.gateway,
+            project,
+            &mut result,
+            &mut events,
+        )?;
         pre_zip = Some(pre);
     }
 

@@ -3165,6 +3165,7 @@ fn git_prodshape_handover() {
             &saved,
             &prep,
             &export,
+            None,
         )
         .await
         .expect("restore and advance");

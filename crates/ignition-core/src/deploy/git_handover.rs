@@ -72,6 +72,21 @@ pub struct GitRestoreReport {
     pub dropped: Vec<String>,
     /// Where the save is (kept; the caller removes it once everything held).
     pub save_path: String,
+    /// The advance abandoned gateway commits (27-15, D-05): the save holds the
+    /// repo as the module left it, so the caller keeps it after a green run
+    /// instead of removing it.
+    pub keep_save: bool,
+}
+
+/// The gateway commits an advance abandons (27-15, D-05): the advance writes
+/// `refs/ign-discarded/<run_id>` naming `abandoned_head`, so they stay
+/// reachable once the branch moves to the release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Discarding<'a> {
+    /// The run that discards them (the ref's name).
+    pub run_id: &'a str,
+    /// The gateway's HEAD commit before the advance.
+    pub abandoned_head: &'a str,
 }
 
 /// Why a handover stopped. The save is kept in every case.
@@ -157,6 +172,10 @@ async fn classify_live(
 /// same repo, else `git_recreated` and it is left alone; anything else at
 /// `.git` is `git_recreated` too. (c) the writes, lock-and-rename, through
 /// `write`. (d) each written file's sha256 read back.
+///
+/// With `discard` the writes of (c) include `refs/ign-discarded/<run id>`
+/// naming the abandoned HEAD (27-15, D-05), and the report says `keep_save`:
+/// the caller keeps the save of the repo it abandoned.
 // The handover needs the whole context at once; bundling it in a struct would
 // only rename the arguments.
 #[allow(clippy::too_many_arguments)]
@@ -169,6 +188,7 @@ pub async fn restore_and_advance(
     save: &GitSaveReport,
     prep: &AdvancePrep,
     export_zip: &[u8],
+    discard: Option<Discarding<'_>>,
 ) -> Result<GitRestoreReport, GitRestoreFailure> {
     let restored_now = std::sync::atomic::AtomicBool::new(false);
     let fail = |reason: &'static str, paths: Vec<String>, detail: String| GitRestoreFailure {
@@ -185,7 +205,18 @@ pub async fn restore_and_advance(
 
     // (a) Everything that can fail without touching the gateway.
     let plan = match finish_advance(git, checkout, prep, export_zip).await {
-        Ok(plan) => plan,
+        Ok(mut plan) => {
+            // The abandoned HEAD stays reachable through a ref the advance
+            // writes next to the branch (27-15). The ref write is part of the
+            // plan, so it is shape-checked with the rest before any `.git`
+            // write.
+            if let Some(discard) = discard
+                && let Err(why) = plan.keep_discarded(discard.run_id, discard.abandoned_head)
+            {
+                return Err(fail("advance_failed", Vec::new(), why.to_string()));
+            }
+            plan
+        }
         Err(AdvanceFailure::Mismatch(m)) => {
             return Err(fail(
                 "status_unexpected",
@@ -309,6 +340,7 @@ pub async fn restore_and_advance(
         expected_drift: plan.expected_drift,
         dropped: plan.dropped,
         save_path: save.path.clone(),
+        keep_save: discard.is_some(),
     })
 }
 
@@ -353,6 +385,7 @@ pub async fn restore_unchanged(
         expected_drift: Vec::new(),
         dropped: Vec::new(),
         save_path: save.path.clone(),
+        keep_save: false,
     };
     match files.kind {
         GitEntry::Absent => {

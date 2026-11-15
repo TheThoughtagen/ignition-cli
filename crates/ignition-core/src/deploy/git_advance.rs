@@ -32,6 +32,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 
+use super::apply::run_store::RunId;
 use super::git_remote::{HostGit, PackFiles, host_failure, is_object_id, safe_ref_name};
 use super::git_state::{GitRefs, GitState, GitStateKind};
 use crate::actions::projects::IMPORT_MAX_BYTES;
@@ -57,6 +58,10 @@ pub enum GitWriteName {
         /// The branch.
         branch: String,
     },
+    /// `refs/ign-discarded/<run-id>`: the keep-alive ref of a run that
+    /// discards gateway commits (27-15, D-05). It names the abandoned HEAD so
+    /// the commits stay reachable after the branch moves to the release.
+    DiscardRef(String),
     /// `config`
     Config,
     /// `HEAD`
@@ -75,6 +80,7 @@ impl GitWriteName {
             GitWriteName::RemoteRef { remote, branch } => {
                 format!("refs/remotes/{remote}/{branch}")
             }
+            GitWriteName::DiscardRef(run_id) => format!("refs/ign-discarded/{run_id}"),
             GitWriteName::Config => "config".to_string(),
             GitWriteName::Head => "HEAD".to_string(),
             GitWriteName::Index => "index".to_string(),
@@ -106,6 +112,15 @@ impl GitWriteName {
                     Ok(())
                 } else {
                     Err("the remote or branch is not a safe ref name")
+                }
+            }
+            GitWriteName::DiscardRef(run_id) => {
+                if RunId::parse(run_id).is_ok()
+                    && safe_ref_name(&format!("refs/ign-discarded/{run_id}"))
+                {
+                    Ok(())
+                } else {
+                    Err("the run id is not a safe ref name")
                 }
             }
             GitWriteName::Config | GitWriteName::Head | GitWriteName::Index => Ok(()),
@@ -345,6 +360,39 @@ pub struct AdvancePlan {
     /// What a git status over the advanced repo lists: modified plus
     /// untracked, byte-sorted.
     pub expected_drift: Vec<String>,
+}
+
+impl AdvancePlan {
+    /// Keep the gateway commits this run abandons reachable (27-15, D-05): add
+    /// the write of `refs/ign-discarded/<run_id>` naming `abandoned_head`,
+    /// right after the branch ref. The pack is unchanged: the abandoned
+    /// commits' objects are already in the gateway repo, and a ref naming them
+    /// keeps them there. A run id that is not a safe ref name, or a head that
+    /// is not a full object id, adds nothing and is refused.
+    pub fn keep_discarded(
+        &mut self,
+        run_id: &str,
+        abandoned_head: &str,
+    ) -> Result<(), &'static str> {
+        if !is_object_id(abandoned_head) {
+            return Err("the abandoned HEAD is not a full hex commit id");
+        }
+        let name = GitWriteName::DiscardRef(run_id.to_string());
+        name.check_shape()?;
+        let at = self
+            .writes
+            .iter()
+            .position(|w| matches!(w.name, GitWriteName::BranchRef(_)))
+            .map_or(self.writes.len(), |i| i + 1);
+        self.writes.insert(
+            at,
+            GitWrite {
+                name,
+                bytes: format!("{abandoned_head}\n").into_bytes(),
+            },
+        );
+        Ok(())
+    }
 }
 
 /// Build the advance from the read-back export (`export_zip`). Local work on
@@ -829,6 +877,7 @@ mod tests {
                 GitWriteName::PackIndex(_) => "idx",
                 GitWriteName::BranchRef(_) => "branch",
                 GitWriteName::RemoteRef { .. } => "remote",
+                GitWriteName::DiscardRef(_) => "discarded",
                 GitWriteName::Config => "config",
                 GitWriteName::Head => "head",
                 GitWriteName::Index => "index",
@@ -1104,5 +1153,54 @@ mod tests {
         }
         // The config shape exists for 27-17 and carries no parts to check.
         assert_eq!(GitWriteName::Config.rel(), "config");
+    }
+
+    #[test]
+    fn keep_discarded_adds_the_ref_after_the_branch() {
+        let head = "a".repeat(40);
+        let write = |name: GitWriteName| GitWrite {
+            name,
+            bytes: Vec::new(),
+        };
+        let mut plan = AdvancePlan {
+            branch: "production".to_string(),
+            remote: "capapp".to_string(),
+            release_commit: "b".repeat(40),
+            writes: vec![
+                write(GitWriteName::PackFile("c".repeat(40))),
+                write(GitWriteName::BranchRef("production".to_string())),
+                write(GitWriteName::RemoteRef {
+                    remote: "capapp".to_string(),
+                    branch: "production".to_string(),
+                }),
+                write(GitWriteName::Head),
+                write(GitWriteName::Index),
+            ],
+            assume_unchanged: Vec::new(),
+            dropped: Vec::new(),
+            expected_drift: Vec::new(),
+        };
+        plan.keep_discarded("20261113T101500Z-ab12cd", &head)
+            .expect("a safe run id and a full id");
+        let names: Vec<String> = plan.writes.iter().map(|w| w.name.rel()).collect();
+        assert_eq!(
+            names,
+            [
+                format!("objects/pack/pack-{}.pack", "c".repeat(40)),
+                "refs/heads/production".to_string(),
+                "refs/ign-discarded/20261113T101500Z-ab12cd".to_string(),
+                "refs/remotes/capapp/production".to_string(),
+                "HEAD".to_string(),
+                "index".to_string(),
+            ]
+        );
+        assert_eq!(plan.writes[2].bytes, format!("{head}\n").into_bytes());
+        // Unsafe run ids and a short head add nothing.
+        for run in ["", "../x", ".hidden", "a b", "a..b", "x.lock"] {
+            let before = plan.writes.len();
+            assert!(plan.keep_discarded(run, &head).is_err(), "{run:?}");
+            assert_eq!(plan.writes.len(), before);
+        }
+        assert!(plan.keep_discarded("run-1", "abc").is_err());
     }
 }
