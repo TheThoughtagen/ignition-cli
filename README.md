@@ -2550,6 +2550,7 @@ followed.
 | `nodes.*.local` | `data_dir`: the gateway data directory on the machine running `ign` (rigs, tests, a runner on the gateway host). A relative value resolves against `--repo`. Mutually exclusive with `ssh` |
 | `rehearsal` | optional, default `false`: this environment is a disposable gateway that `ign deploy projects --rehearse <ENV>` may wipe owned tag providers on. Such a target has no `nodes.backup`, declares `nodes.master.gateway_name` and does not set `require_rehearsal` (`deploy_tree_invalid` otherwise); see `deploy projects`, **Rehearsing a run** |
 | `require_rehearsal` | optional, default `false`: a tag-owning `ign deploy projects` apply to this environment needs `--rehearsal <ID>` naming a green rehearsal of the same inputs (`rehearsal_required`, `rehearsal_stale`) |
+| `git_branch` | optional: the branch a partial gateway repository is adopted onto when the git module's `git.yaml` has no `repo_branch` for the project (see [Projects the git module manages](#projects-the-git-module-manages)). A valid branch name (letters, digits and `. _ / -`, no `..`, no leading `-` or `/`, no trailing `/`, `.` or `.lock`; `deploy_tree_invalid` otherwise, naming the key and not the value). The release must be on that branch of the remote |
 
 #### Excluded tag providers
 
@@ -5778,8 +5779,10 @@ of `logs/HEAD`. Git on the machine running `ign` parses them; the gateway's
 `.git` is never used as a git directory, so its configuration, hooks and
 filters never run. The repository must be a clean module clone: a branch
 checked out, one remote with an upstream, no merge or rebase in progress, no
-lock file, not shallow and with no alternates. A repository that is not is
-refused `project_git_managed` with the reason word below.
+lock file, not shallow and with no alternates. The one exception is the partial
+repository the module leaves when its first clone fails, which `ign` adopts
+(see the adoption paragraph below). Any other repository is refused
+`project_git_managed` with the reason word below.
 
 **What it asks the remote.** With the credentials of the machine that runs
 `ign`, it asks the remote named in the gateway repository's `config` for its
@@ -5869,6 +5872,53 @@ gateway repository's own object files through the host channel
 (`dirty_source: gateway_objects`); if that read fails the run refuses
 `deploy_preflight_failed` check `git_gateway_objects` before any write.
 
+**Adopting a partial repository.** When the module's `setupLocalRepo` ran
+against a remote that has no `master`, it leaves a partial `.git`: `HEAD` is
+`ref: refs/heads/master` and that branch does not exist, the one remote is
+called `origin`, every remote branch and tag is already in `packed-refs`, and
+there is no local branch, no index and no `[branch]` section (the `git.yaml`
+variant does not change the shape). Such a repository holds no commit, so there
+is no gateway work to lose: `ign` adopts it instead of refusing. Adoptable means
+exactly an unborn `HEAD`, no `refs/heads/*` (loose or packed), no `index`, one
+remote, no merge, rebase or lock marker, not shallow and no alternates. Every
+other shape keeps the reason word of the table below; an unborn `HEAD` beside a
+local branch or an index is still `unborn_head`.
+
+- **The dirty, unpushed and not-merged checks are skipped**, because the
+  repository holds no commit to compare (`dirty` is `null`). The release must
+  still be on the adoption branch of the remote (`release_not_on_branch`
+  otherwise, no flag passes it), and the release checkout's `origin` must still
+  equal the repository's remote (`remote_mismatch`).
+- **The branch must be named.** The unborn `HEAD` says `master` only because
+  that is JGit's default, not because anyone chose it, so `ign` never takes it
+  as intent. The branch comes from, in this order: `repo_branch` of the
+  project's entry in the gateway's `git.yaml` (the entry whose
+  `ignition_projectName` is the project; a file that names the project twice
+  with different branches is no source), then `git_branch` in the target file.
+  With neither, the run refuses `project_git_managed` reason `branch_required`
+  before any write. `data.git.nodes[].branch_source` says which one was used:
+  `git_yaml` or `target`.
+- **`git.yaml` is read for allow-listed keys only.** It is a list of maps, one
+  per project, and holds a credential: only the project name, the branch and the
+  module's settings keys are read; every other key is skipped by the parser and
+  never stored, logged or written, and `repo_uri` is reduced to its redacted
+  form. A file that is not a list of maps, is over 1 MiB, is not UTF-8 or is a
+  symlink refuses `deploy_run_invalid` naming `git.yaml`, and the message never
+  echoes a value of the file.
+- **What the adoption writes**, as one advance after the import: the release
+  objects the repository lacks (one pack), `refs/heads/<branch>` and
+  `refs/remotes/<remote>/<branch>` at the release commit, a `[branch
+  "<branch>"]` section in `config` (`remote` and `merge = refs/heads/<branch>`,
+  each added only when absent; a value that is already set to something else
+  refuses `deploy_preflight_failed` check `git_host`), `HEAD` as `ref:
+  refs/heads/<branch>`, and the index with the paths the import removed marked
+  assume-unchanged. The config is built on a private copy before any write and
+  is written only over the config it was built from (a config that changed
+  since the plan is `plan_stale`). Afterwards the module's `pull` fast-forwards.
+- **Reading the result.** `--check` reports `state: adoptable`, the branch and
+  its `branch_source` and writes nothing (`adopted: false`, `expected_drift:
+  null`); a run that wrote the advance reports `adopted: true`.
+
 **Keep and advance.** Right before the import the repository is read again (a
 change since the plan is `plan_stale`) and saved to
 `ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo`, a path no
@@ -5935,23 +5985,32 @@ userinfo. In human mode, one line per node says the state, branch and short
 head, then the gate counts, the restore result, and the expected drift.
 
 **The reason words.** `project_git_managed` carries `reason`, and
-`restore.reason` carries a restore word:
+`restore.reason` carries a restore word. A `project_git_managed` refusal is
+before any write; the tool never deletes or renames a `.git`, so what clears a
+word is a change to the repository, the checkout or the target file:
 
-| Word | Meaning |
-|------|---------|
-| `not_directory`, `symlink` | `.git` is a file or a symlink |
-| `no_head`, `unborn_head`, `detached_head` | no usable branch is checked out |
-| `mid_operation`, `locked` | a merge, rebase or lock file is present |
-| `no_remote`, `multiple_remotes`, `no_upstream` | the remote or upstream is not exactly one |
-| `shallow`, `alternates` | the repository borrows objects it does not hold |
-| `remote_mismatch` | the release checkout's `origin` is not the gateway repository's remote |
-| `release_not_on_branch` | the release is not on the branch the repository tracks |
-| `restore_failed` | the saved `.git` could not be put back |
-| `advance_failed` | the advance could not be built or written |
-| `status_unexpected` | the status over the read-back export differs from the prediction; nothing was written |
-| `git_recreated` | the `.git` after the import is not the one prepared against |
-| `post_status_mismatch` | the status over the project directory differs from `expected_drift` |
-| `designer_attached` | a Designer session was attached at the check before a `.git` write |
+| Word | Meaning | What clears it |
+|------|---------|----------------|
+| `not_directory`, `symlink` | `.git` is a file or a symlink | an administrator on the host replaces it with the real repository directory |
+| `no_head` | `HEAD` is missing or cannot be read | an administrator repairs the repository on the host |
+| `unborn_head` | `HEAD` names a branch with no commit, and the repository is not the adoptable partial shape (a local branch or an index exists) | check out a branch with commits in the module, or restore the repository to the module's clone |
+| `detached_head` | `HEAD` is a commit id, not a branch | check a branch out in the module |
+| `mid_operation` | a merge, cherry-pick, revert or rebase is in progress | finish or abort it on the gateway |
+| `locked` | `index.lock`, `HEAD.lock` or `config.lock` exists | wait for the process that holds it; an administrator removes a stale lock on the host |
+| `no_remote`, `multiple_remotes` | the repository has no remote or more than one | leave exactly one remote |
+| `no_upstream` | the checked-out branch does not track the one remote | set the branch's upstream to that remote |
+| `shallow`, `alternates` | the repository borrows objects it does not hold | replace it with a full clone |
+| `remote_mismatch` | the release checkout's `origin` is not the gateway repository's remote | add a remote with that URL to the release checkout |
+| `release_not_on_branch` | the release is not on the branch the repository tracks (or, for an adoption, on the adoption branch) | release from that branch, or merge the release into it |
+| `branch_required` | a partial repository was found and no branch is named for it | set `repo_branch` for the project in the gateway's `git.yaml`, or `git_branch` in the target file |
+| `nodes_disagree` | on a redundant pair, the two nodes' repositories are not in the same state | bring the backup's repository to the master's state |
+| `restore_failed` | the saved `.git` could not be put back | restore the copy `data.git.nodes[].save.path` names |
+| `advance_failed` | the advance could not be built or written | the run's warning names the cause; fix it and deploy again (the saved copy is kept) |
+| `status_unexpected` | the status over the read-back export differs from the prediction; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
+| `git_recreated` | the `.git` after the import is not the one prepared against | check the repository, then deploy again; it was left as it is |
+| `backup_unsynced` | the backup node did not converge before its `.git` was handled | wait for the pair to converge, then deploy again |
+| `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |
+| `designer_attached` | a Designer session was attached at the check before a `.git` write | close the Designer session, deploy again |
 
 When a restore or the advance fails the run ends `git_restore_failed` (slug
 `deploy_git_restore_failed`, exit 6): see [the verdict
