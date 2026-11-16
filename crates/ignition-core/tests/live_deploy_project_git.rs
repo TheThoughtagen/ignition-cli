@@ -3870,6 +3870,269 @@ async fn git_pair_e2e() {
     eprintln!("LIVE-RAN git_pair_e2e");
 }
 
+/// 27-38 (GITDEP-09 detection, never the passing gate): on the rig pair, with
+/// the git module's backup `project.json` deletion present, one apply of v1.1.0
+/// must end `git_restore_failed` (slug `deploy_git_restore_failed`, exit 6) with
+/// `restore.reason` `backup_project_json_missing` on `nodes.backup` and the
+/// backup's save kept, while the master is as strict and green as
+/// `git_pair_e2e` demands. Its last line is `LIVE-DETECT git_pair_detect_live`,
+/// a different line kind from the passing-gate line, so a proof that the guard
+/// fires is never read as a green pair. When the defect does not reproduce (the
+/// module fix is installed) it prints `LIVE-DETECT-NA defect not reproduced`
+/// and fails: retire or rewrite this check when `git_pair_e2e` goes green.
+#[tokio::test]
+#[ignore = "needs the pair rig with the git module on both nodes: IGNITION_LIVE_PAIR=1"]
+async fn git_pair_detect_live() {
+    let Some(rig) = pair_rig().await else { return };
+    let backup = rig.backup.as_ref().expect("pair");
+    let api_a = rig.api();
+    let api_b = pair_api_b(&rig);
+    let host = HostGit::new();
+    let node_a = LocalFsTransport::new(rig.data.clone(), "nodes.master");
+    let node_b = LocalFsTransport::new(backup.data.clone(), "nodes.backup");
+
+    // 1. The starting state: both nodes managed, HEAD at v1.0.0.
+    let (_keep, _checkout, c2) = release_checkout(&rig, "v1.1.0");
+    let (_keep0, _checkout0, c1) = release_checkout(&rig, "v1.0.0");
+    for (label, node) in [("master", &node_a), ("backup", &node_b)] {
+        let (state, refs) = node_state(node, &host).await;
+        assert_eq!(
+            state.kind,
+            GitStateKind::Managed,
+            "{label}: the module's clone must classify as managed: {state:?}"
+        );
+        assert_eq!(
+            head_commit(&refs),
+            c1,
+            "{label}: the module's clone must sit at v1.0.0 (run the pair driver's reset first)"
+        );
+    }
+    eprintln!("LIVE-DETECT-STEP start: both nodes managed at v1.0.0");
+
+    // The scriptExec route follows to the backup by the project sync; JGit is
+    // asked on each node through its own route.
+    let (_work, config) = script_config(&api_a, &rig.url).await;
+    let started = Instant::now();
+    loop {
+        match script_run(&api_b, &config, "rig", WEBDEV_PROJECT, "print 1").await {
+            Ok(_) => break,
+            Err(err) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(300),
+                    "the scriptExec route never answered on the backup: {}",
+                    err.code()
+                );
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+
+    // 2. The apply of v1.1.0 with the digest a check showed.
+    let first = DeployFlags {
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let check = deploy_in_process(&rig, true, ENV, "v1.1.0", &first, "detect-check")
+        .await
+        .unwrap_or_else(|err| panic!("detect check: {} ({err})", err.code()));
+    let flags = DeployFlags {
+        artifact_sha256: Some(check.artifact_sha256.clone()),
+        first_change: true,
+        ..DeployFlags::default()
+    };
+    let applied = deploy_in_process(&rig, false, ENV, "v1.1.0", &flags, "detect-apply")
+        .await
+        .unwrap_or_else(|err| panic!("detect apply: {} ({err})", err.code()));
+    let applied_json = serde_json::to_value(&applied).expect("apply json");
+
+    // The backup's project.json on disk, read first: a regular file here means
+    // the defect did not occur (the module fix is installed).
+    let project_json_b = backup.data.join("projects").join(APP).join("project.json");
+    let json_state = match std::fs::symlink_metadata(&project_json_b) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "absent",
+        Err(err) => panic!("the backup's project.json cannot be read: {err}"),
+        Ok(meta) if meta.is_dir() => "directory",
+        Ok(meta) if meta.is_file() => "file",
+        Ok(_) => "other",
+    };
+    if json_state == "file" {
+        eprintln!("LIVE-DETECT-NA defect not reproduced");
+        panic!(
+            "the backup's project.json is a regular file after the deploy; outcome {} (slug {})",
+            applied.outcome.as_str(),
+            applied_json["slug"]
+        );
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // 3. The detection.
+    if applied.outcome.as_str() != "git_restore_failed" {
+        problems.push(format!(
+            "outcome is {}, not git_restore_failed",
+            applied.outcome.as_str()
+        ));
+    }
+    if applied_json["slug"] != "deploy_git_restore_failed" {
+        problems.push(format!("slug is {}", applied_json["slug"]));
+    }
+    if applied.failure_exit_code() != Some(6) {
+        problems.push(format!(
+            "failure_exit_code is {:?}, not Some(6)",
+            applied.failure_exit_code()
+        ));
+    }
+    let nodes = applied_json["git"]["nodes"].as_array().expect("nodes");
+    assert_eq!(nodes.len(), 2, "{}", applied_json["git"]);
+    assert_eq!(nodes[0]["node"], "nodes.master");
+    assert_eq!(nodes[1]["node"], "nodes.backup");
+    let restore_a = &nodes[0]["restore"];
+    let restore_b = &nodes[1]["restore"];
+    if restore_b["reason"] != "backup_project_json_missing" {
+        problems.push(format!(
+            "backup restore.reason is {}, not backup_project_json_missing",
+            restore_b["reason"]
+        ));
+    }
+    if restore_b["save_kept"] != true {
+        problems.push(format!(
+            "backup restore.save_kept is {}",
+            restore_b["save_kept"]
+        ));
+    }
+    let save_path = nodes[1]["save"]["path"].as_str().unwrap_or_default();
+    let save_repo = backup.data.join(save_path);
+    if save_path.is_empty() || !save_repo.is_dir() {
+        problems.push(format!(
+            "the backup's kept save is not on disk: save.path {save_path:?}"
+        ));
+    }
+    let warned = strs(&applied_json["warnings"]).iter().any(|line| {
+        line.contains("backup") && line.contains("project.json") && line.contains("restart")
+    });
+    if !warned {
+        problems.push("no warning names the backup, project.json and the restart".to_string());
+    }
+
+    // 4. project.json on the backup: absent or a directory.
+    if !matches!(json_state, "absent" | "directory") {
+        problems.push(format!("the backup's project.json is {json_state}"));
+    }
+
+    // 5. The master, as strict as git_pair_e2e.
+    if !(restore_a["advanced"] == true && restore_a["verified"] == true) {
+        problems.push(format!(
+            "master: the handover did not complete: {restore_a}"
+        ));
+    }
+    if restore_a["reason"] != serde_json::Value::Null {
+        problems.push(format!("master: restore.reason is {}", restore_a["reason"]));
+    }
+    if restore_a["post_status"] != "matched" {
+        problems.push(format!(
+            "master: post_status is {} ({})",
+            restore_a["post_status"], restore_a["post_status_note"]
+        ));
+    }
+    if !strs(&restore_a["dropped"]).iter().any(|path| path == NOTES) {
+        problems.push("master: restore.dropped does not name the unlisted member".to_string());
+    }
+    let (state_a, refs_a) = node_state(&node_a, &host).await;
+    if state_a.kind != GitStateKind::Managed || head_commit(&refs_a) != c2 {
+        problems.push("master: the repository is not managed at the release".to_string());
+    }
+    assert_eq!(applied_json["git"]["expected_drift_complete"], true);
+    let predicted = strs(&applied_json["git"]["expected_drift"]);
+    assert_eq!(
+        predicted.len() as u64,
+        applied_json["git"]["expected_drift_count"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
+        "the drift list is not capped here"
+    );
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let jg_a = jgit(&api_a, &config).await;
+    let (extra_a, missing_a) = drift_difference(&jg_a, &predicted);
+    if !(extra_a.is_empty() && missing_a.is_empty()) {
+        problems.push(format!(
+            "master: JGit differs from expected_drift: extra={extra_a:?} missing={missing_a:?}"
+        ));
+    }
+    let deleted_a: Vec<&String> = jg_a
+        .rows
+        .iter()
+        .filter(|r| r.starts_with("Deleted "))
+        .collect();
+    if !deleted_a.is_empty() {
+        problems.push(format!("master: JGit lists Deleted rows: {deleted_a:?}"));
+    }
+    if jg_a.unpushed != 0 {
+        problems.push("master: unpushed commits after the deploy".to_string());
+    }
+    if jg_a.branch != "production" {
+        problems.push(format!("master: current branch is {}", jg_a.branch));
+    }
+    eprintln!(
+        "LIVE-DETECT-STEP master jgit: uncommitted={} expected={} extra={} missing={} unpushed={}",
+        jg_a.paths.len(),
+        predicted.len(),
+        extra_a.len(),
+        missing_a.len(),
+        jg_a.unpushed
+    );
+
+    // 6. The backup's JGit list equals expected_drift except one Deleted
+    // project.json row, which matches the detection.
+    let jg_b = jgit(&api_b, &config).await;
+    let (extra_b, missing_b) = drift_difference(&jg_b, &predicted);
+    if !(extra_b.is_empty() && missing_b.is_empty()) {
+        problems.push(format!(
+            "backup: JGit differs from expected_drift: extra={extra_b:?} missing={missing_b:?}"
+        ));
+    }
+    let deleted_b: Vec<&String> = jg_b
+        .rows
+        .iter()
+        .filter(|r| r.starts_with("Deleted "))
+        .collect();
+    if deleted_b != [&"Deleted project.json".to_string()] {
+        problems.push(format!(
+            "backup: expected exactly one Deleted project.json row, got {deleted_b:?}"
+        ));
+    }
+    eprintln!(
+        "LIVE-DETECT-STEP backup jgit: uncommitted={} extra={} missing={} deleted={:?}",
+        jg_b.paths.len(),
+        extra_b.len(),
+        missing_b.len(),
+        deleted_b
+    );
+
+    write_evidence(
+        &rig,
+        "git_pair_detect_live",
+        &serde_json::json!({
+            "outcome": applied.outcome.as_str(),
+            "slug": applied_json["slug"],
+            "exit_code": applied.failure_exit_code(),
+            "backup_reason": restore_b["reason"],
+            "backup_save_kept": restore_b["save_kept"],
+            "backup_save_path": save_path,
+            "backup_project_json": json_state,
+            "master_post_status": restore_a["post_status"],
+            "expected_drift": predicted,
+            "master_jgit": jg_a.rows,
+            "backup_jgit": jg_b.rows,
+            "problems": problems,
+        }),
+    );
+    assert!(
+        problems.is_empty(),
+        "findings of the detection run: {problems:#?}"
+    );
+    eprintln!("LIVE-DETECT git_pair_detect_live");
+}
+
 // ---- 27-25 Task 3: the D-20 normalization of a real project repository ----------
 //
 // `capture27.sh g2norm <out-dir>` (never run by hand without its guards). The

@@ -35,6 +35,13 @@
 #            test's `LIVE-RAN <name>` is not at the end of a log line. A gate
 #            prints that line as its last statement, so it means the gate
 #            passed; test names are `[a-z0-9_]+` and match whole
+#   detect LOG TEST...
+#            (27-38) the detection checks: the `live` runner, except that each
+#            named test must end its log with an anchored `LIVE-DETECT <name>`
+#            line (the check proves the backup project.json guard fires on the
+#            rig pair; it is never a passing gate) and the log must not hold a
+#            `LIVE-RAN <name>` line for the same name. `git_pair_e2e` is not run
+#            by it and stays RED until the git-module fix lands
 #   down     remove the pair (compose down -v), the git server and the override
 #
 # G5 steps (each timed):
@@ -586,15 +593,19 @@ g5() {
   tail -n 1 "$log" | grep -qx 'LIVE-RAN capture27-pair g5' || { echo "g5: the log does not end with its LIVE-RAN line" >&2; exit 1; }
 }
 
-# live LOG TEST...: the pair gates (27-25).
-live() {
-  local name=${1:?LOG-NAME} log rc=0 t missing=0
-  shift
-  [ $# -gt 0 ] || die "live: name at least one test"
-  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "live: LOG-NAME is letters, digits, dot, dash, underscore"
+# pair_run KIND LOG TEST...: the shared runner of `live` and `detect`. KIND is
+# the line kind a named test must print as its last statement: LIVE-RAN (a gate
+# that passed) or LIVE-DETECT (27-38: a check that the guard fires, which is
+# never a passing gate). A `detect` log that also holds a LIVE-RAN line for a
+# name is refused, so a detection proof cannot be read as a green pair.
+pair_run() {
+  local kind=${1:?KIND} name=${2:?LOG-NAME} log rc=0 t missing=0
+  shift 2
+  [ $# -gt 0 ] || die "$kind: name at least one test"
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "$kind: LOG-NAME is letters, digits, dot, dash, underscore"
   # WR-D2: a test name is a bare identifier; it is matched as a whole name below
   for t in "$@"; do
-    [[ $t =~ ^[a-z0-9_]+$ ]] || die "live: a test name is lowercase letters, digits and underscore"
+    [[ $t =~ ^[a-z0-9_]+$ ]] || die "$kind: a test name is lowercase letters, digits and underscore"
   done
   token_env
   mkdir -p "$STATE/evidence"
@@ -610,21 +621,32 @@ live() {
     cargo test -p ignition-core --test live_deploy_project_git -- --ignored --nocapture --test-threads=1 "$@" 2>&1 | tee "$log"
   ) || rc=$?
   for t in "$@"; do
-    if ! grep -qE "(^|[[:space:]])LIVE-RAN ${t}\$" "$log"; then
-      echo "live: the log has no 'LIVE-RAN $t'" >&2
+    if ! grep -qE "(^|[[:space:]])${kind} ${t}\$" "$log"; then
+      echo "$kind: the log has no '$kind $t'" >&2
+      missing=1
+    fi
+    if [ "$kind" = LIVE-DETECT ] && grep -qE "(^|[[:space:]])LIVE-RAN ${t}\$" "$log"; then
+      echo "$kind: the log also has 'LIVE-RAN $t'; a detection proof is never a passing gate" >&2
       missing=1
     fi
   done
-  [ "$rc" -eq 0 ] || { echo "live: cargo test exited $rc" >&2; exit "$rc"; }
+  [ "$rc" -eq 0 ] || { echo "$kind: cargo test exited $rc" >&2; exit "$rc"; }
   [ "$missing" -eq 0 ] || exit 1
-  echo "live: every named gate printed its LIVE-RAN line; log $log"
+  echo "$kind: every named check printed its line; log $log"
 }
+
+# live LOG TEST...: the pair gates (27-25).
+live() { pair_run LIVE-RAN "$@"; }
+
+# detect LOG TEST...: the detection checks (27-38).
+detect() { pair_run LIVE-DETECT "$@"; }
 
 case "${1:-}" in
   up) up ;;
   reset) reset ;;
   g5) g5 ;;
   live) shift; live "$@" ;;
+  detect) shift; detect "$@" ;;
   down) down ;;
-  *) echo "usage: capture27-pair.sh up|reset|g5|live LOG TEST...|down" >&2; exit 64 ;;
+  *) echo "usage: capture27-pair.sh up|reset|g5|live LOG TEST...|detect LOG TEST...|down" >&2; exit 64 ;;
 esac
