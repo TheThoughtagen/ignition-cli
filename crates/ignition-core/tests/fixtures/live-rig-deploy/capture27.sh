@@ -83,7 +83,8 @@
 # LOOPBACK ONLY. The gateway URL is checked first (before any file is written
 # and before any request) and must be localhost, 127.0.0.1 or [::1]. The rig
 # git.yaml carries a fixed dummy credential the module requires; it and the API
-# token are never printed. Never enable `set -x` here. Synthetic names only.
+# token are never printed and never on a command line (curl reads the token
+# header from a config on stdin). Never enable `set -x` here. Synthetic names only.
 set -euo pipefail
 
 PORT=18292
@@ -154,6 +155,19 @@ dc() {
 
 cid() {
   docker ps -q --filter "label=com.docker.compose.project=$PROJ" --filter "label=com.docker.compose.service=gw"
+}
+
+# curl_tok VAR CURL-ARG...: curl with the gateway API token header taken from
+# the variable named VAR and handed to curl as a config on stdin (`-K -`), so
+# the token is never on a command line (`ps` shows argv). printf is a shell
+# builtin: it starts no process. WR-D4.
+curl_tok() {
+  local var=$1 v
+  shift
+  v=${!var:?no token in $var}
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf 'header = "X-Ignition-API-Token: %s"\n' "$v" | curl -K - "$@"
 }
 
 # token_env: the rig token as an environment of the calling process only.
@@ -505,7 +519,7 @@ wait_app() {
   local limit=${1:-420} end code
   end=$(( $(date +%s) + limit ))
   while [ "$(date +%s)" -lt "$end" ]; do
-    code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -H "X-Ignition-API-Token: ${IGN_GIT27_RIG_TOKEN:?}" "$BASE$PRJ/find/$APP" 2> /dev/null || true)
+    code=$(curl_tok IGN_GIT27_RIG_TOKEN -sS -m 10 -o /dev/null -w '%{http_code}' "$BASE$PRJ/find/$APP" 2> /dev/null || true)
     [ "$code" = 200 ] && return 0
     sleep 5
   done
@@ -639,7 +653,7 @@ reset27() {
   yaml27 "${GIT27_YAML_MODE:-template}"
   # A save a failed gate left behind would make the next save refuse.
   /bin/rm -rf "$DATA/ign-deploy"
-  curl -sS -m 60 -o /dev/null -X DELETE -H "X-Ignition-API-Token: $IGN_GIT27_RIG_TOKEN" "$BASE$PRJ/$APP?confirm=true" || true
+  curl_tok IGN_GIT27_RIG_TOKEN -sS -m 60 -o /dev/null -X DELETE "$BASE$PRJ/$APP?confirm=true" || true
   # The module cloned into the directory: remove what the API delete left.
   docker exec -u root "$(cid)" sh -c "rm -rf $CONTAINER_DATA/projects/$APP"
   # The server container's CGI socket can vanish after hours up: restart it
@@ -1096,7 +1110,7 @@ g9why() {
   logs27 "$ts" | grep -v 'Tag provider' | sed 's/^/     /'
   case "$setting" in
     scan)
-      code=$(curl -sS -m 60 -o /dev/null -w '%{http_code}' -X POST -H "X-Ignition-API-Token: $IGN_GIT27_RIG_TOKEN" "$BASE/data/api/v1/scan/projects" || true)
+      code=$(curl_tok IGN_GIT27_RIG_TOKEN -sS -m 60 -o /dev/null -w '%{http_code}' -X POST "$BASE/data/api/v1/scan/projects" || true)
       echo "   project scan triggered: HTTP $code"
       sleep 25
       echo "   after the scan: .git present=$(app_has_git && echo yes || echo no)"

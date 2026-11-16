@@ -2868,6 +2868,60 @@ fn git_prodshape_shape_file_refuses_unknown_keys_and_bad_relations() {
     assert!(GitShape::from_toml(&text("", neutral.tracked + 1)).is_err());
 }
 
+/// WR-D9, D-18: a parse error never repeats a value (or a key) from the shape
+/// file. serde's own messages do: ``invalid type: floating point `1500000000`,
+/// expected u64`` and ``invalid value: integer `-1`, expected usize``.
+#[test]
+fn git_prodshape_shape_file_errors_never_echo_values() {
+    let neutral = GitShape::neutral();
+    // The neutral shape with one line replaced (or one line added).
+    let with = |key: &str, value: &str| {
+        let mut rows: Vec<(String, String)> = vec![
+            ("git_bytes".into(), neutral.git_bytes.to_string()),
+            ("git_files".into(), neutral.git_files.to_string()),
+            ("packs".into(), neutral.packs.to_string()),
+            ("loose_objects".into(), neutral.loose_objects.to_string()),
+            ("commits".into(), neutral.commits.to_string()),
+            ("tracked".into(), neutral.tracked.to_string()),
+            ("in_scope".into(), neutral.in_scope.to_string()),
+            ("out_of_scope".into(), neutral.out_of_scope.to_string()),
+            (
+                "advance_commits".into(),
+                neutral.advance_commits.to_string(),
+            ),
+        ];
+        match rows.iter_mut().find(|(k, _)| k == key) {
+            Some(row) => row.1 = value.to_string(),
+            None => rows.push((key.to_string(), value.to_string())),
+        }
+        rows.iter()
+            .map(|(k, v)| format!("{k} = {v}\n"))
+            .collect::<String>()
+    };
+    let cases = [
+        (with("git_bytes", "1.5e9"), vec!["1.5e9", "1500000000"]),
+        (with("packs", "-1"), vec!["-1"]),
+        (
+            with("surprise_private_key", "7777777"),
+            vec!["surprise_private_key", "7777777"],
+        ),
+        (
+            with("git_files", "\"private-string-value\""),
+            vec!["private-string-value"],
+        ),
+    ];
+    for (text, forbidden) in cases {
+        let err = GitShape::from_toml(&text).expect_err("the shape file does not parse");
+        assert!(
+            err.contains("the shape file does not parse"),
+            "the error says what failed: {err}"
+        );
+        for value in forbidden {
+            assert!(!err.contains(value), "the error repeats {value:?}: {err}");
+        }
+    }
+}
+
 /// The run id every save in these rows uses.
 const GIT_PRODSHAPE_RUN: &str = "20261113T101500Z-ab12";
 

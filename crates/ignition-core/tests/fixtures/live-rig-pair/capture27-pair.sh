@@ -59,7 +59,8 @@
 # exits 2 unless the host is localhost, 127.0.0.1 or [::1]. The backup (gw-b) is
 # only ever read: every request to it is a GET and its project directory is only
 # written by the restore of step (c), which is the point of that step. Tokens come
-# from tokens.env (0600, outside the repository) and are never printed. The
+# from tokens.env (0600, outside the repository) and are never printed and never
+# on a command line (curl reads the token header from a config on stdin). The
 # rig git.yaml carries a fixed dummy credential the module requires; it is never
 # printed. Never enable `set -x` here. Synthetic names only.
 set -euo pipefail
@@ -132,6 +133,19 @@ pdir() { printf '%s/data-%s/projects/%s' "$STATE" "$1" "$APP"; }
 
 seedgit() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git "$@"; }
 
+# curl_tok VAR CURL-ARG...: curl with the gateway API token header taken from
+# the variable named VAR and handed to curl as a config on stdin (`-K -`), so
+# the token is never on a command line (`ps` shows argv). printf is a shell
+# builtin: it starts no process. WR-D4.
+curl_tok() {
+  local var=$1 v
+  shift
+  v=${!var:?no token in $var}
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf 'header = "X-Ignition-API-Token: %s"\n' "$v" | curl -K - "$@"
+}
+
 # token_env: the node tokens as the calling process's environment only.
 token_env() {
   [ -f "$STATE/tokens.env" ] || die "no $STATE/tokens.env: run up first"
@@ -147,7 +161,7 @@ get() {
   var=IGN_PAIR_TOKEN_$(printf '%s' "$node" | tr '[:lower:]' '[:upper:]')
   tok=${!var:-}
   [ -n "$tok" ] || die "no token for node $node"
-  curl -sS -m 120 -H "X-Ignition-API-Token: $tok" "$(base_of "$node")$path"
+  curl_tok "$var" -sS -m 120 "$(base_of "$node")$path"
 }
 
 # wait_git_server: the git server answers the smart-HTTP advertisement from a
@@ -497,7 +511,7 @@ g5_steps() {
   shape "$(pdir a)" "node a after pairing"
   shape "$(pdir b)" "node b after pairing (the backup)"
   bash "$HERE/setup-pair.sh" status
-  echo "backup REST find $APP: HTTP $(curl -s -o /dev/null -w '%{http_code}' -H "X-Ignition-API-Token: ${IGN_PAIR_TOKEN_B:?}" "$BASE_B/data/api/v1/projects/find/$APP")"
+  echo "backup REST find $APP: HTTP $(curl_tok IGN_PAIR_TOKEN_B -s -o /dev/null -w '%{http_code}' "$BASE_B/data/api/v1/projects/find/$APP")"
   echo "== (d) backup export before: $(digest_b)"
   /bin/rm -rf "$TMPD/b-git-before"
   if [ -d "$(pdir b)/.git" ]; then

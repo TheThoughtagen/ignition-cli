@@ -137,9 +137,17 @@ impl GitShape {
         }
     }
 
-    /// Parse and check a shape file's text. The error never repeats a value.
+    /// Parse and check a shape file's text. The error never repeats a value
+    /// or a key from the file: serde's messages quote both, so none of the
+    /// parser's text is used, only the byte span (WR-D9, D-18).
     pub fn from_toml(text: &str) -> Result<GitShape, String> {
-        let shape: GitShape = toml::from_str(text).map_err(|e| e.message().to_string())?;
+        let shape: GitShape = toml::from_str(text).map_err(|e| {
+            let at = e.span().map_or_else(
+                || "no span".to_string(),
+                |s| format!("bytes {}..{}", s.start, s.end),
+            );
+            format!("the shape file does not parse ({at})")
+        })?;
         shape.validate()?;
         Ok(shape)
     }
