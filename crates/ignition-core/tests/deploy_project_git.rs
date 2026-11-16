@@ -3076,6 +3076,63 @@ mod published {
         writable
     }
 
+    /// What a D-22 write-preflight test does when the account may ignore
+    /// mode bits (WR-D6).
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    enum RootGuard {
+        /// The account honours mode bits: run the assertions.
+        Run,
+        /// The account ignores mode bits and the operator said so on
+        /// purpose: print a countable line and return.
+        Skip,
+        /// The account ignores mode bits and nobody said so: fail.
+        Refuse,
+    }
+
+    /// The pure rule: `ignores` is `ignores_modes`, `allow` is the value of
+    /// `IGN_ALLOW_ROOT_SKIP`. Only the exact value `1` allows the skip.
+    #[cfg(unix)]
+    fn root_guard_decision(ignores: bool, allow: Option<&str>) -> RootGuard {
+        match (ignores, allow) {
+            (false, _) => RootGuard::Run,
+            (true, Some("1")) => RootGuard::Skip,
+            (true, _) => RootGuard::Refuse,
+        }
+    }
+
+    /// WR-D6: the D-22 write-preflight tests never pass vacuously as root.
+    /// Returns true when the test must return now (a deliberate skip, with a
+    /// `SKIPPED-AS-ROOT <test>` line); panics when the account ignores mode
+    /// bits and `IGN_ALLOW_ROOT_SKIP=1` is not set.
+    #[cfg(unix)]
+    fn root_guard(test: &str, dir: &std::path::Path) -> bool {
+        let allow = std::env::var("IGN_ALLOW_ROOT_SKIP").ok();
+        match root_guard_decision(ignores_modes(dir), allow.as_deref()) {
+            RootGuard::Run => false,
+            RootGuard::Skip => {
+                println!("SKIPPED-AS-ROOT {test}");
+                true
+            }
+            RootGuard::Refuse => panic!(
+                "{test}: run as a non-root user (or set IGN_ALLOW_ROOT_SKIP=1 to skip on purpose)"
+            ),
+        }
+    }
+
+    /// WR-D6: the guard rule itself, testable as any user.
+    #[cfg(unix)]
+    #[test]
+    fn root_guard_rule() {
+        assert_eq!(root_guard_decision(false, None), RootGuard::Run);
+        assert_eq!(root_guard_decision(false, Some("1")), RootGuard::Run);
+        assert_eq!(root_guard_decision(true, None), RootGuard::Refuse);
+        assert_eq!(root_guard_decision(true, Some("0")), RootGuard::Refuse);
+        assert_eq!(root_guard_decision(true, Some("")), RootGuard::Refuse);
+        assert_eq!(root_guard_decision(true, Some("yes")), RootGuard::Refuse);
+        assert_eq!(root_guard_decision(true, Some("1")), RootGuard::Skip);
+    }
+
     /// No probe file is left in the project directory or in `.git`.
     fn assert_no_probe_left(rig: &Rig) {
         for dir in [rig.f.project_dir(), rig.f.git_dir()] {
@@ -3097,8 +3154,7 @@ mod published {
     async fn write_preflight_refuses_no_run_dir() {
         use std::os::unix::fs::PermissionsExt;
         let rig = Rig::new();
-        if ignores_modes(&rig.f.project_dir()) {
-            println!("running with privileges that ignore mode bits; skipped");
+        if root_guard("write_preflight_refuses_no_run_dir", &rig.f.project_dir()) {
             return;
         }
         let host = rig.host();
@@ -3132,8 +3188,7 @@ mod published {
     async fn write_preflight_git_dir() {
         use std::os::unix::fs::PermissionsExt;
         let rig = Rig::new();
-        if ignores_modes(&rig.f.project_dir()) {
-            println!("running with privileges that ignore mode bits; skipped");
+        if root_guard("write_preflight_git_dir", &rig.f.project_dir()) {
             return;
         }
         let host = rig.host();
@@ -3161,8 +3216,7 @@ mod published {
     async fn preflight_not_in_check() {
         use std::os::unix::fs::PermissionsExt;
         let rig = Rig::new();
-        if ignores_modes(&rig.f.project_dir()) {
-            println!("running with privileges that ignore mode bits; skipped");
+        if root_guard("preflight_not_in_check", &rig.f.project_dir()) {
             return;
         }
         std::fs::set_permissions(rig.f.project_dir(), std::fs::Permissions::from_mode(0o555))
@@ -6149,15 +6203,16 @@ mod published {
         use std::os::unix::fs::PermissionsExt;
         let rig = pair();
         let dir = rig.f.backup_project_dir();
+        // Probe BEFORE the chmod (CR-D1): after the restore the directory is
+        // writable again for every user, so a late probe always skipped.
+        if root_guard("pair_preflight_both_nodes", &dir) {
+            return;
+        }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let _unlock = Unlock(dir.clone());
         let backup = rig.backup_node(0);
         let outcome = rig.apply_pair(&backup, WAIT).await;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
-        if std::fs::write(dir.join(".ign-probe-root-check"), b"x").is_ok() {
-            // Running as a user that ignores directory modes: nothing to prove.
-            let _ = std::fs::remove_file(dir.join(".ign-probe-root-check"));
-            return;
-        }
         let err = refusal(outcome);
         assert_eq!(preflight_checks(&err), ["git_write_access"], "{err}");
         assert!(err.to_string().contains("nodes.backup"), "{err}");

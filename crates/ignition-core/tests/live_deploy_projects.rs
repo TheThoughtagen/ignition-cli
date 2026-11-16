@@ -115,7 +115,7 @@ fn local_url_guard_refuses_non_loopback() {
         "https://gwnode01.example.local:8043",
         "http://localhost.evil.example:18290",
         "http://127.0.0.2:18290",
-        "http://52.154.75.231:8088",
+        "http://192.0.2.15:8088",
         "not a url",
     ] {
         assert!(local_url_guard(raw).is_err(), "must refuse {raw}");
