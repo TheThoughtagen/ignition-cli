@@ -5959,6 +5959,41 @@ mod winps_git {
         assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_err());
     }
 
+    /// WR-B5 (27-33, confirmed on the Windows test VM under 5.1): a raw
+    /// `[IO.Directory]::Delete(path, $true)` stops on a ReadOnly file, so every
+    /// recursive delete of the git scripts goes through the one helper `Dr`,
+    /// which clears ReadOnly first without entering a reparse point.
+    #[test]
+    fn winps_git_recursive_deletes_clear_readonly_first() {
+        for (name, body) in [
+            ("GIT_SAVE", winps::GIT_SAVE),
+            ("GIT_RESTORE", winps::GIT_RESTORE),
+            ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
+        ] {
+            assert!(body.contains("function Dr("), "{name} has the helper");
+            assert_eq!(
+                body.matches(",$true)").count(),
+                1,
+                "{name}: the only recursive delete is the one inside Dr"
+            );
+            assert!(
+                body.contains("[IO.Directory]::Delete($d,$true)"),
+                "{name}: Dr deletes"
+            );
+        }
+        for name in ["GIT_SAVE", "GIT_RESTORE"] {
+            let body = if name == "GIT_SAVE" {
+                winps::GIT_SAVE
+            } else {
+                winps::GIT_RESTORE
+            };
+            assert!(
+                body.contains("could not be removed)"),
+                "{name}: a delete that still fails names the leftover"
+            );
+        }
+    }
+
     #[test]
     fn winps_git_params_only() {
         let bodies = [
@@ -6403,6 +6438,16 @@ mod winps_git {
         let fx = GitFixture::new();
         let home = tempfile::tempdir().expect("home");
         let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        // a ReadOnly file, as git sets on its pack and object files (WR-B5):
+        // the copy keeps the attribute, and the removal at the end must cope
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                fx.git_dir().join("HEAD"),
+                std::fs::Permissions::from_mode(0o444),
+            )
+            .expect("read-only HEAD");
+        }
         let local = fx.node().git_manifest(PROJECT).await.expect("local");
         let save = || WinScript::git_save("", &data, PROJECT, &home_s, GATEWAY, RUN);
         let restore = || WinScript::git_restore("", &data, PROJECT, &home_s, GATEWAY, RUN);
@@ -6470,6 +6515,69 @@ mod winps_git {
             "a linked repo is refused"
         );
         assert!(!fx.git_dir().exists());
+        // the save holds the ReadOnly file; its removal clears it and succeeds
+        std::fs::remove_file(&repo).expect("unlink repo");
+        std::fs::rename(&moved, &repo).expect("move back");
+        let rel = format!("ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}/repo");
+        let removed =
+            pwsh_exec::run(&WinScript::git_save_rm("", &home_s, &rel, RUN)).expect("remove");
+        assert_eq!(removed["removed"], 1);
+        assert!(!repo.exists(), "a save with a ReadOnly file is removed");
+    }
+
+    /// WR-B5: the removal of a save clears ReadOnly on the files first, never
+    /// enters or changes what a link points at, and a delete that still fails
+    /// names the leftover path with the real error.
+    #[tokio::test]
+    async fn pwsh_git_save_rm_clears_readonly_and_names_what_is_left() {
+        use std::os::unix::fs::PermissionsExt;
+        if !pwsh_exec::gate("pwsh_git_save_rm_clears_readonly_and_names_what_is_left") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect("save");
+        let rel = format!("ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}");
+        let repo = home.path().join(&rel).join("repo");
+        let rm = || WinScript::git_save_rm("", &home_s, &format!("{rel}/repo"), RUN);
+        // a ReadOnly file, and a link to a directory outside holding another
+        let readonly = repo.join("HEAD");
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).expect("ro");
+        let outside = tempfile::tempdir().expect("outside");
+        let precious = outside.path().join("precious");
+        std::fs::write(&precious, "keep").expect("precious");
+        std::fs::set_permissions(&precious, std::fs::Permissions::from_mode(0o444)).expect("ro");
+        std::os::unix::fs::symlink(outside.path(), repo.join("link")).expect("link");
+        // a directory that cannot be emptied: the delete fails, and says where
+        let locked = repo.join("objects");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("lock");
+        let why = pwsh_exec::run(&rm()).expect_err("an undeletable tree");
+        assert!(
+            why.contains("could not be removed") && why.contains(&s(&repo)),
+            "the leftover is named: {why}"
+        );
+        assert!(repo.is_dir(), "nothing else was touched");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+        let done = pwsh_exec::run(&rm()).expect("remove");
+        assert_eq!(done["removed"], 1);
+        assert!(!repo.exists(), "the save is gone, ReadOnly file included");
+        assert_eq!(
+            std::fs::read(&precious).expect("the link target is intact"),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::metadata(&precious)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o222,
+            0,
+            "a file behind a link was not changed"
+        );
     }
 
     #[tokio::test]

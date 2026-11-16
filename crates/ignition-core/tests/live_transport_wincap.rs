@@ -7612,6 +7612,267 @@ async fn wincap_git_scripts() {
     println!("LIVE-RAN wincap_git_scripts");
 }
 
+// ---- WR-B5: ReadOnly files and the recursive deletes of the git scripts (27-33) ---
+//
+// Plan 27-33 Task 1. `[IO.Directory]::Delete(path, $true)` in Windows PowerShell 5.1
+// is the commonly reported cause of "Access to the path ... is denied" on a tree that
+// holds ReadOnly files. The gate records three observations on the real host family
+// before any script changes, each as a `WR-B5 ...` line:
+//
+// (a) the raw call, on a one-off tree with one ReadOnly file;
+// (b) the shipped `save_git` of a `.git` whose pack, idx and one loose object are
+//     ReadOnly (robocopy `/COPY:DAT` keeps the attribute), then the shipped
+//     `remove_git_save`: is the save gone;
+// (c) a `save_git` forced to fail after a partial copy (a loose object held open for
+//     reading with no sharing makes robocopy fail on it after the pack was copied): does the error
+//     that comes back name robocopy (the real error), and is the partial copy gone.
+//
+// It works only below `ign-live-scratch\data27w` (project `CapApp27w`) and the saves
+// below `ign-deploy\live-scratch27w`, both removed at the start and at the end. The
+// gate stays as a regression check after the fix. (d) plants a junction inside a save and
+// checks the removal fails closed and neither follows it nor changes the ReadOnly file behind it. `LIVE-RAN`
+// is its last line, printed only when (b) removed the save, (c) surfaced the real error
+// and left nothing, and (d) held.
+
+const RO_GATEWAY: &str = "live-scratch27w";
+const RO_PROJECT: &str = "CapApp27w";
+const RO_RUN_B: &str = "20261116T090000Z-w33b";
+const RO_RUN_C: &str = "20261116T090100Z-w33c";
+const RO_RUN_D: &str = "20261116T090200Z-w33d";
+
+/// One tree with one ReadOnly file, the raw delete, and the clean-up of what it
+/// leaves. `r` is `ok` or `threw`.
+const RO_RAW_DELETE: &str = "$d=$p.x+$p.path;[void][IO.Directory]::CreateDirectory($d+'\\sub');$f=$d+'\\sub\\ro.pack';[IO.File]::WriteAllText($f,'x');[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly);$r='ok';$m='';try{[IO.Directory]::Delete($d,$true)}catch{$r='threw';$m=$_.Exception.GetType().Name+': '+$_.Exception.Message};$left=[int][IO.Directory]::Exists($d);if($left){foreach($e in [IO.Directory]::EnumerateFiles($d,'*',[IO.SearchOption]::AllDirectories)){[IO.File]::SetAttributes($e,[IO.FileAttributes]::Normal)};[IO.Directory]::Delete($d,$true)};E @{ok=1;r=$r;m=$m;left=$left}";
+/// A small `.git` below `$p.git` (native); the files named in `$p.ro` are 4096 bytes
+/// and ReadOnly, the rest are small text files.
+const RO_MAKE_GIT: &str = "$g=$p.x+$p.git;foreach($e in $p.dirs){[void][IO.Directory]::CreateDirectory($g+'\\'+$e.Replace('/','\\'))};foreach($e in $p.text){[IO.File]::WriteAllText($g+'\\'+$e.Replace('/','\\'),'x'+[char]10)};foreach($e in $p.ro){$f=$g+'\\'+$e.Replace('/','\\');[IO.File]::WriteAllBytes($f,(New-Object byte[] 4096));[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly)};E @{ok=1}";
+/// Hold a file open for reading with no sharing at all for `$p.s` seconds.
+/// A junction `$p.link` to the directory `$p.target`, which holds one ReadOnly file.
+const RO_MAKE_JUNCTION: &str = "[void][IO.Directory]::CreateDirectory($p.target);$f=$p.target+'\\precious.txt';[IO.File]::WriteAllText($f,'keep');[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly);cmd /c mklink /J $p.link $p.target|Out-Null;if($LASTEXITCODE -ne 0){throw 'mklink failed'};E @{ok=1}";
+const RO_HOLD_EXCLUSIVE: &str = "$h=[IO.File]::Open($p.path,'Open','Read','None');Start-Sleep -Seconds $p.s;$h.Dispose();E @{ok=1}";
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_git_readonly_delete() {
+    use ignition_core::deploy::transport::projects::GitStateWriter;
+
+    let Some(live) = live() else { return };
+    let host_repo = repo(&live, "git27w-home", &live.data_dir, None);
+    let host_shell = shell_of(host_repo.path(), "git27w-home");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let data = format!("{home_native}\\{SCRATCH}\\data27w");
+    let saves = format!("{home_native}\\ign-deploy\\{RO_GATEWAY}");
+    let probe = format!("{home_native}\\{SCRATCH}\\wr-b5-raw");
+    let git_dir = format!("{data}\\projects\\{RO_PROJECT}\\.git");
+    assert!(!data.to_ascii_lowercase().contains("program files"));
+    assert!(data.contains(SCRATCH));
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    println!(
+        "WR-B5 host: PSEdition {} PSVersion {}",
+        facts["e"], facts["v"]
+    );
+    assert_eq!(
+        facts["e"], "Desktop",
+        "the deploy account's ssh runs Windows PowerShell"
+    );
+
+    for tree in [&data, &saves, &probe] {
+        remove_tree(&host_shell, tree).await;
+    }
+
+    // (a) the raw observation
+    let raw = host_shell
+        .exec_powershell(&script("ro_raw", RO_RAW_DELETE, path_params(&probe)))
+        .await
+        .expect("raw delete probe");
+    let raw_threw = raw["r"] == "threw";
+    println!(
+        "WR-B5 raw-delete {} (tree left {}): {}",
+        raw["r"].as_str().unwrap_or("?"),
+        raw["left"],
+        raw["m"].as_str().unwrap_or("")
+    );
+
+    // the `.git` with ReadOnly packs
+    let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
+    let idx = format!("objects/pack/pack-{}.idx", "a".repeat(40));
+    let loose = format!("objects/ab/{}", "c".repeat(38));
+    host_shell
+        .exec_powershell(&script(
+            "ro_make_git",
+            RO_MAKE_GIT,
+            serde_json::json!({
+                "x": LONG_PATH_PREFIX, "git": git_dir,
+                "dirs": ["objects/pack", "objects/ab", "refs/heads"],
+                "text": ["HEAD", "config", "refs/heads/main"],
+                "ro": [pack, idx, loose],
+            }),
+        ))
+        .await
+        .expect("build the .git");
+
+    let repo_dir = repo(&live, "git27w", &data, None);
+    let shell = shell_of(repo_dir.path(), "git27w");
+    let (_, ssh, _) = ssh_of(repo_dir.path(), "git27w");
+    let node = SftpTransport::new_windows(
+        shell,
+        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
+        "nodes.master",
+    );
+
+    // (b) the shipped save and its removal
+    let save_b = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_B}");
+    node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_B)
+        .await
+        .expect("save with ReadOnly packs");
+    let attrs = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": format!("{save_b}\\repo\\{}", pack.replace('/', "\\")) }),
+        ))
+        .await
+        .expect("attributes of the saved pack");
+    let ro_kept = attrs["a"].as_i64().unwrap_or(0) & 1 != 0;
+    println!(
+        "WR-B5 save carries ReadOnly on the pack: {ro_kept} (attributes {})",
+        attrs["a"]
+    );
+    let removed = node.remove_git_save(RO_GATEWAY, RO_PROJECT, RO_RUN_B).await;
+    let left_b = enumerate(&host_shell, &save_b).await.is_some();
+    match &removed {
+        Ok(()) => println!("WR-B5 remove_git_save ok; save left on the host: {left_b}"),
+        Err(err) => println!("WR-B5 remove_git_save threw: {err}; save left on the host: {left_b}"),
+    }
+    let b_ok = removed.is_ok() && !left_b;
+
+    // (c) a save that fails after a partial copy: one loose object is held open with
+    // no sharing while robocopy runs (the manifest does not open objects, it reads
+    // their length), so robocopy fails on it after copying the pack beside it
+    let held = format!("{git_dir}\\{}", loose.replace('/', "\\"));
+    let hold_script = script(
+        "ro_hold",
+        RO_HOLD_EXCLUSIVE,
+        serde_json::json!({ "path": held, "s": 40 }),
+    );
+    let holder = host_shell.exec_powershell(&hold_script);
+    let forced = async {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_C).await
+    };
+    let (hold_answer, failed) = tokio::join!(holder, forced);
+    hold_answer.expect("the holder ran");
+    let save_c = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_C}\\repo");
+    let partial_left = enumerate(&host_shell, &save_c).await.is_some();
+    let (c_forced, real_error) = match &failed {
+        Ok(_) => {
+            println!("WR-B5 forced save failure: the save SUCCEEDED, the failure was not forced");
+            (false, false)
+        }
+        Err(err) => {
+            let text = err.to_string();
+            let real = text.to_ascii_lowercase().contains("robocopy failed");
+            println!("WR-B5 forced save failure: {text}");
+            (true, real)
+        }
+    };
+    println!(
+        "WR-B5 failed save: the real error (robocopy) came back: {real_error}; partial copy left on the host: {partial_left}"
+    );
+    let c_ok = c_forced && real_error && !partial_left;
+
+    // (d) a junction inside a save is never entered: the removal fails closed, naming
+    // the leftover, and the ReadOnly file behind the link is neither removed nor changed
+    let save_d = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_D}");
+    let outside = format!("{home_native}\\{SCRATCH}\\wr-b5-outside");
+    remove_tree(&host_shell, &outside).await;
+    node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_D)
+        .await
+        .expect("a third save");
+    host_shell
+        .exec_powershell(&script(
+            "ro_junction",
+            RO_MAKE_JUNCTION,
+            serde_json::json!({ "link": format!("{save_d}\\repo\\link"), "target": outside }),
+        ))
+        .await
+        .expect("plant a junction in the save");
+    let removed_d = node.remove_git_save(RO_GATEWAY, RO_PROJECT, RO_RUN_D).await;
+    let left_d = enumerate(&host_shell, &save_d).await.is_some();
+    let behind = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": format!("{outside}\\precious.txt") }),
+        ))
+        .await;
+    let behind_ro = behind
+        .as_ref()
+        .map(|v| v["a"].as_i64().unwrap_or(0) & 1 != 0)
+        .unwrap_or(false);
+    println!(
+        "WR-B5 junction in a save: removal ok {}; save left {left_d}; the file behind the link still exists and is still ReadOnly: {behind_ro}",
+        removed_d.is_ok()
+    );
+    if let Err(err) = &removed_d {
+        println!("WR-B5 junction in a save: the removal said: {err}");
+    }
+    // .NET's recursive delete refuses a junction inside the tree ("Access to the path
+    // 'link' is denied"): the removal fails closed and names the leftover; the link is
+    // never followed
+    let d_ok = removed_d
+        .as_ref()
+        .is_err_and(|err| err.to_string().contains("could not be removed"))
+        && left_d
+        && behind_ro;
+    host_shell
+        .exec_powershell(&script(
+            "drop_junction",
+            DROP_JUNCTION,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "link": format!("{save_d}\\repo\\link") }),
+        ))
+        .await
+        .expect("drop the junction");
+    remove_tree(&host_shell, &outside).await;
+
+    let confirmed = raw_threw || !b_ok || !c_ok;
+    println!(
+        "WR-B5 verdict: {}",
+        if confirmed {
+            "confirmed"
+        } else {
+            "not reproduced"
+        }
+    );
+
+    for tree in [&data, &saves, &probe] {
+        remove_tree(&host_shell, tree).await;
+    }
+    host_shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    assert!(
+        c_forced,
+        "(c) was not forced: pick another way to fail the save"
+    );
+    assert!(b_ok, "(b) a save with ReadOnly packs was not removed");
+    assert!(
+        c_ok,
+        "(c) a failed save masked its real error or left a partial copy"
+    );
+    assert!(d_ok, "(d) a junction inside a save was entered or changed");
+    println!("LIVE-RAN wincap_git_readonly_delete");
+}
+
 // ---- the gateway-object read of 27-11 (checker W14, D-24) ---------------------
 //
 // `list_git_objects` and the worst case of `gateway_head_digest` through

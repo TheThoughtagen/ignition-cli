@@ -321,7 +321,7 @@ pub const GIT_ENTRY: &str = concat!(
 // ---- generated pieces (see the GIT_* docs) ----
 macro_rules! git_ps_base {
     () => {
-        r##"$c=[IO.Path]::DirectorySeparatorChar;function Z($x){try{Get-Item -LiteralPath $x -Force}catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){throw}}};function K($i){if(!$i -or !$i.PSIsContainer -or (([int]$i.Attributes -band 1024) -ne 0)){throw 'a path is not a real directory'};$i};"##
+        r##"$c=[IO.Path]::DirectorySeparatorChar;function Z($x){try{Get-Item -LiteralPath $x -Force}catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){throw}}};function K($i){if(!$i -or !$i.PSIsContainer -or ([int]$i.Attributes -band 1024)){throw 'a path is not a real directory'};$i};"##
     };
 }
 macro_rules! git_ps_yc {
@@ -336,7 +336,12 @@ macro_rules! git_ps_x {
 }
 macro_rules! git_ps_m {
     () => {
-        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function M($d){$d=$p.x+$d;$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=[long]0;$l=@();$s=New-Object Collections.Stack;$s.Push(@((New-Object IO.DirectoryInfo $d),''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()}};$l+=$r+"`0"+$v}}};$z=$l;[Array]::Sort($z,[StringComparer]::Ordinal);@{files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($(if($z.Length){($z-join"`n")+"`n"}else{''}))))}}"##
+        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function M($d){$d=$p.x+$d;$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=0;$l=@();$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$d,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){$a=[int]$f.Attributes;if(($a -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()}};$l+=$r+"`0"+$v}}};[Array]::Sort($l,[StringComparer]::Ordinal);@{files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($(if($l.Length){($l-join"`n")+"`n"}else{''}))))}}"##
+    };
+}
+macro_rules! git_ps_dr {
+    () => {
+        r##"function Dy($i){foreach($f in $i.GetFileSystemInfos()){$a=[int]$f.Attributes;if($a -band 1024){continue};if($a -band 16){Dy $f}else{$f.Attributes=128}}};function Dr($d){$d=$p.x+$d;Dy ([IO.DirectoryInfo]$d);[IO.Directory]::Delete($d,$true)};"##
     };
 }
 macro_rules! git_ps_l {
@@ -381,13 +386,24 @@ pub const GIT_STATE: &str = concat!(
 /// the source's Hidden attribute to `repo` (robocopy copies the contents of a
 /// directory, not the directory's own attributes) and compares the manifest of
 /// the copy with the source's. A failure removes the partial `repo`
-/// (`Directory.Delete`, which does not follow a reparse point). The answer is
-/// the copy's manifest.
+/// (`Dr`, below). The answer is the copy's manifest.
+///
+/// WR-B5 (27-33, confirmed on the Windows test VM under 5.1): robocopy
+/// `/COPY:DAT` keeps the ReadOnly attribute of git's pack and object files, and
+/// `[IO.Directory]::Delete(path, $true)` stops on such a file with `Access to the
+/// path ... is denied`, which in a `catch` replaced the real error. Every
+/// recursive delete of this family goes through `Dr`: it walks the tree with
+/// `EnumerateFileSystemInfos`, never enters or changes a reparse point (a link
+/// is left for `Directory.Delete`, which removes the link itself), sets the
+/// attributes of each ReadOnly file to Normal (the file is about to be deleted),
+/// then deletes. A delete that still fails does not hide the original error:
+/// the script rethrows it with the leftover path appended.
 pub const GIT_SAVE: &str = concat!(
     git_ps_base!(),
     git_ps_yc!(),
     git_ps_m!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){K $y|Out-Null}else{[IO.Directory]::CreateDirectory($q)|Out-Null}};$r=$q+$c+'repo';New-Item -ItemType Directory -Path $r|Out-Null;try{Yc $a $r;if(([int]$i.Attributes -band 2) -ne 0){[IO.File]::SetAttributes($r,[IO.File]::GetAttributes($r) -bor 2)};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{[IO.Directory]::Delete($p.x+$r,$true);throw};E @{ok=1;files=$n.files;bytes=$n.bytes;digest=$n.digest}"##,
+    git_ps_dr!(),
+    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){K $y|Out-Null}else{[IO.Directory]::CreateDirectory($q)|Out-Null}};$r=$q+$c+'repo';New-Item -Type Directory $r|Out-Null;try{Yc $a $r;if([int]$i.Attributes -band 2){$h=Z $r;$h.Attributes+=2};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};$n.ok=1;E $n"##,
 );
 
 /// Restore the save of a run as the project's `.git` (Phase 27, D-06):
@@ -409,7 +425,8 @@ pub const GIT_RESTORE: &str = concat!(
     git_ps_base!(),
     git_ps_yc!(),
     git_ps_m!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j;K (Z $a)|Out-Null;$g=$a+$c+'.git';if(Z $g){throw 'the project already has a .git; it is never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;K (Z $q)|Out-Null};$r=$q+$c+'repo';$i=K (Z $r);$m=M $r;$t=$a+$c+'.ign-restore-'+$p.i;New-Item -ItemType Directory -Path $t|Out-Null;try{Yc $r $t;if(([int]$i.Attributes -band 2) -ne 0){[IO.File]::SetAttributes($t,[IO.File]::GetAttributes($t) -bor 2)};$n=M $t;if($n.digest -ne $m.digest){throw 'the restored copy does not match the save; nothing was restored'};[IO.Directory]::Move($t,$g)}catch{if([IO.Directory]::Exists($p.x+$t)){[IO.Directory]::Delete($p.x+$t,$true)};throw};$f=M $g;E @{ok=1;files=$f.files;bytes=$f.bytes;digest=$f.digest}"##,
+    git_ps_dr!(),
+    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw '.git already exists; it is never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$m=M $q;$t=$a+$c+'.ign-restore-'+$p.i;ni -Type Directory $t|Out-Null;try{Yc $q $t;if([int]$i.Attributes -band 2){$h=Z $t;$h.Attributes+=2};$n=M $t;if($n.digest -ne $m.digest){throw 'the restored copy does not match the save'};[IO.Directory]::Move($t,$g)}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};$f=M $g;$f.ok=1;E $f"##,
 );
 
 /// The manifest of a tree: file count, total bytes and one digest (Phase 27).
@@ -517,12 +534,14 @@ pub const GIT_PROBE: &str = concat!(
 /// account home, `r` the path below it (`/`-separated), `i` the run id. A path
 /// that is not exactly `ign-deploy/<g>/projects/<p>/git-save/<i>/repo` is
 /// refused before anything is touched; every level must be a real directory (a
-/// missing level answers `removed:0`); `Directory.Delete(recursive)` does not
-/// follow a reparse point inside the tree. The empty run directory is then
-/// removed.
+/// missing level answers `removed:0`); the tree goes through `Dr` (ReadOnly
+/// cleared first, a reparse point inside never entered or changed, WR-B5), and a
+/// delete that still fails names the leftover path. The empty run directory is
+/// then removed.
 pub const GIT_SAVE_RM: &str = concat!(
     git_ps_base!(),
-    r##"$u=$p.r.Split('/');$n=$u.Length;if($n -lt 4 -or $u[0] -ne 'ign-deploy' -or $u[$n-1] -ne 'repo' -or $u[$n-2] -ne $p.i -or $u[$n-3] -ne 'git-save'){throw 'refusing a path that does not end in git-save/<run-id>/repo'};$q=$p.h;K (Z $q)|Out-Null;$o=1;foreach($e in $u){if($e -in '','.','..'){throw 'refusing an empty, . or .. component'};$q+=$c+$e;$y=Z $q;if(!$y){$o=0;break};K $y|Out-Null};if($o){[IO.Directory]::Delete($p.x+$q,$true);$v=[IO.Path]::GetDirectoryName($q);if(!@([IO.Directory]::EnumerateFileSystemEntries($v)).Count){[IO.Directory]::Delete($v)}};E @{ok=1;removed=$o}"##,
+    git_ps_dr!(),
+    r##"$u=$p.r.Split('/');$n=$u.Length;if($n -lt 4 -or $u[0] -ne 'ign-deploy' -or $u[$n-1] -ne 'repo' -or $u[$n-2] -ne $p.i -or $u[$n-3] -ne 'git-save'){throw 'refusing a path that does not end in git-save/<run-id>/repo'};$q=$p.h;K (Z $q)|Out-Null;$o=1;foreach($e in $u){if($e -in '','.','..'){throw 'refusing an empty, . or .. component'};$q+=$c+$e;$y=Z $q;if(!$y){$o=0;break};K $y|Out-Null};if($o){try{Dr $q}catch{throw ($_.Exception.Message+' (the save at '+$q+' could not be removed)')};$v=[IO.Path]::GetDirectoryName($q);if(!@([IO.Directory]::EnumerateFileSystemEntries($v)).Count){[IO.Directory]::Delete($v)}};E @{ok=1;removed=$o}"##,
 );
 
 /// Free bytes on the volume that will hold a save (Phase 27). Parameters: `h`
