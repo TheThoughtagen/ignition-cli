@@ -2268,42 +2268,7 @@ impl GitStateWriter for SftpTransport {
         if !self.windows {
             return self.write_git_files_posix(&rel, &plan).await;
         }
-        // The Windows arm (27-33 gives it the same shape): lock every file
-        // exclusively, put the bytes into the locks over sftp, then replace.
-        let limit = self.shell.op_timeout();
-        // 1. Every lock exclusively (a lock that exists refuses, nothing is
-        //    written), creating the missing parent directories.
-        let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
-        let script = WinScript::git_lock(&self.win_git(project), false, &targets);
-        self.git_win("write_git_files", script, limit).await?;
-        // 2. The bytes over sftp into the locks.
-        let staged = match self.stage_git_writes(&plan) {
-            Ok(staged) => staged,
-            Err(err) => return Err(self.unlock_git_writes(err, project, &plan).await),
-        };
-        let ops: Vec<SftpOp> = staged
-            .1
-            .iter()
-            .map(|s| SftpOp::Put {
-                local: s.local.clone(),
-                remote: format!("{git}/{}", s.lock),
-            })
-            .collect();
-        if let Err(err) = self.run_batch("write", ops).await {
-            return Err(self.unlock_git_writes(err, project, &plan).await);
-        }
-        // 3. Each lock over its file, after a size check.
-        let writes: Vec<(String, u64)> = staged
-            .1
-            .iter()
-            .map(|s| (s.target.clone(), s.size as u64))
-            .collect();
-        let script = WinScript::git_replace(&self.win_git(project), &writes, RENAME_RETRIES);
-        if let Err(err) = self.git_win("write_git_files", script, limit).await {
-            return Err(self.unlock_git_writes(err, project, &plan).await);
-        }
-        drop(staged);
-        Ok(())
+        self.write_git_files_windows(project, &plan).await
     }
 
     async fn remove_git_save(
@@ -2580,22 +2545,207 @@ impl SftpTransport {
     }
 }
 
+/// How many writes one Windows lock or replace script takes: the command budget
+/// ([`COMMAND_BUDGET`](crate::deploy::transport::winps::COMMAND_BUDGET)) holds the
+/// script text and its parameters, and a longer plan is split (`winps_git_write_chunks_fit_budget`
+/// pins a chunk of this size with the longest names a write can carry).
+pub const GIT_WIN_CHUNK: usize = 3;
+
 impl SftpTransport {
-    /// Take the locks of a failed Windows write away again (they are this
-    /// call's: the lock script created each one exclusively) and return `err`.
-    async fn unlock_git_writes(
+    /// The Windows arm of `write_git_files` (27-33, WR-B3 and WR-B2, D-10): the
+    /// same design as the POSIX arm. The bytes go only into a private stage in the
+    /// deploy account's home. One script per chunk of the plan creates each lock
+    /// with `CreateNew` and fills it from the stage after a reparse check, one
+    /// more per chunk puts the locks over their targets (the last removes the
+    /// stage), and a failure runs the cleanup, which removes only locks equal to
+    /// the staged bytes.
+    async fn write_git_files_windows(
         &self,
-        err: CoreError,
         project: &str,
         plan: &[(String, String, &GitWrite)],
-    ) -> CoreError {
-        let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
-        let script = WinScript::git_lock(&self.win_git(project), true, &targets);
-        let _ = self
-            .git_win("write_git_files", script, self.shell.op_timeout())
-            .await;
-        err
+    ) -> Result<(), CoreError> {
+        let limit = self.shell.op_timeout();
+        let staged = self.stage_git_writes(plan)?;
+        let home_sftp = self.account_home().await?;
+        let home = self.win_home().await?;
+        let data = self.win_data();
+        let stage = format!("git-stage-{}", RunId::generate().as_str());
+        let stage_sftp = format!("{home_sftp}/ign-deploy/{stage}");
+        safe_remote_path(&format!("{stage_sftp}/00")).map_err(|why| {
+            self.mirror_fail(
+                "write",
+                format!("the stage path cannot ride an sftp batch line ({why})"),
+            )
+        })?;
+        let sized: Vec<(String, u64)> = staged
+            .1
+            .iter()
+            .map(|s| (s.target.clone(), s.size as u64))
+            .collect();
+        let ctx = WinWrite {
+            project,
+            data: &data,
+            home: &home,
+            stage: &stage,
+            plan,
+            sized: &sized,
+        };
+        // (a) the private stage: a refusal (the stage exists, a link on the way)
+        //     made nothing and is returned as it is
+        if let Err(err) = self
+            .git_win(
+                "write_git_files",
+                WinScript::git_stage(&home, &stage),
+                limit,
+            )
+            .await
+        {
+            return Err(if git_win_script_settled(&err) {
+                err
+            } else {
+                self.git_win_leftovers(err, &ctx, false).await
+            });
+        }
+        // (b) the bytes over sftp, into the stage and nowhere else
+        let ops: Vec<SftpOp> = staged
+            .1
+            .iter()
+            .enumerate()
+            .map(|(index, s)| SftpOp::Put {
+                local: s.local.clone(),
+                remote: format!("{stage_sftp}/{index}"),
+            })
+            .collect();
+        if let Err(err) = self.run_batch("write", ops).await {
+            return Err(self.git_win_leftovers(err, &ctx, false).await);
+        }
+        // (c) every lock created exclusively and filled, chunk by chunk
+        for (n, chunk) in sized.chunks(GIT_WIN_CHUNK).enumerate() {
+            let script =
+                WinScript::git_lock(&data, project, &home, &stage, n * GIT_WIN_CHUNK, chunk);
+            if let Err(err) = self.git_win("write_git_files", script, limit).await {
+                // a script that ran to its own failure took its own locks away;
+                // the cleanup still removes the ones of the chunks before it
+                let named = !git_win_script_settled(&err);
+                return Err(self.git_win_leftovers(err, &ctx, named).await);
+            }
+        }
+        // (d) each lock over its file, after a size check; the last chunk
+        //     removes the stage
+        let chunks = sized.chunks(GIT_WIN_CHUNK).count();
+        for (n, chunk) in sized.chunks(GIT_WIN_CHUNK).enumerate() {
+            let script = WinScript::git_replace(
+                &data,
+                project,
+                &home,
+                &stage,
+                chunk,
+                RENAME_RETRIES,
+                n + 1 == chunks,
+            );
+            if let Err(err) = self.git_win("write_git_files", script, limit).await {
+                let named = !git_win_script_settled(&err);
+                return Err(self.git_win_leftovers(err, &ctx, named).await);
+            }
+        }
+        drop(staged);
+        Ok(())
     }
+
+    /// A Windows write that failed: run the cleanup (remove the locks that hold
+    /// ign's own bytes, then the stage) and fold what it did, or that it failed
+    /// too, into `err`. When the failed script may not have cleaned up after
+    /// itself (`named`: a dropped connection, a timeout) the error also names
+    /// every lock of the plan.
+    async fn git_win_leftovers(
+        &self,
+        err: CoreError,
+        ctx: &WinWrite<'_>,
+        named: bool,
+    ) -> CoreError {
+        let mut more = String::new();
+        if named {
+            let locks: Vec<String> = ctx
+                .plan
+                .iter()
+                .map(|(_, lock, _)| {
+                    format!(
+                        "{}\\projects\\{}\\.git\\{}",
+                        ctx.data,
+                        ctx.project,
+                        lock.replace('/', "\\")
+                    )
+                })
+                .collect();
+            more.push_str(&format!(
+                "; these lock files may still be in .git: {}",
+                locks.join(", ")
+            ));
+        }
+        more.push_str(&format!(
+            "; the stage {}\\ign-deploy\\{} may still be in the account home",
+            ctx.home, ctx.stage
+        ));
+        let limit = self.shell.op_timeout();
+        let chunks = ctx.sized.chunks(GIT_WIN_CHUNK).count();
+        let (mut removed, mut kept) = (0, 0);
+        let mut failure = None;
+        for (n, chunk) in ctx.sized.chunks(GIT_WIN_CHUNK).enumerate() {
+            let script = WinScript::git_unlock(
+                ctx.data,
+                ctx.project,
+                ctx.home,
+                ctx.stage,
+                n * GIT_WIN_CHUNK,
+                chunk,
+                n + 1 == chunks,
+            );
+            match self.git_win("write_git_files", script, limit).await {
+                Ok(answer) => {
+                    let count = |key: &str| answer.get(key).and_then(serde_json::Value::as_u64);
+                    removed += count("removed").unwrap_or(0);
+                    kept += count("kept").unwrap_or(0);
+                }
+                Err(cleanup) => {
+                    failure = Some(match cleanup {
+                        CoreError::TransportFailed { detail, .. } => detail,
+                        other => other.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => more.push_str(&format!(
+                "; the cleanup removed {removed} lock(s) that held ign's own bytes and the stage, and left {kept} lock(s) that hold other bytes"
+            )),
+            Some(why) => more.push_str(&format!("; the cleanup also failed: {why}")),
+        }
+        with_detail(err, &more)
+    }
+}
+
+/// What a Windows write's scripts and its cleanup share.
+struct WinWrite<'a> {
+    project: &'a str,
+    data: &'a str,
+    home: &'a str,
+    stage: &'a str,
+    plan: &'a [(String, String, &'a GitWrite)],
+    sized: &'a [(String, u64)],
+}
+
+/// Whether a failed Windows git script ran to its own failure (a terminating
+/// error, exit code 1): it removed the locks it made itself. Anything else (a
+/// dropped connection, exit 255, a timeout, a kill) says nothing about how far
+/// it got.
+fn git_win_script_settled(err: &CoreError) -> bool {
+    let CoreError::TransportFailed { detail, .. } = err else {
+        return false;
+    };
+    detail
+        .split_once("exit code ")
+        .is_some_and(|(_, rest)| rest.starts_with("1:") || rest.starts_with("1 "))
 }
 
 #[cfg(test)]
@@ -2612,6 +2762,7 @@ mod tests {
     struct Scripted {
         outs: Mutex<Vec<ProcessOutput>>,
         argv: Mutex<Vec<Vec<String>>>,
+        stdins: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2620,9 +2771,13 @@ mod tests {
             &self,
             _program: &OsStr,
             args: &[OsString],
-            _stdin: Option<Vec<u8>>,
+            stdin: Option<Vec<u8>>,
             _timeout: Duration,
         ) -> ProcessOutput {
+            self.stdins
+                .lock()
+                .expect("stdins")
+                .push(String::from_utf8_lossy(&stdin.unwrap_or_default()).into_owned());
             self.argv.lock().expect("argv").push(
                 args.iter()
                     .map(|a| a.to_string_lossy().into_owned())
@@ -2651,6 +2806,7 @@ mod tests {
         let runner = Arc::new(Scripted {
             outs: Mutex::new(outs),
             argv: Mutex::new(Vec::new()),
+            stdins: Mutex::new(Vec::new()),
         });
         let shell = RemoteShell::local_sftp_server(
             Path::new("/unused"),
@@ -3320,7 +3476,11 @@ mod tests {
         }
         let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":0}\n")]);
         assert!(t.probe_write("CapApp", "r1").await.is_err());
-        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":0}\n")]);
+        // (the answer says nothing about how far the script got, so the cleanup runs)
+        let (_, t) = win_host(vec![
+            ok("IGN-RESULT:{\"ok\":0}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":0,\"kept\":0}\n"),
+        ]);
         assert!(t.write_git_files("CapApp", &write).await.is_err());
         // a state answer with a marker the host may not report, or no index
         let bad_state = [
@@ -3607,38 +3767,160 @@ mod tests {
         }
     }
 
-    /// A Windows write is the lock script, one sftp batch and the replace
-    /// script (the sftp client cannot create a file exclusively), and a failed
-    /// replace takes the locks away again.
+    const WIN_WRITE: [(&str, &[u8]); 1] = [("production", b"0123\n")];
+
+    fn win_write() -> Vec<GitWrite> {
+        WIN_WRITE
+            .iter()
+            .map(|(branch, bytes)| GitWrite {
+                name: GitWriteName::BranchRef((*branch).to_string()),
+                bytes: bytes.to_vec(),
+            })
+            .collect()
+    }
+
+    fn fail(code: i32, stderr: &str) -> ProcessOutput {
+        ProcessOutput {
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            code,
+            timed_out: false,
+        }
+    }
+
+    /// 27-33 (WR-B3): a Windows write is a stage script, one sftp batch that
+    /// puts the bytes only below the private stage in the account home, the
+    /// lock script (which creates each lock exclusively and fills it from the
+    /// stage) and the replace script (which also removes the stage). No sftp
+    /// path names `.git`.
     #[tokio::test]
-    async fn sftp_git_windows_write_is_lock_put_replace() {
-        let write = [GitWrite {
-            name: GitWriteName::BranchRef("production".to_string()),
-            bytes: b"0123\n".to_vec(),
-        }];
+    async fn sftp_git_windows_write_stages_then_fills() {
+        let write = win_write();
         let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
-        let (runner, t) = win_host(vec![ok_answer(), ok(""), ok_answer()]);
+        let (runner, t) = win_host(vec![ok_answer(), ok(""), ok_answer(), ok_answer()]);
         t.write_git_files("CapApp", &write).await.expect("write");
         let argv = runner.argv.lock().expect("argv").clone();
-        assert_eq!(argv.len(), 3, "lock, put, replace");
-        let lock = win_params(&argv[0]);
-        assert_eq!(lock["m"], "lock");
-        assert_eq!(lock["w"][0], "refs/heads/production");
-        let replace = win_params(&argv[2]);
+        let stdins = runner.stdins.lock().expect("stdins").clone();
+        assert_eq!(argv.len(), 4, "stage, put, lock (fill), replace");
+
+        let stage = win_params(&argv[0]);
+        let name = stage["s"].as_str().expect("stage name").to_string();
+        assert!(name.starts_with("git-stage-"), "{name}");
+        assert_eq!(stage["h"], "C:\\Users\\svc");
+
+        let puts: Vec<&str> = stdins[1]
+            .lines()
+            .filter(|l| l.starts_with("put "))
+            .collect();
+        assert_eq!(puts.len(), 1, "{}", stdins[1]);
+        let want = format!("\"/C:/Users/svc/ign-deploy/{name}/0\"");
+        assert!(puts[0].ends_with(&want), "{} must end with {want}", puts[0]);
+        assert!(
+            !stdins[1].contains(".git") && !stdins[1].contains("/gw/"),
+            "no sftp path names .git or the data dir: {}",
+            stdins[1]
+        );
+
+        let lock = win_params(&argv[2]);
+        for (key, want) in [
+            ("d", "C:\\gw\\data"),
+            ("j", "CapApp"),
+            ("h", "C:\\Users\\svc"),
+            ("s", name.as_str()),
+        ] {
+            assert_eq!(lock[key], want, "lock {key}");
+        }
+        assert_eq!(lock["o"], 0);
+        assert_eq!(lock["w"][0], "refs/heads/production:5");
+        let replace = win_params(&argv[3]);
         assert_eq!(replace["w"][0], "refs/heads/production:5");
         assert_eq!(replace["q"], RENAME_RETRIES);
+        assert_eq!(replace["r"], true, "the replace removes the stage");
+        assert_eq!(replace["s"], name.as_str());
+    }
 
-        // a replace that fails unlocks: lock, put, replace (fails), unlock
+    /// 27-33 (WR-B2): a replace that fails is followed by the cleanup, which
+    /// removes only locks that hold ign's own bytes and then the stage.
+    #[tokio::test]
+    async fn sftp_git_windows_failed_replace_runs_the_cleanup() {
+        let write = win_write();
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
         let (runner, t) = win_host(vec![
             ok_answer(),
             ok(""),
-            ok("IGN-RESULT:{\"ok\":0}\n"),
             ok_answer(),
+            fail(1, "the lock is not the size that was sent"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":1,\"kept\":0}\n"),
         ]);
-        assert!(t.write_git_files("CapApp", &write).await.is_err());
+        let why = detail(
+            t.write_git_files("CapApp", &write)
+                .await
+                .expect_err("replace"),
+        );
+        assert!(why.contains("size that was sent"), "the real error: {why}");
         let argv = runner.argv.lock().expect("argv").clone();
-        assert_eq!(argv.len(), 4);
-        assert_eq!(win_params(&argv[3])["m"], "unlock");
+        assert_eq!(argv.len(), 5);
+        let unlock = win_params(&argv[4]);
+        assert_eq!(unlock["r"], true, "the cleanup removes the stage");
+        assert_eq!(unlock["w"][0], "refs/heads/production:5");
+        // a script that ran to its own failure took its locks away, so the
+        // error does not send the operator looking for them
+        assert!(!why.contains("may still be in .git"), "{why}");
+    }
+
+    /// 27-33 (WR-B2): a connection that dies while the lock script runs leaves
+    /// an error that names every lock and the stage, and the cleanup runs.
+    #[tokio::test]
+    async fn sftp_git_windows_transport_failure_names_locks() {
+        let write = win_write();
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
+        let (runner, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            fail(255, "Connection reset by peer"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":1,\"kept\":0}\n"),
+        ]);
+        let why = detail(t.write_git_files("CapApp", &write).await.expect_err("dead"));
+        assert!(why.contains("may still be in .git"), "{why}");
+        assert!(
+            why.contains("C:\\gw\\data\\projects\\CapApp\\.git\\refs\\heads\\production.lock"),
+            "every lock is named: {why}"
+        );
+        assert!(why.contains("git-stage-"), "the stage is named: {why}");
+        assert!(
+            why.contains("removed 1"),
+            "the cleanup result is told: {why}"
+        );
+        assert_eq!(runner.argv.lock().expect("argv").len(), 4);
+
+        // a cleanup that dies as well is told in the same error
+        let (_, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            fail(255, "Connection reset by peer"),
+            fail(255, "Connection reset again"),
+        ]);
+        let why = detail(t.write_git_files("CapApp", &write).await.expect_err("dead"));
+        assert!(why.contains("the cleanup also failed"), "{why}");
+        assert!(why.contains("production.lock"), "{why}");
+    }
+
+    /// 27-33: a stage that exists is refused by the stage script and left
+    /// alone: nothing else runs, no cleanup touches it.
+    #[tokio::test]
+    async fn sftp_git_windows_refused_stage_is_left_alone() {
+        let write = win_write();
+        let (runner, t) = win_host(vec![fail(
+            1,
+            "An item with the specified name already exists",
+        )]);
+        let why = detail(
+            t.write_git_files("CapApp", &write)
+                .await
+                .expect_err("refused"),
+        );
+        assert!(why.contains("already exists"), "{why}");
+        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
     }
 
     /// The git scripts run under the local `sh`, with shims standing in for

@@ -76,6 +76,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod apply_ops;
 mod project_ops;
 
+pub use project_ops::GIT_WIN_CHUNK;
+
 use super::bundle::{self, BundleFile};
 use super::remote::{RemoteShell, SftpOp, safe_remote_path};
 use super::winps::{

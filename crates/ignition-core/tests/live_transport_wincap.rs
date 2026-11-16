@@ -7242,6 +7242,10 @@ const GIT_HOST_ATTR: &str = "E @{ok=1;a=[int][IO.File]::GetAttributes($p.path)}"
 const GIT_HOST_TOUCH: &str = "[IO.File]::WriteAllBytes($p.path,[byte[]]@());E @{ok=1}";
 const GIT_HOST_UNTOUCH: &str =
     "if([IO.File]::Exists($p.path)){[IO.File]::Delete($p.path)};E @{ok=1}";
+/// What `FileMode.CreateNew` does at a path that is a junction, and at one that is a
+/// dangling symbolic link (the deploy account may not hold the privilege to make
+/// one): the observation behind the pre-check and the re-check of `GIT_LOCK`.
+const GIT_HOST_CREATENEW: &str = "$d=$p.dir;[void][IO.Directory]::CreateDirectory($d);$t1=$d+'\\tgt1';[void][IO.Directory]::CreateDirectory($t1);$j=$d+'\\jl.lock';cmd /c mklink /J $j $t1|Out-Null;$r1='ok';try{$s=[IO.File]::Open($j,'CreateNew','Write','None');$s.Dispose()}catch{$r1=$_.Exception.GetType().Name};$k=$d+'\\sl.lock';$m=$d+'\\nothing';$mk=1;try{cmd /c mklink $k $m 2>&1|Out-Null;$mk=[int]$LASTEXITCODE}catch{};$r2='no link made';if($mk -eq 0){$r2='ok';try{$s=[IO.File]::Open($k,'CreateNew','Write','None');$s.Dispose()}catch{$r2=$_.Exception.GetType().Name}};$made=[int][IO.File]::Exists($m);if($mk -eq 0){[IO.File]::Delete($k)};if([IO.File]::Exists($m)){[IO.File]::Delete($m)};[IO.Directory]::Delete($j);[IO.Directory]::Delete($t1);E @{ok=1;junction=$r1;mklink=$mk;symlink=$r2;behind=$made}";
 const GIT_HOST_FACTS: &str = "E @{ok=1;e=[string]$PSVersionTable.PSEdition;v=[string]$PSVersionTable.PSVersion;c=$env:COMPUTERNAME}";
 
 fn git_step(name: &str, took: Duration, budget: Option<Duration>) {
@@ -7506,6 +7510,17 @@ async fn wincap_git_scripts() {
         leftovers.is_empty(),
         "no lock is left behind: {leftovers:?}"
     );
+    // 27-33: the private stage of the write is gone (the replace removed it)
+    let ledger = enumerate(&host_shell, &format!("{home_native}\\ign-deploy"))
+        .await
+        .expect("ign-deploy");
+    let stages: Vec<&str> = ledger
+        .iter()
+        .map(|(rel, _, _)| rel.as_str())
+        .filter(|rel| rel.starts_with("git-stage-"))
+        .collect();
+    assert!(stages.is_empty(), "a stage is left behind: {stages:?}");
+    println!("wincap_git_scripts write: no lock and no stage left");
     // a lock another writer holds refuses the write and leaves the file alone
     let held = format!("{git_dir}\\refs\\heads\\production.lock");
     host_shell
@@ -7542,6 +7557,78 @@ async fn wincap_git_scripts() {
         .await
         .expect("remove the planted lock");
     println!("wincap_git_scripts write over a held lock: refused, ref unchanged");
+
+    // 27-33 (WR-B3): a junction planted at the lock path, and one in a level above
+    // the lock, are refused; nothing is written through them and the stage is
+    // removed by the cleanup
+    let outside_lock = format!("{data27}\\outside-lock");
+    let outside_level = format!("{data27}\\outside-level");
+    let planted = [
+        (
+            format!("{git_dir}\\refs\\heads\\production.lock"),
+            outside_lock.clone(),
+            GitWriteName::BranchRef("production".to_string()),
+        ),
+        (
+            format!("{git_dir}\\refs\\heads\\feature"),
+            outside_level.clone(),
+            GitWriteName::BranchRef("feature/x".to_string()),
+        ),
+    ];
+    for (link, target, name) in &planted {
+        host_shell
+            .exec_powershell(&script(
+                "make_junction",
+                MAKE_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link, "target": target }),
+            ))
+            .await
+            .expect("plant a junction");
+        let attempt = vec![GitWrite {
+            name: name.clone(),
+            bytes: b"fedcba9876543210fedcba9876543210fedcba98\n".to_vec(),
+        }];
+        let why = node
+            .write_git_files(GIT_PROJECT, &attempt)
+            .await
+            .expect_err("a planted junction");
+        println!("wincap_git_scripts write over a planted junction: refused: {why}");
+        assert_eq!(
+            enumerate(&host_shell, target).await,
+            Some(Vec::new()),
+            "nothing was written through the junction {link}"
+        );
+        host_shell
+            .exec_powershell(&script(
+                "drop_junction",
+                DROP_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link }),
+            ))
+            .await
+            .expect("drop the junction");
+        let ledger = enumerate(&host_shell, &format!("{home_native}\\ign-deploy"))
+            .await
+            .expect("ign-deploy");
+        assert!(
+            !ledger
+                .iter()
+                .any(|(rel, _, _)| rel.starts_with("git-stage-")),
+            "a refused write leaves no stage"
+        );
+    }
+    println!("wincap_git_scripts write over planted junctions: refused, nothing written through");
+    let created = host_shell
+        .exec_powershell(&script(
+            "createnew_at_links",
+            GIT_HOST_CREATENEW,
+            serde_json::json!({ "dir": format!("{data27}\\createnew") }),
+        ))
+        .await
+        .expect("CreateNew at links");
+    println!(
+        "wincap_git_scripts CreateNew at a junction: {}; at a dangling symlink (mklink exit {}): {}; a file created behind the symlink: {}",
+        created["junction"], created["mklink"], created["symlink"], created["behind"]
+    );
 
     // 10. remove_git_save: a path that is not the save's is refused before
     //     anything is touched, then the real one is removed

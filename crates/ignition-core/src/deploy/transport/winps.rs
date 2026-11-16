@@ -341,12 +341,28 @@ macro_rules! git_ps_m {
 }
 macro_rules! git_ps_dr {
     () => {
-        r##"function Dy($i){foreach($f in $i.GetFileSystemInfos()){$a=[int]$f.Attributes;if($a -band 1024){}elseif($a -band 16){Dy $f}elseif($a -band 1){if(!(Z $f.FullName).LinkType){$f.Attributes=128}}}};function Dr($d){$null=K (Z $d);$d=$p.x+$d;Dy ([IO.DirectoryInfo]$d);[IO.Directory]::Delete($d,$true)};"##
+        r##"function Dy($i){foreach($f in $i.GetFileSystemInfos()){$a=[int]$f.Attributes;if($a -band 1024){}elseif($a -band 16){Dy $f}elseif($a -band 1 -and !(Z $f.FullName).LinkType){$f.Attributes=128}}};function Dr($d){$null=K (Z $d);$d=$p.x+$d;Dy ([IO.DirectoryInfo]$d);[IO.Directory]::Delete($d,$true)};"##
     };
 }
 macro_rules! git_ps_l {
     () => {
         r##"function L($t){$g+$c+($t+$(if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'})).Replace('/',$c)};"##
+    };
+}
+
+macro_rules! git_ps_w {
+    () => {
+        r##"function G(){$q=$p.d+$c+'projects';$null=K (Z $q);$q+=$c+$p.j;$null=K (Z $q);$q+=$c+'.git';$null=K (Z $q);$q};$g=G;$u=$p.h+$c+'ign-deploy';function Pc($t,$m){$q=G;$x=$t.Split('/');for($k=0;$k -lt $x.Length-1;$k++){$q+=$c+$x[$k];$y=Z $q;if(!$y -and $m){$null=[IO.Directory]::CreateDirectory($q);$y=Z $q};$null=K $y}};"##
+    };
+}
+macro_rules! git_ps_sn {
+    () => {
+        r##"if($p.s -notmatch '^git-stage-[A-Za-z0-9._-]+$'){throw 'refusing the stage name'};"##
+    };
+}
+macro_rules! git_ps_sx {
+    () => {
+        r##"function Sx(){foreach($f in ([IO.DirectoryInfo]$u).GetFileSystemInfos()){if(!([int]$f.Attributes -band 1040)){$f.Delete()}};[IO.Directory]::Delete($u)};"##
     };
 }
 
@@ -403,7 +419,7 @@ pub const GIT_SAVE: &str = concat!(
     git_ps_yc!(),
     git_ps_m!(),
     git_ps_dr!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$r=$q+$c+'repo';$null=ni -Type Directory $r;try{Yc $a $r;if([int]$i.Attributes -band 2){(Z $r).Attributes+=2};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};E $n"##,
+    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$r=$q+$c+'repo';$null=ni -Type Directory $r;try{Yc $a $r;if([int]$i.Attributes -band 2){($h=Z $r).Attributes=$h.Attributes -bor 2};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};E $n"##,
 );
 
 /// Restore the save of a run as the project's `.git` (Phase 27, D-06):
@@ -426,7 +442,7 @@ pub const GIT_RESTORE: &str = concat!(
     git_ps_yc!(),
     git_ps_m!(),
     git_ps_dr!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw 'the .git exists; never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$m=M $q;$t=$a+$c+'.ign-restore-'+$p.i;$null=ni -Type Directory $t;try{Yc $q $t;if([int]$i.Attributes -band 2){(Z $t).Attributes+=2};$n=M $t;if($n.digest -ne $m.digest){throw 'the copy differs from the save'};[IO.Directory]::Move($t,$g)}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};E (M $g)"##,
+    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw '.git exists; never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$m=M $q;$t=$a+$c+'.ign-restore-'+$p.i;$null=ni -Type Directory $t;try{Yc $q $t;if([int]$i.Attributes -band 2){($h=Z $t).Attributes=$h.Attributes -bor 2};$n=M $t;if($n.digest -ne $m.digest){throw 'the copy differs'};[IO.Directory]::Move($t,$g)}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};E (M $g)"##,
 );
 
 /// The manifest of a tree: file count, total bytes and one digest (Phase 27).
@@ -484,35 +500,79 @@ pub const GIT_DIGEST: &str = concat!(
     r##"K (Z $p.a)|Out-Null;$q=$p.a;$o=0;$u=$p.f.Split('/');for($k=0;$k -lt $u.Length;$k++){$q+=$c+$u[$k];$y=Z $q;if(!$y){$o=1;break};if($k -lt $u.Length-1){K $y|Out-Null}elseif($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw 'the file is not a regular file'}};if($o){E @{ok=1;digest=$null}}else{$m=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{$d=X ([Security.Cryptography.SHA256]::Create().ComputeHash($m))}finally{$m.Dispose()};E @{ok=1;digest=$d}}"##,
 );
 
-/// Take (or give back) the `.lock` files of a `.git` write (Phase 27): the
-/// sftp client cannot create a file exclusively, so a script does it.
+/// The private stage of a `.git` write (Phase 27, 27-33, WR-B3): `ign-deploy\<stage>`
+/// in the deploy account's home, where sftp puts the bytes of the write. Parameters:
+/// `h` the native account home, `s` the stage name (`git-stage-<id>`, one component).
+/// `ign-deploy` is made when absent and refused when it is a link; the stage is made
+/// with `New-Item`, which fails when anything is there, so a planted entry is never
+/// reused and never removed.
+pub const GIT_STAGE: &str = concat!(
+    git_ps_base!(),
+    r##"if($p.s -notmatch '^git-stage-[A-Za-z0-9._-]+$'){throw 'refusing the stage name'};$u=$p.h+$c+'ign-deploy';$y=Z $u;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($u)};$null=ni -Type Directory ($u+$c+$p.s);E @{ok=1}"##,
+);
+
+/// Create each lock of a `.git` write exclusively and fill it from the stage
+/// (Phase 27, 27-33, WR-B3), the Windows half of the POSIX `GIT_WRITE_SH`.
 ///
-/// Parameters: `a` the native `.git`, `m` `lock` or `unlock`, `w` the paths
-/// below `.git` of the files to be written (the lock of a path below
-/// `objects/pack/` is `<path>.ign-tmp`, any other `<path>.lock`). `lock` makes
-/// every missing parent directory (a link on the way is refused), refuses a
-/// target that is not a regular file and creates each lock with
-/// `FileMode.CreateNew`, so a lock that exists (another writer) fails the call
-/// and the locks made so far are removed again. `unlock` removes the locks of
-/// `w` that are regular files.
+/// Parameters: `d` the native data directory, `j` the project, `h` the account
+/// home, `s` the stage name, `o` the plan index of the first entry, `w` entries
+/// `<path>:<size>` (the paths below `.git`; the lock of a path below
+/// `objects/pack/` is `<path>.ign-tmp`, any other `<path>.lock`). The bytes of
+/// plan index `o + n` are in `<home>\ign-deploy\<stage>\<o + n>`.
+///
+/// Nothing is written through a path the gateway account can change. The walk
+/// from `projects` down to the lock's directory checks every level (`K`: a real
+/// directory, not a reparse point); a missing level is made one directory at a
+/// time and checked. The target must be absent or a regular file, and the lock
+/// must be absent (`Get-Item -Force` also sees a dangling link). The stage file
+/// must be a regular file of the size that was sent. The lock is opened with
+/// `FileMode.CreateNew` and `FileShare.None`, so nobody can delete, rename or
+/// replace it while it is open; before one byte is written the whole walk is
+/// checked again and the lock must be a regular, empty file (a link swapped in
+/// between would have sent the create elsewhere, and nothing was written). Only
+/// then is the stage file copied into the open lock. On any failure the locks
+/// this call made are removed and the error is rethrown.
 pub const GIT_LOCK: &str = concat!(
     git_ps_base!(),
     git_ps_l!(),
-    r##"$g=$p.a;K (Z $g)|Out-Null;if($p.m -eq 'unlock'){foreach($t in @($p.w)){$l=L $t;$y=Z $l;if($y -and !$y.PSIsContainer -and (([int]$y.Attributes -band 1024) -eq 0)){[IO.File]::Delete($l)}}}else{$made=@();try{foreach($t in @($p.w)){$u=$t.Split('/');$q=$g;for($k=0;$k -lt $u.Length-1;$k++){$q+=$c+$u[$k];$y=Z $q;if($y){K $y|Out-Null}else{[IO.Directory]::CreateDirectory($q)|Out-Null}};$y=Z ($g+$c+$t.Replace('/',$c));if($y -and ($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0))){throw "$t is not a regular file; it is left alone"};$l=L $t;$s=[IO.File]::Open($l,'CreateNew','Write','None');$s.Dispose();$made+=$l}}catch{foreach($l in $made){[IO.File]::Delete($l)};throw}};E @{ok=1}"##,
+    git_ps_w!(),
+    r##"$null=K (Z $u);$u+=$c+$p.s;$null=K (Z $u);$made=@();$s=$null;$n=$null;try{$i=[int]$p.o;foreach($e in @($p.w)){$k=$e.LastIndexOf(':');$t=$e.Substring(0,$k);$z=[long]$e.Substring($k+1);Pc $t 1;$y=Z ($g+$c+$t.Replace('/',$c));if($y -and ($y.PSIsContainer -or ([int]$y.Attributes -band 1024))){throw "$t is not a regular file"};$l=L $t;if(Z $l){throw "$l already exists"};$f=$u+$c+$i;$y=Z $f;if(!$y -or $y.PSIsContainer -or ([int]$y.Attributes -band 1024) -or $y.Length -ne $z){throw "the staged bytes of $t are not a file of the size sent"};$n=[IO.File]::Open($f,'Open','Read','Read');$s=[IO.File]::Open($l,'CreateNew','Write','None');$made+=$l;Pc $t;$y=Z $l;if(!$y -or $y.PSIsContainer -or ([int]$y.Attributes -band 1024) -or $y.Length){throw "$l changed while it was created"};$n.CopyTo($s);$s.Dispose();$s=$null;$n.Dispose();$n=$null;$i++}}catch{$e=$_;if($s){$s.Dispose()};if($n){$n.Dispose()};foreach($l in $made){$y=Z $l;if($y -and !$y.PSIsContainer -and !([int]$y.Attributes -band 1024)){[IO.File]::Delete($l)}};throw $e};E @{ok=1}"##,
 );
 
-/// Put each uploaded lock over its target (Phase 27), after the sftp upload
-/// of [`GIT_LOCK`]'s files. Parameters: `a` the native `.git`, `w` entries
-/// `<path>:<size>`, `q` the retries. The lock must be a regular file of exactly
-/// the size that was sent; the target must be a regular file or absent. An
-/// existing target is replaced with `File.Replace` (atomic for readers), a new
-/// one is moved in; a sharing violation is retried `q` times a second apart
-/// and then fails, leaving the previous file in place. Not an `Add-Type`
-/// P/Invoke: nothing is compiled.
+/// Take away the locks of a failed `.git` write that hold ign's own bytes
+/// (Phase 27, 27-33, WR-B2). Parameters as [`GIT_LOCK`], plus `r`: remove the
+/// stage afterwards. A lock is removed only when it is a regular file and its
+/// length and SHA-256 equal those of the matching stage file; a lock that holds
+/// other bytes (a JGit `index.lock`), a lock whose stage file is missing and a
+/// link are left alone. The answer is `{ok:1,removed,kept}`. A stage that is
+/// missing is not an error. With `r` the stage is removed (its files, then the
+/// directory, which fails and names itself when anything else is in it).
+pub const GIT_UNLOCK: &str = concat!(
+    git_ps_base!(),
+    git_ps_x!(),
+    git_ps_l!(),
+    git_ps_w!(),
+    git_ps_sn!(),
+    git_ps_sx!(),
+    r##"$s=$null;$y=Z $u;$u+=$c+$p.s;if($y){$null=K $y;$s=Z $u;if($s){$null=K $s}};function Hs($f){$m=[IO.File]::Open($f,'Open','Read','ReadWrite,Delete');try{X ([Security.Cryptography.SHA256]::Create().ComputeHash($m))}finally{$m.Dispose()}};$r=0;$h=0;$i=[int]$p.o;foreach($e in @($p.w)){$t=$e.Substring(0,$e.LastIndexOf(':'));$l=L $t;$y=Z $l;if($y -and !$y.PSIsContainer -and !([int]$y.Attributes -band 1024)){$f=$u+$c+$i;$v=$null;if($s){$v=Z $f};if($v -and !$v.PSIsContainer -and !([int]$v.Attributes -band 1024) -and $v.Length -eq $y.Length -and (Hs $l) -eq (Hs $f)){[IO.File]::Delete($l);$r++}else{$h++}};$i++};if($p.r -and $s){Sx};E @{ok=1;removed=$r;kept=$h}"##,
+);
+
+/// Put each filled lock over its target (Phase 27), after [`GIT_LOCK`], and
+/// with `r` remove the stage. Parameters: `d`, `j`, `h`, `s` as [`GIT_LOCK`], `w`
+/// entries `<path>:<size>`, `q` the retries, `r` remove the stage at the end.
+/// The walk to the target's directory is checked again before each replace. The
+/// lock must be a regular file of exactly the size that was sent; the target
+/// must be a regular file or absent. An existing target is replaced with
+/// `File.Replace` (atomic for readers), a new one is moved in; a sharing
+/// violation is retried `q` times a second apart and then fails, leaving the
+/// previous file in place. Not an `Add-Type` P/Invoke: nothing is compiled.
 pub const GIT_REPLACE: &str = concat!(
     git_ps_base!(),
     git_ps_l!(),
-    r##"$g=$p.a;K (Z $g)|Out-Null;foreach($e in @($p.w)){$k=$e.LastIndexOf(':');$t=$e.Substring(0,$k);$z=[long]$e.Substring($k+1);$l=L $t;$d=$g+$c+$t.Replace('/',$c);$y=Z $l;if(!$y -or $y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$t.lock is not a regular file"};if($y.Length -ne $z){throw "$t.lock is not the size that was sent"};$y=Z $d;if($y -and ($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0))){throw "$t is not a regular file; it is left alone"};for($n=0;;$n++){try{if($y){[IO.File]::Replace($l,$d,[NullString]::Value)}else{[IO.File]::Move($l,$d)};break}catch{if($n -ge $p.q){throw};Start-Sleep 1}}};E @{ok=1}"##,
+    git_ps_w!(),
+    git_ps_sn!(),
+    git_ps_sx!(),
+    r##"$null=K (Z $u);$u+=$c+$p.s;$null=K (Z $u);foreach($e in @($p.w)){$k=$e.LastIndexOf(':');$t=$e.Substring(0,$k);$z=[long]$e.Substring($k+1);$l=L $t;$d=$g+$c+$t.Replace('/',$c);Pc $t;$y=Z $l;if(!$y -or $y.PSIsContainer -or ([int]$y.Attributes -band 1024)){throw "$t.lock is not a regular file"};if($y.Length -ne $z){throw "$t.lock is not the size that was sent"};$y=Z $d;if($y -and ($y.PSIsContainer -or ([int]$y.Attributes -band 1024))){throw "$t is not a regular file; it is left alone"};for($n=0;;$n++){try{if($y){[IO.File]::Replace($l,$d,[NullString]::Value)}else{[IO.File]::Move($l,$d)};break}catch{if($n -ge $p.q){throw};Start-Sleep 1}}};if($p.r){Sx};E @{ok=1}"##,
 );
 
 /// Prove the grant before any other write (Phase 27): create exclusively and
@@ -832,32 +892,83 @@ impl WinScript {
         }
     }
 
-    /// The script that creates (`unlock` false) or removes (`unlock` true) the
-    /// locks of `targets`, paths below the native `.git` ([`GIT_LOCK`]).
-    pub fn git_lock(git: &str, unlock: bool, targets: &[String]) -> WinScript {
+    /// The script that makes the private stage `stage` below `ign-deploy` of the
+    /// native account `home` ([`GIT_STAGE`]).
+    pub fn git_stage(home: &str, stage: &str) -> WinScript {
+        WinScript {
+            name: "git_stage",
+            body: GIT_STAGE,
+            params: serde_json::json!({ "h": home, "s": stage }),
+        }
+    }
+
+    /// The script that creates and fills the locks of `writes` (`(path below
+    /// .git, size)`), the first of which is plan index `offset` ([`GIT_LOCK`]).
+    pub fn git_lock(
+        data: &str,
+        project: &str,
+        home: &str,
+        stage: &str,
+        offset: usize,
+        writes: &[(String, u64)],
+    ) -> WinScript {
         WinScript {
             name: "git_lock",
             body: GIT_LOCK,
             params: serde_json::json!({
-                "a": git,
-                "m": if unlock { "unlock" } else { "lock" },
-                "w": targets,
+                "d": data, "j": project, "h": home, "s": stage, "o": offset,
+                "w": Self::git_entries(writes),
+            }),
+        }
+    }
+
+    /// The script that removes the locks of `writes` that hold ign's own bytes,
+    /// and with `remove_stage` the stage ([`GIT_UNLOCK`]).
+    pub fn git_unlock(
+        data: &str,
+        project: &str,
+        home: &str,
+        stage: &str,
+        offset: usize,
+        writes: &[(String, u64)],
+        remove_stage: bool,
+    ) -> WinScript {
+        WinScript {
+            name: "git_unlock",
+            body: GIT_UNLOCK,
+            params: serde_json::json!({
+                "d": data, "j": project, "h": home, "s": stage, "o": offset,
+                "w": Self::git_entries(writes), "r": remove_stage,
             }),
         }
     }
 
     /// The script that puts each lock over its target ([`GIT_REPLACE`]):
     /// `writes` are `(path below .git, size sent)`.
-    pub fn git_replace(git: &str, writes: &[(String, u64)], retries: u32) -> WinScript {
-        let entries: Vec<String> = writes
-            .iter()
-            .map(|(path, size)| format!("{path}:{size}"))
-            .collect();
+    pub fn git_replace(
+        data: &str,
+        project: &str,
+        home: &str,
+        stage: &str,
+        writes: &[(String, u64)],
+        retries: u32,
+        remove_stage: bool,
+    ) -> WinScript {
         WinScript {
             name: "git_replace",
             body: GIT_REPLACE,
-            params: serde_json::json!({ "a": git, "w": entries, "q": retries }),
+            params: serde_json::json!({
+                "d": data, "j": project, "h": home, "s": stage,
+                "w": Self::git_entries(writes), "q": retries, "r": remove_stage,
+            }),
         }
+    }
+
+    fn git_entries(writes: &[(String, u64)]) -> Vec<String> {
+        writes
+            .iter()
+            .map(|(path, size)| format!("{path}:{size}"))
+            .collect()
     }
 
     /// The script that probes write access in a project directory (below the

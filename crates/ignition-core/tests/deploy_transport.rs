@@ -5905,6 +5905,11 @@ mod winps_git {
         let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
         let writes: Vec<String> = (0..12).map(|_| pack.clone()).collect();
         let sized: Vec<(String, u64)> = writes.iter().map(|w| (w.clone(), 123_456_789)).collect();
+        // one chunk of a write plan (the transport splits a longer plan) and the
+        // longest stage name a run id can make
+        let chunk: Vec<(String, u64)> =
+            sized[..ignition_core::deploy::transport::sftp::GIT_WIN_CHUNK].to_vec();
+        let stage = format!("git-stage-{}", "R".repeat(64));
         vec![
             WinScript::git_state(&git, GIT_MARKERS),
             WinScript::git_save(prefix, data, &project, home, &gateway, &run),
@@ -5921,9 +5926,10 @@ mod winps_git {
                 &git,
                 &format!("refs/remotes/{}/{}", "o".repeat(40), "b".repeat(80)),
             ),
-            WinScript::git_lock(&git, false, &writes),
-            WinScript::git_lock(&git, true, &writes),
-            WinScript::git_replace(&git, &sized, 3),
+            WinScript::git_stage(home, &stage),
+            WinScript::git_lock(data, &project, home, &stage, 8, &chunk),
+            WinScript::git_unlock(data, &project, home, &stage, 8, &chunk, true),
+            WinScript::git_replace(data, &project, home, &stage, &chunk, 3, true),
             WinScript::git_probe(data, &project, &format!(".ign-probe-{}", "R".repeat(128))),
             WinScript::git_save_rm(prefix, home, &format!("{save_rel}/repo"), &run),
             WinScript::git_free(home, &save_rel),
@@ -5933,7 +5939,7 @@ mod winps_git {
     #[test]
     fn winps_git_scripts_fit_budget() {
         let scripts = maximal();
-        assert_eq!(scripts.len(), 13);
+        assert_eq!(scripts.len(), 14);
         for script in &scripts {
             let command = winps::encoded_command(script, COMMAND_BUDGET)
                 .unwrap_or_else(|why| panic!("{}: {why}", script.name));
@@ -5944,18 +5950,49 @@ mod winps_git {
             );
             assert!(used <= COMMAND_BUDGET, "{}", script.name);
         }
-        // eight SHA-256 pack names fit too
-        let sha256: Vec<String> = (0..8)
-            .map(|i| format!("objects/pack/pack-{}{i}.pack", "b".repeat(63)))
+        // a chunk of the write plan with the longest names a write can carry
+        // (SHA-256 pack names, 10-digit sizes, a 100-character project, the
+        // longest stage name) fits too, for each of the three scripts that take
+        // a chunk; the transport splits a longer plan into chunks of this size
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let home = "C:\\Users\\svc-ignition-deploy";
+        let project = "P".repeat(100);
+        let stage = format!("git-stage-{}", "R".repeat(64));
+        let chunk_size = ignition_core::deploy::transport::sftp::GIT_WIN_CHUNK;
+        let plan: Vec<(String, u64)> = (0..12)
+            .map(|i| {
+                let ext = if i % 2 == 0 { "pack" } else { "idx" };
+                (
+                    format!("objects/pack/pack-{}{i:02}.{ext}", "b".repeat(62)),
+                    4_000_000_000 + i as u64,
+                )
+            })
             .collect();
-        let script = WinScript::git_lock("C:\\gw\\data\\projects\\CapApp\\.git", false, &sha256);
-        assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_ok());
-        // a lock list that cannot fit is refused before anything is sent,
-        // never truncated
-        let many: Vec<String> = (0..60)
-            .map(|i| format!("objects/pack/pack-{}-{i}.pack", "a".repeat(40)))
+        for (n, chunk) in plan.chunks(chunk_size).enumerate() {
+            let offset = n * chunk_size;
+            for script in [
+                WinScript::git_lock(data, &project, home, &stage, offset, chunk),
+                WinScript::git_unlock(data, &project, home, &stage, offset, chunk, true),
+                WinScript::git_replace(data, &project, home, &stage, chunk, 3, true),
+            ] {
+                let used = winps::encoded_command(&script, COMMAND_BUDGET)
+                    .unwrap_or_else(|why| panic!("{}: {why}", script.name))
+                    .as_str()
+                    .chars()
+                    .count();
+                println!(
+                    "winps_git_scripts_fit_budget {} chunk of {}: {used} of {COMMAND_BUDGET}",
+                    script.name,
+                    chunk.len()
+                );
+            }
+        }
+        // a chunk that cannot fit is refused before anything is sent, never
+        // truncated
+        let many: Vec<(String, u64)> = (0..60)
+            .map(|i| (format!("objects/pack/pack-{}-{i}.pack", "a".repeat(40)), 1))
             .collect();
-        let script = WinScript::git_lock("C:\\gw\\data\\projects\\CapApp\\.git", false, &many);
+        let script = WinScript::git_lock(data, &project, home, &stage, 0, &many);
         assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_err());
     }
 
@@ -6715,66 +6752,171 @@ mod winps_git {
         assert!(free["free"].as_u64().expect("free") > 0);
     }
 
+    /// A project's `.git` and the private stage a Windows write fills its locks
+    /// from (27-33): the stage lives in the account home, the bytes of plan
+    /// index `n` are the file `n` in it.
+    struct WriteRig {
+        fx: GitFixture,
+        home: tempfile::TempDir,
+        data: String,
+        home_s: String,
+        stage: String,
+    }
+
+    impl WriteRig {
+        fn new() -> WriteRig {
+            let fx = GitFixture::new();
+            let home = tempfile::tempdir().expect("home");
+            let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+            WriteRig {
+                fx,
+                home,
+                data,
+                home_s,
+                stage: "git-stage-w33a".to_string(),
+            }
+        }
+
+        fn git(&self) -> PathBuf {
+            self.fx.git_dir()
+        }
+
+        fn stage_dir(&self) -> PathBuf {
+            self.home.path().join("ign-deploy").join(&self.stage)
+        }
+
+        fn make_stage(&self) -> Result<Value, String> {
+            pwsh_exec::run(&WinScript::git_stage(&self.home_s, &self.stage))
+        }
+
+        /// The bytes of plan index `index`, as sftp would have put them.
+        fn put(&self, index: usize, bytes: &[u8]) {
+            std::fs::write(self.stage_dir().join(index.to_string()), bytes).expect("put");
+        }
+
+        fn lock(&self, offset: usize, writes: &[(&str, u64)]) -> Result<Value, String> {
+            let writes: Vec<(String, u64)> =
+                writes.iter().map(|(p, n)| ((*p).to_string(), *n)).collect();
+            pwsh_exec::run(&WinScript::git_lock(
+                &self.data,
+                PROJECT,
+                &self.home_s,
+                &self.stage,
+                offset,
+                &writes,
+            ))
+        }
+
+        fn unlock(&self, writes: &[(&str, u64)], remove_stage: bool) -> Result<Value, String> {
+            let writes: Vec<(String, u64)> =
+                writes.iter().map(|(p, n)| ((*p).to_string(), *n)).collect();
+            pwsh_exec::run(&WinScript::git_unlock(
+                &self.data,
+                PROJECT,
+                &self.home_s,
+                &self.stage,
+                0,
+                &writes,
+                remove_stage,
+            ))
+        }
+
+        fn replace(&self, writes: &[(&str, u64)], remove_stage: bool) -> Result<Value, String> {
+            let writes: Vec<(String, u64)> =
+                writes.iter().map(|(p, n)| ((*p).to_string(), *n)).collect();
+            pwsh_exec::run(&WinScript::git_replace(
+                &self.data,
+                PROJECT,
+                &self.home_s,
+                &self.stage,
+                &writes,
+                2,
+                remove_stage,
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn pwsh_git_write_lock_replace_digest() {
         if !pwsh_exec::gate("pwsh_git_write_lock_replace_digest") {
             return;
         }
-        let fx = GitFixture::new();
-        let git = s(&fx.git_dir());
+        let rig = WriteRig::new();
+        let (fx, git) = (&rig.fx, s(&rig.fx.git_dir()));
         let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
-        let targets = vec![
-            "refs/heads/feature/new".to_string(),
-            "HEAD".to_string(),
-            pack.clone(),
+        let new_head = b"ref: refs/heads/feature/new\n".to_vec();
+        let new_ref = b"0123456789abcdef0123456789abcdef01234567\n".to_vec();
+        let new_pack = vec![b'P'; 4096];
+        let plan = [
+            ("refs/heads/feature/new", new_ref.len() as u64),
+            ("HEAD", new_head.len() as u64),
+            (pack.as_str(), new_pack.len() as u64),
         ];
         let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
-        let lock = pwsh_exec::run(&WinScript::git_lock(&git, false, &targets)).expect("lock");
-        assert_eq!(lock["ok"], 1);
-        for lock in [
-            "refs/heads/feature/new.lock",
-            "HEAD.lock",
-            &format!("{pack}.ign-tmp"),
+
+        // the stage is made once and never reused
+        assert_eq!(rig.make_stage().expect("stage")["ok"], 1);
+        assert!(rig.stage_dir().is_dir());
+        let why = rig.make_stage().expect_err("a second stage of the name");
+        assert!(why.contains("already exists"), "{why}");
+        // a stage name that is not one component of git-stage-* is refused
+        let bad = pwsh_exec::run(&WinScript::git_stage(&rig.home_s, "../escape"));
+        assert!(bad.is_err());
+        assert!(!rig.home.path().join("escape").exists());
+
+        rig.put(0, &new_ref);
+        rig.put(1, &new_head);
+        rig.put(2, &new_pack);
+        // the locks are created and filled from the stage, byte for byte
+        assert_eq!(rig.lock(0, &plan).expect("lock")["ok"], 1);
+        for (lock, bytes) in [
+            ("refs/heads/feature/new.lock", &new_ref),
+            ("HEAD.lock", &new_head),
+            (&*format!("{pack}.ign-tmp"), &new_pack),
         ] {
-            assert!(fx.git_dir().join(lock).is_file(), "{lock}");
+            assert_eq!(&std::fs::read(fx.git_dir().join(lock)).expect(lock), bytes);
         }
         // a second writer is refused and the first one's locks stay
-        let why = pwsh_exec::run(&WinScript::git_lock(&git, false, &targets)).expect_err("held");
+        let why = rig.lock(0, &plan).expect_err("held");
         assert!(why.contains("already exists"), "{why}");
-        assert!(fx.git_dir().join("HEAD.lock").is_file());
-        // a lock call that fails halfway takes back what it made this call
-        std::fs::write(fx.git_dir().join("config.lock"), "").expect("foreign lock");
-        let both = vec!["refs/heads/other".to_string(), "config".to_string()];
-        assert!(pwsh_exec::run(&WinScript::git_lock(&git, false, &both)).is_err());
-        assert!(!fx.git_dir().join("refs/heads/other.lock").exists());
-        assert!(
-            fx.git_dir().join("config.lock").is_file(),
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD.lock")).expect("lock"),
+            new_head
+        );
+        // a lock call that fails halfway takes back what it made this call, and
+        // leaves the lock another writer holds
+        let rig2 = WriteRig::new();
+        rig2.make_stage().expect("stage");
+        rig2.put(0, b"other\n");
+        rig2.put(1, b"[core]\n");
+        std::fs::write(rig2.git().join("config.lock"), "held").expect("foreign lock");
+        let both = [("refs/heads/other", 6), ("config", 7)];
+        assert!(rig2.lock(0, &both).is_err());
+        assert!(!rig2.git().join("refs/heads/other.lock").exists());
+        assert_eq!(
+            std::fs::read_to_string(rig2.git().join("config.lock")).expect("kept"),
+            "held",
             "a foreign lock is left"
         );
-        std::fs::remove_file(fx.git_dir().join("config.lock")).expect("rm");
+        // bytes in the stage that are not the size that was sent are refused before
+        // any lock exists
+        let rig3 = WriteRig::new();
+        rig3.make_stage().expect("stage");
+        rig3.put(0, b"abc");
+        let why = rig3.lock(0, &[("refs/heads/x", 4)]).expect_err("size");
+        assert!(why.contains("size"), "{why}");
+        assert!(!rig3.git().join("refs/heads/x.lock").exists());
 
-        // the upload (here a plain write), then the replace
-        let new_head = b"ref: refs/heads/feature/new\n";
-        let new_ref = b"0123456789abcdef0123456789abcdef01234567\n";
-        let new_pack = vec![b'P'; 4096];
-        std::fs::write(fx.git_dir().join("HEAD.lock"), new_head).expect("head lock");
-        std::fs::write(fx.git_dir().join("refs/heads/feature/new.lock"), new_ref)
-            .expect("ref lock");
-        std::fs::write(fx.git_dir().join(format!("{pack}.ign-tmp")), &new_pack).expect("pack");
-        // a size that is not the size sent is refused
-        let wrong = vec![("HEAD".to_string(), new_head.len() as u64 + 1)];
-        let why = pwsh_exec::run(&WinScript::git_replace(&git, &wrong, 0)).expect_err("size");
+        // a size that is not the size sent is refused by the replace
+        let wrong = [("HEAD", new_head.len() as u64 + 1)];
+        let why = rig.replace(&wrong, false).expect_err("size");
         assert!(why.contains("size"), "{why}");
         assert_eq!(
             std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
             head_before
         );
-        let writes = vec![
-            ("refs/heads/feature/new".to_string(), new_ref.len() as u64),
-            ("HEAD".to_string(), new_head.len() as u64),
-            (pack.clone(), new_pack.len() as u64),
-        ];
-        let done = pwsh_exec::run(&WinScript::git_replace(&git, &writes, 2)).expect("replace");
+        // the replace puts every lock over its file and removes the stage
+        let done = rig.replace(&plan, true).expect("replace");
         assert_eq!(done["ok"], 1);
         assert_eq!(
             std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
@@ -6791,22 +6933,166 @@ mod winps_git {
         for gone in ["HEAD.lock", "refs/heads/feature/new.lock"] {
             assert!(!fx.git_dir().join(gone).exists(), "{gone}");
         }
+        assert!(!rig.stage_dir().exists(), "no stage remains");
         // the read-back digest is the sha256 of what was written
         let digest = pwsh_exec::run(&WinScript::git_digest(&git, "HEAD")).expect("digest");
-        assert_eq!(digest["digest"], sha256_hex(new_head));
+        assert_eq!(digest["digest"], sha256_hex(&new_head));
         let absent =
             pwsh_exec::run(&WinScript::git_digest(&git, "refs/heads/none")).expect("absent");
         assert!(absent["digest"].is_null());
         let nodir = pwsh_exec::run(&WinScript::git_digest(&git, "no/dir/file")).expect("nodir");
         assert!(nodir["digest"].is_null());
-        // unlock removes only locks that are regular files
-        let one = vec!["refs/heads/again".to_string()];
-        pwsh_exec::run(&WinScript::git_lock(&git, false, &one)).expect("lock");
-        pwsh_exec::run(&WinScript::git_lock(&git, true, &one)).expect("unlock");
-        assert!(!fx.git_dir().join("refs/heads/again.lock").exists());
+
+        // the cleanup removes the locks that hold ign's bytes and the stage
+        let rig4 = WriteRig::new();
+        rig4.make_stage().expect("stage");
+        rig4.put(0, b"again\n");
+        rig4.lock(0, &[("refs/heads/again", 6)]).expect("lock");
+        let cleaned = rig4
+            .unlock(&[("refs/heads/again", 6)], true)
+            .expect("unlock");
+        assert_eq!(
+            (cleaned["removed"].as_u64(), cleaned["kept"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert!(!rig4.git().join("refs/heads/again.lock").exists());
+        assert!(!rig4.stage_dir().exists());
         // a link as a lock target is refused
-        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("refs/heads/linked")).expect("link");
-        let linked = vec!["refs/heads/linked".to_string()];
-        assert!(pwsh_exec::run(&WinScript::git_lock(&git, false, &linked)).is_err());
+        let rig5 = WriteRig::new();
+        rig5.make_stage().expect("stage");
+        rig5.put(0, b"x");
+        std::os::unix::fs::symlink("HEAD", rig5.git().join("refs/heads/linked")).expect("link");
+        assert!(rig5.lock(0, &[("refs/heads/linked", 1)]).is_err());
+    }
+
+    /// 27-33 (WR-B3): a link planted where the lock goes, or in a level above
+    /// it, or in the stage, is refused: nothing is written through it and no
+    /// target in `.git` changes.
+    #[tokio::test]
+    async fn pwsh_git_write_refuses_a_planted_link_at_a_lock() {
+        if !pwsh_exec::gate("pwsh_git_write_refuses_a_planted_link_at_a_lock") {
+            return;
+        }
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head = |rig: &WriteRig| std::fs::read(rig.git().join("HEAD")).expect("head");
+
+        // a link at the lock path: to a file, and dangling
+        for target in [victim.clone(), outside.path().join("not-there")] {
+            let rig = WriteRig::new();
+            rig.make_stage().expect("stage");
+            rig.put(0, b"ref: refs/heads/x\n");
+            let before = head(&rig);
+            std::os::unix::fs::symlink(&target, rig.git().join("HEAD.lock")).expect("plant");
+            let why = rig
+                .lock(0, &[("HEAD", 18)])
+                .expect_err("a link at the lock");
+            assert!(why.contains("already exists"), "{why}");
+            assert_eq!(std::fs::read(&victim).expect("victim"), b"precious\n");
+            assert!(
+                !outside.path().join("not-there").exists(),
+                "nothing was created behind the link"
+            );
+            assert_eq!(head(&rig), before, "no target changed");
+            assert!(
+                std::fs::symlink_metadata(rig.git().join("HEAD.lock"))
+                    .expect("still there")
+                    .file_type()
+                    .is_symlink(),
+                "the planted link is not ours and stays"
+            );
+        }
+        // a link in a level above the lock: refused, nothing created behind it
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"x");
+        std::os::unix::fs::symlink(outside.path(), rig.git().join("refs/heads/feature"))
+            .expect("plant");
+        let why = rig
+            .lock(0, &[("refs/heads/feature/new", 1)])
+            .expect_err("a link above");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert!(!outside.path().join("new.lock").exists());
+        // a link as the project's .git is refused outright
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"x");
+        let moved = rig.git().with_file_name("real-git");
+        std::fs::rename(rig.git(), &moved).expect("move");
+        std::os::unix::fs::symlink(&moved, rig.git()).expect("link .git");
+        let why = rig.lock(0, &[("HEAD", 1)]).expect_err("a linked .git");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert!(!moved.join("HEAD.lock").exists());
+        // a link in the stage in place of the staged bytes is refused
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        std::os::unix::fs::symlink(&victim, rig.stage_dir().join("0")).expect("plant");
+        let why = rig
+            .lock(0, &[("HEAD", 9)])
+            .expect_err("a link in the stage");
+        assert!(why.contains("staged bytes"), "{why}");
+        assert!(!rig.git().join("HEAD.lock").exists());
+        // the replace does not go through a link planted in a level above either
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"y");
+        rig.lock(0, &[("refs/heads/main", 1)]).expect("lock");
+        let heads = rig.git().join("refs/heads");
+        let moved = rig.git().join("refs/heads-real");
+        std::fs::rename(&heads, &moved).expect("move heads");
+        std::os::unix::fs::symlink(&moved, &heads).expect("link heads");
+        let why = rig
+            .replace(&[("refs/heads/main", 1)], true)
+            .expect_err("a link above");
+        assert!(why.contains("not a real directory"), "{why}");
+    }
+
+    /// 27-33 (WR-B2): the cleanup removes a lock only when its bytes equal the
+    /// staged bytes: a lock another writer holds (JGit's `index.lock`) stays.
+    #[tokio::test]
+    async fn pwsh_git_write_cleanup_spares_a_foreign_lock() {
+        if !pwsh_exec::gate("pwsh_git_write_cleanup_spares_a_foreign_lock") {
+            return;
+        }
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"ref: refs/heads/x\n");
+        rig.put(1, b"the staged index");
+        let plan = [("HEAD", 18), ("index", 16)];
+        // our lock holds the staged bytes; the other one is JGit's, with other
+        // bytes of the same length, and a third entry has no lock at all
+        std::fs::write(rig.git().join("HEAD.lock"), b"ref: refs/heads/x\n").expect("own");
+        std::fs::write(rig.git().join("index.lock"), b"jgit's own index!").expect("foreign");
+        let done = rig.unlock(&plan, true).expect("cleanup");
+        assert_eq!(
+            (done["removed"].as_u64(), done["kept"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert!(!rig.git().join("HEAD.lock").exists(), "our lock went");
+        assert_eq!(
+            std::fs::read(rig.git().join("index.lock")).expect("foreign"),
+            b"jgit's own index!",
+            "the foreign lock stays"
+        );
+        assert!(!rig.stage_dir().exists(), "the stage went");
+        // without a stage nothing can be proved ours: every lock stays, and
+        // that is not an error
+        let rig = WriteRig::new();
+        std::fs::write(rig.git().join("HEAD.lock"), b"ref: refs/heads/x\n").expect("lock");
+        let done = rig.unlock(&[("HEAD", 18)], true).expect("no stage");
+        assert_eq!(
+            (done["removed"].as_u64(), done["kept"].as_u64()),
+            (Some(0), Some(1))
+        );
+        assert!(rig.git().join("HEAD.lock").exists());
+        // a link as a lock is never removed (it is not a regular file)
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"x");
+        std::os::unix::fs::symlink("HEAD", rig.git().join("config.lock")).expect("link");
+        let done = rig.unlock(&[("config", 1)], false).expect("cleanup");
+        assert_eq!(done["removed"], 0);
+        assert!(rig.git().join("config.lock").symlink_metadata().is_ok());
     }
 }
