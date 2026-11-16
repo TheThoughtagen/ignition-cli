@@ -4081,6 +4081,8 @@ mod sftp_git {
 
     const RUN: &str = "20261114T101500Z-ab12";
 
+    type BatchHook = Arc<dyn Fn(&str) + Send + Sync>;
+
     /// Counts the exec calls (`sh -c`) and the sftp sessions a transport makes
     /// and keeps the exec command texts.
     #[derive(Default)]
@@ -4089,6 +4091,16 @@ mod sftp_git {
         sftp: AtomicUsize,
         /// A per-test directory of shim programs put first on `sh`'s PATH.
         shims: Mutex<Option<PathBuf>>,
+        /// A directory that is the whole PATH of `sh` (a host without a tool).
+        only_path: Mutex<Option<PathBuf>>,
+        /// Exec commands holding a needle that fail like a dead connection
+        /// (exit 255, nothing run): the needle and how many calls still fail.
+        dead: Mutex<Vec<(String, usize)>>,
+        /// Every `put` of every sftp batch: the remote path and the mode of its
+        /// parent directory at the moment the batch was sent.
+        puts: Mutex<Vec<(String, Option<u32>)>>,
+        /// Called with the batch text just before an sftp batch runs.
+        before_batch: Mutex<Option<BatchHook>>,
     }
 
     #[async_trait::async_trait]
@@ -4105,9 +4117,56 @@ mod sftp_git {
                     .last()
                     .map(|a| a.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.execs.lock().expect("execs").push(command);
+                self.execs.lock().expect("execs").push(command.clone());
+                let dead = {
+                    let mut dead = self.dead.lock().expect("dead");
+                    dead.iter_mut()
+                        .find(|(needle, left)| *left > 0 && command.contains(needle.as_str()))
+                        .map(|(_, left)| *left -= 1)
+                        .is_some()
+                };
+                if dead {
+                    return ProcessOutput {
+                        stdout: Vec::new(),
+                        stderr: b"Connection reset by peer".to_vec(),
+                        code: 255,
+                        timed_out: false,
+                    };
+                }
             } else {
                 self.sftp.fetch_add(1, Ordering::Relaxed);
+                let batch =
+                    String::from_utf8_lossy(stdin.as_deref().unwrap_or_default()).into_owned();
+                let hook = self.before_batch.lock().expect("hook").clone();
+                if let Some(hook) = hook {
+                    hook(&batch);
+                }
+                for line in batch.lines().filter(|l| l.starts_with("put ")) {
+                    if let Some(remote) = line.rsplit('"').nth(1) {
+                        let parent = Path::new(remote).parent().and_then(|p| {
+                            std::fs::metadata(p)
+                                .ok()
+                                .map(|m| m.permissions().mode() & 0o777)
+                        });
+                        self.puts
+                            .lock()
+                            .expect("puts")
+                            .push((remote.to_string(), parent));
+                    }
+                }
+            }
+            let only = self.only_path.lock().expect("only").clone();
+            if program == "sh"
+                && let Some(only) = only
+            {
+                let mut wrapped = vec![
+                    OsString::from(format!("PATH={}", only.display())),
+                    OsString::from("/bin/sh"),
+                ];
+                wrapped.extend(args.iter().cloned());
+                return TokioProcessRunner
+                    .run(OsStr::new("env"), &wrapped, stdin, timeout)
+                    .await;
             }
             let extra = self.shims.lock().expect("shims").clone();
             let (program, args) = common::posix_exec::shimmed_with(program, args, extra.as_deref());
@@ -4120,6 +4179,20 @@ mod sftp_git {
     impl Count {
         fn use_shims(&self, shims: &common::posix_exec::Shims) {
             *self.shims.lock().expect("shims") = Some(shims.path().to_path_buf());
+        }
+        /// The next `times` exec commands holding `needle` die like a dropped
+        /// connection.
+        fn kill_exec(&self, needle: &str, times: usize) {
+            self.dead
+                .lock()
+                .expect("dead")
+                .push((needle.to_string(), times));
+        }
+        fn puts(&self) -> Vec<(String, Option<u32>)> {
+            self.puts.lock().expect("puts").clone()
+        }
+        fn on_batch(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+            *self.before_batch.lock().expect("hook") = Some(Arc::new(hook));
         }
         fn execs(&self) -> usize {
             self.execs.lock().expect("execs").len()
@@ -4605,6 +4678,7 @@ mod sftp_git {
             .filter(|p| p.ends_with(".lock") || p.ends_with(".ign-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(stages(&n).is_empty(), "no stage is left: {:?}", stages(&n));
         // the ref file is a regular readable file, not private to the writer
         let mode = std::fs::metadata(fx.git_dir().join("refs/heads/feature/new"))
             .expect("ref")
@@ -4652,6 +4726,11 @@ mod sftp_git {
             "held",
             "the other writer's lock is left alone"
         );
+        assert!(
+            stages(&n).is_empty(),
+            "a refusal leaves no stage: {:?}",
+            stages(&n)
+        );
         // a pack name that is not a hex digest never reaches the host
         let calls = n.count.execs();
         let bad = vec![GitWrite {
@@ -4662,6 +4741,271 @@ mod sftp_git {
             .await
             .expect_err("bad shape");
         assert_eq!(n.count.execs(), calls, "refused before any remote call");
+    }
+
+    /// The `git-stage-*` directories in the account's ledger root.
+    fn stages(n: &Node) -> Vec<String> {
+        match std::fs::read_dir(n.home.path().join("ign-deploy")) {
+            Ok(entries) => entries
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("git-stage-"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn two_writes(fx: &GitFixture) -> Vec<GitWrite> {
+        vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/feature/new\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("feature/new".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ]
+    }
+
+    /// 27-31 (WR-B3): sftp puts the advance's bytes only into a private stage
+    /// in the deploy account's ledger root, never into a path the gateway
+    /// account can change.
+    #[tokio::test]
+    async fn sftp_git_write_stage_is_private() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let writes = two_writes(&fx);
+        n.t.write_git_files(PROJECT, &writes).await.expect("write");
+        for write in &writes {
+            assert_eq!(
+                std::fs::read(fx.git_dir().join(write.name.rel())).expect("read back"),
+                write.bytes
+            );
+        }
+        let puts = n.count.puts();
+        assert_eq!(puts.len(), writes.len(), "one put per write: {puts:?}");
+        let stage_root = format!("{}/ign-deploy/git-stage-", n.home.path().display());
+        let data = fx.data_dir.display().to_string();
+        for (remote, parent_mode) in &puts {
+            assert!(
+                remote.starts_with(&stage_root),
+                "{remote} is not below a stage in the ledger root"
+            );
+            assert!(!remote.starts_with(&data), "{remote} is below the data dir");
+            assert_eq!(*parent_mode, Some(0o700), "the stage is owner-only");
+        }
+        let ledger_mode = std::fs::metadata(n.home.path().join("ign-deploy"))
+            .expect("ledger root")
+            .permissions()
+            .mode();
+        assert_eq!(ledger_mode & 0o077, 0, "{ledger_mode:o}");
+        assert!(stages(&n).is_empty(), "the stage is gone: {:?}", stages(&n));
+    }
+
+    /// 27-31 (WR-B3): a symlink at a lock path is never written through. The
+    /// link appears after ign has looked, while the bytes are on their way.
+    #[tokio::test]
+    async fn sftp_git_write_never_follows_a_planted_link() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+
+        let git = fx.git_dir();
+        let link_to = victim.clone();
+        n.count.on_batch(move |_| {
+            let lock = git.join("HEAD.lock");
+            let _ = std::fs::remove_file(&lock);
+            std::os::unix::fs::symlink(&link_to, &lock).expect("plant");
+        });
+        let why = detail(
+            n.t.write_git_files(PROJECT, &two_writes(&fx))
+                .await
+                .expect_err("a link at the lock path"),
+        );
+        assert!(why.contains("exit code 4"), "refused as a refusal: {why}");
+        assert!(why.contains("HEAD.lock"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "precious\n",
+            "nothing was written through the link"
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before,
+            "no target changed"
+        );
+        assert!(
+            !fx.git_dir().join("refs/heads/feature/new").exists(),
+            "no target changed"
+        );
+        assert!(
+            std::fs::symlink_metadata(fx.git_dir().join("HEAD.lock"))
+                .expect("planted link")
+                .file_type()
+                .is_symlink(),
+            "what ign did not create is left alone"
+        );
+        assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    /// 27-31 (WR-B3): the exclusive create itself does not follow a link that
+    /// is planted after the checks and before the create.
+    #[tokio::test]
+    async fn sftp_git_write_create_refuses_a_link_planted_in_the_window() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+
+        // while the first lock is filled, the gateway account plants a link at
+        // the second lock's path
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "cat",
+            &format!(
+                "case $2 in */git-stage-*/0) ln -s {} {}/refs/heads/feature/new.lock;; esac\n\
+                 exec \"$(real cat)\" \"$@\"",
+                victim.display(),
+                fx.git_dir().display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &two_writes(&fx))
+                .await
+                .expect_err("a link planted in the window"),
+        );
+        assert!(why.contains("exit code 4"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "precious\n",
+            "the create did not follow the link"
+        );
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "the lock ign made is taken away again"
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before
+        );
+        assert!(
+            std::fs::symlink_metadata(fx.git_dir().join("refs/heads/feature/new.lock"))
+                .expect("planted link")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    /// 27-31 (WR-B2): a connection that dies while the write script runs
+    /// leaves an error that names every lock and the stage, and a cleanup that
+    /// removes the locks that hold ign's own bytes.
+    #[tokio::test]
+    async fn sftp_git_write_transport_failure_names_locks() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let writes = two_writes(&fx);
+        // the connection drops after the first lock was made and filled
+        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("own lock");
+        n.count.kill_exec("HEAD.lock", 1);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a dead connection"),
+        );
+        assert!(
+            why.contains("may still be in .git"),
+            "the leftovers are announced: {why}"
+        );
+        for lock in ["HEAD.lock", "refs/heads/feature/new.lock"] {
+            assert!(why.contains(lock), "{lock} is named: {why}");
+        }
+        assert!(why.contains("git-stage-"), "the stage is named: {why}");
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "the lock that held ign's bytes was removed by the cleanup"
+        );
+        assert!(stages(&n).is_empty(), "the cleanup took the stage away");
+
+        // a cleanup that dies as well is told in the same error, and the stage
+        // it could not remove is still named
+        let n = node(&fx.data_dir);
+        n.count.kill_exec("HEAD.lock", 2);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a dead connection twice"),
+        );
+        assert!(
+            why.contains("cleanup"),
+            "the failed cleanup is folded in: {why}"
+        );
+        assert!(why.contains("HEAD.lock"), "{why}");
+        assert!(why.contains("git-stage-"), "{why}");
+        assert_eq!(stages(&n).len(), 1, "the stage really is still there");
+    }
+
+    /// 27-31 (WR-B2): a lock that was there before the write and holds other
+    /// bytes (a JGit `index.lock`) is never removed, by a refusal or by the
+    /// cleanup after a dead connection.
+    #[tokio::test]
+    async fn sftp_git_write_cleanup_spares_a_foreign_lock() {
+        let fx = GitFixture::new();
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/feature/new\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Index,
+                bytes: vec![9u8; 64],
+            },
+        ];
+        let foreign = fx.git_dir().join("index.lock");
+
+        // refused: nothing written, the foreign lock stays
+        let n = node(&fx.data_dir);
+        std::fs::write(&foreign, "JGit holds this\n").expect("foreign lock");
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("held"),
+        );
+        assert!(why.contains("index.lock"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("foreign"),
+            "JGit holds this\n"
+        );
+        assert!(!fx.git_dir().join("HEAD.lock").exists());
+        assert!(stages(&n).is_empty());
+
+        // a dead connection: the cleanup runs, removes the lock that holds
+        // ign's bytes and spares the foreign one
+        let n = node(&fx.data_dir);
+        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("own lock");
+        n.count.kill_exec("index.lock", 1);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a dead connection"),
+        );
+        assert!(why.contains("index.lock"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("foreign"),
+            "JGit holds this\n",
+            "a lock with other bytes is never removed"
+        );
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "the lock with ign's own bytes is"
+        );
+        assert!(stages(&n).is_empty());
     }
 
     /// Every file below `dir`, `/`-separated and relative.

@@ -3344,6 +3344,20 @@ mod git_rows {
             .expect("restore when absent");
     }
 
+    /// 27-31: a write leaves no `git-stage-*` behind in the ledger root, on
+    /// any host (a host that has no such stage has none to leave).
+    fn assert_no_git_stage(c: &GitCtx, after: &str) {
+        let root = c.ledger.join("ign-deploy");
+        let left: Vec<String> = match std::fs::read_dir(&root) {
+            Ok(entries) => entries
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("git-stage-"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        assert!(left.is_empty(), "{after} left a stage behind: {left:?}");
+    }
+
     pub async fn git_write_lock_refuses(c: &GitCtx) {
         let head = std::fs::read(c.fx.git_dir().join("HEAD")).expect("head");
         std::fs::write(c.fx.git_dir().join("config.lock"), "held").expect("lock");
@@ -3368,12 +3382,14 @@ mod git_rows {
             std::fs::read(c.fx.git_dir().join("HEAD")).expect("head"),
             head
         );
+        assert_no_git_stage(c, "a refused write");
         std::fs::remove_file(c.fx.git_dir().join("config.lock")).expect("rm lock");
         // with the lock gone the same write lands, and reads back equal
         c.write
             .write_git_files(PROJECT, &writes)
             .await
             .expect("write");
+        assert_no_git_stage(c, "a write that landed");
         for write in &writes {
             assert_eq!(
                 std::fs::read(c.fx.git_dir().join(write.name.rel())).expect("file"),

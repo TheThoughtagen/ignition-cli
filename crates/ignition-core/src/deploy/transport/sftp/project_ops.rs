@@ -442,52 +442,119 @@ pub(super) const GIT_PROBE_W_SH: &str = concat!(
     "pw \"$1/$2\" \"$2\" \"$3\"; pw \"$1/$2/.git\" \"$2/.git\" \"$3\" acl; printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
-pub(super) const GIT_LOCK_SH: &str = concat!(
+/// 27-31 (WR-B3), step (a) of a POSIX `.git` write: a private stage
+/// `ign-deploy/git-stage-<id>` in the deploy account's ledger root. The ledger
+/// root is made owner-only when absent and refused when it is a symlink; the
+/// stage is made with `mkdir -m 700` (atomic) and refused when anything is at
+/// its name. Arguments: the account home and the stage name, both data.
+pub(super) const GIT_STAGE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in ls mkdir rm; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in ls mkdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "umask 022; wk \"$1\" \"$2\"; mode=$3; shift 3; set -f; NL=$(printf '\\nx'); NL=${NL%x}; ",
-    "if [ \"$mode\" = unlock ]; then while [ $# -ge 2 ]; do l=$2; shift 2; ",
-    "if [ -f \"$l\" ] && [ ! -L \"$l\" ]; then rm -f -- \"$l\" || exit 3; fi; done; printf 'IGN-RESULT:{\"ok\":1}\\n'; exit 0; fi; ",
-    "ck() { p=''; OI=$IFS; IFS=/; for c in $1; do p=${p:+$p/}$c; ",
-    "if [ -L \"$p\" ]; then printf '%s is a symlink\\n' \"$p\" >&2; exit 4; ",
-    "elif [ -d \"$p\" ]; then :; ",
-    "elif pr \"$p\"; then printf '%s is not a directory\\n' \"$p\" >&2; exit 4; ",
-    "elif [ \"$2\" = m ]; then mkdir -- \"$p\" || exit 3; else break; fi; done; IFS=$OI; }; ",
-    "n=$#; k=0; while [ $k -lt $n ]; do t=$1; l=$2; shift 2; set -- \"$@\" \"$t\" \"$l\"; k=$((k+2)); ",
-    "case $t in */*) par=${t%/*};; *) par='';; esac; ck \"$par\" c; ",
-    "if pr \"$t\"; then [ -f \"$t\" ] && [ ! -L \"$t\" ] || { printf '%s is not a regular file; it is left alone\\n' \"$t\" >&2; exit 4; }; fi; ",
-    "if pr \"$l\"; then printf '%s exists; another writer holds it, nothing was written\\n' \"$l\" >&2; exit 4; fi; done; ",
-    "made=''; k=0; while [ $k -lt $n ]; do t=$1; l=$2; shift 2; set -- \"$@\" \"$t\" \"$l\"; k=$((k+2)); ",
-    "case $t in */*) par=${t%/*};; *) par='';; esac; ck \"$par\" m; ",
-    "if ( set -C; : > \"$l\" ) 2>/dev/null; then made=\"$made$l$NL\"; ",
-    "else IFS=$NL; for f in $made; do rm -f -- \"$f\"; done; unset IFS; printf '%s exists or cannot be created; nothing was written\\n' \"$l\" >&2; exit 4; fi; done; ",
+    "case $2 in git-stage-*) ;; *) printf 'refusing the stage name %s\\n' \"$2\" >&2; exit 4;; esac; ",
+    "case $2 in */*) printf 'refusing the stage name %s\\n' \"$2\" >&2; exit 4;; esac; ",
+    "umask 077; [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; ",
+    "if [ -L ign-deploy ]; then echo 'ign-deploy is a symlink' >&2; exit 4; ",
+    "elif [ -d ign-deploy ]; then :; ",
+    "elif pr ign-deploy; then echo 'ign-deploy is not a directory' >&2; exit 4; ",
+    "else mkdir -m 700 -- ign-deploy || exit 3; fi; ",
+    "cd -- ign-deploy || exit 3; ",
+    "mkdir -m 700 -- \"$2\" || { printf '%s exists or cannot be created; it is left alone\\n' \"$2\" >&2; exit 4; }; ",
+    "[ -d \"$2\" ] && [ ! -L \"$2\" ] || { printf '%s is not a real directory\\n' \"$2\" >&2; exit 4; }; ",
     "printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
-pub(super) const GIT_REPLACE_SH: &str = concat!(
+/// 27-31 (WR-B3), step (c) of a POSIX `.git` write. The bytes are already in
+/// the private stage (`<stage>/<index>` for the write at that position); no
+/// path the gateway account can change is ever written by anything but this
+/// script. Arguments: the data dir, the `.git` path below it, the stage path,
+/// then (target, lock, size) triples; every value is data.
+///
+/// 1. walk to `.git` level by level (each a real directory);
+/// 2. check every triple: parents are directories (a missing one is allowed),
+///    the target is absent or a regular non-symlink file, the lock is absent,
+///    the stage file is a regular non-symlink file of the sent size;
+/// 3. create the missing directories;
+/// 4. create every lock with an exclusive create that is filled from the stage
+///    in the same open (`set -C` redirection, so a planted link or an existing
+///    file fails the create and is never written through);
+/// 5. move each lock over its target in plan order;
+/// 6. remove the stage.
+///
+/// The script removes the locks it made and the stage on every refusal and
+/// failure it reports itself (exit 3, 4, 5, 6); it never removes a lock it did
+/// not create. Exit 4 is a refusal, 5 a size mismatch, 3 a host failure.
+pub(super) const GIT_WRITE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in ls mv wc; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in ls mkdir rmdir rm mv wc cat; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
+    "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
+    "[ -d \"$3\" ] && [ ! -L \"$3\" ] || { printf '%s is not a real stage directory\\n' \"$3\" >&2; exit 4; }; ",
+    "umask 022; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; stg=$3; ",
+    "ab() { IFS=$NL; for f in $made; do rm -f -- \"$f\"; done; for d in $mkd; do rmdir -- \"$d\" 2>/dev/null; done; unset IFS; rm -rf -- \"$stg\"; }; ",
+    "fl() { ab; printf \"$2\\n\" \"$3\" \"$4\" >&2; exit \"$1\"; }; ",
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
-    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; shift 2; ",
-    "while [ $# -ge 3 ]; do t=$1; l=$2; z=$3; shift 3; ",
-    "[ -f \"$l\" ] && [ ! -L \"$l\" ] || { printf '%s is not a regular file\\n' \"$l\" >&2; exit 4; }; ",
-    "[ $(( $(wc -c < \"$l\") )) -eq \"$z\" ] || { printf '%s is not the size that was sent\\n' \"$l\" >&2; exit 5; }; ",
-    "if pr \"$t\"; then [ -f \"$t\" ] && [ ! -L \"$t\" ] || { printf '%s is not a regular file; it is left alone\\n' \"$t\" >&2; exit 4; }; fi; ",
-    "mv -f -- \"$l\" \"$t\" || { printf '%s cannot be put in place\\n' \"$t\" >&2; exit 3; }; done; ",
-    "printf 'IGN-RESULT:{\"ok\":1}\\n'",
+    "ab; printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "[ -d \"$1\" ] || fl 4 '%s is not a directory' \"$1\"; cd -- \"$1\" || fl 3 'cannot enter %s' \"$1\"; ",
+    "IFS=/; for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || fl 4 '%s is not a real directory' \"$c\"; ",
+    "cd -- \"$c\" || fl 3 'cannot enter %s' \"$c\"; done; unset IFS; ",
+    "shift 3; ",
+    "ck() { p=''; IFS=/; for c in $1; do p=${p:+$p/}$c; ",
+    "if [ -L \"$p\" ]; then fl 4 '%s is a symlink' \"$p\"; ",
+    "elif [ -d \"$p\" ]; then :; ",
+    "elif pr \"$p\"; then fl 4 '%s is not a directory' \"$p\"; ",
+    "else break; fi; done; unset IFS; }; ",
+    "md() { p=''; IFS=/; for c in $1; do p=${p:+$p/}$c; ",
+    "if [ -L \"$p\" ]; then fl 4 '%s is a symlink' \"$p\"; ",
+    "elif [ -d \"$p\" ]; then :; ",
+    "elif pr \"$p\"; then fl 4 '%s is not a directory' \"$p\"; ",
+    "else mkdir -- \"$p\" || fl 3 '%s cannot be created' \"$p\"; mkd=\"$p$NL$mkd\"; fi; done; unset IFS; }; ",
+    "n=$#; i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; ck \"$par\"; ",
+    "if pr \"$t\"; then [ -f \"$t\" ] && [ ! -L \"$t\" ] || fl 4 '%s is not a regular file; it is left alone' \"$t\"; fi; ",
+    "if pr \"$l\"; then fl 4 '%s exists; another writer holds it, nothing was written' \"$l\"; fi; ",
+    "[ -f \"$s\" ] && [ ! -L \"$s\" ] || fl 4 '%s is not a regular file' \"$s\"; ",
+    "[ $(( $(wc -c < \"$s\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$s\"; done; ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; md \"$par\"; done; ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
+    "( set -C; exec 3> \"$l\" || exit 7; cat -- \"$s\" >&3 || exit 8 ) 2>/dev/null; r=$?; ",
+    "if [ $r = 8 ]; then made=\"$made$l$NL\"; fl 3 '%s cannot be filled from the stage' \"$l\"; ",
+    "elif [ $r != 0 ]; then fl 4 '%s exists or cannot be created; nothing was written' \"$l\"; fi; ",
+    "made=\"$made$l$NL\"; ",
+    "[ -f \"$l\" ] && [ ! -L \"$l\" ] || fl 4 '%s is not the regular file that was created' \"$l\"; ",
+    "[ $(( $(wc -c < \"$l\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$l\"; done; ",
+    "i=0; k=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
+    "mv -f -- \"$l\" \"$t\" 2>/dev/null || fl 3 '%s cannot be put in place; %s targets were moved before it' \"$t\" \"$k\"; ",
+    "made=${made#*\"$NL\"}; k=$((k+1)); done; ",
+    "rm -rf -- \"$stg\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
+);
+
+/// 27-31 (WR-B2), the best-effort cleanup after a POSIX `.git` write whose
+/// connection died. Arguments: the data dir, the `.git` path, the stage path,
+/// then (lock, stage index) pairs. A lock is removed only when it is a regular
+/// non-symlink file whose bytes equal the matching stage file (`cmp -s`), so a
+/// lock another writer holds (JGit's `index.lock`) is never removed. The
+/// stage is removed last. Answers how many locks it removed and how many it
+/// left.
+pub(super) const GIT_WRITE_CLEAN_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; ",
+    "for c in ls rm cmp; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
+    "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
+    "dd=$1; rr=$2; stg=$3; shift 3; set -f; ",
+    "rl() { [ -d \"$dd\" ] || return 4; cd -- \"$dd\" || return 3; IFS=/; ",
+    "for c in $rr; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || return 4; cd -- \"$c\" || return 3; done; unset IFS; ",
+    "a=0; b=0; while [ $# -ge 2 ]; do l=$1; s=$stg/$2; shift 2; ",
+    "if [ -f \"$l\" ] && [ ! -L \"$l\" ] && [ -f \"$s\" ] && [ ! -L \"$s\" ] && cmp -s -- \"$l\" \"$s\"; then rm -f -- \"$l\" || return 3; a=$((a+1)); ",
+    "elif [ -e \"$l\" ] || [ -L \"$l\" ]; then b=$((b+1)); fi; done; printf '%s %s' \"$a\" \"$b\"; }; ",
+    "o=$(rl \"$@\"); r=$?; rm -rf -- \"$stg\" || { printf '%s cannot be removed\\n' \"$stg\" >&2; exit 3; }; ",
+    "[ $r = 0 ] || { echo 'the locks could not be checked' >&2; exit $r; }; ",
+    "set -- $o; printf 'IGN-RESULT:{\"removed\":%s,\"kept\":%s}\\n' \"$1\" \"$2\"",
 );
 
 pub(super) const GIT_SAVE_RM_SH: &str = concat!(
@@ -1294,8 +1361,9 @@ impl SftpTransport {
 // | `GIT_SAVE_SH` | `cp -a` of `.git` into the private save, then both manifests compared |
 // | `GIT_RESTORE_SH` | `cp -a` of the save beside `.git`, the D-G1 ACL step, manifest compare, `mv` into place |
 // | `GIT_PROBE_W_SH` | exclusive create then remove of a probe file in the project directory and its `.git` |
-// | `GIT_LOCK_SH` | `<rel>.lock` (or `.ign-tmp`) created exclusively; the sftp CLI cannot open `O_EXCL` |
-// | `GIT_REPLACE_SH` | size check, then `mv -f` of each lock over its file |
+// | `GIT_STAGE_SH` | the private stage `ign-deploy/git-stage-<id>` of a `.git` write, in the account's ledger root |
+// | `GIT_WRITE_SH` | each lock created exclusively and filled from the stage in the same open, then moved over its target in plan order |
+// | `GIT_WRITE_CLEAN_SH` | after a dead connection: removes the locks whose bytes equal the stage, then the stage |
 // | `GIT_SAVE_RM_SH` | removes `git-save/<run-id>/repo` and nothing else |
 // | `GIT_FREE_SH` | free bytes of the file system under the save root |
 //
@@ -2153,26 +2221,21 @@ impl GitStateWriter for SftpTransport {
             return Ok(());
         }
         let rel = Self::git_rel(project);
+        if !self.windows {
+            return self.write_git_files_posix(&rel, &plan).await;
+        }
+        // The Windows arm (27-33 gives it the same shape): lock every file
+        // exclusively, put the bytes into the locks over sftp, then replace.
         let limit = self.shell.op_timeout();
         // 1. Every lock exclusively (a lock that exists refuses, nothing is
         //    written), creating the missing parent directories.
-        if self.windows {
-            let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
-            let script = WinScript::git_lock(&self.win_git(project), false, &targets);
-            self.git_win("write_git_files", script, limit).await?;
-        } else {
-            let mut lock_args = vec![self.data_dir.as_str(), rel.as_str(), "lock"];
-            for (target, lock, _) in &plan {
-                lock_args.push(target);
-                lock_args.push(lock);
-            }
-            self.git_run("write_git_files", GIT_LOCK_SH, &lock_args, limit)
-                .await?;
-        }
+        let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
+        let script = WinScript::git_lock(&self.win_git(project), false, &targets);
+        self.git_win("write_git_files", script, limit).await?;
         // 2. The bytes over sftp into the locks.
         let staged = match self.stage_git_writes(&plan) {
             Ok(staged) => staged,
-            Err(err) => return Err(self.unlock_git_writes(err, project, &rel, &plan).await),
+            Err(err) => return Err(self.unlock_git_writes(err, project, &plan).await),
         };
         let ops: Vec<SftpOp> = staged
             .1
@@ -2183,33 +2246,17 @@ impl GitStateWriter for SftpTransport {
             })
             .collect();
         if let Err(err) = self.run_batch("write", ops).await {
-            return Err(self.unlock_git_writes(err, project, &rel, &plan).await);
+            return Err(self.unlock_git_writes(err, project, &plan).await);
         }
         // 3. Each lock over its file, after a size check.
-        let replaced = if self.windows {
-            let writes: Vec<(String, u64)> = staged
-                .1
-                .iter()
-                .map(|s| (s.target.clone(), s.size as u64))
-                .collect();
-            let script = WinScript::git_replace(&self.win_git(project), &writes, RENAME_RETRIES);
-            self.git_win("write_git_files", script, limit)
-                .await
-                .map(|_| ())
-        } else {
-            let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
-            let mut replace_args = vec![self.data_dir.as_str(), rel.as_str()];
-            for (s, size) in staged.1.iter().zip(&sizes) {
-                replace_args.push(&s.target);
-                replace_args.push(&s.lock);
-                replace_args.push(size);
-            }
-            self.git_run("write_git_files", GIT_REPLACE_SH, &replace_args, limit)
-                .await
-                .map(|_| ())
-        };
-        if let Err(err) = replaced {
-            return Err(self.unlock_git_writes(err, project, &rel, &plan).await);
+        let writes: Vec<(String, u64)> = staged
+            .1
+            .iter()
+            .map(|s| (s.target.clone(), s.size as u64))
+            .collect();
+        let script = WinScript::git_replace(&self.win_git(project), &writes, RENAME_RETRIES);
+        if let Err(err) = self.git_win("write_git_files", script, limit).await {
+            return Err(self.unlock_git_writes(err, project, &plan).await);
         }
         drop(staged);
         Ok(())
@@ -2320,36 +2367,187 @@ impl SftpTransport {
     }
 }
 
+/// Whether a failed git script ran to one of its own exits (3 a host failure,
+/// 4 a refusal, 5 a size mismatch, 6 the ACL step): such a script took the
+/// locks it made and the stage away itself. Anything else (a dropped
+/// connection, a timeout, a kill, an answer that cannot be read) says nothing
+/// about how far it got.
+fn git_script_settled(err: &CoreError) -> bool {
+    let CoreError::TransportFailed { detail, .. } = err else {
+        return false;
+    };
+    detail
+        .split_once("exit code ")
+        .and_then(|(_, rest)| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse::<u32>().ok()
+        })
+        .is_some_and(|code| (3..=6).contains(&code))
+}
+
+/// `err` with `more` appended to the detail of a transport failure.
+fn with_detail(err: CoreError, more: &str) -> CoreError {
+    match err {
+        CoreError::TransportFailed {
+            operation,
+            node,
+            detail,
+        } => CoreError::TransportFailed {
+            operation,
+            node,
+            detail: format!("{detail}{more}"),
+        },
+        other => other,
+    }
+}
+
 impl SftpTransport {
-    /// Take the locks of a failed write away again (they are this call's: the
-    /// lock script created each one exclusively) and return `err`.
+    /// The POSIX arm of `write_git_files` (27-31, D-10): the bytes go only into
+    /// a private stage in the deploy account's ledger root, and one host script
+    /// creates each lock exclusively, fills it from the stage in the same open
+    /// and moves the locks over their targets.
+    async fn write_git_files_posix(
+        &self,
+        rel: &str,
+        plan: &[(String, String, &GitWrite)],
+    ) -> Result<(), CoreError> {
+        let limit = self.shell.op_timeout();
+        let staged = self.stage_git_writes(plan)?;
+        let home = self.account_home().await?;
+        let stage_name = format!("git-stage-{}", RunId::generate().as_str());
+        let stage = format!("{home}/ign-deploy/{stage_name}");
+        // (a) the private stage
+        if let Err(err) = self
+            .git_run(
+                "write_git_files",
+                GIT_STAGE_SH,
+                &[&home, &stage_name],
+                limit,
+            )
+            .await
+        {
+            // a refusal made nothing; a dropped connection may have
+            return Err(if git_script_settled(&err) {
+                err
+            } else {
+                self.git_write_leftovers(err, rel, &stage, plan, false)
+                    .await
+            });
+        }
+        // (b) the bytes over sftp, into the stage and nowhere else
+        let ops: Vec<SftpOp> = staged
+            .1
+            .iter()
+            .enumerate()
+            .map(|(index, s)| SftpOp::Put {
+                local: s.local.clone(),
+                remote: format!("{stage}/{index}"),
+            })
+            .collect();
+        if let Err(err) = self.run_batch("write", ops).await {
+            return Err(self
+                .git_write_leftovers(err, rel, &stage, plan, false)
+                .await);
+        }
+        // (c) every lock created and filled, then moved over its target
+        let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
+        let mut args = vec![self.data_dir.as_str(), rel, stage.as_str()];
+        for (s, size) in staged.1.iter().zip(&sizes) {
+            args.push(&s.target);
+            args.push(&s.lock);
+            args.push(size);
+        }
+        if let Err(err) = self
+            .git_run("write_git_files", GIT_WRITE_SH, &args, limit)
+            .await
+        {
+            return Err(if git_script_settled(&err) {
+                err
+            } else {
+                self.git_write_leftovers(err, rel, &stage, plan, true).await
+            });
+        }
+        drop(staged);
+        Ok(())
+    }
+
+    /// A write whose host script may have died half way: name what may be
+    /// left (every lock of the plan when the write script may have run, and
+    /// the stage), then run the best-effort cleanup, which removes only locks
+    /// whose bytes equal the stage's (WR-B2). A cleanup that fails is folded
+    /// into the same error.
+    async fn git_write_leftovers(
+        &self,
+        err: CoreError,
+        rel: &str,
+        stage: &str,
+        plan: &[(String, String, &GitWrite)],
+        locks_may_exist: bool,
+    ) -> CoreError {
+        let mut more = String::new();
+        if locks_may_exist {
+            let locks: Vec<String> = plan
+                .iter()
+                .map(|(_, lock, _)| format!("{}/{rel}/{lock}", self.data_dir))
+                .collect();
+            more.push_str(&format!(
+                "; these lock files may still be in .git: {}",
+                locks.join(", ")
+            ));
+        }
+        more.push_str(&format!(
+            "; the stage {stage} may still be in the account home"
+        ));
+        let mut args = vec![self.data_dir.as_str(), rel, stage];
+        let indexes: Vec<String> = (0..plan.len()).map(|i| i.to_string()).collect();
+        if locks_may_exist {
+            for ((_, lock, _), index) in plan.iter().zip(&indexes) {
+                args.push(lock);
+                args.push(index);
+            }
+        }
+        match self
+            .git_run(
+                "write_git_files",
+                GIT_WRITE_CLEAN_SH,
+                &args,
+                self.shell.op_timeout(),
+            )
+            .await
+        {
+            Ok(answer) => {
+                let count = |key: &str| answer.get(key).and_then(serde_json::Value::as_u64);
+                if let (Some(removed), Some(kept)) = (count("removed"), count("kept")) {
+                    more.push_str(&format!(
+                        "; the cleanup removed {removed} lock(s) that held ign's own bytes and the stage, and left {kept} lock(s) that hold other bytes"
+                    ));
+                }
+            }
+            Err(cleanup) => {
+                let why = match cleanup {
+                    CoreError::TransportFailed { detail, .. } => detail,
+                    other => other.to_string(),
+                };
+                more.push_str(&format!("; the cleanup also failed: {why}"));
+            }
+        }
+        with_detail(err, &more)
+    }
+}
+
+impl SftpTransport {
+    /// Take the locks of a failed Windows write away again (they are this
+    /// call's: the lock script created each one exclusively) and return `err`.
     async fn unlock_git_writes(
         &self,
         err: CoreError,
         project: &str,
-        rel: &str,
         plan: &[(String, String, &GitWrite)],
     ) -> CoreError {
-        if self.windows {
-            let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
-            let script = WinScript::git_lock(&self.win_git(project), true, &targets);
-            let _ = self
-                .git_win("write_git_files", script, self.shell.op_timeout())
-                .await;
-            return err;
-        }
-        let mut args = vec![self.data_dir.as_str(), rel, "unlock"];
-        for (target, lock, _) in plan {
-            args.push(target);
-            args.push(lock);
-        }
+        let targets: Vec<String> = plan.iter().map(|(target, _, _)| target.clone()).collect();
+        let script = WinScript::git_lock(&self.win_git(project), true, &targets);
         let _ = self
-            .git_run(
-                "write_git_files",
-                GIT_LOCK_SH,
-                &args,
-                self.shell.op_timeout(),
-            )
+            .git_win("write_git_files", script, self.shell.op_timeout())
             .await;
         err
     }
@@ -2883,7 +3081,7 @@ mod tests {
         }
     }
 
-    const ALL_GIT_SCRIPTS: [(&str, &str); 12] = [
+    const ALL_GIT_SCRIPTS: [(&str, &str); 13] = [
         ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
         ("GIT_STATE_SH", GIT_STATE_SH),
         ("GIT_MANIFEST_SH", GIT_MANIFEST_SH),
@@ -2892,8 +3090,9 @@ mod tests {
         ("GIT_SAVE_SH", GIT_SAVE_SH),
         ("GIT_RESTORE_SH", GIT_RESTORE_SH),
         ("GIT_PROBE_W_SH", GIT_PROBE_W_SH),
-        ("GIT_LOCK_SH", GIT_LOCK_SH),
-        ("GIT_REPLACE_SH", GIT_REPLACE_SH),
+        ("GIT_STAGE_SH", GIT_STAGE_SH),
+        ("GIT_WRITE_SH", GIT_WRITE_SH),
+        ("GIT_WRITE_CLEAN_SH", GIT_WRITE_CLEAN_SH),
         ("GIT_SAVE_RM_SH", GIT_SAVE_RM_SH),
         ("GIT_FREE_SH", GIT_FREE_SH),
     ];
@@ -4125,15 +4324,27 @@ mod tests {
             assert!(home.join("ign-deploy/gw/other/p/git-save/r1/repo").is_dir());
         }
 
+        /// A stage `ign-deploy/git-stage-t` below the rig's home holding the
+        /// given files as `0`, `1`, and so on; returns its path.
+        fn stage_with(rig: &Rig, files: &[&str]) -> String {
+            let stage = rig.root.path().join("home/ign-deploy/git-stage-t");
+            std::fs::create_dir_all(&stage).expect("stage");
+            for (index, bytes) in files.iter().enumerate() {
+                std::fs::write(stage.join(index.to_string()), bytes).expect("staged bytes");
+            }
+            stage.display().to_string()
+        }
+
         #[test]
-        fn replace_script_refuses_a_lock_of_the_wrong_size() {
+        fn write_script_refuses_a_stage_file_of_the_wrong_size() {
             let rig = Rig::new();
-            std::fs::write(rig.git().join("config.lock"), "12345").expect("lock");
+            let stage = stage_with(&rig, &["12345"]);
             let out = run(
-                GIT_REPLACE_SH,
+                GIT_WRITE_SH,
                 &[
                     &rig.data(),
                     "projects/CapApp/.git",
+                    &stage,
                     "config",
                     "config.lock",
                     "99",
@@ -4146,6 +4357,70 @@ mod tests {
                 "[core]\n",
                 "the file is untouched"
             );
+            assert!(!rig.git().join("config.lock").exists(), "no lock is made");
+            assert!(!Path::new(&stage).exists(), "the stage is taken away");
+        }
+
+        #[test]
+        fn write_script_refuses_a_stage_it_does_not_own_by_name() {
+            let rig = Rig::new();
+            let outside = rig.root.path().join("home/precious");
+            std::fs::create_dir_all(&outside).expect("dir");
+            std::fs::write(outside.join("0"), "x").expect("file");
+            for bad in [
+                outside.display().to_string(),
+                format!("{}/home/ign-deploy/../precious", rig.root.path().display()),
+                "ign-deploy/git-stage-t".to_string(),
+            ] {
+                for script in [GIT_WRITE_SH, GIT_WRITE_CLEAN_SH] {
+                    let out = run(
+                        script,
+                        &[
+                            &rig.data(),
+                            "projects/CapApp/.git",
+                            &bad,
+                            "config",
+                            "config.lock",
+                            "1",
+                        ],
+                        &system_path(),
+                    );
+                    assert_eq!(out.code, 4, "{bad}: {}", out.stderr);
+                }
+            }
+            assert!(outside.join("0").is_file(), "nothing outside was removed");
+        }
+
+        #[test]
+        fn clean_script_removes_only_locks_equal_to_the_stage() {
+            let rig = Rig::new();
+            let stage = stage_with(&rig, &["ours\n", "theirs\n"]);
+            std::fs::write(rig.git().join("HEAD.lock"), "ours\n").expect("own");
+            std::fs::write(rig.git().join("index.lock"), "someone else\n").expect("foreign");
+            let out = run(
+                GIT_WRITE_CLEAN_SH,
+                &[
+                    &rig.data(),
+                    "projects/CapApp/.git",
+                    &stage,
+                    "HEAD.lock",
+                    "0",
+                    "index.lock",
+                    "1",
+                    "config.lock",
+                    "1",
+                ],
+                &system_path(),
+            );
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.contains("\"removed\":1"), "{}", out.stdout);
+            assert!(out.stdout.contains("\"kept\":1"), "{}", out.stdout);
+            assert!(!rig.git().join("HEAD.lock").exists());
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("index.lock")).expect("foreign"),
+                "someone else\n"
+            );
+            assert!(!Path::new(&stage).exists(), "the stage is gone");
         }
 
         #[test]
