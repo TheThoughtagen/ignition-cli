@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# capture27-vm.sh STEP
+# capture27-vm.sh STEP [ARG]
 #
 # Phase 27 (27-07) capture driver for the two TEST gateway VMs: the Linux VM
 # (Azure `ign-lnx-836`) and the Windows VM (Azure `ign-win-836`). It records
@@ -31,10 +31,21 @@
 #   scratch-down  remove ign-live-scratch/git27 (NOT run in 27-07: 27-09 and 27-11
 #                 run their WinScripts on the uploaded `.git`; 27-25 runs it last)
 #   emit NAME     print the remote script NAME (offline test aid), e.g. lnx-g4
+#   guard         the guard only: ssh answers with the pinned key, the gateway tunnel
+#                 comes up and gateway-info through it names the expected test gateway
+#   vm-gate TEST  run the ignored live gate TEST (`^[a-z0-9_]+$`) of the one VM in
+#                 CAPTURE27_VMS (`live_transport_lnxvm` or `live_transport_wincap`)
+#                 from the repo root: guard, tunnel, the gate's own environment, cargo
+#                 inside the redact-and-tee runner; it passes only on cargo exit 0 plus
+#                 a `LIVE-RAN TEST` line matched as a whole word at the end of its line
+#   winvm-handover  `vm-gate wincap_git_handover` with the Windows VM fixed; it passes
+#                 PRODSHAPE_GIT_OUT and IGN_PROD_SHAPE_FILE through when exported
+#                 (`lnxvm-handover`, the Linux gate run ON ign-lnx-836, comes in 27-32)
 #
 # Environment. Addresses, accounts and key paths come only from here (or from
 # the user's own 0600 files named below); nothing is written to a tracked file.
 #   CAPTURE27_VMS               "lnx win" (default) or one of them
+#   CAPTURE27_RUN               the log name prefix (default 27-07)
 #   PRODSHAPE_GIT_OUT           `upload` only: the directory the 27-06 generator
 #                               emitted (holds capapp.git and data/projects/CapApp/.git)
 #   Linux:   IGN_LNXVM_HOST (default: contents of $HOME/.cache/ign-lnxvm01/host)
@@ -58,17 +69,21 @@
 #
 # Safety. The pinned known_hosts file must exist and carry an entry for the host
 # BEFORE the network is touched; ssh runs with StrictHostKeyChecking=yes. Every
-# step first (1) answers over ssh with the pinned key, (2) exports IGNITION_URL
-# for the run to that same address and (3) refuses (exit 2) unless gateway-info
-# there names the expected test gateway. The gateway serves plain HTTP: its API
-# token crosses the network in cleartext to the host the pinned key just proved,
-# so run this only against the throwaway test VMs, never a production host.
+# step first (1) answers over ssh with the pinned key, (2) opens a pinned
+# `ssh -L` tunnel from a free port on 127.0.0.1 to the gateway port on the VM's
+# own loopback, exports IGNITION_URL for the run as http://127.0.0.1:<port> and
+# (3) refuses (exit 2) unless gateway-info through the tunnel names the expected
+# test gateway. The gateway serves plain HTTP, so its API token now stays on the
+# loopback and inside ssh: nothing is sent to the gateway without the tunnel, and
+# there is no fallback to the VM's address (a forward the VM's sshd refuses, or one
+# that never answers, stops the step). The tunnel is closed when the step ends.
+# Run this only against the throwaway test VMs, never a production host.
 # Output is passed through a filter that replaces the host addresses before it
 # reaches the terminal or the log. Never enable `set -x` here.
 #
-# Each step tees its output to $HOME/.cache/ign-git27-vm/evidence/27-07-<step>.log
-# and prints `LIVE-RAN capture27-vm <step>` as its last line only when every
-# selected VM completed it.
+# Each step tees its output to $HOME/.cache/ign-git27-vm/evidence/<run>-<step>.log
+# (vm-gate: <run>-<step>-<test>.log) and prints `LIVE-RAN capture27-vm <step>` as
+# its last line only when every selected VM completed it.
 # shellcheck disable=SC2329,SC2034,SC2016
 # (the R_*, B_* and PARAMS_* names are reached indirectly by emit_script and
 # win_script; the PowerShell text is deliberately single-quoted)
@@ -77,18 +92,45 @@ export LC_ALL=C
 
 STEP=${1:-}
 case "$STEP" in
-  project-up | upload | g1-before | g4 | g8 | g8-jgit | g1-after | project-down | scratch-down | emit) ;;
+  project-up | upload | g1-before | g4 | g8 | g8-jgit | g1-after | project-down | scratch-down | emit | guard | vm-gate | winvm-handover) ;;
   *)
-    echo "usage: capture27-vm.sh project-up|upload|g1-before|g4|g8|g8-jgit|g1-after|project-down|scratch-down|emit NAME" >&2
+    echo "usage: capture27-vm.sh project-up|upload|g1-before|g4|g8|g8-jgit|g1-after|project-down|scratch-down|guard|winvm-handover|emit NAME|vm-gate TEST" >&2
     exit 64
     ;;
 esac
+GATE_TEST=
+LOG_STEP=
+case "$STEP" in
+  vm-gate) GATE_TEST=${2:-} ;;
+  winvm-handover)
+    GATE_TEST=wincap_git_handover
+    STEP=vm-gate
+    CAPTURE27_VMS=win
+    LOG_STEP=winvm-handover
+    ;;
+esac
+if [ "$STEP" = vm-gate ]; then
+  case "$GATE_TEST" in
+    '' | *[!a-z0-9_]*)
+      echo "REFUSING: vm-gate needs a test name matching ^[a-z0-9_]+\$" >&2
+      exit 64
+      ;;
+  esac
+fi
 
 PROJ=CapApp27
 PROJG=${CAPTURE27_PROJG:-CapApp27g}
 SCRATCH_REL=ign-live-scratch/git27
 IGN=${IGN_BIN:-ign}
 VMS=${CAPTURE27_VMS:-lnx win}
+RUN=${CAPTURE27_RUN:-27-07}
+case "$RUN" in
+  '' | *[!A-Za-z0-9._-]*)
+    echo "REFUSING: CAPTURE27_RUN holds characters outside [A-Za-z0-9._-]" >&2
+    exit 64
+    ;;
+esac
+REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)
 CACHE=$HOME/.cache/ign-git27-vm
 EVID=$CACHE/evidence
 
@@ -606,8 +648,17 @@ fi
 
 TMPD=$(mktemp -d)
 chmod 700 "$TMPD"
-cleanup() { /bin/rm -rf "$TMPD"; }
+TUN_PIDFILE=$TMPD/tunnel.pid
+TUN_PORT=
+# The tunnel's pid lives in a file: the step runs in a subshell, and an EXIT trap is not
+# inherited by it, so this trap (the main shell's) is what closes a tunnel left open.
+cleanup() {
+  tunnel_down
+  /bin/rm -rf "$TMPD"
+}
 trap cleanup EXIT
+trap 'exit 130' INT HUP
+trap 'exit 143' TERM
 
 command -v jq >/dev/null 2>&1 || die "jq is required"
 command -v perl >/dev/null 2>&1 || die "perl is required"
@@ -682,7 +733,7 @@ vm_select() {
     *) die "pinned known_hosts must be 0600 (or 0644)" ;;
   esac
   DEST="$SSH_USER@$HOST"
-  OPTS=(
+  OPTS_COMMON=(
     -o BatchMode=yes
     -o StrictHostKeyChecking=yes
     -o "UserKnownHostsFile=$PIN"
@@ -696,7 +747,6 @@ vm_select() {
     -o IdentitiesOnly=yes
     -o ForwardAgent=no
     -o ForwardX11=no
-    -o ClearAllForwardings=yes
     -o PermitLocalCommand=no
     -o ControlMaster=no
     -o ControlPath=none
@@ -705,12 +755,11 @@ vm_select() {
     -o ServerAliveCountMax=8
     -o LogLevel=ERROR
   )
+  # every ssh call but the tunnel drops all forwardings; the tunnel adds its own
+  OPTS=("${OPTS_COMMON[@]}" -o ClearAllForwardings=yes)
+  TUN_ARGS=(-N -T -p 22 -i "$KEYFILE" "${OPTS_COMMON[@]}" -o ExitOnForwardFailure=yes)
   SSH_ARGS=(-T -p 22 -i "$KEYFILE" "${OPTS[@]}")
   SFTP_ARGS=(-q -b - -P 22 -i "$KEYFILE" "${OPTS[@]}")
-  case "$HOST" in
-    *:*) URL_HOST="[$HOST]" ;;
-    *) URL_HOST=$HOST ;;
-  esac
 }
 
 # The output filter: host addresses never reach the terminal or the log.
@@ -760,11 +809,56 @@ win_ps() { # NAME [ARG ...]
   return "$rc"
 }
 
-ign_gw() { # ign args... against the selected VM's gateway
+# tunnel_up: a pinned `ssh -L` from a free port on 127.0.0.1 to the gateway port on the
+# VM's loopback (WR-D5). Sets TUN_PORT. A forward that the VM's sshd refuses, or one that
+# never answers a token-free request, stops the step: there is no fallback to the VM's
+# address, and nothing here changes the VM's sshd or network rules.
+tunnel_up() {
+  local port deadline pid=""
+  tunnel_down
+  command -v curl > /dev/null 2>&1 || die "curl is required"
+  port=$(perl -MIO::Socket::INET -e 'my $s = IO::Socket::INET->new(Listen => 1, LocalAddr => "127.0.0.1", LocalPort => 0, Proto => "tcp") or die "no free port"; print $s->sockport') || die "no free loopback port"
+  case "$port" in '' | *[!0-9]*) die "no free loopback port" ;; esac
+  # the tunnel must not hold this step's pipe open: its output goes to a file
+  ssh "${TUN_ARGS[@]}" -L "127.0.0.1:$port:127.0.0.1:$GW_PORT" -- "$DEST" < /dev/null > "$TMPD/tunnel.err" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$TUN_PIDFILE"
+  deadline=$(($(date +%s) + 30))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! kill -0 "$pid" 2> /dev/null; then
+      echo "ssh tunnel stderr: $(tail -n 3 "$TMPD/tunnel.err" | tr '\n' ' ')" >&2
+      die "the ssh tunnel to the $VM gateway exited (the VM's sshd may refuse the port forward); not falling back to the VM's address"
+    fi
+    # token-free: the gateway's status ping carries no credential
+    if curl -s -o /dev/null --noproxy '*' --max-time 3 "http://127.0.0.1:$port/StatusPing" 2> /dev/null; then
+      TUN_PORT=$port
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ssh tunnel stderr: $(tail -n 3 "$TMPD/tunnel.err" | tr '\n' ' ')" >&2
+  tunnel_down
+  die "the $VM gateway did not answer through the ssh tunnel within 30 s (the VM's sshd may refuse the port forward); not falling back to the VM's address"
+}
+
+tunnel_down() {
+  local pid
+  if [ -s "$TUN_PIDFILE" ]; then
+    pid=$(cat "$TUN_PIDFILE")
+    kill "$pid" 2> /dev/null || true
+    wait "$pid" 2> /dev/null || true
+    : > "$TUN_PIDFILE"
+  fi
+  TUN_PORT=
+}
+
+ign_gw() { # ign args... against the selected VM's gateway, only through the tunnel
+  [ -n "$TUN_PORT" ] || die "no ssh tunnel to the $VM gateway: nothing is sent to the gateway without it"
+  # bounded: a call that waits on a credential prompt (a keychain dialog) must fail, not hang
   if [ -n "$IGN_CFG" ]; then
-    IGNITION_CLI_CONFIG=$IGN_CFG IGNITION_URL="http://$URL_HOST:$GW_PORT" "$IGN" --profile "$PROFILE" --json "$@"
+    run_to "${T_IGN:-120}" env IGNITION_CLI_CONFIG="$IGN_CFG" IGNITION_URL="http://127.0.0.1:$TUN_PORT" "$IGN" --profile "$PROFILE" --json "$@"
   else
-    IGNITION_URL="http://$URL_HOST:$GW_PORT" "$IGN" --profile "$PROFILE" --json "$@"
+    run_to "${T_IGN:-120}" env IGNITION_URL="http://127.0.0.1:$TUN_PORT" "$IGN" --profile "$PROFILE" --json "$@"
   fi
 }
 
@@ -776,11 +870,12 @@ guard() {
   if ! run_to 60 ssh "${SSH_ARGS[@]}" -- "$DEST" whoami < /dev/null > /dev/null 2>&1; then
     die "the $VM host did not answer over ssh with the pinned host key; it may no longer be the test VM (the Windows VM address is dynamic)"
   fi
+  tunnel_up
   name=$(ign_gw api call --method GET --path /data/api/v1/gateway-info 2> /dev/null | jq -r '.data.result.data.name // empty' 2> /dev/null || true)
   if [ "$name" != "$GW_NAME" ]; then
-    die "gateway-info at the $VM host names '${name:-<nothing>}', not '$GW_NAME'"
+    die "gateway-info through the ssh tunnel names '${name:-<nothing>}', not '$GW_NAME' (an empty answer can be a credential prompt, such as a keychain dialog for the ign binary, that nobody answered)"
   fi
-  echo "GUARD ok $VM: ssh answered with the pinned key; gateway-info names $GW_NAME"
+  echo "GUARD ok $VM: ssh answered with the pinned key; gateway-info through the ssh tunnel names $GW_NAME"
 }
 
 project_present() { # exit 0 when CapApp27 is in the REST project list
@@ -796,6 +891,7 @@ each_vm() { # FUNCTION: run it once per selected VM, after the guard
     echo "######## $v: $fn"
     guard
     "$fn"
+    tunnel_down
   done
 }
 
@@ -905,19 +1001,84 @@ vm_scratch_down() {
 
 step_scratch_down() { each_vm vm_scratch_down; }
 
+step_guard() { each_vm vm_guard_only; }
+
+vm_guard_only() { echo "guard only: nothing else to do on $VM"; }
+
+# vm-gate TEST: the ignored live gate TEST of the one selected VM, cargo from the repo root
+# inside this step's redact-and-tee runner. It passes only on cargo exit 0 plus an anchored
+# `LIVE-RAN TEST` line (WR-D7, D-18). The gate reaches the gateway only through the tunnel:
+# the driver exports the loopback URL, and the gate refuses anything else (WR-D5).
+vm_vm_gate() {
+  local bin out=$TMPD/gate.out rc=0 t=$GATE_TEST
+  local -a gate_env
+  case "$VM" in
+    lnx)
+      bin=live_transport_lnxvm
+      gate_env=(
+        IGNITION_LIVE_LNXVM=1
+        "IGN_LNXVM_HOST=$HOST"
+        "IGN_LNXVM_USER=$SSH_USER"
+        "IGN_LNXVM_KEY_FILE=$KEYFILE"
+        "IGN_LNXVM_KNOWN_HOSTS=$PIN"
+        "IGN_LNXVM_PROFILE=$PROFILE"
+        "IGN_LNXVM_DATA_DIR=$DATA"
+        "IGN_LNXVM_GATEWAY_NAME=$GW_NAME"
+        "IGN_LNXVM_GATEWAY_URL=http://127.0.0.1:$TUN_PORT"
+        "IGNITION_CLI_CONFIG=$IGN_CFG"
+      )
+      ;;
+    win)
+      bin=live_transport_wincap
+      gate_env=(
+        IGNITION_LIVE_WINCAP=1
+        "IGN_WINCAP_HOST=$HOST"
+        "IGN_WINCAP_USER=$SSH_USER"
+        "IGN_WINCAP_KEY=${IGN_WINVM_KEY:-$(cat "$KEYFILE")}"
+        "IGN_WINCAP_KNOWN_HOSTS=$PIN"
+        "IGN_WINCAP_PROFILE=$PROFILE"
+        "IGN_WINCAP_DATA_DIR=$DATA"
+        "IGN_WINVM_GATEWAY_NAME=$GW_NAME"
+        "IGN_WINVM_GATEWAY_URL=http://127.0.0.1:$TUN_PORT"
+      )
+      ;;
+  esac
+  command -v cargo > /dev/null 2>&1 || die "cargo is required for vm-gate"
+  echo "== vm-gate $t ($bin)"
+  (
+    cd "$REPO_ROOT"
+    env "${gate_env[@]}" cargo test -p ignition-core --test "$bin" "$t" -- --ignored --nocapture --test-threads=1
+  ) 2>&1 | tee "$out"
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] || die "cargo test $t exited $rc"
+  grep -Eq "(^|[[:space:]])LIVE-RAN $t\$" "$out" || die "cargo test $t exited 0 but printed no LIVE-RAN $t line (a skipped gate is not a pass)"
+}
+
+step_vm_gate() {
+  local -a sel
+  read -r -a sel <<< "$VMS"
+  [ "${#sel[@]}" -eq 1 ] || die "vm-gate needs exactly one VM in CAPTURE27_VMS (lnx or win)"
+  each_vm vm_vm_gate
+}
+
 # ---------------------------------------------------------------------------
 # Run the step with its log and the redaction filter.
 # ---------------------------------------------------------------------------
 
 fn=step_${STEP//-/_}
-LOG=$EVID/27-07-$STEP.log
+LOG_STEP=${LOG_STEP:-$STEP}
+if [ "$STEP" = vm-gate ] && [ "$LOG_STEP" = vm-gate ]; then
+  LOG=$EVID/$RUN-$LOG_STEP-$GATE_TEST.log
+else
+  LOG=$EVID/$RUN-$LOG_STEP.log
+fi
 # Pre-resolve the host strings the filter must hide (without network access).
 R27_H1=${IGN_LNXVM_HOST:-}
 if [ -z "$R27_H1" ] && [ -r "$HOME/.cache/ign-lnxvm01/host" ]; then R27_H1=$(tr -d '[:space:]' < "$HOME/.cache/ign-lnxvm01/host"); fi
 R27_H2=${IGN_WINVM_HOST:-}
 export R27_H1 R27_H2
 
-printf 'capture27-vm %s started %s\n' "$STEP" "$(date -u +%FT%TZ)" > "$LOG"
+printf 'capture27-vm %s started %s\n' "$LOG_STEP" "$(date -u +%FT%TZ)" > "$LOG"
 rc=0
 set +e
 (
@@ -927,8 +1088,8 @@ set +e
 rc=${PIPESTATUS[0]}
 set -e
 if [ "$rc" -eq 0 ]; then
-  echo "LIVE-RAN capture27-vm $STEP" | tee -a "$LOG"
+  echo "LIVE-RAN capture27-vm $LOG_STEP" | tee -a "$LOG"
 else
-  echo "capture27-vm $STEP FAILED with exit $rc" | tee -a "$LOG" >&2
+  echo "capture27-vm $LOG_STEP FAILED with exit $rc" | tee -a "$LOG" >&2
 fi
 exit "$rc"
