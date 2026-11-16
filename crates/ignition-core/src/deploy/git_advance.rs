@@ -20,7 +20,9 @@
 //!   in-scope file on import, which would otherwise read as a deletion), checks
 //!   host git's status over the extracted export against the prediction, and
 //!   returns the [`AdvancePlan`]: fixed [`GitWrite`]s in the order the host
-//!   applies them. It writes nothing.
+//!   applies them (pack, pack index, index, config on an adoption, remote-tracking
+//!   ref, branch ref, HEAD: the index before every ref, config and HEAD, 27-26).
+//!   It writes nothing.
 //!
 //! A partial repo the module left behind (an unborn `HEAD`, no local branch, no
 //! index; [`GitStateKind::Adoptable`]) is advanced the same way under
@@ -479,8 +481,12 @@ pub struct AdvancePlan {
     pub remote: String,
     /// The release commit.
     pub release_commit: String,
-    /// Pack, pack index, branch ref, remote-tracking ref, config (adoption
-    /// only), HEAD, index.
+    /// In the order the host applies them and stops at the first failure:
+    /// pack, pack index, index, config (adoption only), remote-tracking ref,
+    /// discard ref (override only), branch ref, HEAD. The index is before
+    /// every ref, config and HEAD write, so a write that fails part way leaves
+    /// HEAD and the branch at the old commit over an index that holds the
+    /// release (staged changes, never a revert of the deploy).
     pub writes: Vec<GitWrite>,
     /// Release tree paths the export does not hold, byte-sorted; marked
     /// assume-unchanged in the index.
@@ -495,7 +501,10 @@ pub struct AdvancePlan {
 impl AdvancePlan {
     /// Keep the gateway commits this run abandons reachable (27-15, D-05): add
     /// the write of `refs/ign-discarded/<run_id>` naming `abandoned_head`,
-    /// right after the branch ref. The pack is unchanged: the abandoned
+    /// right before the branch ref (before HEAD when the plan has no branch
+    /// ref, at the end when it has no HEAD either). ign writes no reflog, so
+    /// if the branch moved first and this write then failed, the abandoned
+    /// commits would be left without a ref (27-26, WR-A1). The pack is unchanged: the abandoned
     /// commits' objects are already in the gateway repo, and a ref naming them
     /// keeps them there. A run id that is not a safe ref name, or a head that
     /// is not a full object id, adds nothing and is refused.
@@ -513,7 +522,12 @@ impl AdvancePlan {
             .writes
             .iter()
             .position(|w| matches!(w.name, GitWriteName::BranchRef(_)))
-            .map_or(self.writes.len(), |i| i + 1);
+            .or_else(|| {
+                self.writes
+                    .iter()
+                    .position(|w| matches!(w.name, GitWriteName::Head))
+            })
+            .unwrap_or(self.writes.len());
         self.writes.insert(
             at,
             GitWrite {
@@ -584,20 +598,21 @@ pub async fn finish_advance(
             bytes: pack.idx.clone(),
         });
     }
+    // The index goes before every ref, config and HEAD write (27-26, WR-A1,
+    // D-06, D-10). A write that fails part way stops the host with the
+    // earlier ones applied and no undo: with the index first, HEAD and the
+    // branch still name the old commit and the index holds the release, which
+    // reads as the release's changes staged on the old commit. The old order
+    // (index last) left the branch at the release over the old index, or HEAD
+    // on a branch with no index, which a Designer commit or discard turns into
+    // a revert of the deploy.
+    writes.push(GitWrite {
+        name: GitWriteName::Index,
+        bytes: index,
+    });
     let commit_line = format!("{}\n", prep.release_commit).into_bytes();
-    writes.push(GitWrite {
-        name: GitWriteName::BranchRef(prep.branch.clone()),
-        bytes: commit_line.clone(),
-    });
-    writes.push(GitWrite {
-        name: GitWriteName::RemoteRef {
-            remote: prep.remote.clone(),
-            branch: prep.branch.clone(),
-        },
-        bytes: commit_line,
-    });
-    // An adopted repo's upstream section: after the remote-tracking ref,
-    // before HEAD, so a reader that sees HEAD on the branch sees the section.
+    // An adopted repo's upstream section: after the index, before the refs and
+    // HEAD, so a reader that sees HEAD on the branch sees the section.
     if let Some(config) = &prep.config {
         writes.push(GitWrite {
             name: GitWriteName::Config,
@@ -605,12 +620,20 @@ pub async fn finish_advance(
         });
     }
     writes.push(GitWrite {
-        name: GitWriteName::Head,
-        bytes: format!("ref: refs/heads/{}\n", prep.branch).into_bytes(),
+        name: GitWriteName::RemoteRef {
+            remote: prep.remote.clone(),
+            branch: prep.branch.clone(),
+        },
+        bytes: commit_line.clone(),
+    });
+    // `keep_discarded` puts the discard ref of an override right before this.
+    writes.push(GitWrite {
+        name: GitWriteName::BranchRef(prep.branch.clone()),
+        bytes: commit_line,
     });
     writes.push(GitWrite {
-        name: GitWriteName::Index,
-        bytes: index,
+        name: GitWriteName::Head,
+        bytes: format!("ref: refs/heads/{}\n", prep.branch).into_bytes(),
     });
     for write in &writes {
         write
@@ -1138,7 +1161,7 @@ mod tests {
         let plan = finish_advance(&host, &f.seed, &prep, &export)
             .await
             .expect("plan");
-        assert_eq!(kinds(&plan), vec!["branch", "remote", "head", "index"]);
+        assert_eq!(kinds(&plan), vec!["index", "remote", "branch", "head"]);
         f.apply(&plan);
         assert_eq!(f.status_paths(), plan.expected_drift);
     }
@@ -1352,7 +1375,7 @@ mod tests {
             .expect("plan");
         assert_eq!(
             kinds(&plan),
-            vec!["pack", "idx", "branch", "remote", "head", "index"]
+            vec!["pack", "idx", "index", "remote", "branch", "head"]
         );
         let pack = prep.pack.as_ref().expect("pack");
         let rels: Vec<String> = plan.writes.iter().map(|w| w.name.rel()).collect();
@@ -1361,14 +1384,14 @@ mod tests {
             vec![
                 format!("objects/pack/pack-{}.pack", pack.name),
                 format!("objects/pack/pack-{}.idx", pack.name),
-                "refs/heads/production".to_string(),
-                "refs/remotes/origin/production".to_string(),
-                "HEAD".to_string(),
                 "index".to_string(),
+                "refs/remotes/origin/production".to_string(),
+                "refs/heads/production".to_string(),
+                "HEAD".to_string(),
             ]
         );
-        assert_eq!(plan.writes[4].bytes, b"ref: refs/heads/production\n");
-        assert_eq!(plan.writes[2].bytes, format!("{}\n", f.c2).into_bytes());
+        assert_eq!(plan.writes[5].bytes, b"ref: refs/heads/production\n");
+        assert_eq!(plan.writes[4].bytes, format!("{}\n", f.c2).into_bytes());
         for write in &plan.writes {
             write.name.check_shape().expect("fixed shape");
         }
@@ -1393,11 +1416,15 @@ mod tests {
     }
 
     #[test]
-    fn keep_discarded_adds_the_ref_after_the_branch() {
+    fn keep_discarded_adds_the_ref_before_the_branch() {
         let head = "a".repeat(40);
         let write = |name: GitWriteName| GitWrite {
             name,
             bytes: Vec::new(),
+        };
+        let remote = || GitWriteName::RemoteRef {
+            remote: "capapp".to_string(),
+            branch: "production".to_string(),
         };
         let mut plan = AdvancePlan {
             branch: "production".to_string(),
@@ -1405,13 +1432,10 @@ mod tests {
             release_commit: "b".repeat(40),
             writes: vec![
                 write(GitWriteName::PackFile("c".repeat(40))),
-                write(GitWriteName::BranchRef("production".to_string())),
-                write(GitWriteName::RemoteRef {
-                    remote: "capapp".to_string(),
-                    branch: "production".to_string(),
-                }),
-                write(GitWriteName::Head),
                 write(GitWriteName::Index),
+                write(remote()),
+                write(GitWriteName::BranchRef("production".to_string())),
+                write(GitWriteName::Head),
             ],
             assume_unchanged: Vec::new(),
             dropped: Vec::new(),
@@ -1424,14 +1448,14 @@ mod tests {
             names,
             [
                 format!("objects/pack/pack-{}.pack", "c".repeat(40)),
-                "refs/heads/production".to_string(),
-                "refs/ign-discarded/20261113T101500Z-ab12cd".to_string(),
-                "refs/remotes/capapp/production".to_string(),
-                "HEAD".to_string(),
                 "index".to_string(),
+                "refs/remotes/capapp/production".to_string(),
+                "refs/ign-discarded/20261113T101500Z-ab12cd".to_string(),
+                "refs/heads/production".to_string(),
+                "HEAD".to_string(),
             ]
         );
-        assert_eq!(plan.writes[2].bytes, format!("{head}\n").into_bytes());
+        assert_eq!(plan.writes[3].bytes, format!("{head}\n").into_bytes());
         // Unsafe run ids and a short head add nothing.
         for run in ["", "../x", ".hidden", "a b", "a..b", "x.lock"] {
             let before = plan.writes.len();
@@ -1439,5 +1463,30 @@ mod tests {
             assert_eq!(plan.writes.len(), before);
         }
         assert!(plan.keep_discarded("run-1", "abc").is_err());
+
+        // No branch ref in the plan: before HEAD, never after it; with no
+        // HEAD either, at the end.
+        for (given, want) in [
+            (
+                vec![GitWriteName::Index, GitWriteName::Head],
+                vec!["index", "refs/ign-discarded/run-1", "HEAD"],
+            ),
+            (
+                vec![GitWriteName::Index, remote()],
+                vec![
+                    "index",
+                    "refs/remotes/capapp/production",
+                    "refs/ign-discarded/run-1",
+                ],
+            ),
+        ] {
+            let mut bare = AdvancePlan {
+                writes: given.into_iter().map(write).collect(),
+                ..plan.clone()
+            };
+            bare.keep_discarded("run-1", &head).expect("added");
+            let names: Vec<String> = bare.writes.iter().map(|w| w.name.rel()).collect();
+            assert_eq!(names, want);
+        }
     }
 }

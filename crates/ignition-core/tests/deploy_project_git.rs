@@ -248,6 +248,149 @@ async fn handover_dropped_in_scope_member() {
     f.git_in_project(&["fsck", "--connectivity-only"]);
 }
 
+/// A git writer that applies the first `applied` writes of an advance, in
+/// order, and then fails: the lock that appears between two renames, or a
+/// full disk, in the middle of the advance.
+struct FailsAfter {
+    inner: ignition_core::deploy::transport::local::LocalFsTransport,
+    applied: usize,
+}
+
+#[async_trait::async_trait]
+impl GitStateWriter for FailsAfter {
+    async fn save_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.inner.save_git(gateway, project, run_id).await
+    }
+    async fn restore_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.inner.restore_git(gateway, project, run_id).await
+    }
+    async fn write_git_files(
+        &self,
+        project: &str,
+        writes: &[GitWrite],
+    ) -> Result<(), ignition_core::error::CoreError> {
+        let first = &writes[..self.applied.min(writes.len())];
+        self.inner.write_git_files(project, first).await?;
+        Err(ignition_core::error::CoreError::TransportFailed {
+            operation: "write".to_string(),
+            node: "nodes.master".to_string(),
+            detail: "the write was refused after the first files".to_string(),
+        })
+    }
+    async fn remove_git_save(
+        &self,
+        g: &str,
+        p: &str,
+        r: &str,
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.inner.remove_git_save(g, p, r).await
+    }
+    async fn probe_write(
+        &self,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.inner.probe_write(project, run_id).await
+    }
+}
+
+/// WR-A1 (27-26, D-06, D-10): the advance writes the index before every ref,
+/// config and HEAD. A write that fails right after pack, pack index and index
+/// leaves HEAD and the branch at the old commit with an index that holds the
+/// release: the release shows as staged changes on the old commit, never the
+/// deploy reversed.
+#[tokio::test]
+async fn handover_write_fails_after_index_leaves_staged_changes() {
+    let f = GitFixture::new();
+    let host = HostGit::new();
+    let node = f.node();
+    let (state, prep) = f.prepare(&host).await;
+    assert!(prep.pack.is_some(), "the release commit needs a pack");
+    let saved = save(&node, &node, GATEWAY, PROJECT, RUN)
+        .await
+        .expect("save");
+    f.module_import(false, &[UTIL_RES], &[], &[]);
+    // Pack, pack index, index: the first three writes of the advance.
+    let writer = FailsAfter {
+        inner: f.node(),
+        applied: 3,
+    };
+    let failure = restore_and_advance(
+        &node,
+        &writer,
+        &host,
+        &f.checkout,
+        &state,
+        &saved,
+        &prep,
+        &f.export_zip(),
+        None,
+    )
+    .await
+    .expect_err("the write fails after the index");
+    assert_eq!(failure.reason, "advance_failed", "{failure:?}");
+    assert!(RESTORE_REASONS.contains(&failure.reason));
+    assert_eq!(failure.save_path, saved.path);
+    assert!(f.data_dir.join(&failure.save_path).is_dir(), "save kept");
+
+    // HEAD and the branch still name the old commit.
+    assert_eq!(f.git_in_project(&["rev-parse", "HEAD"]), f.c1);
+    assert_eq!(
+        f.git_in_project(&["rev-parse", &format!("refs/heads/{BRANCH}")]),
+        f.c1
+    );
+    assert_eq!(
+        f.git_in_project(&["rev-parse", &format!("refs/remotes/{REMOTE}/{BRANCH}")]),
+        f.c1
+    );
+
+    // The index describes the release: old commit to index is the release's
+    // changes as staged work, not their reverse. Asked on a copy of the repo.
+    let copy = tempfile::tempdir().expect("tempdir");
+    let copied = copy.path().join("repo");
+    let status = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(f.project_dir())
+        .arg(&copied)
+        .status()
+        .expect("cp runs");
+    assert!(status.success());
+    let out = std::process::Command::new("git")
+        .args(["write-tree"])
+        .current_dir(&copied)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let index_tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        index_tree,
+        git(&copied, &["rev-parse", &format!("{}^{{tree}}", f.c2)]),
+        "the index must hold the release tree"
+    );
+}
+
 #[tokio::test]
 async fn restore_never_overwrites() {
     let f = GitFixture::new();
@@ -4795,11 +4938,11 @@ mod published {
             [
                 "pack".to_string(),
                 "idx".to_string(),
-                format!("refs/heads/{BRANCH}"),
-                format!("refs/remotes/origin/{BRANCH}"),
-                "config".to_string(),
-                "HEAD".to_string(),
                 "index".to_string(),
+                "config".to_string(),
+                format!("refs/remotes/origin/{BRANCH}"),
+                format!("refs/heads/{BRANCH}"),
+                "HEAD".to_string(),
             ]
         );
         // The first write is only planned: nothing was written.

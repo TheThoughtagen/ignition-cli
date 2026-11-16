@@ -81,8 +81,8 @@ pub struct GitRestoreReport {
 }
 
 /// The gateway commits an advance abandons (27-15, D-05): the advance writes
-/// `refs/ign-discarded/<run_id>` naming `abandoned_head`, so they stay
-/// reachable once the branch moves to the release.
+/// `refs/ign-discarded/<run_id>` naming `abandoned_head` before the branch ref
+/// moves, so they stay reachable once the branch moves to the release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Discarding<'a> {
     /// The run that discards them (the ref's name).
@@ -173,7 +173,10 @@ async fn classify_live(
 /// advance was prepared against (`state`); `.git` present: it must be that
 /// same repo, else `git_recreated` and it is left alone; anything else at
 /// `.git` is `git_recreated` too. (c) the writes, lock-and-rename, through
-/// `write`. (d) each written file's sha256 read back.
+/// `write`, in the plan's order: the index before every ref, config and HEAD
+/// write, so a write that fails part way leaves HEAD and the branch at the old
+/// commit over an index that holds the release (27-26, WR-A1). (d) each
+/// written file's sha256 read back.
 ///
 /// With `discard` the writes of (c) include `refs/ign-discarded/<run id>`
 /// naming the abandoned HEAD (27-15, D-05), and the report says `keep_save`:
@@ -209,9 +212,9 @@ pub async fn restore_and_advance(
     let plan = match finish_advance(git, checkout, prep, export_zip).await {
         Ok(mut plan) => {
             // The abandoned HEAD stays reachable through a ref the advance
-            // writes next to the branch (27-15). The ref write is part of the
-            // plan, so it is shape-checked with the rest before any `.git`
-            // write.
+            // writes right before the branch ref moves (27-15, 27-26). The ref
+            // write is part of the plan, so it is shape-checked with the rest
+            // before any `.git` write.
             if let Some(discard) = discard
                 && let Err(why) = plan.keep_discarded(discard.run_id, discard.abandoned_head)
             {
