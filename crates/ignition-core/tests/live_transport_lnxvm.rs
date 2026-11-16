@@ -1830,18 +1830,24 @@ async fn lnxvm_conformance_table_on_host() {
 // `capture27-vm.sh project-up` and `upload` (with `PRODSHAPE_GIT_OUT`) first;
 // `project-down` and `scratch-down` clean up after.
 //
-// Run it through the driver (27-29, `CAPTURE27_VMS=lnx ... vm-gate lnxvm_git_handover`),
-// which tunnels the gateway to 127.0.0.1, exports `IGN_LNXVM_GATEWAY_URL` and the gate's
-// environment, redacts the output and writes the log to the private evidence directory.
-// The gate refuses an `http://` URL whose host is not loopback, and an unset
-// `IGN_LNXVM_GATEWAY_URL`. The 451 MB object fetch does not fit the 60 s budget over the
-// operator link, so the full run is on ign-lnx-836 itself (27-25 record; the driver step
-// `lnxvm-handover` for that comes in 27-32), where the URL is `http://127.0.0.1:8088`:
+// Run it through the driver step `lnxvm-handover` (27-32). The 451 MB object fetch does not
+// fit the 60 s budget over the operator link (27-25 record), so the step builds this test
+// binary on ign-lnx-836 itself and runs the gate there as the deploy account: the deploy key
+// stays on the operator machine (a dedicated forwarded agent), the gateway token crosses only
+// inside ssh stdin, the gateway is at `http://127.0.0.1:8088` on the VM, and the output is
+// redacted into the private evidence directory. It passes only on exit 0 plus this gate's
+// `LIVE-RAN` line:
 //
 // ```text
-// export CAPTURE27_VMS=lnx PRODSHAPE_GIT_OUT=...
-// bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh vm-gate lnxvm_git_handover
+// bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh project-up
+// PRODSHAPE_GIT_OUT=... bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh upload
+// (the stand-in owner and ACL grant on CapApp27, see 27-LIVE-CAPTURES.md)
+// CAPTURE27_RUN=<run> bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh lnxvm-handover
 // ```
+//
+// `capture27-vm.sh vm-gate lnxvm_git_handover` runs the same gate from the operator machine
+// through the driver's loopback tunnel (27-29); the gate refuses an `http://` URL whose host
+// is not loopback, and an unset `IGN_LNXVM_GATEWAY_URL`.
 
 const HANDOVER_PROJECT: &str = "CapApp27";
 const HANDOVER_RUN: &str = "20261115T120000Z-l27h";

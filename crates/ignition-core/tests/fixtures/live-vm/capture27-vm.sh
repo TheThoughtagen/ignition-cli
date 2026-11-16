@@ -30,7 +30,10 @@
 #   project-down  remove CapApp27 only and quote the REST project list
 #   scratch-down  remove ign-live-scratch/git27 (NOT run in 27-07: 27-09 and 27-11
 #                 run their WinScripts on the uploaded `.git`; 27-25 runs it last)
-#   emit NAME     print the remote script NAME (offline test aid), e.g. lnx-g4
+#   emit NAME     print the remote script NAME (offline test aid), e.g. lnx-g4;
+#                 lnx-handover (the run script that receives the token on stdin) and its
+#                 phases lnx-handover-setup, lnx-handover-build, lnx-handover-pin and
+#                 lnx-handover-clean
 #   guard         the guard only: ssh answers with the pinned key, the gateway tunnel
 #                 comes up and gateway-info through it names the expected test gateway
 #   vm-gate TEST  run the ignored live gate TEST (`^[a-z0-9_]+$`) of the one VM in
@@ -40,7 +43,22 @@
 #                 a `LIVE-RAN TEST` line matched as a whole word at the end of its line
 #   winvm-handover  `vm-gate wincap_git_handover` with the Windows VM fixed; it passes
 #                 PRODSHAPE_GIT_OUT and IGN_PROD_SHAPE_FILE through when exported
-#                 (`lnxvm-handover`, the Linux gate run ON ign-lnx-836, comes in 27-32)
+#   lnxvm-handover  the Linux handover gate (`lnxvm_git_handover`) run ON ign-lnx-836
+#                 itself (the operator link cannot carry its 451 MB object fetch inside
+#                 the 60 s budget, 27-25), as the deploy account. It needs project-up,
+#                 upload and the stand-in grant first. In order: a private 0700 work dir
+#                 in the deploy account's home (removed on every exit path); `git archive
+#                 HEAD` streamed in; a rustup-minimal toolchain inside the work dir and
+#                 the ign lean build plus the gate's test binary, 2 jobs; a known_hosts for
+#                 the VM's own private address, written only after the VM's own host key
+#                 fingerprint equals the operator's pinned entry; a dedicated ssh-agent
+#                 holding only the deploy key, forwarded with `ssh -A` over
+#                 `-o IdentityAgent=<socket>` (the key file is never copied; the target's
+#                 `key_file` names its public half); the gateway token only on ssh stdin;
+#                 the gateway at the VM's own loopback. It passes only on remote exit 0
+#                 plus an anchored `LIVE-RAN lnxvm_git_handover` line. Needs
+#                 PRODSHAPE_GIT_OUT only for `upload`: the gate's fixture on the VM is the
+#                 uploaded remote.git.
 #
 # Environment. Addresses, accounts and key paths come only from here (or from
 # the user's own 0600 files named below); nothing is written to a tracked file.
@@ -92,9 +110,9 @@ export LC_ALL=C
 
 STEP=${1:-}
 case "$STEP" in
-  project-up | upload | g1-before | g4 | g8 | g8-jgit | g1-after | project-down | scratch-down | emit | guard | vm-gate | winvm-handover) ;;
+  project-up | upload | g1-before | g4 | g8 | g8-jgit | g1-after | project-down | scratch-down | emit | guard | vm-gate | winvm-handover | lnxvm-handover) ;;
   *)
-    echo "usage: capture27-vm.sh project-up|upload|g1-before|g4|g8|g8-jgit|g1-after|project-down|scratch-down|guard|winvm-handover|emit NAME|vm-gate TEST" >&2
+    echo "usage: capture27-vm.sh project-up|upload|g1-before|g4|g8|g8-jgit|g1-after|project-down|scratch-down|guard|winvm-handover|lnxvm-handover|emit NAME|vm-gate TEST" >&2
     exit 64
     ;;
 esac
@@ -108,6 +126,7 @@ case "$STEP" in
     CAPTURE27_VMS=win
     LOG_STEP=winvm-handover
     ;;
+  lnxvm-handover) CAPTURE27_VMS=lnx ;;
 esac
 if [ "$STEP" = vm-gate ]; then
   case "$GATE_TEST" in
@@ -330,6 +349,176 @@ done
 echo "project directory: still present"
 ls -la "$DATA/projects/$PROJ" 2>&1
 exit 1
+EOS
+}
+
+# --- lnxvm-handover (27-32): the Linux handover gate run ON the VM -------------------------
+# Four phases, each a bash script fed to `bash -s` with its parameters exported first.
+# Only the run phase receives the gateway token, and only on that ssh stdin.
+
+R_lnx_handover_setup() {
+  cat <<'EOS'
+set -eu
+umask 077
+d=$(mktemp -d "$HOME/ign-lnxho.XXXXXX")
+chmod 700 "$d"
+mkdir "$d/src" "$d/fixture"
+echo "HANDOVER-WORKDIR=$d"
+EOS
+}
+
+R_lnx_handover_build() {
+  cat <<'EOS'
+set -eu
+case "$WORK" in "$HOME"/ign-lnxho.*) ;; *) echo "refusing an unexpected work dir" >&2; exit 2 ;; esac
+cd "$WORK"
+export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo" CARGO_TARGET_DIR="$WORK/target"
+t0=$(date +%s)
+echo "== fixture: the uploaded remote.git becomes the gate's capapp.git"
+[ -d "$HOME/$SCRATCH_REL/remote.git" ] || { echo "no uploaded remote.git: run upload first" >&2; exit 2; }
+cp -a "$HOME/$SCRATCH_REL/remote.git" "$WORK/fixture/capapp.git"
+echo "== toolchain (rustup-minimal inside the work dir)"
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$WORK/rustup-init.sh" < /dev/null
+sh "$WORK/rustup-init.sh" -y --profile minimal --no-modify-path --default-toolchain stable < /dev/null > "$WORK/rustup.log" 2>&1 || { tail -n 20 "$WORK/rustup.log"; exit 1; }
+rm -f "$WORK/rustup-init.sh"
+export PATH="$CARGO_HOME/bin:$PATH"
+rustc --version
+cd "$WORK/src"
+echo "== ign lean build, 2 jobs"
+cargo build -p ignition-cli --no-default-features -j 2 < /dev/null 2>&1 | tail -n 3
+echo "== the gate's test binary, 2 jobs"
+cargo test -p ignition-core --test live_transport_lnxvm --no-run -j 2 < /dev/null 2>&1 | tail -n 3
+[ -x "$WORK/target/debug/ign" ] || { echo "no ign binary was built" >&2; exit 1; }
+echo "build total $(($(date +%s) - t0)) s"
+EOS
+}
+
+R_lnx_handover_pin() {
+  cat <<'EOS'
+set -eu
+case "$WORK" in "$HOME"/ign-lnxho.*) ;; *) echo "refusing an unexpected work dir" >&2; exit 2 ;; esac
+priv=$(ip -4 route get 1.1.1.1 2> /dev/null | sed -n 's/.* src \([0-9.][0-9.]*\).*/\1/p' | head -n 1)
+[ -n "$priv" ] || priv=$(hostname -I | awk '{ print $1 }')
+case "$priv" in
+  10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.*) ;;
+  *) echo "the VM's own address is not a private address" >&2; exit 2 ;;
+esac
+# the VM's own host key fingerprints
+own=$WORK/own.fp
+: > "$own"
+for f in /etc/ssh/ssh_host_*_key.pub; do
+  ssh-keygen -lf "$f" | awk '{ print $2 }' >> "$own"
+done
+# the operator's pinned entries, re-addressed to the VM's own private address; a line is kept
+# only when its fingerprint equals one of the VM's own host keys
+: > "$WORK/known_hosts"
+kept=0
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  one=$WORK/pin.one
+  printf '%s\n' "$line" | awk -v h="$priv" '{ $1 = h; print }' > "$one"
+  fp=$(ssh-keygen -lf "$one" 2> /dev/null | awk '{ print $2 }' | head -n 1)
+  if [ -n "$fp" ] && grep -qxF "$fp" "$own"; then
+    cat "$one" >> "$WORK/known_hosts"
+    kept=$((kept + 1))
+    echo "host key fingerprint equal: $fp"
+  else
+    echo "a pinned entry's fingerprint is not one of the VM's own: ${fp:-none}"
+  fi
+done <<EOF2
+$PIN_LINES
+EOF2
+rm -f "$WORK/pin.one" "$own"
+if [ "$kept" -lt 1 ]; then echo "REFUSING: no pinned host key equals the VM's own host key" >&2; exit 2; fi
+chmod 600 "$WORK/known_hosts"
+# the public half of the deploy key: ssh then asks the forwarded agent for the private half
+printf '%s\n' "$PUBKEY" > "$WORK/key.pub"
+chmod 600 "$WORK/key.pub"
+# a profile for the gate's own ign calls; the token comes from the environment at run time
+umask 077
+{
+  printf '[profiles.%s]\n' "$PROFILE"
+  printf 'url = "http://127.0.0.1:%s/"\n' "$GW_PORT"
+  printf 'ssl_verify = true\n\n'
+  printf '[profiles.%s.auth]\n' "$PROFILE"
+  printf 'token_env = "%s"\n' "$TOKEN_VAR"
+} > "$WORK/config.toml"
+echo "HANDOVER-PRIVADDR=$priv"
+EOS
+}
+
+R_lnx_handover() {
+  cat <<'EOS'
+set -u
+case "$WORK" in "$HOME"/ign-lnxho.*) ;; *) echo "refusing an unexpected work dir" >&2; exit 2 ;; esac
+export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo" CARGO_TARGET_DIR="$WORK/target"
+export PATH="$WORK/target/debug:$CARGO_HOME/bin:$PATH"
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then echo "REFUSING: no forwarded agent" >&2; exit 2; fi
+n=$(ssh-add -l < /dev/null 2> /dev/null | grep -c . || true)
+if [ "$n" != 1 ]; then echo "REFUSING: the forwarded agent holds $n keys, expected exactly 1" >&2; exit 2; fi
+echo "forwarded agent: 1 key ($(ssh-add -l < /dev/null | awk '{ print $2 }'))"
+if [ -z "${!TOKEN_VAR:-}" ]; then echo "REFUSING: the gateway token did not arrive on stdin" >&2; exit 2; fi
+export IGNITION_LIVE_LNXVM=1
+export IGN_LNXVM_HOST="$PRIVADDR" IGN_LNXVM_USER="$DEPLOY_USER"
+export IGN_LNXVM_KEY_FILE="$WORK/key.pub" IGN_LNXVM_KNOWN_HOSTS="$WORK/known_hosts"
+export IGN_LNXVM_PROFILE="$PROFILE" IGN_LNXVM_DATA_DIR="$DATA" IGN_LNXVM_GATEWAY_NAME="$GW_NAME"
+export IGN_LNXVM_GATEWAY_URL="http://127.0.0.1:$GW_PORT"
+export IGNITION_CLI_CONFIG="$WORK/config.toml" PRODSHAPE_GIT_OUT="$WORK/fixture"
+cd "$WORK/src" || exit 2
+load1() { cut -d' ' -f1 /proc/loadavg; }
+echo "LOAD before $(load1)"
+samples=$WORK/load.samples
+: > "$samples"
+( while :; do load1 >> "$samples"; sleep 5; done ) < /dev/null > /dev/null 2>&1 &
+sampler=$!
+rc=0
+cargo test -p ignition-core --test live_transport_lnxvm lnxvm_git_handover -- --ignored --nocapture --test-threads=1 < /dev/null || rc=$?
+kill "$sampler" 2> /dev/null || true
+echo "LOAD after $(load1) during $(sort -n "$samples" | sed -n '1p') to $(sort -n "$samples" | tail -n 1) over $(grep -c . "$samples") samples"
+echo "== after the gate (as the deploy account): the gateway account's entries on what the advance wrote"
+gitdir="$DATA/projects/CapApp27/.git"
+if [ -d "$gitdir" ]; then
+  u=$(stat -c %u "$DATA/projects/CapApp27")
+  echo "owner uid of the project: $u; deploy uid: $(id -u)"
+  nd=0; nn=0; nf=0
+  while IFS= read -r -d '' d; do
+    nd=$((nd + 1))
+    if getfacl -n -p -- "$d" 2> /dev/null | tr '\t' ' ' | grep -q "^user:$u:"; then nn=$((nn + 1)); else echo "DIR-NO-NAMED-ENTRY ${d#"$gitdir"}"; fi
+  done < <(find "$gitdir" -type d -print0)
+  echo "directories: $nd, with a named access entry for uid $u: $nn"
+  nfn=0
+  while IFS= read -r -d '' f; do
+    nf=$((nf + 1))
+    if getfacl -n -p -- "$f" 2> /dev/null | tr '\t' ' ' | grep -q "^user:$u:"; then nfn=$((nfn + 1)); else echo "FILE-NO-NAMED-ENTRY $(stat -c '%a %U' -- "$f") ${f#"$gitdir"/}"; fi
+  done < <(find "$gitdir" -type f -print0)
+  echo "files: $nf, with a named access entry for uid $u: $nfn"
+  for p in HEAD index refs/heads/production; do
+    if [ -e "$gitdir/$p" ]; then
+      echo "-- $p: $(stat -c 'owner=%U mode=%a' -- "$gitdir/$p")"
+      getfacl -n -p -- "$gitdir/$p" 2> /dev/null | grep -E '^(user|mask)' | tr '\t' ' '
+    fi
+  done
+  echo "-- the five directories made last (birth time), with their entries"
+  find "$gitdir" -type d -exec stat -c '%W %n' {} + 2> /dev/null | sort -n | tail -n 5 | while read -r _ d; do
+    echo "-- ${d#"$gitdir"}: $(stat -c 'owner=%U mode=%a' -- "$d")"
+    getfacl -n -p -- "$d" 2> /dev/null | grep -E '^(default:)?(user|mask)' | tr '\t' ' '
+  done
+fi
+exit "$rc"
+EOS
+}
+
+R_lnx_handover_clean() {
+  cat <<'EOS'
+set -u
+case "$WORK" in
+  *[!A-Za-z0-9._/-]* | *..*) echo "refusing an unexpected work dir" >&2; exit 2 ;;
+  "$HOME"/ign-lnxho.*) ;;
+  *) echo "refusing an unexpected work dir" >&2; exit 2 ;;
+esac
+rm -rf -- "$WORK"
+if [ -e "$WORK" ]; then echo "work dir: still present"; exit 1; fi
+echo "work dir: removed"
 EOS
 }
 
@@ -649,11 +838,14 @@ fi
 TMPD=$(mktemp -d)
 chmod 700 "$TMPD"
 TUN_PIDFILE=$TMPD/tunnel.pid
+AGENT_PIDFILE=$TMPD/agent.pid
+AGENT_SOCK=$TMPD/agent.sock
 TUN_PORT=
 # The tunnel's pid lives in a file: the step runs in a subshell, and an EXIT trap is not
 # inherited by it, so this trap (the main shell's) is what closes a tunnel left open.
 cleanup() {
   tunnel_down
+  agent_down
   /bin/rm -rf "$TMPD"
 }
 trap cleanup EXIT
@@ -1059,6 +1251,131 @@ step_vm_gate() {
   read -r -a sel <<< "$VMS"
   [ "${#sel[@]}" -eq 1 ] || die "vm-gate needs exactly one VM in CAPTURE27_VMS (lnx or win)"
   each_vm vm_vm_gate
+}
+
+# ---------------------------------------------------------------------------
+# lnxvm-handover (27-32, WR-D7): the Linux handover gate run ON ign-lnx-836
+# ---------------------------------------------------------------------------
+
+# A dedicated ssh-agent that holds only the deploy key. ssh reaches it with
+# `-o IdentityAgent=<socket>` and forwards exactly that agent to the VM, so the key
+# file is never copied and the operator's own agent is never involved.
+agent_up() {
+  local out pid
+  command -v ssh-agent > /dev/null 2>&1 || die "ssh-agent is required"
+  command -v ssh-add > /dev/null 2>&1 || die "ssh-add is required"
+  [ "${#AGENT_SOCK}" -le 100 ] || die "the agent socket path is too long for a unix socket"
+  out=$(ssh-agent -a "$AGENT_SOCK" -s) || die "could not start the dedicated ssh-agent"
+  pid=$(printf '%s\n' "$out" | sed -n 's/^SSH_AGENT_PID=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  [ -n "$pid" ] || die "could not read the dedicated ssh-agent's pid"
+  printf '%s\n' "$pid" > "$AGENT_PIDFILE"
+  SSH_AUTH_SOCK=$AGENT_SOCK ssh-add "$KEYFILE" < /dev/null > /dev/null 2>&1 || die "ssh-add could not load the deploy key into the dedicated agent"
+  [ "$(SSH_AUTH_SOCK=$AGENT_SOCK ssh-add -l < /dev/null | grep -c .)" = 1 ] || die "the dedicated agent does not hold exactly one key"
+  echo "dedicated agent: holds exactly one key"
+}
+
+agent_down() {
+  local pid
+  if [ -s "$AGENT_PIDFILE" ]; then
+    pid=$(cat "$AGENT_PIDFILE")
+    kill "$pid" 2> /dev/null || true
+    : > "$AGENT_PIDFILE"
+  fi
+}
+
+HO_WORK=
+
+# Runs at the step's exit on every path (the step is a subshell; its trap is its own):
+# the dedicated agent, the tunnel and the VM work dir go away, and a work dir that cannot
+# be removed is named and fails the step.
+ho_cleanup() {
+  local rc=$?
+  trap - EXIT
+  agent_down
+  tunnel_down
+  if [ -n "$HO_WORK" ]; then
+    if ! { printf 'export WORK=%q\n' "$HO_WORK"; R_lnx_handover_clean; } | run_to 180 ssh "${SSH_ARGS[@]}" -- "$DEST" 'bash -s'; then
+      echo "LEFTOVER on the VM, remove by hand: $HO_WORK" >&2
+      [ "$rc" -ne 0 ] || rc=1
+    fi
+  fi
+  exit "$rc"
+}
+
+vm_lnxvm_handover() {
+  local out=$TMPD/handover.out rc=0 head tokvar tok pin_lines pubkey setup pinned
+  local -a fwd_args=()
+  local o i=0
+  [ "$VM" = lnx ] || die "lnxvm-handover is a Linux step"
+  trap 'exit 130' INT HUP
+  trap 'exit 143' TERM
+  trap ho_cleanup EXIT
+  # the gate reaches the gateway on the VM's own loopback, so the operator tunnel is not needed
+  tunnel_down
+  git -C "$REPO_ROOT" diff --quiet HEAD -- || die "tracked files differ from HEAD: the VM builds 'git archive HEAD', so commit first"
+  head=$(git -C "$REPO_ROOT" rev-parse --short HEAD)
+  tokvar=$(sed -n 's/^token_env *= *"\([A-Z0-9_]*\)".*/\1/p' "$IGN_CFG" | head -n 1)
+  case "$tokvar" in IGNITION_TOKEN_[A-Z0-9_]*) ;; *) die "the profile's token_env is not an IGNITION_TOKEN_ variable" ;; esac
+  tok=${!tokvar:-}
+  [ -n "$tok" ] || die "$tokvar is empty: the gateway token is read from the user's own cache file or the environment"
+  case "$tok" in *[[:space:]]* | *[[:cntrl:]]*) die "the gateway token holds whitespace" ;; esac
+  [ -r "$KEYFILE.pub" ] || die "the deploy key's public half ($KEYFILE.pub) is not readable"
+  pubkey=$(head -n 1 "$KEYFILE.pub")
+  case "$pubkey" in ssh-ed25519\ * | ssh-rsa\ * | ecdsa-sha2-*) ;; *) die "the public key file is not a public key" ;; esac
+  pin_lines=$(awk -v h="$HOST" '$1 == h' "$PIN")
+  [ -n "$pin_lines" ] || die "the pinned known_hosts has no plain entry for the VM"
+  echo "== lnxvm-handover: HEAD $head, build and run on the VM as $SSH_USER"
+
+  echo "== 1. private work dir (0700, removed on every exit path)"
+  setup=$(lnx_script handover_setup)
+  HO_WORK=$(printf '%s\n' "$setup" | sed -n 's/^HANDOVER-WORKDIR=//p' | head -n 1)
+  case "$HO_WORK" in
+    *[!A-Za-z0-9._/-]* | *..* | '') die "the VM's work dir answer is malformed" ;;
+    /*/ign-lnxho.*) ;;
+    *) die "the VM's work dir answer is malformed" ;;
+  esac
+  echo "work dir made"
+
+  echo "== 2. git archive HEAD into the work dir over the pinned channel"
+  git -C "$REPO_ROOT" archive --format=tar HEAD | run_to 900 ssh "${SSH_ARGS[@]}" -- "$DEST" "tar -xf - -C '$HO_WORK/src'" || die "streaming git archive HEAD failed"
+  echo "archive of HEAD $head extracted"
+
+  echo "== 3. toolchain and build on the VM"
+  T_SSH=3600 lnx_script handover_build "WORK=$HO_WORK" "SCRATCH_REL=$SCRATCH_REL"
+
+  echo "== 4. the VM's own known_hosts (host key fingerprint checked), key half, profile"
+  pinned=$(lnx_script handover_pin "WORK=$HO_WORK" "PIN_LINES=$pin_lines" "PUBKEY=$pubkey" "PROFILE=$PROFILE" "GW_PORT=$GW_PORT" "TOKEN_VAR=$tokvar")
+  HO_PRIV=$(printf '%s\n' "$pinned" | sed -n 's/^HANDOVER-PRIVADDR=//p' | head -n 1)
+  case "$HO_PRIV" in '' | *[!0-9.]*) die "the VM's own address answer is malformed" ;; esac
+  printf '%s\n' "$pinned" | grep -v '^HANDOVER-PRIVADDR=' || true
+
+  echo "== 5. the gate on the VM: forwarded dedicated agent, token on ssh stdin"
+  agent_up
+  fwd_args=(-T -p 22 -i "$KEYFILE" -o "IdentityAgent=$AGENT_SOCK")
+  while [ "$i" -lt "${#OPTS_COMMON[@]}" ]; do
+    if [ "${OPTS_COMMON[$i]}" = -o ]; then
+      o=${OPTS_COMMON[$((i + 1))]}
+      if [ "$o" = ForwardAgent=no ]; then o=ForwardAgent=yes; fi
+      fwd_args+=(-o "$o")
+      i=$((i + 2))
+    else
+      fwd_args+=("${OPTS_COMMON[$i]}")
+      i=$((i + 1))
+    fi
+  done
+  {
+    # the token crosses inside ssh's stdin only: printf is a builtin, so no argument list holds it
+    printf 'export %s=%q\n' "$tokvar" "$tok"
+    printf 'export %s=%q\n' TOKEN_VAR "$tokvar" WORK "$HO_WORK" PRIVADDR "$HO_PRIV" DEPLOY_USER "$SSH_USER" PROFILE "$PROFILE" DATA "$DATA" GW_NAME "$GW_NAME" GW_PORT "$GW_PORT"
+    R_lnx_handover
+  } | run_to "${T_SSH:-2400}" ssh "${fwd_args[@]}" -- "$DEST" 'bash -s' 2>&1 | R27_PRIV=$HO_PRIV perl -pe 'BEGIN { $| = 1 } s/\Q$ENV{R27_PRIV}\E/<host>/g' | tee "$out" || rc=$?
+  agent_down
+  [ "$rc" -eq 0 ] || die "the gate on the VM exited $rc"
+  grep -Eq '(^|[[:space:]])LIVE-RAN lnxvm_git_handover$' "$out" || die "the gate exited 0 but printed no LIVE-RAN lnxvm_git_handover line (a skipped gate is not a pass)"
+}
+
+step_lnxvm_handover() {
+  each_vm vm_lnxvm_handover
 }
 
 # ---------------------------------------------------------------------------
