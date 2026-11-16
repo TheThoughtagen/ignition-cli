@@ -126,6 +126,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
         "designer_attached",
         "git_restore_designer_gate (27-13, D-07), called before every post-import .git write; 27-21 adds git_after_rollback",
     ),
+    (
+        "backup_project_json_missing",
+        "advance_after and settle_backup_git, the backup's project.json check after it converged (27-37)",
+    ),
 ];
 
 /// The words [`REASON_PRODUCERS`] names this module as the producer of.
@@ -134,6 +138,7 @@ pub const PRODUCED_HERE: &[&str] = &[
     "release_not_on_branch",
     "post_status_mismatch",
     "designer_attached",
+    "backup_project_json_missing",
 ];
 
 /// The restore reason of a restore that was not attempted because a Designer
@@ -148,6 +153,18 @@ pub const BACKUP: &str = "nodes.backup";
 /// The restore reason of a backup whose project did not converge to the
 /// artifact within `--backup-timeout` (27-22, D-G5).
 pub const REASON_BACKUP_UNSYNCED: &str = "backup_unsynced";
+
+/// The restore reason of a backup whose `data/projects/<p>/project.json` is
+/// absent or not a regular file after its project converged (27-37, user
+/// decision 2026-11-15, checkpoint 27-26 option-a). Redundancy project sync
+/// removes that file after the git module registered pseudo-resources on the
+/// master; the backup then cannot load the project at its next restart. ign
+/// only detects it: it never repairs the file and never hides the deletion
+/// from the index it writes.
+pub const REASON_BACKUP_PROJECT_JSON_MISSING: &str = "backup_project_json_missing";
+
+/// The manifest file the finding is about, as a status path.
+const PROJECT_JSON: &str = "project.json";
 
 /// How long the Designer gate before a post-import `.git` write waits for an
 /// attached session to close when the run's own `--designers` mode is not
@@ -1938,6 +1955,9 @@ async fn advance_after(
 ) -> GitAfter {
     let save_path = saved.path.clone();
     let node_name = report.master().node.clone();
+    // The backup's `project.json` is checked once its project converged
+    // (27-37); the master's handling is unchanged.
+    let is_backup = node_name == BACKUP;
     let Some(prep) = prepared.prep.as_ref() else {
         return failed_restore(
             report,
@@ -2054,14 +2074,39 @@ async fn advance_after(
                          for {count} path(s): {}",
                         shown.join(", ")
                     ));
-                    restore.reason = Some(REASON_POST_STATUS_MISMATCH.to_string());
                     after.failed = true;
-                    after.warnings.push(format!(
-                        "project {}: git {REASON_POST_STATUS_MISMATCH}: the repository was advanced \
-                         but the project directory does not match the predicted status; the \
-                         saved .git is at {save_path}",
-                        inputs.project
-                    ));
+                    // 27-37: a backup whose only differing path is a missing
+                    // `project.json` takes the detection word; any other
+                    // difference keeps the status mismatch and the finding
+                    // becomes a warning beside it.
+                    let finding = if is_backup {
+                        check_backup_project_json(inputs.read, inputs.project).await
+                    } else {
+                        None
+                    };
+                    let manifest_only = differ.iter().all(|p| p == PROJECT_JSON);
+                    match finding {
+                        Some(finding) if manifest_only => {
+                            restore.reason = Some(REASON_BACKUP_PROJECT_JSON_MISSING.to_string());
+                            after
+                                .warnings
+                                .push(backup_project_json_warning(inputs.project, &finding));
+                        }
+                        finding => {
+                            restore.reason = Some(REASON_POST_STATUS_MISMATCH.to_string());
+                            after.warnings.push(format!(
+                                "project {}: git {REASON_POST_STATUS_MISMATCH}: the repository was \
+                                 advanced but the project directory does not match the predicted \
+                                 status; the saved .git is at {save_path}",
+                                inputs.project
+                            ));
+                            if let Some(finding) = finding {
+                                after
+                                    .warnings
+                                    .push(backup_project_json_warning(inputs.project, &finding));
+                            }
+                        }
+                    }
                 }
                 Err(detail) => {
                     restore.post_status = Some("mismatch");
@@ -2075,15 +2120,27 @@ async fn advance_after(
                          could not be run; the saved .git is at {save_path}",
                         inputs.project
                     ));
+                    if is_backup
+                        && let Some(finding) =
+                            check_backup_project_json(inputs.read, inputs.project).await
+                    {
+                        after
+                            .warnings
+                            .push(backup_project_json_warning(inputs.project, &finding));
+                    }
                 }
             }
         }
     }
+    let failed_reason = restore
+        .reason
+        .clone()
+        .unwrap_or_else(|| REASON_POST_STATUS_MISMATCH.to_string());
     report.master_mut().restore = Some(restore);
     if after.failed {
         after.events.push(ProjectsEvent::GitRestoreFailed {
             node: node_name,
-            reason: REASON_POST_STATUS_MISMATCH.to_string(),
+            reason: failed_reason,
             path: Some(save_path),
         });
     } else if done.keep_save {
@@ -2095,10 +2152,20 @@ async fn advance_after(
             inputs.project,
             discard_ref_name(&saved.run_id)
         ));
+        if is_backup {
+            project_json_gate(report, saved, inputs, &mut after).await;
+        }
     } else {
         match hold {
+            // The settle looks again, and checks `project.json` then.
             Some(slot) if !done.restored => slot.held = true,
-            _ => remove_save(report, saved, inputs, &mut after).await,
+            _ => {
+                let blocked =
+                    is_backup && project_json_gate(report, saved, inputs, &mut after).await;
+                if !blocked {
+                    remove_save(report, saved, inputs, &mut after).await;
+                }
+            }
         }
     }
     report.expected_drift = Some(drift);
@@ -2132,6 +2199,87 @@ fn settle_failed(
         reason: reason.to_string(),
         path: Some(saved.path.clone()),
     });
+}
+
+/// Whether the backup's `data/projects/<p>/project.json` is a regular file
+/// (27-37). `None` when it is. Otherwise the finding as the warning words it:
+/// `is absent`, `is a directory`, `is a link`, `is not a regular file`, or
+/// `could not be checked (<code>)` for a probe that failed, which is never
+/// read as present. A read through the host's per-name probe: nothing is
+/// followed, read or written, and nothing on the backup is repaired.
+pub async fn check_backup_project_json(read: &dyn GitHostRead, project: &str) -> Option<String> {
+    match read
+        .project_dir_entry(project, ImportDir::ProjectJson)
+        .await
+    {
+        Ok(GitEntry::File) => None,
+        Ok(GitEntry::Absent) => Some("is absent".to_string()),
+        Ok(GitEntry::Directory) => Some("is a directory".to_string()),
+        Ok(GitEntry::Symlink) => Some("is a link".to_string()),
+        Ok(GitEntry::Other) => Some("is not a regular file".to_string()),
+        Err(err) => Some(format!("could not be checked ({})", err.code())),
+    }
+}
+
+/// The warning of a [`check_backup_project_json`] finding. It names the
+/// consequence, the owner of the defect and the one step; it never tells the
+/// operator to restore `.git` (D-09), because the repository is not the
+/// problem.
+pub fn backup_project_json_warning(project: &str, finding: &str) -> String {
+    let verb = if finding.starts_with("could not") {
+        "may"
+    } else {
+        "will"
+    };
+    format!(
+        "project {project}: the backup's data/projects/{project}/project.json {finding} after the \
+         deploy; the backup {verb} lose project {project} on its next restart. This is a git \
+         module and redundancy project-sync defect that ign does not repair; put project.json \
+         back on the backup (for example a copy of the master's) before the backup restarts."
+    )
+}
+
+/// The finding fails the backup node (27-37): its reason is the detection
+/// word, its save is kept and named, the node ends `git_restore_failed`, and
+/// the warning says what it means. The advance itself stays as reported.
+fn fail_on_project_json(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    after: &mut GitAfter,
+    finding: &str,
+) {
+    let node = report.master().node.clone();
+    if let Some(restore) = report.master_mut().restore.as_mut() {
+        restore.reason = Some(REASON_BACKUP_PROJECT_JSON_MISSING.to_string());
+        restore.save_kept = true;
+    }
+    after.failed = true;
+    after
+        .warnings
+        .push(backup_project_json_warning(&saved.project, finding));
+    after.events.push(ProjectsEvent::GitRestoreFailed {
+        node,
+        reason: REASON_BACKUP_PROJECT_JSON_MISSING.to_string(),
+        path: Some(saved.path.clone()),
+    });
+}
+
+/// The backup's `project.json` check at the point where its save would go
+/// (27-37): a finding fails the node and the save stays. `true` when the node
+/// was failed, so the caller leaves the save.
+async fn project_json_gate(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    after: &mut GitAfter,
+) -> bool {
+    match check_backup_project_json(inputs.read, inputs.project).await {
+        Some(finding) => {
+            fail_on_project_json(report, saved, after, &finding);
+            true
+        }
+        None => false,
+    }
 }
 
 /// The backup's settle (27-35, WR-08, D-19, D-G5). Redundancy removes the
@@ -2184,7 +2332,12 @@ async fn settle_backup_git(
     match files.kind {
         GitEntry::Directory => match inputs.read.git_manifest(project).await {
             Ok(now) if advanced.as_ref() == Some(&now) => {
-                remove_save(report, saved, inputs, &mut after).await;
+                // The second look also covers `project.json` (27-37): the
+                // sync's late delete takes it with the `.git`. A finding
+                // fails the node and the save stays.
+                if !project_json_gate(report, saved, inputs, &mut after).await {
+                    remove_save(report, saved, inputs, &mut after).await;
+                }
             }
             Ok(_) => settle_failed(
                 report,
@@ -3038,7 +3191,16 @@ pub async fn git_rollback_backup(
             )],
         };
     }
-    git_after_rollback(report, saved, inputs).await
+    let mut step = git_after_rollback(report, saved, inputs).await;
+    // 27-37: the backup converged on the rolled-back project, so its
+    // `project.json` is looked at too. Only a warning: these paths already
+    // exit 6 and keep their outcome.
+    if let Some(finding) = check_backup_project_json(inputs.read, inputs.project).await {
+        step.after
+            .warnings
+            .push(backup_project_json_warning(inputs.project, &finding));
+    }
+    step
 }
 
 /// The `record` action's advance on the backup (27-22): the project already is
@@ -3254,7 +3416,7 @@ mod tests {
             assert!(!producer.is_empty(), "{word}");
             let here = producer.contains("(27-12");
             let known = HOST_REASONS.contains(word) || RESTORE_REASONS.contains(word);
-            let later = ["27-13", "27-17", "27-22"]
+            let later = ["27-13", "27-17", "27-22", "27-37"]
                 .iter()
                 .any(|plan| producer.contains(plan));
             assert!(

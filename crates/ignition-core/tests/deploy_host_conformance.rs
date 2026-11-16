@@ -3591,6 +3591,44 @@ mod git_rows {
             GitEntry::Symlink
         );
         std::fs::remove_file(project.join("themes")).expect("rm");
+        // `project.json` (27-37): a regular file, absent, a directory and a
+        // link, each by name, nothing followed
+        let manifest = project.join("project.json");
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::ProjectJson)
+                .await
+                .expect("project.json"),
+            GitEntry::File
+        );
+        let kept = std::fs::read(&manifest).expect("project.json");
+        std::fs::remove_file(&manifest).expect("rm");
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::ProjectJson)
+                .await
+                .expect("project.json"),
+            GitEntry::Absent
+        );
+        std::fs::create_dir(&manifest).expect("mkdir");
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::ProjectJson)
+                .await
+                .expect("project.json"),
+            GitEntry::Directory
+        );
+        std::fs::remove_dir(&manifest).expect("rmdir");
+        std::os::unix::fs::symlink("/", &manifest).expect("symlink");
+        assert_eq!(
+            c.read
+                .project_dir_entry(PROJECT, ImportDir::ProjectJson)
+                .await
+                .expect("project.json"),
+            GitEntry::Symlink
+        );
+        std::fs::remove_file(&manifest).expect("rm");
+        std::fs::write(&manifest, kept).expect("put back");
         assert_eq!(
             c.read
                 .project_dir_entry("NoSuchProject", ImportDir::Tags)

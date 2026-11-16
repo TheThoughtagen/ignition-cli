@@ -2076,20 +2076,35 @@ mod published {
         /// backup's `.git` in place (R-6), so the run finds it present once
         /// the backup's project converges.
         pub fn backup_node_with(&self, lag: usize, managed: bool) -> FakeBackupNode<'_> {
+            self.backup_node_losing(lag, managed, None)
+        }
+
+        /// [`Rig::backup_node_with`] whose redundancy sync also does `fate`
+        /// to the backup's `project.json` on disk (27-37).
+        pub fn backup_node_losing(
+            &self,
+            lag: usize,
+            managed: bool,
+            fate: Option<common::fake_projects::ProjectJsonFate>,
+        ) -> FakeBackupNode<'_> {
             let members = members_of(&self.f.backup_project_dir());
             let borrowed: Vec<(&str, Vec<u8>)> = members
                 .iter()
                 .map(|(path, bytes)| (path.as_str(), bytes.clone()))
                 .collect();
-            let gw = FakeProjects::new()
+            let mut gw = FakeProjects::new()
                 .with_project(PROJECT, None, false, &borrowed)
                 .with_disk_mirror(&self.f.backup_data_dir(), managed);
+            if let Some(fate) = fate {
+                gw = gw.with_disk_mirror_project_json(fate);
+            }
             FakeBackupNode {
                 master: &self.gateway,
                 gw,
                 lag,
                 reads: std::sync::Mutex::new(Vec::new()),
                 drop_git_at_first_read: false,
+                drop_project_json_at_first_read: false,
                 tags_differ: false,
                 backup_git: self.f.backup_git_dir(),
             }
@@ -5740,6 +5755,10 @@ mod published {
         /// The sync already deleted the backup's `.git` when the run reads it
         /// first (the content changed during the run).
         pub drop_git_at_first_read: bool,
+        /// The sync already deleted the backup's `project.json` when the run
+        /// reads it first (27-37): for a rollback, where the backup's project
+        /// needs no import and so no mirror write takes it.
+        pub drop_project_json_at_first_read: bool,
         pub backup_git: PathBuf,
         /// The backup's copy of the owned tags is not the master's: one
         /// documentation value differs (27-34).
@@ -5820,6 +5839,10 @@ mod published {
             };
             if self.drop_git_at_first_read && n == 1 {
                 std::fs::remove_dir_all(&self.backup_git).expect("the sync deletes .git");
+            }
+            if self.drop_project_json_at_first_read && n == 1 {
+                let file = self.backup_git.with_file_name("project.json");
+                std::fs::remove_file(file).expect("the sync deletes project.json");
             }
             if n > self.lag {
                 use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
@@ -7246,5 +7269,368 @@ mod published {
             .and_then(|t| t.backup.as_ref())
             .expect("data.tags.backup is reported");
         assert!(report.converged, "{report:?}");
+    }
+
+    // ---- 27-37: the backup's project.json is checked after a pair deploy ----
+
+    /// The detection word of 27-26 (checkpoint option-a).
+    const PROJECT_JSON_WORD: &str = "backup_project_json_missing";
+
+    fn backup_project_json(rig: &Rig) -> PathBuf {
+        rig.f.backup_project_dir().join("project.json")
+    }
+
+    /// What every loud finding says: the consequence, the owner of the defect
+    /// and what to do. Never a `.git` restore instruction.
+    fn assert_project_json_warning(result: &DeployProjectsResult, what: &str) {
+        let line = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("project.json"))
+            .unwrap_or_else(|| panic!("a project.json warning: {:?}", result.warnings));
+        for needle in [
+            what,
+            "will lose project CapApp on its next restart",
+            "git module and redundancy project-sync defect",
+            "ign does not repair",
+            "before the backup restarts",
+        ] {
+            assert!(line.contains(needle), "{needle:?} is missing from {line}");
+        }
+        assert!(!line.contains("restore"), "no restore instruction: {line}");
+    }
+
+    /// The backup node of `result`, which the finding failed.
+    fn assert_backup_project_json_failure(rig: &Rig, result: &DeployProjectsResult) {
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok);
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let git = git_of(result);
+        let backup = node_of(git, "nodes.backup")
+            .restore
+            .as_ref()
+            .expect("the backup restore");
+        assert_eq!(backup.reason.as_deref(), Some(PROJECT_JSON_WORD));
+        assert!(backup.save_kept, "the save is kept: {backup:?}");
+        assert_eq!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).len(),
+            1,
+            "the backup's save is on disk"
+        );
+        // The master is green and unchanged.
+        let master = node_of(git, "nodes.master")
+            .restore
+            .as_ref()
+            .expect("the master restore");
+        assert!(master.advanced && master.verified, "{master:?}");
+        assert_eq!(master.reason, None);
+        assert!(!master.save_kept);
+        assert!(rig.save_trees().is_empty());
+        // The failure is an event naming the backup, its reason and its save.
+        let failed: Vec<serde_json::Value> = rig
+            .events(result)
+            .into_iter()
+            .filter(|e| e["event"] == "git_restore_failed")
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0]["node"], "nodes.backup");
+        assert_eq!(failed[0]["reason"], PROJECT_JSON_WORD);
+        assert!(failed[0]["path"].is_string(), "{failed:?}");
+        // ign repairs nothing.
+        assert!(
+            std::fs::symlink_metadata(backup_project_json(rig))
+                .map(|m| !m.file_type().is_file())
+                .unwrap_or(true),
+            "project.json on the backup was not put back"
+        );
+    }
+
+    /// Debug B8: the redundancy sync deletes the backup's `project.json` after
+    /// the master's import. The run fails loudly with the decided outcome.
+    #[tokio::test]
+    async fn pair_backup_project_json_absent_fails_loudly() {
+        let rig = pair();
+        let backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_backup_project_json_failure(&rig, &result);
+        assert_project_json_warning(&result, "is absent after the deploy");
+        assert!(!backup_project_json(&rig).exists());
+    }
+
+    /// Debug B4: the path is an empty directory on the backup.
+    #[tokio::test]
+    async fn pair_backup_project_json_directory_fails_loudly() {
+        let rig = pair();
+        let backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Directory),
+        );
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_backup_project_json_failure(&rig, &result);
+        assert_project_json_warning(&result, "is a directory after the deploy");
+        assert!(backup_project_json(&rig).is_dir());
+    }
+
+    /// Nothing else changed: a backup that keeps its `project.json` is green
+    /// and says nothing about it.
+    #[tokio::test]
+    async fn pair_backup_project_json_present_is_green() {
+        let rig = pair();
+        let backup = rig.backup_node(1);
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.ok && result.slug.is_none());
+        assert!(backup_project_json(&rig).is_file());
+        assert!(
+            result.warnings.iter().all(|w| !w.contains("project.json")),
+            "{:?}",
+            result.warnings
+        );
+        let restore = node_of(git_of(&result), "nodes.backup")
+            .restore
+            .as_ref()
+            .expect("the backup restore");
+        assert_eq!(restore.reason, None);
+        assert!(!restore.save_kept);
+    }
+
+    /// The finding is a read. ign does not hide the deletion: `project.json`
+    /// stays tracked in the index it wrote, with no assume-unchanged bit.
+    #[tokio::test]
+    async fn pair_backup_project_json_keeps_the_index_honest() {
+        let rig = pair();
+        let backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_backup_project_json_failure(&rig, &result);
+        let listing = rig.f.git_in_backup(&["ls-files", "-v"]);
+        let line = listing
+            .lines()
+            .find(|l| l.ends_with("project.json"))
+            .unwrap_or_else(|| panic!("project.json is tracked on the backup: {listing}"));
+        assert!(
+            line.starts_with("H "),
+            "tracked, not assume-unchanged (lowercase) or skip-worktree (S): {line}"
+        );
+        let status = rig.f.git_in_backup(&["status", "--porcelain"]);
+        assert!(
+            status.lines().any(|l| l.contains("project.json")),
+            "git still sees the deletion: {status}"
+        );
+    }
+
+    /// The post-advance status of a local backup flags `project.json` and
+    /// nothing else: the reason is the detection word, and the status words
+    /// stay as measured. When another path differs too, the reason stays the
+    /// status mismatch and the finding is a warning.
+    #[tokio::test]
+    async fn pair_backup_post_status_only_project_json_takes_the_detection_word() {
+        let rig = pair();
+        let backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_backup_project_json_failure(&rig, &result);
+        let restore = node_of(git_of(&result), "nodes.backup")
+            .restore
+            .as_ref()
+            .expect("the backup restore");
+        assert_eq!(restore.post_status, Some("mismatch"));
+        let note = restore.post_status_note.as_deref().expect("a note");
+        assert!(note.contains("project.json"), "{note}");
+        assert!(restore.advanced && restore.verified, "{restore:?}");
+
+        // Another path differs as well: the status mismatch keeps the reason.
+        let rig = pair();
+        let mut backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let gw = std::mem::take(&mut backup.gw);
+        backup.gw = gw.with_disk_mirror_extra_on_disk("stray.txt");
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let restore = node_of(git_of(&result), "nodes.backup")
+            .restore
+            .as_ref()
+            .expect("the backup restore");
+        assert_eq!(restore.reason.as_deref(), Some("post_status_mismatch"));
+        assert_eq!(restore.post_status, Some("mismatch"));
+        assert!(restore.save_kept);
+        assert_project_json_warning(&result, "is absent after the deploy");
+    }
+
+    /// The sync reaches `project.json` after the post-advance status was read
+    /// (the late window of WR-08): the settle's second look finds it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_backup_project_json_removed_late_fails_after_settle() {
+        let mut rig = pair();
+        rig.backup_interval = std::time::Duration::from_millis(100);
+        let scratch = tempfile::tempdir().expect("scratch");
+        let program = late_backup_git(
+            scratch.path(),
+            &rig,
+            &format!("/bin/rm -f '{}'", backup_project_json(&rig).display()),
+        );
+        let host = rig.host_with_program(&program);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig
+            .apply_pair_on(&host, &backup, WAIT)
+            .await
+            .expect("a verdict");
+        assert!(scratch.path().join("late-ran").exists());
+        assert_backup_project_json_failure(&rig, &result);
+        let restore = node_of(git_of(&result), "nodes.backup")
+            .restore
+            .as_ref()
+            .expect("the backup restore");
+        assert_eq!(restore.post_status, Some("matched"));
+        assert_project_json_warning(&result, "is absent after the deploy");
+    }
+
+    /// A `record` (no import ran) checks the backup's `project.json` too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_record_checks_backup_project_json() {
+        let mut rig = pair();
+        rig.backup_interval = std::time::Duration::from_millis(100);
+        rig.make_live_equal_artifact().await;
+        let scratch = tempfile::tempdir().expect("scratch");
+        let program = late_backup_git(
+            scratch.path(),
+            &rig,
+            &format!("/bin/rm -f '{}'", backup_project_json(&rig).display()),
+        );
+        let host = rig.host_with_program(&program);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig
+            .apply_pair_on(&host, &backup, WAIT)
+            .await
+            .expect("a verdict");
+        assert!(scratch.path().join("late-ran").exists());
+        assert!(rig.gateway.import_calls().is_empty(), "no import");
+        assert_backup_project_json_failure(&rig, &result);
+        assert_project_json_warning(&result, "is absent after the deploy");
+    }
+
+    /// The automatic rollback keeps its outcome and says the backup lost its
+    /// `project.json`.
+    #[tokio::test]
+    async fn pair_rollback_warns_backup_project_json() {
+        let rig = Rig::tagged_pair(true);
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let mut backup = rig.backup_node(0);
+        backup.drop_git_at_first_read = true;
+        backup.drop_project_json_at_first_read = true;
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok);
+        assert_project_json_warning(&result, "is absent after the deploy");
+        let restore = node_of(git_of(&result), "nodes.backup")
+            .restore
+            .as_ref()
+            .expect("the backup restore");
+        assert!(restore.restored && !restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None, "a rollback keeps its reasons");
+    }
+
+    /// `--rollback-run` does the same.
+    #[tokio::test]
+    async fn rollback_run_pair_warns_backup_project_json() {
+        let rig = Rig::tagged_pair(true);
+        let green = rig.backup_node(0);
+        let applied = rig.apply_pair(&green, WAIT).await.expect("green");
+        assert_eq!(
+            applied.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            applied.warnings
+        );
+        let run_id = applied.run_id.clone().expect("a run id");
+        let losing = rig.backup_node_losing(
+            0,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let undo = rig
+            .rollback_run_with(&run_id, false, Some((&losing, WAIT)))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            undo.warnings
+        );
+        assert_project_json_warning(&undo, "is absent after the deploy");
+    }
+
+    /// The probe on its own: a regular file is fine; absent, a directory, a
+    /// link and a probe that fails are each a finding, and a failed probe is
+    /// never reported as present.
+    #[tokio::test]
+    async fn backup_project_json_probe_names_each_kind() {
+        use ignition_core::actions::deploy_projects::git::check_backup_project_json;
+        let rig = pair();
+        let node = rig.f.backup_node();
+        let file = backup_project_json(&rig);
+        assert_eq!(check_backup_project_json(&node, PROJECT).await, None);
+        std::fs::remove_file(&file).expect("rm");
+        let absent = check_backup_project_json(&node, PROJECT).await;
+        assert_eq!(absent.as_deref(), Some("is absent"));
+        std::fs::create_dir(&file).expect("dir");
+        let dir = check_backup_project_json(&node, PROJECT).await;
+        assert_eq!(dir.as_deref(), Some("is a directory"));
+        std::fs::remove_dir(&file).expect("rmdir");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", &file).expect("link");
+            let link = check_backup_project_json(&node, PROJECT).await;
+            assert_eq!(link.as_deref(), Some("is a link"));
+            std::fs::remove_file(&file).expect("rm link");
+            // `projects` itself is a link: the probe fails, and that is a
+            // finding, never "present".
+            let projects = rig.f.backup_data_dir().join("projects");
+            let moved = rig.f.backup_data_dir().join("projects-real");
+            std::fs::rename(&projects, &moved).expect("rename");
+            std::os::unix::fs::symlink(&moved, &projects).expect("link");
+            let failed = check_backup_project_json(&node, PROJECT)
+                .await
+                .expect("a failed probe is a finding");
+            assert!(failed.starts_with("could not be checked ("), "{failed}");
+        }
     }
 }

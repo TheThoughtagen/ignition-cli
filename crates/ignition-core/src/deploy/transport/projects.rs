@@ -97,9 +97,11 @@ pub fn git_entry_location(project: &str) -> String {
     format!("projects/{project}/.git")
 }
 
-/// A directory the git module's start sync imports from, directly below
-/// `projects/<project>` (Phase 27, 27-18). A fixed set of names, so no path is
-/// ever built from outside input.
+/// An entry probed directly below `projects/<project>`: the directories the
+/// git module's start sync imports from (Phase 27, 27-18) and, since 27-37,
+/// the project's `project.json` (a backup that lost it cannot load the project
+/// at its next restart). A fixed set of names, so no path is ever built from
+/// outside input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDir {
     /// `tags/`: tag providers the module imports at the start.
@@ -108,6 +110,9 @@ pub enum ImportDir {
     Images,
     /// `themes/`.
     Themes,
+    /// `project.json`, the project's manifest file (27-37). Probed, never
+    /// read or written: a regular file is what a loadable project has.
+    ProjectJson,
 }
 
 impl ImportDir {
@@ -117,6 +122,7 @@ impl ImportDir {
             ImportDir::Tags => "tags",
             ImportDir::Images => "images",
             ImportDir::Themes => "themes",
+            ImportDir::ProjectJson => "project.json",
         }
     }
 }

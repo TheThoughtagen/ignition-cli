@@ -127,7 +127,10 @@
 //! `with_disk_mirror_readonly_after_import()` makes the project directory
 //! read-only once written, so a restore of `.git` fails;
 //! `with_disk_mirror_extra_on_disk(path)` writes one file to disk that no
-//! export ever shows.
+//! export ever shows. `with_disk_mirror_project_json(fate)` models the
+//! redundancy project sync on a backup (27-37): the import's `project.json`
+//! is deleted from disk or replaced by a directory, while the export still
+//! carries it.
 //!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
@@ -293,6 +296,22 @@ struct DiskMirror {
     /// A Designer opened while `.git` was absent (D-07, R-9): the module's
     /// `setupLocalRepo` leaves its partial repository right after the import.
     recreates_git: bool,
+    /// What the redundancy project sync does to the backup's `project.json`
+    /// after the import wrote it (27-37, debug backup-project-json-absent).
+    project_json: Option<ProjectJsonFate>,
+}
+
+/// What happens to `<project>/project.json` on a mirrored node right after
+/// an import wrote it: the redundancy project sync's delete of the backup's
+/// manifest file (debug B8), or the full pull that leaves a directory at that
+/// path (debug B4). Never a repair: the fake only models the defect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ProjectJsonFate {
+    /// The file is deleted.
+    Absent,
+    /// The path becomes an empty directory.
+    Directory,
 }
 
 /// Take one of the `due` failures, if any is left. A compare-exchange loop
@@ -431,7 +450,23 @@ impl FakeProjects {
             readonly_after: false,
             extra_on_disk: Vec::new(),
             recreates_git: false,
+            project_json: None,
         });
+        self
+    }
+
+    /// An import also removes `project.json` from the mirrored project
+    /// directory, or turns it into a directory: what redundancy project sync
+    /// does to the backup after the git module registered pseudo-resources on
+    /// the master (27-37). Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_project_json(self, fate: ProjectJsonFate) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .project_json = Some(fate);
         self
     }
 
@@ -554,6 +589,16 @@ impl FakeProjects {
                 "https://example.invalid/capapp.git",
             ]);
             git(&["config", "http.sslVerify", "false"]);
+        }
+        match mirror.project_json {
+            Some(ProjectJsonFate::Absent) => {
+                let _ = std::fs::remove_file(dir.join("project.json"));
+            }
+            Some(ProjectJsonFate::Directory) => {
+                let _ = std::fs::remove_file(dir.join("project.json"));
+                std::fs::create_dir_all(dir.join("project.json")).expect("a directory");
+            }
+            None => {}
         }
         #[cfg(unix)]
         if mirror.readonly_after {
