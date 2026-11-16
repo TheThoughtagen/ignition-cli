@@ -30,6 +30,10 @@
 #   project-down  remove CapApp27 only and quote the REST project list
 #   scratch-down  remove ign-live-scratch/git27 (NOT run in 27-07: 27-09 and 27-11
 #                 run their WinScripts on the uploaded `.git`; 27-25 runs it last)
+#   acl-audit     Linux only, read-only, as the deploy account: what the project's owner
+#                 account (the gateway stand-in) can do inside CapApp27/.git, from the
+#                 ACLs (effective bits of its named entry on every directory and file).
+#                 It reads; it does not write as that account (the deploy account cannot)
 #   emit NAME     print the remote script NAME (offline test aid), e.g. lnx-g4;
 #                 lnx-handover (the run script that receives the token on stdin) and its
 #                 phases lnx-handover-setup, lnx-handover-build, lnx-handover-pin and
@@ -110,9 +114,9 @@ export LC_ALL=C
 
 STEP=${1:-}
 case "$STEP" in
-  project-up | upload | g1-before | g4 | g8 | g8-jgit | g1-after | project-down | scratch-down | emit | guard | vm-gate | winvm-handover | lnxvm-handover) ;;
+  project-up | upload | g1-before | g4 | g8 | g8-jgit | g1-after | project-down | scratch-down | emit | guard | vm-gate | winvm-handover | lnxvm-handover | acl-audit) ;;
   *)
-    echo "usage: capture27-vm.sh project-up|upload|g1-before|g4|g8|g8-jgit|g1-after|project-down|scratch-down|guard|winvm-handover|lnxvm-handover|emit NAME|vm-gate TEST" >&2
+    echo "usage: capture27-vm.sh project-up|upload|g1-before|g4|g8|g8-jgit|g1-after|project-down|scratch-down|guard|winvm-handover|lnxvm-handover|acl-audit|emit NAME|vm-gate TEST" >&2
     exit 64
     ;;
 esac
@@ -505,6 +509,41 @@ if [ -d "$gitdir" ]; then
   done
 fi
 exit "$rc"
+EOS
+}
+
+R_lnx_acl_audit() {
+  cat <<'EOS'
+set -u
+gitdir="$DATA/projects/$PROJ/.git"
+[ -d "$gitdir" ] || { echo "no .git in the project: run lnxvm-handover first" >&2; exit 2; }
+u=$(stat -c %u "$DATA/projects/$PROJ")
+echo "owner uid of the project (the gateway stand-in): $u; deploy uid: $(id -u)"
+# effective bits of user:$u on a path: the named entry's #effective, else the entry's own bits
+eff() {
+  getfacl -n -p -- "$1" 2> /dev/null | tr '\t' ' ' | awk -v u="user:$u:" 'index($0, u) == 1 { e = $0; sub(/^[^:]*:[^:]*:/, "", e); split(e, a, " "); bits = a[1]; if (match($0, /#effective:[rwx-]+/)) bits = substr($0, RSTART + 11, RLENGTH - 11); print bits; exit }'
+}
+dirs=0; dirs_ok=0; files=0; files_rw=0; files_ro=0; first=""
+while IFS= read -r -d '' d; do
+  dirs=$((dirs + 1))
+  b=$(eff "$d")
+  if [ "$b" = rwx ]; then dirs_ok=$((dirs_ok + 1)); else echo "DIR-NOT-RWX ${b:-none} ${d#"$gitdir"}"; fi
+done < <(find "$gitdir" -type d -print0)
+while IFS= read -r -d '' f; do
+  files=$((files + 1))
+  b=$(eff "$f")
+  case "$b" in
+    rw-|rwx) files_rw=$((files_rw + 1)) ;;
+    *) files_ro=$((files_ro + 1)); echo "FILE-NOT-RW ${b:-none} $(stat -c %a -- "$f") ${f#"$gitdir"/}" ;;
+  esac
+done < <(find "$gitdir" -type f -print0)
+echo "directories: $dirs, effective rwx for uid $u: $dirs_ok  (create index.lock, <ref>.lock, a tmp object, and rename in any of them)"
+echo "files: $files, effective rw for uid $u: $files_rw, without: $files_ro"
+echo "leftovers (locks, private write dirs, stages) in .git: $(find "$gitdir" \( -name '*.lock' -o -name '.ign-write-*' -o -name 'git-stage-*' \) | wc -l)"
+echo "stages in the deploy ledger root: $(find "$HOME/ign-deploy" -maxdepth 2 -name 'git-stage-*' 2> /dev/null | wc -l)"
+for p in HEAD index config packed-refs refs/heads/production; do
+  if [ -e "$gitdir/$p" ]; then echo "-- $p: $(stat -c 'owner=%U mode=%a' -- "$gitdir/$p") effective for uid $u: $(eff "$gitdir/$p")"; fi
+done
 EOS
 }
 
@@ -1377,6 +1416,13 @@ vm_lnxvm_handover() {
 step_lnxvm_handover() {
   each_vm vm_lnxvm_handover
 }
+
+vm_acl_audit() {
+  [ "$VM" = lnx ] || die "acl-audit is a Linux step"
+  lnx_script acl_audit "DATA=$DATA" "PROJ=$PROJ"
+}
+
+step_acl_audit() { each_vm vm_acl_audit; }
 
 # ---------------------------------------------------------------------------
 # Run the step with its log and the redaction filter.
