@@ -1919,16 +1919,32 @@ mod published {
                 std::time::Duration,
             )>,
         ) -> Result<DeployProjectsResult, CoreError> {
+            self.rollback_run_on(&self.host(), run_id, check, backup, None)
+                .await
+        }
+
+        /// [`Rig::rollback_run_with`] through `host`, and through `git_writer`
+        /// when the test supplies the master's git writer (27-34).
+        pub async fn rollback_run_on(
+            &self,
+            host: &StubHost,
+            run_id: &str,
+            check: bool,
+            backup: Option<(
+                &dyn ignition_core::deploy::tag_converge::BackupTags,
+                std::time::Duration,
+            )>,
+            git_writer: Option<&dyn GitStateWriter>,
+        ) -> Result<DeployProjectsResult, CoreError> {
             let input = self.input();
             let loaded = ignition_core::actions::deploy_projects::load_project_for_rollback(&input)
                 .expect("the checkout loads");
-            let host = self.host();
             ignition_core::actions::deploy_projects::deploy_projects_rollback_run(
                 &loaded,
                 &input,
                 &ProjectsSurfaces {
                     gateway: &self.gateway,
-                    host: &host,
+                    host,
                     tree: self
                         .tree
                         .as_ref()
@@ -1945,7 +1961,7 @@ mod published {
                     record_writer: None,
                     tag_record_writer: None,
                     run_writer: None,
-                    git_writer: None,
+                    git_writer,
                     designers: Default::default(),
                     children_settle: std::time::Duration::from_secs(1),
                     children_poll: std::time::Duration::from_millis(5),
@@ -6247,5 +6263,397 @@ mod published {
                 "the backup handle has a write method: {write}"
             );
         }
+    }
+
+    // ---- 27-34: WR-01, WR-02, WR-03, WR-10 ----
+
+    /// A git writer that does everything the local one does except remove a
+    /// save: the cleanup that fails (a lock on a pack, a read-only entry).
+    struct KeepsSaves(LocalFsTransport);
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for KeepsSaves {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(&self, p: &str, w: &[GitWrite]) -> Result<(), CoreError> {
+            self.0.write_git_files(p, w).await
+        }
+        async fn remove_git_save(&self, _: &str, _: &str, _: &str) -> Result<(), CoreError> {
+            Err(CoreError::TransportFailed {
+                operation: "remove".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "a pack is locked".to_string(),
+            })
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.0.probe_write(project, run_id).await
+        }
+    }
+
+    /// Files whose name starts with `journal` below the ledger root of
+    /// `data`.
+    fn journals_in(data: &std::path::Path) -> Vec<PathBuf> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("journal"))
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&data.join("ign-deploy"), &mut found);
+        found
+    }
+
+    /// Where the saves of the backup node would go: a regular file there makes
+    /// every save on that node fail.
+    fn block_saves_on_backup(rig: &Rig) {
+        let dir = rig
+            .f
+            .backup_data_dir()
+            .join("ign-deploy/capgw/projects")
+            .join(PROJECT);
+        std::fs::create_dir_all(&dir).expect("the ledger directory");
+        std::fs::write(dir.join("git-save"), b"in the way").expect("the blocker");
+    }
+
+    /// WR-01 (D-22): `--rollback-run` proves the deploy account can write the
+    /// project directory before its first save, journal write or import. A
+    /// read-only project directory refuses `deploy_preflight_failed` with
+    /// nothing saved, journaled or imported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_run_preflight_refuses_before_save() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::tagged(true);
+        if root_guard(
+            "rollback_run_preflight_refuses_before_save",
+            &rig.f.project_dir(),
+        ) {
+            return;
+        }
+        let applied = rig.apply().await.expect("green");
+        let run_id = applied.run_id.clone().expect("a run id");
+        let imports = rig.gateway.import_calls().len();
+        let runs = rig.run_dirs();
+        let journals = journals_in(&rig.f.data_dir);
+        std::fs::set_permissions(rig.f.project_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let _unlock = Unlock(rig.f.project_dir());
+        let err = refusal(rig.rollback_run(&run_id, false).await);
+        let failures = preflight_details(&err);
+        assert_eq!(failures.len(), 1, "{err}");
+        assert_eq!(failures[0].0, "git_write_access", "{err}");
+        assert!(
+            failures[0].1.contains("projects/CapApp"),
+            "{}",
+            failures[0].1
+        );
+        assert_eq!(rig.gateway.import_calls().len(), imports, "no import");
+        assert!(rig.save_trees().is_empty(), "nothing saved");
+        assert_eq!(journals_in(&rig.f.data_dir), journals, "no journal change");
+        assert_eq!(rig.run_dirs(), runs, "no run directory");
+    }
+
+    /// WR-01 on a pair: the backup's project directory is probed too, and the
+    /// refusal names `nodes.backup`. Nothing is saved on either node.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_run_preflight_refuses_on_the_backup() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = Rig::tagged_pair(true);
+        let dir = rig.f.backup_project_dir();
+        if root_guard("rollback_run_preflight_refuses_on_the_backup", &dir) {
+            return;
+        }
+        let backup = rig.backup_node(0);
+        let applied = rig.apply_pair(&backup, WAIT).await.expect("green");
+        let run_id = applied.run_id.clone().expect("a run id");
+        let imports = rig.gateway.import_calls().len();
+        let journals = journals_in(&rig.f.data_dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let _unlock = Unlock(dir.clone());
+        let outcome = rig
+            .rollback_run_with(&run_id, false, Some((&backup, WAIT)))
+            .await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        let err = refusal(outcome);
+        assert_eq!(preflight_checks(&err), ["git_write_access"], "{err}");
+        assert!(err.to_string().contains("nodes.backup"), "{err}");
+        assert_eq!(rig.gateway.import_calls().len(), imports, "no import");
+        assert!(rig.save_trees().is_empty(), "nothing saved on the master");
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+        assert_eq!(journals_in(&rig.f.data_dir), journals, "no journal change");
+    }
+
+    /// WR-01: too little free space refuses `git_free_space` before any save.
+    #[tokio::test]
+    async fn rollback_run_free_space_refuses_before_save() {
+        let rig = Rig::tagged(true);
+        let applied = rig.apply().await.expect("green");
+        let run_id = applied.run_id.clone().expect("a run id");
+        let imports = rig.gateway.import_calls().len();
+        let journals = journals_in(&rig.f.data_dir);
+        let (host, _calls) = metered(&rig, Some(1_048_576));
+        let err = refusal(rig.rollback_run_on(&host, &run_id, false, None, None).await);
+        let failures = preflight_details(&err);
+        assert_eq!(failures.len(), 1, "{err}");
+        assert_eq!(failures[0].0, "git_free_space", "{err}");
+        assert!(
+            failures[0].1.contains("1048576"),
+            "free bytes named: {}",
+            failures[0].1
+        );
+        assert_eq!(rig.gateway.import_calls().len(), imports, "no import");
+        assert!(rig.save_trees().is_empty(), "nothing saved");
+        assert_eq!(journals_in(&rig.f.data_dir), journals, "no journal change");
+        assert_no_probe_left(&rig);
+    }
+
+    /// WR-02 (D-06): the gateway refuses the import. The `.git` was never
+    /// touched, so the saves taken before it, the master's and the backup's,
+    /// are removed and both repositories are as they were.
+    #[tokio::test]
+    async fn refused_import_removes_the_git_saves() {
+        let rig = Rig::with(|g| g.with_project_import_denied());
+        rig.add_backup();
+        let before_master = rig.git_manifest().await;
+        let before_backup = rig.f.backup_node().git_manifest(PROJECT).await.expect("m");
+        let backup = rig.backup_node(0);
+        let err = refusal(rig.apply_pair(&backup, WAIT).await);
+        assert_eq!(err.code(), "import_denied", "{err}");
+        assert_eq!(rig.gateway.import_calls().len(), 1, "the import was tried");
+        assert!(rig.save_trees().is_empty(), "the master's save is gone");
+        assert!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).is_empty(),
+            "the backup's save is gone"
+        );
+        assert_eq!(rig.git_manifest().await, before_master);
+        assert_eq!(
+            rig.f.backup_node().git_manifest(PROJECT).await.expect("m"),
+            before_backup
+        );
+        assert!(
+            !err.to_string().contains("git-save"),
+            "nothing is left to name: {err}"
+        );
+    }
+
+    /// WR-02: the same on a master alone.
+    #[tokio::test]
+    async fn refused_import_removes_the_master_save() {
+        let rig = Rig::with(|g| g.with_project_import_denied());
+        let before = rig.git_manifest().await;
+        let err = refusal(rig.apply().await);
+        assert_eq!(err.code(), "import_denied", "{err}");
+        assert!(rig.save_trees().is_empty(), "the save is gone");
+        assert_eq!(rig.git_manifest().await, before);
+    }
+
+    /// WR-02: the backup's save fails after the master's succeeded. The error
+    /// names `nodes.backup` and the master's save is removed.
+    #[tokio::test]
+    async fn failed_backup_save_removes_the_master_save() {
+        let rig = pair();
+        block_saves_on_backup(&rig);
+        let before = rig.git_manifest().await;
+        let backup = rig.backup_node(0);
+        let err = refusal(rig.apply_pair(&backup, WAIT).await);
+        assert!(err.to_string().contains("nodes.backup"), "{err}");
+        assert!(rig.gateway.import_calls().is_empty(), "nothing imported");
+        assert!(rig.save_trees().is_empty(), "the master's save is gone");
+        assert_eq!(rig.git_manifest().await, before);
+    }
+
+    /// WR-02: a save the run cannot remove is named in the error, with the
+    /// node, and the error keeps its slug and its exit.
+    #[tokio::test]
+    async fn unremovable_save_is_named_in_the_error() {
+        let rig = pair();
+        block_saves_on_backup(&rig);
+        let host = rig.host();
+        let writer = KeepsSaves(rig.f.node());
+        let backup = rig.backup_node(0);
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let err = refusal(
+            rig.run_prepared_full(
+                &host,
+                &loaded,
+                prepared,
+                Some(&writer),
+                Default::default(),
+                Some((&backup, WAIT)),
+            )
+            .await,
+        );
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save stays: {trees:?}");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .to_string();
+        let text = err.to_string();
+        assert!(text.contains(&save), "the save path is named: {text}");
+        assert!(text.contains("nodes.master"), "the node is named: {text}");
+        assert_eq!(err.code(), "transport_failed", "the slug stands: {text}");
+        assert_eq!(err.exit_code(), 4, "the exit stands: {text}");
+        assert!(
+            text.contains("nodes.backup"),
+            "the first cause stays: {text}"
+        );
+    }
+
+    /// WR-02: a refused import whose save cannot be removed names the save in
+    /// the import's own error, which keeps its slug.
+    #[tokio::test]
+    async fn unremovable_save_after_a_refused_import_is_named() {
+        let rig = Rig::with(|g| g.with_project_import_denied());
+        let host = rig.host();
+        let writer = KeepsSaves(rig.f.node());
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let err = refusal(
+            rig.run_prepared(&host, &loaded, prepared, Some(&writer))
+                .await,
+        );
+        assert_eq!(err.code(), "import_denied", "{err}");
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save stays");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .to_string();
+        assert!(err.to_string().contains(&save), "{err}");
+    }
+
+    /// WR-02: `--rollback-run` takes its saves before the journal write. A
+    /// journal the host cannot write stops the undo before any import, and the
+    /// saves it took are removed (the run's events log both).
+    #[tokio::test]
+    async fn rollback_run_journal_failure_removes_the_saves() {
+        let rig = Rig::tagged_pair(true);
+        let backup = rig.backup_node(0);
+        let applied = rig.apply_pair(&backup, WAIT).await.expect("green");
+        let run_id = applied.run_id.clone().expect("a run id");
+        let imports = rig.gateway.import_calls().len();
+        let before = rig.git_manifest().await;
+        // A directory where the journal file goes: the write cannot land.
+        let journal = rig
+            .f
+            .data_dir
+            .join("ign-deploy/capgw/projects")
+            .join(PROJECT)
+            .join("journal.json");
+        std::fs::create_dir_all(&journal).expect("a directory in the journal's place");
+        let err = refusal(
+            rig.rollback_run_with(&run_id, false, Some((&backup, WAIT)))
+                .await,
+        );
+        assert_eq!(rig.gateway.import_calls().len(), imports, "no import");
+        assert!(
+            rig.save_trees().is_empty(),
+            "the master's save is gone: {err}"
+        );
+        assert!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).is_empty(),
+            "the backup's save is gone: {err}"
+        );
+        assert_eq!(rig.git_manifest().await, before);
+        // The undo's own run directory is the newest; it logged both saves and
+        // both removals.
+        let mut runs: Vec<PathBuf> = std::fs::read_dir(rig.repo.join(".ign/deploy/capgw"))
+            .expect("run dirs")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        runs.sort();
+        let events =
+            std::fs::read_to_string(runs.last().expect("the undo's run").join("events.ndjson"))
+                .expect("events");
+        assert_eq!(events.matches("\"git_saved\"").count(), 2, "{events}");
+        assert_eq!(
+            events.matches("\"git_save_removed\"").count(),
+            2,
+            "{events}"
+        );
+    }
+
+    /// WR-02: the import request failed in a way that may have reached the
+    /// gateway (the answer was lost after it applied, and the module recreated
+    /// a different `.git`). The save is the only copy of the old repository:
+    /// it stays, and the run names it.
+    #[tokio::test]
+    async fn uncertain_import_keeps_the_save() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_recreates_git()
+                .with_project_import_answer_lost()
+        });
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save is kept");
+        let node = git_of(&result).master();
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(rig.f.data_dir.join(&save.path).is_dir());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("may have reached the gateway")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    /// WR-02: an import that never left the host (no answer, nothing applied)
+    /// is still an unknown outcome. The run reads the project back and the
+    /// save is not discarded on the strength of the error.
+    #[tokio::test]
+    async fn lost_import_is_read_back_not_discarded() {
+        let rig = Rig::with(|g| g.with_project_import_lost());
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::ImportedUnverified,
+            "{:?}",
+            result.warnings
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("may have reached the gateway")),
+            "{:?}",
+            result.warnings
+        );
     }
 }

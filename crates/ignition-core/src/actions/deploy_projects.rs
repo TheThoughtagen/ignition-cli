@@ -5030,8 +5030,19 @@ async fn execute(
                 .await;
             }
             Err(err) => {
-                return Err(unwritten(
+                // 27-34 (WR-02): the master's save was taken and the `.git`
+                // was never touched.
+                let err = discard_saves_before_import(
                     on_backup(err),
+                    &plan.gateway,
+                    project,
+                    git_undo(&writers, git_saved.as_ref()),
+                    None,
+                    &mut events,
+                )
+                .await;
+                return Err(unwritten(
+                    err,
                     loaded,
                     writers.run,
                     step.writes.host.as_ref(),
@@ -5046,8 +5057,18 @@ async fn execute(
     // is remembered, never an error.
     if tag_owning {
         events.emit_late(ProjectsEvent::ImportSent { overwrite });
-    } else {
-        events.emit(ProjectsEvent::ImportSent { overwrite })?;
+    } else if let Err(err) = events.emit(ProjectsEvent::ImportSent { overwrite }) {
+        // 27-34 (WR-02): a log that cannot be written stops the run before
+        // the import, with the saves it took still unneeded.
+        return Err(discard_saves_before_import(
+            err,
+            &plan.gateway,
+            project,
+            git_undo(&writers, git_saved.as_ref()),
+            backup_undo(&writers, backup_saved.as_ref()),
+            &mut events,
+        )
+        .await);
     }
     let answer = match gateway
         .project_import(project, loaded.artifact.zip.clone(), overwrite)
@@ -5097,6 +5118,20 @@ async fn execute(
             .await;
         }
         Err(err) => {
+            // 27-34 (WR-02, D-06): the gateway gave a definite refusal (or the
+            // request never went out), so the import changed nothing and the
+            // `.git` the saves were taken from is untouched. The saves go;
+            // one that cannot is named in the error. An import whose outcome
+            // is unknown never gets here: it keeps every save.
+            let err = discard_saves_before_import(
+                err,
+                &plan.gateway,
+                project,
+                git_undo(&writers, git_saved.as_ref()),
+                backup_undo(&writers, backup_saved.as_ref()),
+                &mut events,
+            )
+            .await;
             return Err(unwritten(
                 err,
                 loaded,
@@ -6204,6 +6239,102 @@ async fn unwritten(
         events.emit_late(ProjectsEvent::JournalCleared);
     }
     err
+}
+
+/// `err`, after the `.git` saves a run took and then stopped before any
+/// import are removed (27-34, WR-02, D-06). The save exists to restore a
+/// `.git` the import removed; when no import ran, the `.git` was never touched
+/// and the copy (400 MB on a real gateway) would only strand disk space on the
+/// volume the free-space preflight sizes. The master's goes first, then the
+/// backup's, each through its own node's writer.
+///
+/// A save that cannot be removed is named in the error (its path, its node and
+/// that it is safe to delete by hand) with the error's slug and exit kept;
+/// see [`name_kept_saves`] for the errors that carry no message to extend.
+async fn discard_saves_before_import(
+    err: CoreError,
+    gateway: &str,
+    project: &str,
+    master: Option<GitUndo<'_>>,
+    backup: Option<BackupUndo<'_>>,
+    events: &mut RunEvents<'_>,
+) -> CoreError {
+    let mut saves: Vec<(&str, &dyn GitStateWriter, &GitSaveReport)> = Vec::new();
+    if let Some(GitUndo { writer, saved }) = master {
+        saves.push((git::MASTER, writer, saved));
+    }
+    if let Some(BackupUndo { writer, saved, .. }) = backup {
+        saves.push((git::BACKUP, writer, saved));
+    }
+    let mut kept = Vec::new();
+    for (node, writer, saved) in saves {
+        match writer
+            .remove_git_save(gateway, project, &saved.run_id)
+            .await
+        {
+            Ok(()) => events.emit_late(ProjectsEvent::GitSaveRemoved {
+                node: node.to_string(),
+                path: saved.path.clone(),
+            }),
+            Err(_) => kept.push(format!(
+                "the saved .git copy at {} on {node} could not be removed; it is safe to delete \
+                 by hand",
+                saved.path
+            )),
+        }
+    }
+    name_kept_saves(err, &kept)
+}
+
+/// `err` with `kept` appended to its message, keeping its slug and its exit.
+/// Only an error that carries free text can take the note: a transport
+/// failure, a plan that went stale, an import the gateway denied, an internal
+/// error or an invalid input. A refusal that names nothing but an endpoint
+/// (`auth_rejected`, `not_found`, a restarting gateway) is returned as it is
+/// and the note goes to the log instead: changing its slug to make room for
+/// the text would break the contract consumers key on.
+fn name_kept_saves(err: CoreError, kept: &[String]) -> CoreError {
+    if kept.is_empty() {
+        return err;
+    }
+    let note = kept.join("; ");
+    match err {
+        CoreError::TransportFailed {
+            operation,
+            node,
+            detail,
+        } => CoreError::TransportFailed {
+            operation,
+            node,
+            detail: format!("{detail}; {note}"),
+        },
+        CoreError::ImportDenied {
+            project,
+            problem,
+            endpoint,
+        } => CoreError::ImportDenied {
+            project,
+            problem: format!("{problem}; {note}"),
+            endpoint,
+        },
+        CoreError::PlanStale {
+            expected,
+            actual,
+            detail,
+        } => CoreError::PlanStale {
+            expected,
+            actual,
+            detail: format!("{detail}; {note}"),
+        },
+        CoreError::Internal(text) => CoreError::Internal(format!("{text}; {note}")),
+        CoreError::InvalidInput { reason } => CoreError::InvalidInput {
+            reason: format!("{reason}; {note}"),
+        },
+        other => {
+            tracing::warn!("{note}");
+            other
+        }
+    }
 }
 
 /// Switch the run's host journal to `rolling_back` as its rollback starts
@@ -9420,6 +9551,37 @@ pub async fn deploy_projects_rollback_run(
             skipped: true,
         }
     };
+    // 27-34 (WR-01, D-22): the undo imports the pre-image, which removes the
+    // `.git`, and then has to put it back. Prove first, on the master and on
+    // the backup of a pair, that the deploy account can write what the restore
+    // writes and that there is room for it: a missing grant or a full disk
+    // refuses here, before the first save, journal write or import, instead
+    // of after the `.git` is gone. The undo writes no pack (`prep: None`).
+    if let (Some(writer), Some(read)) = (git_writer, surfaces.host.git()) {
+        git::git_preflight(
+            writer,
+            read,
+            &loaded.target.gateway,
+            project,
+            None,
+            RunId::generate().as_str(),
+        )
+        .await?;
+    }
+    if let (Some(writer), Some(host)) = (backup_writer.as_deref(), backup_host.as_deref())
+        && let Some(read) = host.git()
+    {
+        git::git_preflight_on(
+            git::BACKUP,
+            writer,
+            read,
+            &loaded.target.gateway,
+            project,
+            None,
+            RunId::generate().as_str(),
+        )
+        .await?;
+    }
     let (rid, run_dir) = RunDir::create_fresh(&opts.repo, &loaded.target.gateway)?;
     let rel = run_dir_rel(&loaded.target.gateway, &rid);
     result.run_id = Some(rid.as_str().to_string());
@@ -9464,78 +9626,112 @@ pub async fn deploy_projects_rollback_run(
                 sessions: designers.seen.clone(),
             })?;
         }
-        // Phase 27 (D-08): the gateway `.git` is saved before the journal and
-        // before the first gateway write. A save that cannot be taken stops
-        // the undo with nothing written to the gateway.
+        // 27-34 (WR-02): once a save is taken, any stop before the import
+        // removes the saves (the `.git` was never touched), through
+        // `discard_saves_before_import`.
         let mut git_saved: Option<GitSaveReport> = None;
-        if let (Some(report), Some(writer), Some(read)) =
-            (git_report.as_mut(), git_writer, surfaces.host.git())
-        {
-            let saved = crate::deploy::git_handover::save(
-                read,
-                writer,
-                &loaded.target.gateway,
-                project,
-                rid.as_str(),
-            )
-            .await?;
-            report.set_save(&saved);
-            events.emit(ProjectsEvent::GitSaved {
-                node: "nodes.master".to_string(),
-                path: saved.path.clone(),
-                files: saved.manifest.files,
-                bytes: saved.manifest.bytes,
-            })?;
-            git_saved = Some(saved);
-        }
-        // 27-22: the backup's `.git` is saved the same way, on its own host.
         let mut backup_saved: Option<GitSaveReport> = None;
-        if let (Some(report), Some(writer), Some(host)) = (
-            git_report.as_mut(),
+        let staged: Result<(), CoreError> = async {
+            // Phase 27 (D-08): the gateway `.git` is saved before the journal and
+            // before the first gateway write. A save that cannot be taken stops
+            // the undo with nothing written to the gateway.
+            if let (Some(report), Some(writer), Some(read)) =
+                (git_report.as_mut(), git_writer, surfaces.host.git())
+            {
+                let saved = crate::deploy::git_handover::save(
+                    read,
+                    writer,
+                    &loaded.target.gateway,
+                    project,
+                    rid.as_str(),
+                )
+                .await?;
+                report.set_save(&saved);
+                events.emit(ProjectsEvent::GitSaved {
+                    node: "nodes.master".to_string(),
+                    path: saved.path.clone(),
+                    files: saved.manifest.files,
+                    bytes: saved.manifest.bytes,
+                })?;
+                git_saved = Some(saved);
+            }
+            // 27-22: the backup's `.git` is saved the same way, on its own host.
+            if let (Some(report), Some(writer), Some(host)) = (
+                git_report.as_mut(),
+                backup_writer.as_deref(),
+                backup_host.as_deref(),
+            ) && let Some(read) = host.git()
+            {
+                let saved = crate::deploy::git_handover::save(
+                    read,
+                    writer,
+                    &loaded.target.gateway,
+                    project,
+                    rid.as_str(),
+                )
+                .await
+                .map_err(on_backup)?;
+                git::set_backup_save(report, &saved);
+                events.emit(ProjectsEvent::GitSaved {
+                    node: git::BACKUP.to_string(),
+                    path: saved.path.clone(),
+                    files: saved.manifest.files,
+                    bytes: saved.manifest.bytes,
+                })?;
+                backup_saved = Some(saved);
+            }
+            result.git = git_report.take().map(Box::new);
+            // The journal says rolling_back before the first gateway write; a
+            // host that cannot take it stops the undo with nothing written.
+            let journal = ProjectJournal {
+                schema_version: 1,
+                gateway: loaded.target.gateway.clone(),
+                project: project.to_string(),
+                run_id: target.as_str().to_string(),
+                state: JournalState::RollingBack,
+                started_at: rfc3339_now_utc(),
+                providers: set.run.providers.iter().map(|p| p.name.clone()).collect(),
+            };
+            run_writer
+                .write_journal(&loaded.target.gateway, project, &journal.to_bytes())
+                .await?;
+            events.emit(ProjectsEvent::JournalWritten {
+                state: JournalState::RollingBack.as_str(),
+            })?;
+            writes.host = Some(HostCopy {
+                run: set.run.clone(),
+                journal,
+            });
+            Ok(())
+        }
+        .await;
+        let git_now = match (git_writer, git_saved.as_ref()) {
+            (Some(writer), Some(saved)) => Some(GitUndo { writer, saved }),
+            _ => None,
+        };
+        let backup_now = match (
             backup_writer.as_deref(),
             backup_host.as_deref(),
-        ) && let Some(read) = host.git()
-        {
-            let saved = crate::deploy::git_handover::save(
-                read,
+            backup_saved.as_ref(),
+        ) {
+            (Some(writer), Some(host), Some(saved)) => Some(BackupUndo {
+                host,
                 writer,
+                saved,
+            }),
+            _ => None,
+        };
+        if let Err(err) = staged {
+            return Err(discard_saves_before_import(
+                err,
                 &loaded.target.gateway,
                 project,
-                rid.as_str(),
+                git_now,
+                backup_now,
+                &mut events,
             )
-            .await
-            .map_err(on_backup)?;
-            git::set_backup_save(report, &saved);
-            events.emit(ProjectsEvent::GitSaved {
-                node: git::BACKUP.to_string(),
-                path: saved.path.clone(),
-                files: saved.manifest.files,
-                bytes: saved.manifest.bytes,
-            })?;
-            backup_saved = Some(saved);
+            .await);
         }
-        result.git = git_report.take().map(Box::new);
-        // The journal says rolling_back before the first gateway write; a
-        // host that cannot take it stops the undo with nothing written.
-        let journal = ProjectJournal {
-            schema_version: 1,
-            gateway: loaded.target.gateway.clone(),
-            project: project.to_string(),
-            run_id: target.as_str().to_string(),
-            state: JournalState::RollingBack,
-            started_at: rfc3339_now_utc(),
-            providers: set.run.providers.iter().map(|p| p.name.clone()).collect(),
-        };
-        run_writer
-            .write_journal(&loaded.target.gateway, project, &journal.to_bytes())
-            .await?;
-        events.emit(ProjectsEvent::JournalWritten {
-            state: JournalState::RollingBack.as_str(),
-        })?;
-        writes.host = Some(HostCopy {
-            run: set.run.clone(),
-            journal,
-        });
         let failure = TagFailure {
             cause: RollbackCause::RollbackRun,
             what: format!("the undo of run {} from the host copy", target.as_str()),
@@ -9555,22 +9751,8 @@ pub async fn deploy_projects_rollback_run(
                 run: Some(run_writer),
                 records: Some(tag_writer),
                 release: Some(release_writer),
-                git: match (git_writer, git_saved.as_ref()) {
-                    (Some(writer), Some(saved)) => Some(GitUndo { writer, saved }),
-                    _ => None,
-                },
-                backup_git: match (
-                    backup_writer.as_deref(),
-                    backup_host.as_deref(),
-                    backup_saved.as_ref(),
-                ) {
-                    (Some(writer), Some(host), Some(saved)) => Some(BackupUndo {
-                        host,
-                        writer,
-                        saved,
-                    }),
-                    _ => None,
-                },
+                git: git_now,
+                backup_git: backup_now,
             },
             &route,
             &mut events,

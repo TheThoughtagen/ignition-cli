@@ -89,7 +89,10 @@
 //! not clean may have applied part of it), `with_write_after_import` sets one
 //! key of one node right after a given import (a runtime write between the
 //! failure and the rollback, or another administrator's change),
-//! `with_project_import_denied` refuses every project import, and
+//! `with_project_import_lost` fails every project import with a transport error
+//! before anything is applied, `with_project_import_answer_lost` applies it and
+//! then fails the answer (27-34), `with_project_import_denied` refuses every
+//! project import, and
 //! `tag_provider_delete` removes a provider and its tree when the signature
 //! is the current one (the undo of a provider the run created). Three knobs
 //! stand in for other clients around a create: `with_provider_create_conflict`
@@ -255,6 +258,13 @@ pub struct FakeProjects {
     provider_signature_seq: AtomicU64,
     /// Every project import is refused (`import_denied`).
     deny_project_import: AtomicBool,
+    /// Every project import fails before it reaches the gateway's project
+    /// store, as a request whose answer never came back, and changes nothing
+    /// (27-34, WR-02).
+    lose_project_import: AtomicBool,
+    /// Every project import is applied and then answers a transport failure:
+    /// the request reached the gateway and the answer was lost (27-34, WR-02).
+    lose_project_import_answer: AtomicBool,
     /// How the next provider create goes when a test scripts it.
     provider_create_script: Mutex<Option<CreateScript>>,
     /// Providers another client re-signs right after the 1-based tag import.
@@ -397,6 +407,8 @@ impl FakeProjects {
             provider_writes_ignored: AtomicBool::new(false),
             provider_signature_seq: AtomicU64::new(0),
             deny_project_import: AtomicBool::new(false),
+            lose_project_import: AtomicBool::new(false),
+            lose_project_import_answer: AtomicBool::new(false),
             provider_create_script: Mutex::new(None),
             resign_after: Mutex::new(Vec::new()),
             reads_failing_after_create: (AtomicU64::new(0), AtomicU64::new(0)),
@@ -878,6 +890,23 @@ impl FakeProjects {
     /// (`import_denied`) and changes nothing (26-11).
     pub fn with_project_import_denied(self) -> Self {
         self.deny_project_import.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Every project import fails with a transport error before anything is
+    /// applied, so the caller cannot tell whether the gateway imported
+    /// (27-34, WR-02).
+    pub fn with_project_import_lost(self) -> Self {
+        self.lose_project_import.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Every project import is applied and then answers a transport error:
+    /// the gateway changed and the caller never saw the answer (27-34,
+    /// WR-02).
+    pub fn with_project_import_answer_lost(self) -> Self {
+        self.lose_project_import_answer
+            .store(true, Ordering::SeqCst);
         self
     }
 
@@ -1661,6 +1690,13 @@ impl ProjectGateway for FakeProjects {
                 endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/import/{name}")),
             });
         }
+        if self.lose_project_import.load(Ordering::SeqCst) {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/projects/import/{name}"),
+                source: None,
+                observation: None,
+            });
+        }
         self.imported.store(true, Ordering::SeqCst);
         let mut projects = self.projects.lock().expect("projects");
         if !overwrite && projects.contains_key(name) {
@@ -1726,6 +1762,13 @@ impl ProjectGateway for FakeProjects {
         } else {
             serde_json::json!([{ "name": name }])
         };
+        if self.lose_project_import_answer.load(Ordering::SeqCst) {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/projects/import/{name}"),
+                source: None,
+                observation: None,
+            });
+        }
         Ok(ImportOutcome {
             response: serde_json::json!({ "success": true, "changes": changes }),
         })
