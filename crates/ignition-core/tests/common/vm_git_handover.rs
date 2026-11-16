@@ -46,6 +46,51 @@ use super::prod_shape_git::{
     OFFLINE_GATEWAY_DIGEST,
 };
 
+/// The gateway URL a VM gate may hand to `ign` (27-29, WR-D5, T-27-108): `https://` to any
+/// host, `http://` only to a loopback host (`localhost`, `127.0.0.1`, `::1`). The VM
+/// gateways serve plain HTTP, so the driver tunnels the port over its pinned ssh
+/// connection and exports the loopback URL in `var`; an unset variable refuses too, so a
+/// hand run without the driver cannot fall back to the VM's own address. The parse is a
+/// URL parse, never a string match (`http://127.0.0.1@evil` has the host `evil`). The
+/// refusal names the variable and the driver `steps` and never the URL.
+pub fn vm_gateway_url_check(raw: Option<&str>, var: &str, steps: &str) -> Result<String, String> {
+    let refuse = |why: &str| {
+        format!(
+            "REFUSING: {var} {why}; run this gate through `{steps}`, which reaches the gateway \
+             only through a pinned ssh tunnel on 127.0.0.1"
+        )
+    };
+    let raw = raw.ok_or_else(|| refuse("is not set"))?;
+    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(refuse("is empty or holds whitespace"));
+    }
+    let parsed = url::Url::parse(raw).map_err(|_| refuse("is not a URL"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(refuse("carries credentials"));
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(addr)) => addr == std::net::Ipv6Addr::LOCALHOST,
+        None => false,
+    };
+    match parsed.scheme() {
+        "https" if parsed.host().is_some() => Ok(raw.to_string()),
+        "http" if loopback => Ok(raw.to_string()),
+        "http" => Err(refuse(
+            "is a cleartext http:// URL to a host that is not loopback; the gateway token would cross the network",
+        )),
+        _ => Err(refuse("is not an http:// loopback or https:// URL")),
+    }
+}
+
+/// [`vm_gateway_url_check`] on the environment variable `var`; a refusal panics before any
+/// `ign` call.
+pub fn vm_gateway_url(var: &str, steps: &str) -> String {
+    let raw = std::env::var(var).ok();
+    vm_gateway_url_check(raw.as_deref(), var, steps).unwrap_or_else(|refusal| panic!("{refusal}"))
+}
+
 /// The 27-06 host budgets of one host family.
 #[derive(Clone, Copy)]
 pub struct Budgets {

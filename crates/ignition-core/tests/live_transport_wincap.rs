@@ -7623,336 +7623,15 @@ async fn wincap_git_scripts() {
 // `ign-live-scratch\data27` (project `CapApp27`), removed at the start and at
 // the end; the gateway's own data directory is never named.
 //
-// ```text
-// set -o pipefail; set -a; . "$HOME/.config/ign-azure-win/env"; set +a
-// IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST="$IGN_WINVM_HOST" IGN_WINCAP_KEY="$IGN_WINVM_KEY" \
-//   IGN_WINCAP_PROFILE="$IGN_WINVM_PROFILE" \
-//   cargo test -p ignition-core --test live_transport_wincap wincap_git_objects -- --ignored --nocapture --test-threads=1
-// ```
-
-/// The staging directories a read left in the account home (`.ign-ctl-*`).
-const GIT_HOST_LEFT: &str = "$n=@();foreach($e in [IO.Directory]::GetFileSystemEntries($p.path,'.ign-ctl-*')){$n+=[IO.Path]::GetFileName($e)};E @{ok=1;n=$n}";
-
-fn objects_step(name: &str, took: Duration, budget: Duration) {
-    println!(
-        "wincap_git_objects {name}: measured {} ms budget {} ms",
-        took.as_millis(),
-        budget.as_millis()
-    );
-    assert!(
-        took <= budget,
-        "{name}: measured {} ms is over the budget of {} ms",
-        took.as_millis(),
-        budget.as_millis()
-    );
-}
-
-/// The commit a gateway's HEAD names, from the files `read_git_state` returned.
-fn gateway_head_commit(files: &ignition_core::deploy::git_state::GitFiles) -> String {
-    let head = String::from_utf8(files.head.clone().expect("HEAD")).expect("HEAD is text");
-    let head = head.trim();
-    let Some(name) = head.strip_prefix("ref: ") else {
-        return head.to_string();
-    };
-    if let Some((_, bytes)) = files.loose_refs.iter().find(|(path, _)| path == name) {
-        return String::from_utf8_lossy(bytes).trim().to_string();
-    }
-    let packed = String::from_utf8_lossy(files.packed_refs.as_deref().expect("packed-refs"));
-    packed
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .find(|(_, path)| *path == name)
-        .map(|(id, _)| id.to_string())
-        .unwrap_or_else(|| panic!("{name} is neither loose nor packed"))
-}
-
-/// A [`GitHostRead`](ignition_core::deploy::transport::projects::GitHostRead)
-/// over a node that adds up the time of the two object reads (the same
-/// accounting `TimedRead` does in the offline rows).
-struct TimedNode<'a> {
-    node: &'a SftpTransport,
-    spent: std::sync::Mutex<Duration>,
-    fetches: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl ignition_core::deploy::transport::projects::GitHostRead for TimedNode<'_> {
-    async fn read_git_state(
-        &self,
-        project: &str,
-    ) -> Result<ignition_core::deploy::git_state::GitFiles, CoreError> {
-        self.node.read_git_state(project).await
-    }
-    async fn git_manifest(
-        &self,
-        project: &str,
-    ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
-        self.node.git_manifest(project).await
-    }
-    async fn save_manifest(
-        &self,
-        gateway: &str,
-        project: &str,
-        run_id: &str,
-    ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
-        self.node.save_manifest(gateway, project, run_id).await
-    }
-    async fn git_file_digest(
-        &self,
-        project: &str,
-        name: &ignition_core::deploy::git_advance::GitWriteName,
-    ) -> Result<Option<String>, CoreError> {
-        self.node.git_file_digest(project, name).await
-    }
-    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
-        self.node.read_git_yaml().await
-    }
-    async fn project_dir_entry(
-        &self,
-        project: &str,
-        dir: ignition_core::deploy::transport::projects::ImportDir,
-    ) -> Result<ignition_core::deploy::transport::projects::GitEntry, CoreError> {
-        self.node.project_dir_entry(project, dir).await
-    }
-    async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
-        self.node.free_bytes(gateway, project).await
-    }
-    async fn git_size(
-        &self,
-        project: &str,
-    ) -> Result<ignition_core::deploy::transport::projects::GitSize, CoreError> {
-        self.node.git_size(project).await
-    }
-    async fn list_git_objects(
-        &self,
-        project: &str,
-    ) -> Result<ignition_core::deploy::git_objects::GitObjectList, CoreError> {
-        let started = Instant::now();
-        let out = self.node.list_git_objects(project).await;
-        *self.spent.lock().expect("lock") += started.elapsed();
-        out
-    }
-    async fn fetch_git_objects(
-        &self,
-        project: &str,
-        files: &[ignition_core::deploy::git_objects::GitObjectFile],
-        dest: &Path,
-    ) -> Result<(), CoreError> {
-        let started = Instant::now();
-        let before = self.node.sessions();
-        let out = self.node.fetch_git_objects(project, files, dest).await;
-        *self.spent.lock().expect("lock") += started.elapsed();
-        println!(
-            "wincap_git_objects fetch: {} files, {} bytes, {} ms, {} ssh connections",
-            files.len(),
-            files.iter().map(|f| f.size).sum::<u64>(),
-            started.elapsed().as_millis(),
-            self.node.sessions() - before
-        );
-        self.fetches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        out
-    }
-}
-
-#[tokio::test]
-#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and ign-live-scratch\\git27\\src.git from capture27-vm.sh upload"]
-async fn wincap_git_objects() {
-    use ignition_core::deploy::git_objects::gateway_head_digest;
-    use ignition_core::deploy::git_remote::HostGit;
-    use ignition_core::deploy::transport::projects::{GitEntry, GitHostRead};
-
-    let Some(live) = live() else { return };
-    let host_repo = repo(&live, "git27o-home", &live.data_dir, None);
-    let host_shell = shell_of(host_repo.path(), "git27o-home");
-    let home_native = native(&home_sftp(&host_shell).await);
-    let data27 = format!("{home_native}\\{SCRATCH}\\data27");
-    let src_git = format!("{home_native}\\{SCRATCH}\\git27\\src.git");
-    let git_dir = format!("{data27}\\projects\\{GIT_PROJECT}\\.git");
-    // the scratch root is the account's own, never the gateway's data directory
-    assert!(!data27.to_ascii_lowercase().contains("program files"));
-    assert!(data27.contains(SCRATCH));
-
-    let facts = host_shell
-        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
-        .await
-        .expect("facts");
-    println!(
-        "wincap_git_objects host: PSEdition {} PSVersion {} computer {}",
-        facts["e"], facts["v"], facts["c"]
-    );
-    assert_eq!(
-        facts["e"], "Desktop",
-        "the deploy account's ssh runs Windows PowerShell"
-    );
-
-    // leftovers of an earlier run, then the source must exist
-    remove_tree(&host_shell, &data27).await;
-    assert!(
-        enumerate(&host_shell, &src_git).await.is_some(),
-        "{src_git} is missing: run capture27-vm.sh upload first"
-    );
-
-    let repo_dir = repo(&live, "git27o", &data27, None);
-    let shell = shell_of(repo_dir.path(), "git27o");
-    let (_, ssh, _) = ssh_of(repo_dir.path(), "git27o");
-    let node = SftpTransport::new_windows(
-        shell,
-        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
-        "nodes.master",
-    );
-
-    // the production-shape `.git` goes in with the host copy tool, Hidden as
-    // the module's is
-    host_shell
-        .exec_powershell(&script(
-            "git_host_copy",
-            GIT_HOST_COPY,
-            serde_json::json!({ "s": src_git, "d": git_dir }),
-        ))
-        .await
-        .expect("copy src.git in");
-    host_shell
-        .exec_powershell(&script(
-            "git_host_hide",
-            GIT_HOST_HIDE,
-            serde_json::json!({ "path": git_dir }),
-        ))
-        .await
-        .expect("hide");
-    let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
-        let state = node.read_git_state(GIT_PROJECT).await.expect("state");
-        assert_eq!(state.kind, GitEntry::Directory);
-        let head = gateway_head_commit(&state);
-        println!("wincap_git_objects HEAD resolved: {} characters", head.len());
-        let size = node.git_size(GIT_PROJECT).await.expect("size");
-        println!(
-            "wincap_git_objects shape: {} files, {} bytes",
-            size.files, size.bytes
-        );
-
-        // 1. the listing alone, as one WinScript
-        let started = Instant::now();
-        let list = node.list_git_objects(GIT_PROJECT).await.expect("list");
-        objects_step("list_git_objects", started.elapsed(), GIT_OBJECTS_BUDGET);
-        println!(
-            "wincap_git_objects listing: {} loose objects, {} packs, {} bytes",
-            list.loose.len(),
-            list.packs.len(),
-            list.total_bytes()
-        );
-        assert!(list.validate().is_ok());
-        assert!(
-            list.loose.len() + 2 * list.packs.len() <= size.files,
-            "the listing names no more files than the .git holds"
-        );
-        assert!(list.total_bytes() <= size.bytes);
-
-        // 2. the worst case: ign's own store is empty, so every pack holding
-        //    an object of the HEAD's tree is fetched
-        let empty = tempfile::tempdir().expect("empty store");
-        let init = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(empty.path())
-            .status()
-            .expect("git init");
-        assert!(init.success());
-        let timed = TimedNode {
-            node: &node,
-            spent: std::sync::Mutex::new(Duration::ZERO),
-            fetches: std::sync::atomic::AtomicUsize::new(0),
-        };
-        let before = node.sessions();
-        let started = Instant::now();
-        let (digest, stats) =
-            gateway_head_digest(&HostGit::new(), empty.path(), &timed, GIT_PROJECT, &head)
-                .await
-                .expect("the gateway's objects supply HEAD");
-        let total = started.elapsed();
-        let objects = *timed.spent.lock().expect("lock");
-        let resolve = total.saturating_sub(objects);
-        println!(
-            "wincap_git_objects FetchStats: {} loose, {} idx, {} packs, {} bytes in {} fetches, {} ssh connections",
-            stats.loose,
-            stats.idx,
-            stats.packs,
-            stats.bytes,
-            timed.fetches.load(std::sync::atomic::Ordering::Relaxed),
-            node.sessions() - before
-        );
-        objects_step(
-            "listing plus fetch (gateway_head_digest)",
-            objects,
-            GIT_OBJECTS_BUDGET,
-        );
-        objects_step(
-            "resolve and digest (gateway_head_digest)",
-            resolve,
-            GIT_OBJECTS_DIGEST_BUDGET,
-        );
-        assert!(stats.loose + stats.packs > 0, "something was fetched");
-        assert!(stats.bytes <= size.bytes);
-        println!(
-            "wincap_git_objects digest: {} members",
-            digest.members.len()
-        );
-
-        // 3. the staging directory is gone, and the source is untouched
-        let left = host_shell
-            .exec_powershell(&script(
-                "git_host_left",
-                GIT_HOST_LEFT,
-                path_params(&home_native),
-            ))
-            .await
-            .expect("left");
-        assert_eq!(
-            left["n"].as_array().map(Vec::len),
-            Some(0),
-            "no .ign-ctl-* staging directory is left in the account home: {left}"
-        );
-        println!("wincap_git_objects staging: no .ign-ctl-* left in the account home");
-        let after = node.git_size(GIT_PROJECT).await.expect("size after");
-        assert_eq!(
-            (after.files, after.bytes),
-            (size.files, size.bytes),
-            "the read changed nothing in the gateway's .git"
-        );
-    }))
-    .await;
-
-    // cleanup: the scratch root (also after a failure), quoted
-    let data_gone = remove_tree(&host_shell, &data27).await;
-    println!("wincap_git_objects cleanup: data27 gone {data_gone}");
-    assert!(data_gone);
-    assert!(
-        enumerate(&host_shell, &src_git).await.is_some(),
-        "the 27-07 source is kept"
-    );
-    if let Err(panic) = result {
-        std::panic::resume_unwind(panic);
-    }
-    println!("LIVE-RAN wincap_git_objects");
-}
-
-// ---- the git handover at production shape (27-25, D-18, D-24, checker W-5) -----------
-//
-// ign's own ssh transports, built from a target file's `ssh` node exactly as the
-// CLI builds them (`project_host_for_node`, `git_state_writer_for_node`), save,
-// restore and advance the production-shape `.git` of the disposable project
-// `CapApp27` on the REAL gateway data directory as the non-admin deploy account
-// (the narrow grant of 27-07 on that one project directory; the grant is on the
-// directory the gateway creates with the project, so it is applied again after
-// `capture27-vm.sh project-up`). The restore is robocopy, the `.git` must come
-// back Hidden (G8). `project-down` and `scratch-down` clean up afterwards.
+// Run it through the driver (27-29), which tunnels the gateway to 127.0.0.1, exports
+// `IGN_WINVM_GATEWAY_URL` and the gate's environment, redacts the output and writes the
+// log to the private evidence directory. The gate refuses an `http://` URL whose host is
+// not loopback, and an unset `IGN_WINVM_GATEWAY_URL`:
 //
 // ```text
-// set -o pipefail; set -a; . "$HOME/.config/ign-azure-win/env"; set +a
-// IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST="$IGN_WINVM_HOST" IGN_WINCAP_KEY="$IGN_WINVM_KEY" \
-//   IGN_WINCAP_PROFILE="$IGN_WINVM_PROFILE" PRODSHAPE_GIT_OUT=... \
-//   IGN_WINCAP_KNOWN_HOSTS=<pinned file with an entry for the host> \
-//   cargo test -p ignition-core --test live_transport_wincap wincap_git_handover \
-//     -- --ignored --nocapture --test-threads=1 2>&1 | tee 27-25-wincap.log
+// set -a; . "$HOME/.config/ign-azure-win/env"; set +a
+// export PRODSHAPE_GIT_OUT=...
+// CAPTURE27_VMS=win bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh winvm-handover
 // ```
 
 const HANDOVER_RUN: &str = "20261115T120000Z-w27h";
@@ -7969,16 +7648,63 @@ fn mentions_name(value: &serde_json::Value, name: &str) -> bool {
     }
 }
 
-/// One call of the installed `ign` at the gateway of the ssh host (port
-/// `IGN_WINVM_GATEWAY_PORT`, default 8088): exit code and JSON envelope.
-async fn guard_call(profile: &str, host: &str, args: &[&str]) -> (i32, serde_json::Value) {
-    let port = std::env::var("IGN_WINVM_GATEWAY_PORT").unwrap_or_else(|_| "8088".to_string());
+/// The gateway URL of the VM gates (27-29, WR-D5): `https://` anywhere, `http://` only to a
+/// loopback host, and never the VM's own address. The driver exports the tunnel URL.
+#[test]
+fn vm_gateway_url_guard() {
+    use common::vm_git_handover::vm_gateway_url_check;
+    let check = |raw: Option<&str>| {
+        vm_gateway_url_check(
+            raw,
+            "IGN_WINVM_GATEWAY_URL",
+            "capture27-vm.sh winvm-handover or vm-gate",
+        )
+    };
+    for ok in [
+        "http://127.0.0.1:18088",
+        "http://[::1]:18088",
+        "https://192.0.2.15:8043",
+    ] {
+        assert_eq!(check(Some(ok)).as_deref(), Ok(ok), "must accept {ok}");
+    }
+    for bad in [
+        Some("http://192.0.2.15:8088"),
+        Some("http://user@127.0.0.1.evil:8088"),
+        Some("http://127.0.0.1@192.0.2.15:8088"),
+        Some("http://127.0.0.1:18088 /x"),
+        Some("http://127.0.0.1:18088\n"),
+        Some(" http://127.0.0.1:18088"),
+        Some("ftp://127.0.0.1:18088"),
+        Some(""),
+        None,
+    ] {
+        let err = check(bad).expect_err("must refuse");
+        assert!(
+            err.contains("capture27-vm.sh winvm-handover or vm-gate")
+                && err.contains("IGN_WINVM_GATEWAY_URL"),
+            "the refusal names the variable and the driver steps: {err}"
+        );
+        assert!(
+            !err.contains("192.0.2.15"),
+            "the refusal never echoes the address: {err}"
+        );
+    }
+}
+
+/// One call of the installed `ign` at the gateway URL the driver exports in `IGN_WINVM_GATEWAY_URL` (a
+/// loopback tunnel, guarded by [`vm_gateway_url`](common::vm_git_handover::vm_gateway_url)):
+/// exit code and JSON envelope.
+async fn guard_call(profile: &str, args: &[&str]) -> (i32, serde_json::Value) {
+    let url = common::vm_git_handover::vm_gateway_url(
+        "IGN_WINVM_GATEWAY_URL",
+        "capture27-vm.sh winvm-handover or vm-gate",
+    );
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         tokio::process::Command::new("ign")
             .args(["--profile", profile, "--json"])
             .args(args)
-            .env("IGNITION_URL", format!("http://{host}:{port}"))
+            .env("IGNITION_URL", &url)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output(),
@@ -7997,15 +7723,14 @@ async fn guard_call(profile: &str, host: &str, args: &[&str]) -> (i32, serde_jso
     )
 }
 
-/// The gateway-name guard of 27-07: gateway-info at the address of the ssh host
+/// The gateway-name guard of 27-07: gateway-info through the driver's loopback tunnel
 /// names the expected test gateway, and the disposable project exists.
-async fn handover_guard(live: &Live) {
+async fn handover_guard() {
     let profile = std::env::var("IGN_WINCAP_PROFILE").expect("IGN_WINCAP_PROFILE");
     let expected = std::env::var("IGN_WINVM_GATEWAY_NAME")
         .unwrap_or_else(|_| "Ignition-ignwin836".to_string());
     let (code, info) = guard_call(
         &profile,
-        &live.host,
         &[
             "api",
             "call",
@@ -8022,7 +7747,7 @@ async fn handover_guard(live: &Live) {
         Some(expected.as_str()),
         "refusing: gateway-info does not name the {expected} test gateway"
     );
-    let (code, list) = guard_call(&profile, &live.host, &["project", "list"]).await;
+    let (code, list) = guard_call(&profile, &["project", "list"]).await;
     assert_eq!(code, 0);
     assert!(
         mentions_name(&list, GIT_PROJECT),
@@ -8040,7 +7765,7 @@ async fn wincap_git_handover() {
     };
 
     let Some(live) = live() else { return };
-    handover_guard(&live).await;
+    handover_guard().await;
     let started = Instant::now();
     let fixture = fixture_dir();
     let release = release_checkout(&fixture);

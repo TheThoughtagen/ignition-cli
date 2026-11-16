@@ -1830,13 +1830,17 @@ async fn lnxvm_conformance_table_on_host() {
 // `capture27-vm.sh project-up` and `upload` (with `PRODSHAPE_GIT_OUT`) first;
 // `project-down` and `scratch-down` clean up after.
 //
+// Run it through the driver (27-29, `CAPTURE27_VMS=lnx ... vm-gate lnxvm_git_handover`),
+// which tunnels the gateway to 127.0.0.1, exports `IGN_LNXVM_GATEWAY_URL` and the gate's
+// environment, redacts the output and writes the log to the private evidence directory.
+// The gate refuses an `http://` URL whose host is not loopback, and an unset
+// `IGN_LNXVM_GATEWAY_URL`. The 451 MB object fetch does not fit the 60 s budget over the
+// operator link, so the full run is on ign-lnx-836 itself (27-25 record; the driver step
+// `lnxvm-handover` for that comes in 27-32), where the URL is `http://127.0.0.1:8088`:
+//
 // ```text
-// set -o pipefail
-// export IGNITION_LIVE_LNXVM=1 IGN_LNXVM_HOST=... IGN_LNXVM_KEY_FILE=... \
-//   IGN_LNXVM_KNOWN_HOSTS=... IGN_LNXVM_PROFILE=azure-lnx PRODSHAPE_GIT_OUT=...
-// export IGNITION_CLI_CONFIG=... IGNITION_TOKEN_AZURE_LNX=...   # the profile's file and token
-// cargo test -p ignition-core --test live_transport_lnxvm lnxvm_git_handover \
-//   -- --ignored --nocapture --test-threads=1 2>&1 | tee 27-25-lnxvm.log
+// export CAPTURE27_VMS=lnx PRODSHAPE_GIT_OUT=...
+// bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh vm-gate lnxvm_git_handover
 // ```
 
 const HANDOVER_PROJECT: &str = "CapApp27";
@@ -1867,16 +1871,63 @@ fn mentions_name(value: &serde_json::Value, name: &str) -> bool {
     }
 }
 
-/// One call of the installed `ign` at the gateway of the ssh host (port
-/// `IGN_LNXVM_GATEWAY_PORT`, default 8088): exit code and JSON envelope.
-async fn guard_call(profile: &str, host: &str, args: &[&str]) -> (i32, serde_json::Value) {
-    let port = std::env::var("IGN_LNXVM_GATEWAY_PORT").unwrap_or_else(|_| "8088".to_string());
+/// The gateway URL of the VM gates (27-29, WR-D5): `https://` anywhere, `http://` only to a
+/// loopback host, and never the VM's own address. The driver exports the tunnel URL.
+#[test]
+fn vm_gateway_url_guard() {
+    use common::vm_git_handover::vm_gateway_url_check;
+    let check = |raw: Option<&str>| {
+        vm_gateway_url_check(
+            raw,
+            "IGN_LNXVM_GATEWAY_URL",
+            "capture27-vm.sh lnxvm-handover or vm-gate",
+        )
+    };
+    for ok in [
+        "http://127.0.0.1:18088",
+        "http://[::1]:18088",
+        "https://192.0.2.15:8043",
+    ] {
+        assert_eq!(check(Some(ok)).as_deref(), Ok(ok), "must accept {ok}");
+    }
+    for bad in [
+        Some("http://192.0.2.15:8088"),
+        Some("http://user@127.0.0.1.evil:8088"),
+        Some("http://127.0.0.1@192.0.2.15:8088"),
+        Some("http://127.0.0.1:18088 /x"),
+        Some("http://127.0.0.1:18088\n"),
+        Some(" http://127.0.0.1:18088"),
+        Some("ftp://127.0.0.1:18088"),
+        Some(""),
+        None,
+    ] {
+        let err = check(bad).expect_err("must refuse");
+        assert!(
+            err.contains("capture27-vm.sh lnxvm-handover or vm-gate")
+                && err.contains("IGN_LNXVM_GATEWAY_URL"),
+            "the refusal names the variable and the driver steps: {err}"
+        );
+        assert!(
+            !err.contains("192.0.2.15"),
+            "the refusal never echoes the address: {err}"
+        );
+    }
+}
+
+/// One call of the installed `ign` at the gateway URL the driver exports in `IGN_LNXVM_GATEWAY_URL` (a
+/// loopback tunnel, guarded by [`vm_gateway_url`](common::vm_git_handover::vm_gateway_url)):
+/// exit code and JSON envelope.
+async fn guard_call(profile: &str, args: &[&str]) -> (i32, serde_json::Value) {
+    let url = common::vm_git_handover::vm_gateway_url(
+        "IGN_LNXVM_GATEWAY_URL",
+        "capture27-vm.sh lnxvm-handover or vm-gate",
+    );
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         tokio::process::Command::new("ign")
             .args(["--profile", profile, "--json"])
             .args(args)
-            .env("IGNITION_URL", format!("http://{host}:{port}"))
+            .env("IGNITION_URL", &url)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .output(),
@@ -1895,14 +1946,13 @@ async fn guard_call(profile: &str, host: &str, args: &[&str]) -> (i32, serde_jso
     )
 }
 
-/// The gateway-name guard of 27-07: gateway-info at the address of the ssh host
+/// The gateway-name guard of 27-07: gateway-info through the driver's loopback tunnel
 /// names the expected test gateway, and the disposable project exists.
 async fn handover_guard(live: &Live) {
     let expected = std::env::var("IGN_LNXVM_GATEWAY_NAME")
         .unwrap_or_else(|_| "Ignition-ign-lnx-836".to_string());
     let (code, info) = guard_call(
         &live.profile,
-        &live.host,
         &[
             "api",
             "call",
@@ -1919,7 +1969,7 @@ async fn handover_guard(live: &Live) {
         Some(expected.as_str()),
         "refusing: gateway-info does not name the {expected} test gateway"
     );
-    let (code, list) = guard_call(&live.profile, &live.host, &["project", "list"]).await;
+    let (code, list) = guard_call(&live.profile, &["project", "list"]).await;
     assert_eq!(code, 0);
     assert!(
         mentions_name(&list, HANDOVER_PROJECT),
