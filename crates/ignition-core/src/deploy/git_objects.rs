@@ -50,6 +50,11 @@ pub const GIT_OBJECTS_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Most entries a host walks below `objects/` before it refuses.
 pub const GIT_OBJECTS_LIST_MAX_ENTRIES: usize = 200_000;
 
+/// What every cap refusal tells the operator to do (WR-A6): the caps are
+/// counts and sizes of the gateway's object files, which `git gc` brings down.
+const GC_REMEDY: &str =
+    "an administrator runs `git gc` in the gateway's project repository, then deploys again";
+
 /// One object file: its path below the `.git` (`objects/ab/cdef...`) and its
 /// size, the exact number of bytes a fetch must deliver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,13 +267,13 @@ impl GitObjectList {
     pub fn validate(&self) -> Result<(), String> {
         if self.loose.len() > GIT_OBJECTS_LOOSE_MAX {
             return Err(format!(
-                "the gateway repo holds {} loose objects, over the {GIT_OBJECTS_LOOSE_MAX} cap",
+                "the gateway repo holds {} loose objects, over the {GIT_OBJECTS_LOOSE_MAX} cap; {GC_REMEDY}",
                 self.loose.len()
             ));
         }
         if self.packs.len() > GIT_OBJECTS_PACKS_MAX {
             return Err(format!(
-                "the gateway repo holds {} packs, over the {GIT_OBJECTS_PACKS_MAX} cap",
+                "the gateway repo holds {} packs, over the {GIT_OBJECTS_PACKS_MAX} cap; {GC_REMEDY}",
                 self.packs.len()
             ));
         }
@@ -299,7 +304,7 @@ impl GitObjectList {
         if total > GIT_OBJECTS_FETCH_MAX_BYTES {
             return Err(format!(
                 "the gateway repo's object files add up to {total} bytes, over the \
-                 {GIT_OBJECTS_FETCH_MAX_BYTES} byte cap"
+                 {GIT_OBJECTS_FETCH_MAX_BYTES} byte cap; {GC_REMEDY}"
             ));
         }
         Ok(())
@@ -331,7 +336,7 @@ fn reserve(stats: &mut FetchStats, more: u64) -> Result<(), GitGateFailure> {
     let total = stats.bytes.saturating_add(more);
     if total > GIT_OBJECTS_FETCH_MAX_BYTES {
         return Err(gateway(format!(
-            "reading the gateway's objects would copy more than {GIT_OBJECTS_FETCH_MAX_BYTES} bytes"
+            "reading the gateway's objects would copy more than {GIT_OBJECTS_FETCH_MAX_BYTES} bytes; {GC_REMEDY}"
         )));
     }
     stats.bytes = total;
@@ -720,6 +725,63 @@ mod tests {
             ],
         };
         assert!(big.validate().unwrap_err().contains("byte cap"));
+    }
+
+    /// WR-A6 (27-27): a cap refusal says which cap and what to do.
+    #[test]
+    fn validate_cap_refusals_name_the_remedy() {
+        let mut loose = GitObjectList::default();
+        for i in 0..=GIT_OBJECTS_LOOSE_MAX {
+            loose.loose.push(GitObjectFile {
+                rel: format!("objects/{:02x}/{:038x}", i % 256, i),
+                size: 1,
+            });
+        }
+        let packs = GitObjectList {
+            loose: Vec::new(),
+            packs: (0..=GIT_OBJECTS_PACKS_MAX)
+                .map(|i| GitPackFiles {
+                    name: format!("{i:040x}"),
+                    pack_size: 1,
+                    idx_size: 1,
+                })
+                .collect(),
+        };
+        let big = GitObjectList {
+            loose: Vec::new(),
+            packs: (1..=2)
+                .map(|i| GitPackFiles {
+                    name: format!("{i:040x}"),
+                    pack_size: GIT_OBJECTS_FETCH_MAX_BYTES / 2 + 1,
+                    idx_size: 1,
+                })
+                .collect(),
+        };
+        let mut stats = FetchStats::default();
+        reserve(&mut stats, GIT_OBJECTS_FETCH_MAX_BYTES).expect("exactly the cap");
+        let reserved = reserve(&mut stats, 1)
+            .expect_err("over the cap")
+            .to_string();
+        for (text, cap) in [
+            (
+                loose.validate().unwrap_err(),
+                GIT_OBJECTS_LOOSE_MAX.to_string(),
+            ),
+            (
+                packs.validate().unwrap_err(),
+                GIT_OBJECTS_PACKS_MAX.to_string(),
+            ),
+            (
+                big.validate().unwrap_err(),
+                GIT_OBJECTS_FETCH_MAX_BYTES.to_string(),
+            ),
+            (reserved, GIT_OBJECTS_FETCH_MAX_BYTES.to_string()),
+        ] {
+            assert!(text.contains(&cap), "names its cap {cap}: {text}");
+            assert!(text.contains("git gc"), "names the remedy: {text}");
+            assert!(text.contains("administrator"), "{text}");
+            assert!(text.contains("project repository"), "{text}");
+        }
     }
 
     #[test]

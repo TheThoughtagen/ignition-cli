@@ -3058,6 +3058,16 @@ fn prodshape_gateway_objects_over<R: ignition_core::deploy::transport::projects:
             "{row}: fetched {} loose objects, {} indexes, {} packs, {} bytes",
             stats.loose, stats.idx, stats.packs, stats.bytes
         );
+        // The listing against the three caps (27-27, WR-A6). Counts and bytes
+        // go to the test output only, never to a file.
+        if let Some((loose, packs, bytes)) = read.listing() {
+            use ignition_core::deploy::git_objects::{
+                GIT_OBJECTS_FETCH_MAX_BYTES, GIT_OBJECTS_LOOSE_MAX, GIT_OBJECTS_PACKS_MAX,
+            };
+            eprintln!(
+                "GATEWAY-OBJECT-CAPS {row} loose {loose}/{GIT_OBJECTS_LOOSE_MAX} packs {packs}/{GIT_OBJECTS_PACKS_MAX} bytes {bytes}/{GIT_OBJECTS_FETCH_MAX_BYTES}"
+            );
+        }
         // Correct before fast: the tree at G equals the live export (the
         // work tree holds the designer commit), so nothing is dirty.
         let live = canonical_digest(&f.export_zip()).expect("live digest");

@@ -5779,7 +5779,8 @@ ledger, and puts that copy back only when the import removed the original.
 **What it reads (no git runs on the gateway host).** Through the same host
 channel as the rest of the verb (`local`, or `ssh` to a Linux or Windows
 host) it reads the repository's files: `HEAD`, the refs, `config` and the tail
-of `logs/HEAD`. Git on the machine running `ign` parses them; the gateway's
+of `logs/HEAD`. Git on the machine running `ign` (git 2.32 or newer; an older
+git is refused `deploy_preflight_failed` check `git_host`) parses them; the gateway's
 `.git` is never used as a git directory, so its configuration, hooks and
 filters never run. The repository must be a clean module clone: a branch
 checked out, one remote with an upstream, no merge or rebase in progress, no
@@ -5795,7 +5796,8 @@ your checkout moves). The URL is shown without userinfo, and no event, run
 file or output carries a token or a `git.yaml` value. The release checkout must
 be a full-history checkout (`fetch-depth: 0` in CI) whose `origin` URL equals
 the gateway repository's remote URL, and it must be at the release tag. An
-unreachable remote, a shallow or modified checkout or a missing host git is
+unreachable remote, a shallow or modified checkout, a missing host git or a host
+git older than 2.32 is
 `deploy_preflight_failed`, with one of these checks: `git_host`, `git_checkout`,
 `git_remote`, `git_write_access`, `git_free_space`, `git_gateway_objects`,
 `git_yaml` (an adoption whose `git.yaml` cannot be read).
@@ -5936,7 +5938,11 @@ it is computed from `ign`'s own store (`dirty_source: release_store`). When it
 is not (a commit made in the Designer and not pushed), the tree is read from the
 gateway repository's own object files through the host channel
 (`dirty_source: gateway_objects`); if that read fails the run refuses
-`deploy_preflight_failed` check `git_gateway_objects` before any write.
+`deploy_preflight_failed` check `git_gateway_objects` before any write. A
+repository over a cap of that read (50,000 loose objects, 512 packs or 4 GiB of
+object files) is refused the same way, and the refusal names the cap and the
+remedy: an administrator runs `git gc` in the gateway's project repository, then
+deploys again.
 
 **Module start-sync hazards.** Keeping the `.git` keeps the module's project
 registration, so the module's start sync runs again at the gateway's next

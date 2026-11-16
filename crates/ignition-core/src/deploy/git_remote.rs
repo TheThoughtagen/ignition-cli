@@ -9,7 +9,8 @@
 //!
 //! **Gateway data never becomes a git dir.** The bytes a gateway host returns
 //! (`config`, `HEAD`, refs) are untrusted: this module parses the config with
-//! `git config --file <tmp> --no-includes` under an empty global config and no
+//! `git config --file <tmp> --no-includes` under an empty global config
+//! (`GIT_CONFIG_GLOBAL`, which is why git 2.32 is the floor) and no
 //! system config, and reads refs from a scratch git dir it builds itself after
 //! `check-ref-format`, so a hook, `core.fsmonitor`, an include or a filter in a
 //! gateway repo never executes (T-27-01).
@@ -32,8 +33,13 @@ use super::git_state::{GIT_SMALL_FILE_MAX, branch_name_problem, redact_text};
 use super::git_state::{GitBranchConfig, GitConfig, GitFiles, GitHead, GitRefs, GitRemoteConfig};
 use crate::error::{CoreError, PreflightFailure};
 
-/// The oldest git ign drives (the floor for `fetch --no-write-fetch-head`).
-pub const GIT_MIN_VERSION: (u32, u32) = (2, 29);
+/// The oldest git ign drives. The floor is set by `GIT_CONFIG_GLOBAL` (git
+/// 2.32), which the isolated calls rely on for an empty global config, and by
+/// `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` (git
+/// 2.31), which carry the token's extraheader. Below the floor git ignores
+/// both, silently: the gateway-repo isolation would not hold and the token
+/// would not be sent (WR-A3).
+pub const GIT_MIN_VERSION: (u32, u32) = (2, 32);
 
 /// The preflight check id every host-git failure carries.
 pub const GIT_HOST_CHECK: &str = "git_host";
@@ -2441,6 +2447,20 @@ mod tests {
             .expect_err("below the floor");
         assert_eq!(err.code(), "deploy_preflight_failed");
         assert_eq!(failed_check(&err), "git_host");
+
+        // WR-A3 (27-27): 2.31 has GIT_CONFIG_COUNT but not GIT_CONFIG_GLOBAL.
+        let almost = stub(dir.path(), "almost", "echo 'git version 2.31.9'");
+        let err = HostGit::with_program(&almost)
+            .version()
+            .await
+            .expect_err("below the floor");
+        assert_eq!(failed_check(&err), "git_host");
+        assert!(err.to_string().contains("2.32"), "{err}");
+        let floor = stub(dir.path(), "floor", "echo 'git version 2.32.0'");
+        assert_eq!(
+            HostGit::with_program(&floor).version().await.expect("ok"),
+            (2, 32)
+        );
 
         let new = stub(dir.path(), "new", "echo 'git version 2.46.2'");
         assert_eq!(

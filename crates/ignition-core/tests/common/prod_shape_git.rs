@@ -1125,6 +1125,8 @@ fn to_str(path: &Path) -> &str {
 pub struct TimedRead<R: GitHostRead> {
     inner: R,
     spent: std::sync::Mutex<Duration>,
+    /// The loose count, pack count and total bytes of the last listing.
+    listing: std::sync::Mutex<Option<(usize, usize, u64)>>,
 }
 
 impl<R: GitHostRead> TimedRead<R> {
@@ -1133,7 +1135,14 @@ impl<R: GitHostRead> TimedRead<R> {
         TimedRead {
             inner,
             spent: std::sync::Mutex::new(Duration::ZERO),
+            listing: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The last listing's loose count, pack count and total bytes (27-27,
+    /// WR-A6): what the gateway-object caps are compared with.
+    pub fn listing(&self) -> Option<(usize, usize, u64)> {
+        *self.listing.lock().expect("lock")
     }
 
     /// Time spent in the two object reads so far.
@@ -1222,6 +1231,10 @@ impl<R: GitHostRead> GitHostRead for TimedRead<R> {
         let started = std::time::Instant::now();
         let out = self.inner.list_git_objects(project).await;
         self.add(started);
+        if let Ok(list) = &out {
+            *self.listing.lock().expect("lock") =
+                Some((list.loose.len(), list.packs.len(), list.total_bytes()));
+        }
         out
     }
 
