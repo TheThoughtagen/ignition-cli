@@ -627,19 +627,51 @@ fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     builder.create(path)
 }
 
-/// Give the directory or file `path` exactly `mode`, without following a
-/// symlink at the final component (an `fchmod` on a no-follow open).
-fn set_mode_no_follow(path: &Path, mode: u32) -> std::io::Result<()> {
+/// Give the directory `path` exactly `mode` (27-31, security review 3).
+///
+/// Linux has no `lchmod` and `fchmodat(AT_SYMLINK_NOFOLLOW)` is unsupported for
+/// a chmod, so a chmod by path could land on whatever was swapped in after the
+/// `mkdir`. The directory is therefore opened itself, with `O_NOFOLLOW |
+/// O_DIRECTORY` (a symlink or a file at the name fails the open), `fstat`-ed on
+/// the descriptor (it must be a directory owned by this account), and the mode
+/// is set with an `fchmod` on that descriptor.
+fn set_dir_mode_no_follow(path: &Path, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        open_no_follow(path)?.set_permissions(std::fs::Permissions::from_mode(mode))
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::DIRECTORY;
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags.bits() as i32)
+            .open(path)?;
+        let meta = dir.metadata()?;
+        if !meta.is_dir() || meta.uid() != current_uid()? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "not a directory owned by this account",
+            ));
+        }
+        dir.set_permissions(std::fs::Permissions::from_mode(mode))
     }
     #[cfg(not(unix))]
     {
         let _ = (path, mode);
         Ok(())
     }
+}
+
+/// The effective uid of this process, read from the owner of an anonymous
+/// temporary file this process just created (no libc call, no extra rustix
+/// feature).
+#[cfg(unix)]
+fn current_uid() -> std::io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(uid) = UID.get() {
+        return Ok(*uid);
+    }
+    let uid = tempfile::tempfile()?.metadata()?.uid();
+    Ok(*UID.get_or_init(|| uid))
 }
 
 /// `path` opened for reading without following a symlink at the final
@@ -1502,7 +1534,7 @@ impl LocalFsTransport {
                             .and_then(|p| std::fs::symlink_metadata(p).ok())
                             .map_or(0o755, |m| mode_of(&m));
                         create_dir_mode(&dir, parent_mode)
-                            .and_then(|()| set_mode_no_follow(&dir, parent_mode))
+                            .and_then(|()| set_dir_mode_no_follow(&dir, parent_mode))
                             .map_err(|e| {
                                 self.git_fail(
                                     OP,
@@ -2489,6 +2521,35 @@ mod tests {
         for rel in ["HEAD", "config", "private/secret", "objects/ab/cdef"] {
             assert_eq!(mode(&git.join(rel)), 0o600, "{rel} without a record");
         }
+    }
+
+    /// 27-31 (security review 3): a directory is given its mode through an
+    /// open of the directory itself, never by path. A symlink, a regular file
+    /// or a directory the current account does not own is refused and nothing
+    /// is changed.
+    #[cfg(unix)]
+    #[test]
+    fn local_dir_mode_is_set_on_the_directory_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().expect("dir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("real");
+        set_dir_mode_no_follow(&real, 0o750).expect("a directory of ours");
+        assert_eq!(mode(&real), 0o750);
+
+        // a regular file is not a directory: refused, mode untouched
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").expect("file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert!(set_dir_mode_no_follow(&file, 0o777).is_err());
+        assert_eq!(mode(&file), 0o600, "a file is never chmod-ed");
+
+        // a symlink swapped in for the directory is not followed
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        assert!(set_dir_mode_no_follow(&link, 0o777).is_err());
+        assert_eq!(mode(&real), 0o750, "the link's target is untouched");
     }
 
     /// 27-31 (WR-B1): an advanced file never gets a wider mode than the file
