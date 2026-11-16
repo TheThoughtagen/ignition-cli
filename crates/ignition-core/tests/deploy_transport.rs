@@ -4447,6 +4447,103 @@ mod sftp_git {
         );
     }
 
+    /// The shims that make the project directory belong to a third account
+    /// (uid 4242), accept the ACL step and report what `getfacl` is told to.
+    fn acl_shims(file: &str, dir: &str) -> common::posix_exec::Shims {
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ls",
+            "case $1 in -ldn) printf 'drwxr-xr-x 2 4242 4242 64 Jan  1 00:00 %s\\n' \"$3\";; \
+             *) exec \"$(real ls)\" \"$@\";; esac",
+        );
+        shims.add("setfacl", "exit 0");
+        shims.add(
+            "getfacl",
+            "for a; do p=$a; done\n\
+             if [ -d \"$p\" ]; then cat \"$(dirname \"$0\")/getfacl.dir\"; \
+             else cat \"$(dirname \"$0\")/getfacl.file\"; fi",
+        );
+        shims.data("getfacl.file", file);
+        shims.data("getfacl.dir", dir);
+        shims
+    }
+
+    const RW: &str = "user:4242:rwx\t#effective:rw-\n";
+    const RW_NO_SUFFIX: &str = "user:4242:rw-\n";
+    const RX_TAB: &str = "user:4242:rw-\t#effective:r-x\n";
+    const RX_SPACE: &str = "user:4242:rwx #effective:r-x\n";
+
+    /// 27-30 (WR-B4): the probe asks whether the gateway account can write,
+    /// so `#effective:r-x` refuses too, on a file and on a directory.
+    #[tokio::test]
+    async fn sftp_git_probe_refuses_effective_no_write() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        for (file, dir, label) in [
+            (RX_TAB, RW, "file r-x with a tab"),
+            (RX_SPACE, RW, "file r-x with a space"),
+            (RW, RX_TAB, "directory r-x"),
+            (RW, RX_SPACE, "directory r-x with a space"),
+        ] {
+            let shims = acl_shims(file, dir);
+            n.count.use_shims(&shims);
+            let why = detail(
+                n.t.probe_write(PROJECT, RUN)
+                    .await
+                    .expect_err(&format!("{label} must refuse")),
+            );
+            assert!(why.contains("no effective write access"), "{label}: {why}");
+        }
+        // effective rw-, or no effective suffix at all, passes and cleans up
+        for (file, dir) in [(RW, RW), (RW_NO_SUFFIX, RW_NO_SUFFIX)] {
+            let shims = acl_shims(file, dir);
+            n.count.use_shims(&shims);
+            n.t.probe_write(PROJECT, RUN).await.expect("probe passes");
+        }
+        let probe = format!(".ign-probe-{RUN}");
+        assert!(!fx.project_dir().join(&probe).exists());
+        assert!(!fx.git_dir().join(&probe).exists());
+        assert!(!fx.git_dir().join(format!("{probe}.acl")).exists());
+    }
+
+    /// 27-30 (WR-B4): the same on the restore. Refused, with no `.git`
+    /// created and no stage left; with a writable effective right it lands.
+    #[tokio::test]
+    async fn sftp_git_restore_refuses_effective_no_write() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let before = n.t.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        for (file, dir, label) in [
+            (RX_TAB, RW, "file r-x with a tab"),
+            (RX_SPACE, RW, "file r-x with a space"),
+            (RW, RX_TAB, "directory r-x"),
+        ] {
+            let shims = acl_shims(file, dir);
+            n.count.use_shims(&shims);
+            let why = detail(
+                n.t.restore_git(GATEWAY, PROJECT, RUN)
+                    .await
+                    .expect_err(&format!("{label} must refuse")),
+            );
+            assert!(why.contains("no effective write access"), "{label}: {why}");
+            assert!(!fx.git_dir().exists(), "{label}: no .git was created");
+            let beside: Vec<_> = std::fs::read_dir(fx.project_dir())
+                .expect("project")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".ign-restore-"))
+                .collect();
+            assert!(beside.is_empty(), "{label}: no stage is left: {beside:?}");
+        }
+        let shims = acl_shims(RW, RW);
+        n.count.use_shims(&shims);
+        let back =
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("writable restores");
+        assert_eq!(back, before);
+    }
+
     #[tokio::test]
     async fn sftp_git_save_refuses_a_symlink_and_leaves_no_save() {
         let fx = GitFixture::new();

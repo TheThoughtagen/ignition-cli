@@ -63,6 +63,14 @@ use crate::deploy::transport::projects::{
 use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
 
+/// What [`LocalFsTransport::require_save_chain`] found above a save's `repo`.
+enum SaveChain {
+    /// Every level is a real directory.
+    Complete,
+    /// Nothing at the named level.
+    Absent(String),
+}
+
 impl LocalFsTransport {
     /// What `<data_dir>/projects/<project>/.git` is, probed with
     /// `symlink_metadata` at every level (nothing is followed).
@@ -773,6 +781,65 @@ impl LocalFsTransport {
         self.data_dir.join("projects").join(project).join(".git")
     }
 
+    /// Walk every level above `repo` in the save path
+    /// (`ign-deploy/<gateway>/projects/<project>/git-save/<run>`), none of
+    /// them followed: a symlink or an entry that is not a directory refuses,
+    /// naming the level. A level with nothing at it answers
+    /// [`SaveChain::Absent`]; the remove reads that as "nothing to remove",
+    /// the restore and the manifest read as an error (WR-B6).
+    fn require_save_chain(
+        &self,
+        op: &str,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<SaveChain, CoreError> {
+        let mut path = self.data_dir.clone();
+        let rel = git_save_rel(gateway, project, run_id);
+        let parts: Vec<&str> = rel.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(
+                        self.git_fail(op, format!("{part} is a symlink; symlinks are refused"))
+                    );
+                }
+                Ok(m) if !m.file_type().is_dir() => {
+                    return Err(self.git_fail(op, format!("{part} is not a directory")));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(SaveChain::Absent((*part).to_string()));
+                }
+                Err(e) => {
+                    return Err(
+                        self.git_fail(op, format!("{part} cannot be inspected ({})", e.kind()))
+                    );
+                }
+            }
+        }
+        Ok(SaveChain::Complete)
+    }
+
+    /// [`Self::require_save_chain`] for a caller that needs the save to be
+    /// there: an absent level is an error naming it.
+    fn save_chain_must_exist(
+        &self,
+        op: &str,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError> {
+        match self.require_save_chain(op, gateway, project, run_id)? {
+            SaveChain::Complete => Ok(()),
+            SaveChain::Absent(level) => Err(self.git_fail(
+                op,
+                format!("{level} does not exist; there is no save of run {run_id}"),
+            )),
+        }
+    }
+
     fn git_save_repo(&self, gateway: &str, project: &str, run_id: &str) -> PathBuf {
         let mut path = self.data_dir.clone();
         for part in git_save_rel(gateway, project, run_id).split('/') {
@@ -1151,6 +1218,24 @@ impl LocalFsTransport {
         outcome
     }
 
+    fn save_manifest_blocking(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        self.git_save_names(gateway, project, run_id)?;
+        self.require_data_dir()?;
+        self.save_chain_must_exist("read", gateway, project, run_id)?;
+        let repo = self.git_save_repo(gateway, project, run_id);
+        self.require_real_dir(
+            "read",
+            &repo,
+            &git_save_location(LedgerRoot::DataDir, gateway, project, run_id),
+        )?;
+        self.manifest_blocking("read", &repo)
+    }
+
     fn restore_git_blocking(
         &self,
         gateway: &str,
@@ -1183,6 +1268,7 @@ impl LocalFsTransport {
                 ));
             }
         }
+        self.save_chain_must_exist(OP, gateway, project, run_id)?;
         let repo = self.git_save_repo(gateway, project, run_id);
         let location = git_save_location(LedgerRoot::DataDir, gateway, project, run_id);
         self.require_real_dir(OP, &repo, &location)?;
@@ -1285,28 +1371,8 @@ impl LocalFsTransport {
         self.require_data_dir()?;
         let repo = self.git_save_repo(gateway, project, run_id);
         // Every level above `repo` must be a real directory or absent.
-        let mut path = self.data_dir.clone();
-        let rel = git_save_rel(gateway, project, run_id);
-        let parts: Vec<&str> = rel.split('/').collect();
-        for part in &parts[..parts.len() - 1] {
-            path.push(part);
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(
-                        self.git_fail(OP, format!("{part} is a symlink; symlinks are refused"))
-                    );
-                }
-                Ok(m) if !m.file_type().is_dir() => {
-                    return Err(self.git_fail(OP, format!("{part} is not a directory")));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => {
-                    return Err(
-                        self.git_fail(OP, format!("{part} cannot be inspected ({})", e.kind()))
-                    );
-                }
-            }
+        if let SaveChain::Absent(_) = self.require_save_chain(OP, gateway, project, run_id)? {
+            return Ok(());
         }
         match std::fs::symlink_metadata(&repo) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1941,15 +2007,7 @@ impl GitHostRead for LocalFsTransport {
         let (gateway, project, run_id) =
             (gateway.to_string(), project.to_string(), run_id.to_string());
         tokio::task::spawn_blocking(move || {
-            this.git_save_names(&gateway, &project, &run_id)?;
-            this.require_data_dir()?;
-            let repo = this.git_save_repo(&gateway, &project, &run_id);
-            this.require_real_dir(
-                "read",
-                &repo,
-                &git_save_location(LedgerRoot::DataDir, &gateway, &project, &run_id),
-            )?;
-            this.manifest_blocking("read", &repo)
+            this.save_manifest_blocking(&gateway, &project, &run_id)
         })
         .await
         .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
@@ -2130,6 +2188,100 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("projects")).expect("projects");
         dir
+    }
+
+    /// A data dir holding a complete save of run `RUN` for `gw`/`CapApp`
+    /// and a project directory with no `.git` (the state after an import).
+    const SAVE_RUN: &str = "20261114T101500Z-ab12";
+    const SAVE_LEVELS: [&str; 6] = [
+        "ign-deploy",
+        "gw",
+        "projects",
+        "CapApp",
+        "git-save",
+        SAVE_RUN,
+    ];
+
+    fn data_with_save() -> tempfile::TempDir {
+        let dir = data_with_projects();
+        std::fs::create_dir_all(dir.path().join("projects/CapApp")).expect("project");
+        let repo = dir
+            .path()
+            .join("ign-deploy/gw/projects/CapApp/git-save")
+            .join(SAVE_RUN)
+            .join("repo");
+        std::fs::create_dir_all(repo.join("objects")).expect("repo");
+        std::fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        std::fs::write(repo.join("config"), "[core]\n").expect("config");
+        std::fs::write(repo.join("objects/o1"), "object").expect("object");
+        dir
+    }
+
+    /// 27-30 (WR-B6): a symlink at any level of the save path refuses the
+    /// restore and the save-manifest read, the way the remove does.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_restore_refuses_a_symlinked_save_level() {
+        for (index, level) in SAVE_LEVELS.iter().enumerate() {
+            let dir = data_with_save();
+            let t = host(dir.path());
+            // the level becomes a link to a directory that holds the whole,
+            // well formed tree: only the link itself is wrong
+            let mut at = dir.path().to_path_buf();
+            for part in &SAVE_LEVELS[..index] {
+                at.push(part);
+            }
+            let real = at.join(format!("{level}.real"));
+            std::fs::rename(at.join(level), &real).expect("rename");
+            std::os::unix::fs::symlink(format!("{level}.real"), at.join(level)).expect("link");
+
+            let err = t
+                .restore_git_blocking("gw", "CapApp", SAVE_RUN)
+                .expect_err(level);
+            assert_eq!(err.code(), "transport_failed", "{level}");
+            let text = err.to_string();
+            assert!(
+                text.contains(level) && text.contains("symlink"),
+                "{level}: {text}"
+            );
+            assert!(
+                !dir.path().join("projects/CapApp/.git").exists(),
+                "{level}: no .git was created"
+            );
+            let err = t
+                .save_manifest_blocking("gw", "CapApp", SAVE_RUN)
+                .expect_err(level);
+            let text = err.to_string();
+            assert!(
+                text.contains(level) && text.contains("symlink"),
+                "{level}: {text}"
+            );
+        }
+    }
+
+    /// The restore and the manifest read of a chain with nothing at some
+    /// level refuse (an absent level is an error there), and a complete
+    /// chain reads and restores.
+    #[test]
+    fn local_git_restore_and_manifest_of_a_missing_save_refuse() {
+        let dir = data_with_save();
+        let t = host(dir.path());
+        let manifest = t
+            .save_manifest_blocking("gw", "CapApp", SAVE_RUN)
+            .expect("complete chain");
+        assert!(manifest.files >= 3, "{manifest:?}");
+        std::fs::remove_dir_all(dir.path().join("ign-deploy/gw/projects/CapApp/git-save"))
+            .expect("rm git-save");
+        for err in [
+            t.save_manifest_blocking("gw", "CapApp", SAVE_RUN)
+                .expect_err("manifest"),
+            t.restore_git_blocking("gw", "CapApp", SAVE_RUN)
+                .expect_err("restore"),
+        ] {
+            assert_eq!(err.code(), "transport_failed");
+            assert!(err.to_string().contains("git-save"), "{err}");
+        }
+        assert!(!dir.path().join("projects/CapApp/.git").exists());
     }
 
     #[test]

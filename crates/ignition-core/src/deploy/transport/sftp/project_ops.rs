@@ -378,9 +378,15 @@ pub(super) const GIT_RESTORE_SH: &str = concat!(
     "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then ",
     "if ! command -v setfacl >/dev/null 2>&1; then rm -rf -- \"$stage\"; echo 'the gateway account needs write access to the restored .git and the host has no setfacl' >&2; exit 6; fi; ",
     "sg \"$stage\"; setfacl -R -P -m \"u:$gu:rwX\" \"$stage\" && sg \"$stage\" && find -P \"$stage\" -type d -exec setfacl -d -m \"u:$gu:rwX\" {} + || { rm -rf -- \"$stage\"; echo 'setfacl failed on the restored .git' >&2; exit 6; }; ",
-    "if command -v getfacl >/dev/null 2>&1; then e=$(getfacl -n -p -- \"$stage/config\" 2>/dev/null | grep \"^user:$gu:\"); ",
-    "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) rm -rf -- \"$stage\"; echo 'the gateway account has no effective write access on the restored .git' >&2; exit 6;; esac;; ",
-    "*) rm -rf -- \"$stage\"; echo 'the gateway account has no ACL entry on the restored .git' >&2; exit 6;; esac; fi; fi; ",
+    // WR-B4: the write bit of the effective rights is tested directly, on one
+    // file and on the stage root (a directory). `ew` answers 0 for an entry
+    // `user:<gu>:rw..` whose effective rights (when the line carries them,
+    // after a space or a tab) have `w` as their second character, 1 for one
+    // that does not, 2 for no such entry.
+    "ew() { case $1 in \"user:$gu:rw\"*) case $1 in *'#effective:'?w*) return 0;; *'#effective:'*) return 1;; esac; return 0;; esac; return 2; }; ",
+    "if command -v getfacl >/dev/null 2>&1; then for t in \"$stage/config\" \"$stage\"; do e=$(getfacl -n -p -- \"$t\" 2>/dev/null | grep \"^user:$gu:\"); ew \"$e\"; r=$?; ",
+    "if [ $r = 1 ]; then rm -rf -- \"$stage\"; echo 'the gateway account has no effective write access on the restored .git' >&2; exit 6; ",
+    "elif [ $r != 0 ]; then rm -rf -- \"$stage\"; echo 'the gateway account has no ACL entry on the restored .git' >&2; exit 6; fi; done; fi; fi; ",
     "sg \"$stage\"; staged=$(mf \"$stage\") || { r=$?; rm -rf -- \"$stage\"; exit $r; }; ",
     "[ \"$staged\" = \"$saved\" ] || { rm -rf -- \"$stage\"; echo 'the restored copy does not match the save; nothing was restored' >&2; exit 5; }; ",
     "if pr \"$proj/.git\"; then rm -rf -- \"$stage\"; printf '%s/.git appeared; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
@@ -417,10 +423,15 @@ pub(super) const GIT_PROBE_W_SH: &str = concat!(
     "af=\"$st/p\"; pf=\"$1/$3\"; ac() { rm -f -- \"$af\" \"$pf\"; rmdir -- \"$st\" 2>/dev/null; }; ",
     "[ ! -L \"$st\" ] && [ -d \"$st\" ] || { ac; printf '%s.acl is not a real directory\\n' \"$3\" >&2; exit 4; }; ",
     "( set -C; : > \"$af\" ) 2>/dev/null && [ -f \"$af\" ] && [ ! -L \"$af\" ] || { ac; printf 'a probe file cannot be created in %s\\n' \"$2\" >&2; exit 3; }; ",
-    "setfacl -P -m \"u:$gu:rw\" \"$af\" 2>/dev/null || { ac; printf 'setfacl failed on the probe file in %s\\n' \"$2\" >&2; exit 6; }; ",
-    "e=$(getfacl -n -p \"$af\" 2>/dev/null | grep \"^user:$gu:\"); ac; ",
-    "case $e in \"user:$gu:rw\"*) case $e in *'#effective:r--'*|*'#effective:---'*|*'#effective:-'*) printf 'the gateway account would have no effective write access on the restored .git (checked in %s)\\n' \"$2\" >&2; exit 6;; esac;; ",
-    "*) printf 'the gateway account has no ACL entry on the probe file in %s\\n' \"$2\" >&2; exit 6;; esac; }; ",
+    "setfacl -P -m \"u:$gu:rw\" \"$af\" 2>/dev/null && setfacl -P -m \"u:$gu:rwx\" \"$st\" 2>/dev/null || { ac; printf 'setfacl failed on the probe file in %s\\n' \"$2\" >&2; exit 6; }; ",
+    // WR-B4: the write bit of the effective rights is tested directly, on the
+    // probe file and on the probe stage (a directory); see `ew` in
+    // `GIT_RESTORE_SH`.
+    "ew() { case $1 in \"user:$gu:rw\"*) case $1 in *'#effective:'?w*) return 0;; *'#effective:'*) return 1;; esac; return 0;; esac; return 2; }; ",
+    "e=$(getfacl -n -p \"$af\" 2>/dev/null | grep \"^user:$gu:\"); d=$(getfacl -n -p \"$st\" 2>/dev/null | grep \"^user:$gu:\"); ac; ",
+    "for x in \"$e\" \"$d\"; do ew \"$x\"; r=$?; ",
+    "if [ $r = 1 ]; then printf 'the gateway account would have no effective write access on the restored .git (checked in %s)\\n' \"$2\" >&2; exit 6; ",
+    "elif [ $r != 0 ]; then printf 'the gateway account has no ACL entry on the probe file in %s\\n' \"$2\" >&2; exit 6; fi; done; }; ",
     "pw() { [ -d \"$1\" ] && [ ! -L \"$1\" ] || { printf '%s is not a real directory\\n' \"$2\" >&2; exit 4; }; ",
     "if pr \"$1/$3\"; then printf 'a probe file already exists in %s\\n' \"$2\" >&2; exit 4; fi; ",
     "( set -C; : > \"$1/$3\" ) 2>/dev/null || { printf 'a probe file cannot be created in %s\\n' \"$2\" >&2; exit 3; }; ",
@@ -3774,10 +3785,23 @@ mod tests {
                 log.lines().any(|l| l == format!("getfacl -n -p {staged}")),
                 "the entry is read back numerically: {log}"
             );
+            // WR-B4: the stage directory is checked as well as the file, so
+            // it gets the entry too (and is read back, numerically).
+            let stage_dir = rig.git().join(".ign-probe-r1.acl").display().to_string();
+            assert!(
+                log.lines()
+                    .any(|l| l == format!("setfacl -P -m u:{uid}:rwx {stage_dir}")),
+                "the named entry on the stage directory: {log}"
+            );
+            assert!(
+                log.lines()
+                    .any(|l| l == format!("getfacl -n -p {stage_dir}")),
+                "the directory entry is read back numerically: {log}"
+            );
             assert_eq!(
                 log.lines().filter(|l| l.starts_with("setfacl")).count(),
-                1,
-                "only the `.git` probe is checked: {log}"
+                2,
+                "only the `.git` probe's file and stage directory are checked: {log}"
             );
         }
 
