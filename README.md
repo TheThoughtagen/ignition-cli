@@ -6114,7 +6114,7 @@ word is a change to the repository, the checkout or the target file:
 | `mid_operation` | a merge, cherry-pick, revert or rebase is in progress | finish or abort it on the gateway |
 | `locked` | `index.lock`, `HEAD.lock` or `config.lock` exists | wait for the process that holds it; an administrator removes a stale lock on the host |
 | `no_remote`, `multiple_remotes` | the repository has no remote or more than one | leave exactly one remote |
-| `no_upstream` | the checked-out branch does not track the one remote | set the branch's upstream to that remote |
+| `no_upstream` | the checked-out branch does not track a branch of the same name on the one remote | set the branch's upstream to that remote's branch of the same name |
 | `shallow`, `alternates` | the repository borrows objects it does not hold | replace it with a full clone |
 | `remote_mismatch` | the release checkout's `origin` is not the gateway repository's remote | add a remote with that URL to the release checkout |
 | `release_not_on_branch` | the release is not on the branch the repository tracks (or, for an adoption, on the adoption branch) | release from that branch, or merge the release into it |

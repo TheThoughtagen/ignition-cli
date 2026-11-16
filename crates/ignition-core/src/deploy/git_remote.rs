@@ -2323,9 +2323,12 @@ fn record_config_entry(config: &mut GitConfig, key: &str, value: String) {
                 remote: None,
                 merge: None,
             });
+        // git reads these two as single values: the last one listed wins
+        // (WR-A5). `remote.<n>.url` above stays first-wins, because git
+        // fetches from the first url.
         match var {
-            "remote" if branch.remote.is_none() => branch.remote = Some(value),
-            "merge" if branch.merge.is_none() => branch.merge = Some(value),
+            "remote" => branch.remote = Some(value),
+            "merge" => branch.merge = Some(value),
             _ => {}
         }
     }
@@ -2456,6 +2459,25 @@ mod tests {
         let junk = stub(dir.path(), "junk", "echo hello");
         assert!(HostGit::with_program(&junk).version().await.is_err());
         assert!(HostGit::new().version().await.expect("host git") >= GIT_MIN_VERSION);
+    }
+
+    /// WR-A5 (27-27): git reads `branch.<b>.remote` and `.merge` as single
+    /// values, so the last one listed wins; `remote.<n>.url` stays the first
+    /// (git fetches from the first url).
+    #[tokio::test]
+    async fn config_branch_keys_are_last_wins() {
+        let text = "[remote \"origin\"]\n\turl = https://first.example/a.git\n\
+            \turl = https://second.example/b.git\n\
+            [branch \"master\"]\n\tremote = a\n\tmerge = refs/heads/one\n\
+            \tremote = origin\n\tmerge = refs/heads/two\n";
+        let parsed = HostGit::new()
+            .parse_config(text.as_bytes())
+            .await
+            .expect("parse");
+        let branch = &parsed.branches["master"];
+        assert_eq!(branch.remote.as_deref(), Some("origin"));
+        assert_eq!(branch.merge.as_deref(), Some("refs/heads/two"));
+        assert_eq!(parsed.remotes["origin"].url, "https://first.example/a.git");
     }
 
     #[tokio::test]

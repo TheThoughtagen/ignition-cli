@@ -330,8 +330,9 @@ impl GitState {
 /// Order, first match wins: absent; `symlink`; `not_directory`; `no_head`;
 /// `mid_operation`; `locked`; `shallow`; `alternates`; `no_remote`;
 /// `multiple_remotes`; `detached_head`; an unborn `HEAD` (adoptable when no
-/// local branch and no index exists, else `unborn_head`); `no_upstream`;
-/// otherwise managed.
+/// local branch and no index exists, else `unborn_head`); `no_upstream` (the
+/// branch's `remote` is not the one remote, or its `merge` is not
+/// `refs/heads/<branch>`); otherwise managed.
 ///
 /// The adoptable shape is the one the module's `setupLocalRepo` leaves when
 /// the remote has no `master` (G6): by the time the unborn `HEAD` is reached
@@ -390,11 +391,15 @@ pub fn classify(files: &GitFiles, config: Option<&GitConfig>, refs: Option<&GitR
             remote_refs: remote_refs_of(refs, remote_name),
         };
     }
-    let upstream_ok = config
-        .branches
-        .get(branch)
-        .and_then(|b| b.remote.as_deref())
-        .is_some_and(|r| r == remote_name);
+    // The tracked branch is the current branch's upstream (D-03, D-11): the
+    // one remote AND the same-named branch there. `tracked` below is the local
+    // name, which by this check is also the remote branch the module's pull
+    // reads, so the gate and the advance name that branch (WR-A5).
+    let want_merge = format!("refs/heads/{branch}");
+    let upstream_ok = config.branches.get(branch).is_some_and(|b| {
+        b.remote.as_deref() == Some(remote_name.as_str())
+            && b.merge.as_deref() == Some(want_merge.as_str())
+    });
     if !upstream_ok {
         return GitState::unsupported("no_upstream", head);
     }
@@ -589,6 +594,40 @@ mod tests {
             );
         }
         c
+    }
+
+    /// WR-A5 (27-27): the upstream holds only when its `merge` names the same
+    /// branch on the one remote.
+    #[test]
+    fn classify_requires_merge_of_the_same_branch() {
+        let dir = || files(GitEntry::Directory);
+        let good_refs = refs(born());
+        let with_merge = |merge: Option<&str>| {
+            let mut c = config(&["capapp"], Some(("production", "capapp")));
+            c.branches.get_mut("production").expect("branch").merge = merge.map(str::to_string);
+            c
+        };
+        let other = classify(
+            &dir(),
+            Some(&with_merge(Some("refs/heads/other"))),
+            Some(&good_refs),
+        );
+        assert_eq!(reason(&other), "no_upstream");
+        let absent = classify(&dir(), Some(&with_merge(None)), Some(&good_refs));
+        assert_eq!(reason(&absent), "no_upstream");
+        let short = classify(
+            &dir(),
+            Some(&with_merge(Some("production"))),
+            Some(&good_refs),
+        );
+        assert_eq!(reason(&short), "no_upstream");
+        let same = classify(
+            &dir(),
+            Some(&with_merge(Some("refs/heads/production"))),
+            Some(&good_refs),
+        );
+        assert_eq!(same.kind, GitStateKind::Managed, "{same:?}");
+        assert_eq!(same.tracked.as_deref(), Some("production"));
     }
 
     fn refs(head: GitHead) -> GitRefs {

@@ -2506,6 +2506,18 @@ mod published {
         assert_eq!(reason_of(&err), "detached_head");
     }
 
+    /// WR-A5 (27-27): a gateway branch whose upstream is another remote
+    /// branch is not managed: the gate would check the wrong branch. Check and
+    /// apply refuse alike, before any write.
+    #[tokio::test]
+    async fn refuses_upstream_of_another_branch() {
+        let rig = Rig::new();
+        rig.f
+            .git_in_project(&["config", "branch.production.merge", "refs/heads/other"]);
+        let err = refused_alike(&rig).await;
+        assert_eq!(reason_of(&err), "no_upstream");
+    }
+
     #[tokio::test]
     async fn refuses_shallow_checkout() {
         let mut rig = Rig::new();
