@@ -384,7 +384,14 @@ pub(super) const GIT_RESTORE_SH: &str = concat!(
     "sg \"$stage\"; staged=$(mf \"$stage\") || { r=$?; rm -rf -- \"$stage\"; exit $r; }; ",
     "[ \"$staged\" = \"$saved\" ] || { rm -rf -- \"$stage\"; echo 'the restored copy does not match the save; nothing was restored' >&2; exit 5; }; ",
     "if pr \"$proj/.git\"; then rm -rf -- \"$stage\"; printf '%s/.git appeared; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
+    // WR-B7: `mv` onto a directory that appeared since the check above moves
+    // the stage INTO it. The stage then sits inside the gateway's new `.git`:
+    // take it back out (nothing else in that `.git` is touched) and refuse.
+    // `mv -T` is not used; BSD `mv` lacks it.
     "sg \"$stage\"; mv -- \"$stage\" \"$proj/.git\" || { rm -rf -- \"$stage\"; exit 3; }; ",
+    "if [ -e \"$proj/.git/.ign-restore-$5\" ]; then ",
+    "mv -- \"$proj/.git/.ign-restore-$5\" \"$stage\" || { printf '%s/.git appeared and the stage could not be taken back out of it; it is never replaced\\n' \"$2\" >&2; exit 4; }; ",
+    "rm -rf -- \"$stage\"; printf '%s/.git appeared; it is never replaced\\n' \"$2\" >&2; exit 4; fi; ",
     "final=$(mf \"$proj/.git\") || exit $?; set -- $final; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
 );
@@ -480,13 +487,25 @@ pub(super) const GIT_SAVE_RM_SH: &str = concat!(
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
     "case $2 in ign-deploy/*/git-save/\"$3\"/repo) ;; *) printf 'refusing %s: it does not end in git-save/%s/repo\\n' \"$2\" \"$3\" >&2; exit 4;; esac; ",
     "[ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; set -f; OI=$IFS; IFS=/; for c in $2; do ",
+    // CR-B1: the path is walked by position. The six levels above `repo` are
+    // ign-deploy, the gateway, projects, the project, git-save and the run;
+    // no component is ever compared with the word `repo`, because a gateway,
+    // a project or a run may be named that. Only the leaf is removed.
+    "set -f; p=${2%/repo}; k=0; OI=$IFS; IFS=/; for c in $p; do k=$((k+1)); ",
     "case $c in ''|.|..) echo 'refusing an empty, . or .. component' >&2; exit 4;; esac; ",
+    "case $k:$c in 1:ign-deploy|3:projects|5:git-save|2:*|4:*) ;; 6:\"$3\") ;; ",
+    "*) printf 'refusing %s: component %s is not where the save path has it\\n' \"$2\" \"$c\" >&2; exit 4;; esac; done; ",
+    "[ \"$k\" = 6 ] || { printf 'refusing %s: it does not have the six levels above repo\\n' \"$2\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; for c in $p; do ",
     "if [ -L \"$c\" ]; then printf '%s is a symlink\\n' \"$c\" >&2; exit 4; ",
     "elif [ -d \"$c\" ]; then :; ",
     "elif pr \"$c\"; then printf '%s is not a directory\\n' \"$c\" >&2; exit 4; ",
     "else printf 'IGN-RESULT:{\"removed\":0}\\n'; exit 0; fi; ",
-    "if [ \"$c\" = repo ]; then break; fi; cd -- \"$c\" || exit 3; done; IFS=$OI; ",
+    "cd -- \"$c\" || exit 3; done; IFS=$OI; ",
+    "if [ -L repo ]; then echo 'repo is a symlink' >&2; exit 4; ",
+    "elif [ -d repo ]; then :; ",
+    "elif pr repo; then echo 'repo is not a directory' >&2; exit 4; ",
+    "else printf 'IGN-RESULT:{\"removed\":0}\\n'; exit 0; fi; ",
     "rm -rf -- repo || { echo 'the save cannot be removed' >&2; exit 3; }; ",
     "cd .. || exit 3; rmdir -- \"$3\" 2>/dev/null; printf 'IGN-RESULT:{\"removed\":1}\\n'",
 );
@@ -4007,6 +4026,79 @@ mod tests {
             let out = run(GIT_SAVE_RM_SH, &[&home, repo, "r1"], &system_path());
             assert_eq!(out.code, 4, "{}", out.stderr);
             assert!(real.join("kept/r1/repo").is_dir());
+        }
+
+        /// CR-B1, reproduced by running the script itself: a gateway, a
+        /// project or a run named `repo` removes only that run's `repo`.
+        #[test]
+        fn save_rm_script_walks_by_position_when_components_are_named_repo() {
+            for (gw, project, run_id) in [
+                ("repo", "p", "r1"),
+                ("gw", "repo", "r1"),
+                ("gw", "p", "repo"),
+                ("repo", "repo", "repo"),
+            ] {
+                let rig = Rig::new();
+                let home = rig.root.path().join("home");
+                let proj = home
+                    .join("ign-deploy")
+                    .join(gw)
+                    .join("projects")
+                    .join(project);
+                let other = if run_id == "r2" { "r3" } else { "r2" };
+                for r in [run_id, other] {
+                    std::fs::create_dir_all(proj.join("git-save").join(r).join("repo"))
+                        .expect("save");
+                    std::fs::write(proj.join("git-save").join(r).join("repo/HEAD"), r)
+                        .expect("head");
+                }
+                std::fs::create_dir_all(proj.join("release")).expect("release");
+                std::fs::write(proj.join("release/release.json"), "{}").expect("record");
+                let path = format!("ign-deploy/{gw}/projects/{project}/git-save/{run_id}/repo");
+                let out = run(
+                    GIT_SAVE_RM_SH,
+                    &[&rig.home(), &path, run_id],
+                    &system_path(),
+                );
+                let label = format!("{gw}/{project}/{run_id}");
+                assert_eq!(out.code, 0, "{label}: {}", out.stderr);
+                assert!(
+                    out.stdout.contains("\"removed\":1"),
+                    "{label}: {}",
+                    out.stdout
+                );
+                assert!(!proj.join("git-save").join(run_id).exists(), "{label}");
+                assert!(proj.join("release/release.json").is_file(), "{label}");
+                assert!(
+                    proj.join("git-save")
+                        .join(other)
+                        .join("repo/HEAD")
+                        .is_file(),
+                    "{label}"
+                );
+            }
+        }
+
+        /// The levels above `repo` are fixed by position: a path with an
+        /// extra level, or `projects` / `git-save` in the wrong place, is
+        /// refused before anything is touched.
+        #[test]
+        fn save_rm_script_refuses_a_misplaced_component() {
+            let rig = Rig::new();
+            let home = rig.root.path().join("home");
+            std::fs::create_dir_all(home.join("ign-deploy/a/b/git-save/r1/repo")).expect("deep");
+            std::fs::create_dir_all(home.join("ign-deploy/gw/other/p/git-save/r1/repo"))
+                .expect("other");
+            for bad in [
+                "ign-deploy/a/b/git-save/r1/repo",
+                "ign-deploy/gw/other/p/git-save/r1/repo",
+                "ign-deploy/gw/projects/git-save/r1/repo",
+            ] {
+                let out = run(GIT_SAVE_RM_SH, &[&rig.home(), bad, "r1"], &system_path());
+                assert_eq!(out.code, 4, "{bad}: {}", out.stderr);
+            }
+            assert!(home.join("ign-deploy/a/b/git-save/r1/repo").is_dir());
+            assert!(home.join("ign-deploy/gw/other/p/git-save/r1/repo").is_dir());
         }
 
         #[test]

@@ -4087,6 +4087,8 @@ mod sftp_git {
     struct Count {
         execs: Mutex<Vec<String>>,
         sftp: AtomicUsize,
+        /// A per-test directory of shim programs put first on `sh`'s PATH.
+        shims: Mutex<Option<PathBuf>>,
     }
 
     #[async_trait::async_trait]
@@ -4107,7 +4109,8 @@ mod sftp_git {
             } else {
                 self.sftp.fetch_add(1, Ordering::Relaxed);
             }
-            let (program, args) = common::posix_exec::shimmed(program, args);
+            let extra = self.shims.lock().expect("shims").clone();
+            let (program, args) = common::posix_exec::shimmed_with(program, args, extra.as_deref());
             TokioProcessRunner
                 .run(&program, &args, stdin, timeout)
                 .await
@@ -4115,6 +4118,9 @@ mod sftp_git {
     }
 
     impl Count {
+        fn use_shims(&self, shims: &common::posix_exec::Shims) {
+            *self.shims.lock().expect("shims") = Some(shims.path().to_path_buf());
+        }
         fn execs(&self) -> usize {
             self.execs.lock().expect("execs").len()
         }
@@ -4328,6 +4334,117 @@ mod sftp_git {
         n.t.remove_git_save(GATEWAY, PROJECT, RUN)
             .await
             .expect("absent is fine");
+    }
+
+    /// 27-30 (CR-B1): the removal walks the save path by position, so a
+    /// gateway or a project named `repo` never turns it into the removal of
+    /// the whole ledger (the release record, the journals, the other runs).
+    #[tokio::test]
+    async fn sftp_git_save_rm_named_repo_components() {
+        const OTHER: &str = "20261114T101600Z-cd34";
+        for (gateway, project) in [("repo", "p1"), ("gw1", "repo"), ("repo", "repo")] {
+            let fx = GitFixture::new();
+            let n = node(&fx.data_dir);
+            let proj = n
+                .home
+                .path()
+                .join("ign-deploy")
+                .join(gateway)
+                .join("projects")
+                .join(project);
+            let save = |run: &str| proj.join("git-save").join(run).join("repo");
+            for run in [RUN, OTHER] {
+                std::fs::create_dir_all(save(run).join("objects")).expect("save");
+                std::fs::write(save(run).join("HEAD"), format!("ref: {run}\n")).expect("head");
+                std::fs::write(save(run).join("objects/o1"), run).expect("object");
+            }
+            std::fs::create_dir_all(proj.join("release")).expect("release");
+            std::fs::write(proj.join("release/release.json"), "{\"keep\":1}").expect("record");
+            std::fs::create_dir_all(proj.join("journals")).expect("journals");
+            std::fs::write(proj.join("journals/j1.json"), "journal").expect("journal");
+            let sibling = n.home.path().join("ign-deploy").join(gateway).join("note");
+            std::fs::write(&sibling, "gateway-level file").expect("sibling");
+
+            n.t.remove_git_save(gateway, project, RUN)
+                .await
+                .unwrap_or_else(|e| panic!("{gateway}/{project}: {e:?}"));
+
+            let label = format!("{gateway}/{project}");
+            assert!(
+                !proj.join("git-save").join(RUN).exists(),
+                "{label}: removed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("release/release.json")).expect("record"),
+                "{\"keep\":1}",
+                "{label}: the release record survives"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("journals/j1.json")).expect("journal"),
+                "journal",
+                "{label}: the journals survive"
+            );
+            assert_eq!(
+                std::fs::read_to_string(save(OTHER).join("objects/o1")).expect("other save"),
+                OTHER,
+                "{label}: another run's save survives"
+            );
+            assert_eq!(
+                std::fs::read_to_string(save(OTHER).join("HEAD")).expect("other head"),
+                format!("ref: {OTHER}\n")
+            );
+            assert!(
+                sibling.is_file(),
+                "{label}: the gateway-level file survives"
+            );
+        }
+    }
+
+    /// 27-30 (WR-B7): a `.git` that appears between the restore's last check
+    /// and its move is never entered. The stage is taken back out, the restore
+    /// refuses, and the gateway's new `.git` is left as it is.
+    #[tokio::test]
+    async fn sftp_git_restore_refuses_git_that_appears_before_the_move() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let before = n.t.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+
+        // a designer's open creates `.git` right before the restore's `mv`
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "mv",
+            "case $3 in */.git) case $2 in */.ign-restore-*) mkdir -- \"$3\";; esac;; esac\n\
+             exec \"$(real mv)\" \"$@\"",
+        );
+        n.count.use_shims(&shims);
+
+        let why = detail(
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("a .git appeared"),
+        );
+        assert!(why.contains(".git appeared"), "{why}");
+        assert!(fx.git_dir().is_dir(), "the new .git is still there");
+        assert_eq!(
+            std::fs::read_dir(fx.git_dir()).expect("new .git").count(),
+            0,
+            "nothing was left inside the new .git"
+        );
+        let beside: Vec<_> = std::fs::read_dir(fx.project_dir())
+            .expect("project")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ign-restore-"))
+            .collect();
+        assert!(beside.is_empty(), "no stage is left beside it: {beside:?}");
+        let saved = save_dir(&n).join("repo");
+        assert!(saved.is_dir(), "the save is intact");
+        assert_eq!(
+            n.t.save_manifest(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("save manifest"),
+            before
+        );
     }
 
     #[tokio::test]

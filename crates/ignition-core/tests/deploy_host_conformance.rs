@@ -3463,6 +3463,68 @@ mod git_rows {
         );
     }
 
+    /// 27-30 (CR-B1): a gateway or a project named `repo` must not turn the
+    /// removal of one run's save into the removal of the ledger. Every host
+    /// removes only `git-save/<run>/repo`; the release record, the journals
+    /// and another run's save stay, byte for byte.
+    pub async fn git_save_rm_named_repo(c: &GitCtx) {
+        const OTHER: &str = "20261114T101600Z-cd34";
+        for (gateway, project) in [("repo", "p1"), ("gw1", "repo"), ("repo", "repo")] {
+            let proj = c
+                .ledger
+                .join("ign-deploy")
+                .join(gateway)
+                .join("projects")
+                .join(project);
+            let save = |run: &str| proj.join("git-save").join(run).join("repo");
+            for run in [RUN, OTHER] {
+                std::fs::create_dir_all(save(run).join("objects")).expect("save");
+                std::fs::write(save(run).join("HEAD"), format!("ref: {run}\n")).expect("head");
+                std::fs::write(save(run).join("objects").join("o1"), run).expect("object");
+            }
+            std::fs::create_dir_all(proj.join("release")).expect("release");
+            std::fs::write(proj.join("release").join("release.json"), "{\"keep\":1}")
+                .expect("record");
+            std::fs::create_dir_all(proj.join("journals")).expect("journals");
+            std::fs::write(proj.join("journals").join("j1.json"), "journal").expect("journal");
+
+            let label = format!("{gateway}/{project}");
+            c.write
+                .remove_git_save(gateway, project, RUN)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            assert!(
+                !proj.join("git-save").join(RUN).exists(),
+                "{label}: removed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("release").join("release.json")).expect("record"),
+                "{\"keep\":1}",
+                "{label}: the release record survives"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("journals").join("j1.json")).expect("journal"),
+                "journal",
+                "{label}: the journals survive"
+            );
+            assert_eq!(
+                std::fs::read_to_string(save(OTHER).join("objects").join("o1")).expect("other"),
+                OTHER,
+                "{label}: another run's save survives"
+            );
+            assert_eq!(
+                std::fs::read_to_string(save(OTHER).join("HEAD")).expect("other head"),
+                format!("ref: {OTHER}\n"),
+                "{label}"
+            );
+            // a second removal finds nothing and is fine
+            c.write
+                .remove_git_save(gateway, project, RUN)
+                .await
+                .unwrap_or_else(|e| panic!("{label} again: {e:?}"));
+        }
+    }
+
     pub async fn git_size_matches_manifest(c: &GitCtx) {
         let manifest = c.read.git_manifest(PROJECT).await.expect("manifest");
         let size = c.read.git_size(PROJECT).await.expect("size");
@@ -3746,6 +3808,7 @@ mod git_rows {
         conformance_git_local_git_write_lock_refuses, GitCtx::local, git_write_lock_refuses;
         conformance_git_local_git_probe_denied_names_path, GitCtx::local, git_probe_denied_names_path;
         conformance_git_local_git_save_rm_refuses_foreign_path, GitCtx::local, git_save_rm_refuses_foreign_path;
+        conformance_git_local_git_save_rm_named_repo, GitCtx::local, git_save_rm_named_repo;
         conformance_git_local_git_size_matches_manifest, GitCtx::local, git_size_matches_manifest;
         conformance_git_local_git_objects_list_same, GitCtx::local, git_objects_list_same;
         conformance_git_local_git_objects_fetch_round_trip, GitCtx::local, git_objects_fetch_round_trip;
@@ -3759,6 +3822,7 @@ mod git_rows {
         conformance_git_sh_git_write_lock_refuses, GitCtx::posix, git_write_lock_refuses;
         conformance_git_sh_git_probe_denied_names_path, GitCtx::posix, git_probe_denied_names_path;
         conformance_git_sh_git_save_rm_refuses_foreign_path, GitCtx::posix, git_save_rm_refuses_foreign_path;
+        conformance_git_sh_git_save_rm_named_repo, GitCtx::posix, git_save_rm_named_repo;
         conformance_git_sh_git_size_matches_manifest, GitCtx::posix, git_size_matches_manifest;
         conformance_git_sh_git_objects_list_same, GitCtx::posix, git_objects_list_same;
         conformance_git_sh_git_objects_fetch_round_trip, GitCtx::posix, git_objects_fetch_round_trip;
@@ -3787,6 +3851,7 @@ mod git_rows {
         conformance_git_pwsh_git_write_lock_refuses, git_write_lock_refuses;
         conformance_git_pwsh_git_probe_denied_names_path, git_probe_denied_names_path;
         conformance_git_pwsh_git_save_rm_refuses_foreign_path, git_save_rm_refuses_foreign_path;
+        conformance_git_pwsh_git_save_rm_named_repo, git_save_rm_named_repo;
         conformance_git_pwsh_git_size_matches_manifest, git_size_matches_manifest;
         conformance_git_pwsh_git_objects_list_same, git_objects_list_same;
         conformance_git_pwsh_git_objects_fetch_round_trip, git_objects_fetch_round_trip;
@@ -3805,6 +3870,7 @@ mod git_rows {
             "git_write_lock_refuses",
             "git_probe_denied_names_path",
             "git_save_rm_refuses_foreign_path",
+            "git_save_rm_named_repo",
             "git_size_matches_manifest",
             "git_objects_list_same",
             "git_objects_fetch_round_trip",

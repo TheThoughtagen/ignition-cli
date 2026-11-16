@@ -10,7 +10,7 @@
 //! arguments are returned unchanged.
 
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const SHIM: &str = "#!/bin/sh\n\
@@ -54,17 +54,72 @@ fn shim_dir() -> Option<&'static PathBuf> {
 /// `program` and `args` as they should run: unchanged for anything but `sh`,
 /// and for `sh` wrapped in `env PATH=...` when the host needs the shim.
 pub fn shimmed(program: &OsStr, args: &[OsString]) -> (OsString, Vec<OsString>) {
-    match shim_dir() {
-        Some(dir) if program == "sh" => {
-            let path = format!(
-                "PATH={}:{}",
-                dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            );
-            let mut wrapped = vec![OsString::from(path), OsString::from("sh")];
-            wrapped.extend(args.iter().cloned());
-            (OsString::from("env"), wrapped)
+    shimmed_with(program, args, None)
+}
+
+/// [`shimmed`] with a per-test directory of extra shims (see [`Shims`]) put
+/// first on `sh`'s `PATH`, so a test can stand in for `mv`, `ls`, `getfacl`
+/// or `setfacl`. With `None` the behaviour is exactly [`shimmed`]'s.
+pub fn shimmed_with(
+    program: &OsStr,
+    args: &[OsString],
+    extra: Option<&Path>,
+) -> (OsString, Vec<OsString>) {
+    if program != "sh" {
+        return (program.to_os_string(), args.to_vec());
+    }
+    let mut path = String::new();
+    if let Some(dir) = extra {
+        path.push_str(&format!("{}:", dir.display()));
+    }
+    if let Some(dir) = shim_dir() {
+        path.push_str(&format!("{}:", dir.display()));
+    }
+    if path.is_empty() {
+        return (program.to_os_string(), args.to_vec());
+    }
+    let path = format!("PATH={path}{}", std::env::var("PATH").unwrap_or_default());
+    let mut wrapped = vec![OsString::from(path), OsString::from("sh")];
+    wrapped.extend(args.iter().cloned());
+    (OsString::from("env"), wrapped)
+}
+
+/// A shell function a shim body can call to run the real program of the same
+/// name: `exec "$(real mv)" "$@"`. It looks the program up on the system
+/// path only, so a shim never runs itself.
+pub const REAL_FN: &str = "real() ( PATH=/usr/bin:/bin; command -v \"$1\" )";
+
+/// A per-test directory of shim programs for `sh`'s `PATH`. Each shim is a
+/// `#!/bin/sh` script; data files (what a fake `getfacl` prints) sit beside
+/// them and a shim reads them through `$(dirname "$0")`.
+pub struct Shims {
+    dir: tempfile::TempDir,
+}
+
+impl Shims {
+    pub fn new() -> Shims {
+        Shims {
+            dir: tempfile::tempdir().expect("shim dir"),
         }
-        _ => (program.to_os_string(), args.to_vec()),
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// An executable shim `name` with `body` after [`REAL_FN`].
+    pub fn add(&self, name: &str, body: &str) {
+        let path = self.dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{REAL_FN}\n{body}\n")).expect("shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// A data file a shim reads.
+    pub fn data(&self, name: &str, text: &str) {
+        std::fs::write(self.dir.path().join(name), text).expect("shim data");
     }
 }
