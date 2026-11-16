@@ -92,7 +92,7 @@ inputs:
 
 outputs:
   outcome:
-    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, git_restore_failed, rollback_failed, and so on).
+    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, git_restore_failed, git_work_refused, git_sync_hazard_refused, rollback_failed, and so on).
     value: ${{ steps.report.outputs.outcome }}
   run_id:
     description: ign run id of the apply (empty when no run directory was written).
@@ -692,10 +692,23 @@ runs:
             }
             if (exit === 6 && data && (data.outcome === 'imported_unverified' || data.slug === 'deploy_project_unverified')) {
               const restore = data.restore_command ? str(data.restore_command) : '';
+              // Phase 27 (WR-06, D-07): the restore command is a plain overwrite import. It
+              // removes the gateway's .git again, which ign put back unchanged, so the
+              // operator copies it aside first. A K11 git restore that failed is named too,
+              // from data.git.nodes[]; the values stay strings, flattened by oneLine.
+              const gitNodes = data.git && Array.isArray(data.git.nodes) ? data.git.nodes : [];
+              const gitFailed = gitNodes.filter((n) => n && typeof n === 'object' && n.restore && typeof n.restore === 'object' && n.restore.reason);
+              const gitWhere = gitFailed.map((n) => 'node ' + oneLine(n.node) + ': the .git restore failed (' + oneLine(n.restore.reason) +
+                '); saved copy at ' + (n.save && n.save.path ? oneLine(n.save.path) : 'unknown') + ' on that node\'s host');
+              const gitNote = data.git && restore
+                ? '; the restore command\'s import removes the gateway\'s .git again: copy it aside first and put it back after'
+                : '';
               return result(false, 'imported_unverified',
                 prefix + ' deploy_project_unverified: the gateway answered but the project read back is not the artifact' +
-                  (restore ? '; restore the saved pre-image with: ' + restore : '; no pre-image was saved, so there is nothing to restore'),
-                restore ? ['restore command: ' + restore] : []);
+                  (restore ? '; restore the saved pre-image with: ' + restore : '; no pre-image was saved, so there is nothing to restore') +
+                  gitNote +
+                  (gitFailed.length ? '; the gateway\'s .git was not put back on ' + gitFailed.map((n) => oneLine(n.node) + ' (' + oneLine(n.restore.reason) + ', saved copy at ' + (n.save && n.save.path ? oneLine(n.save.path) : 'an unknown path') + ')').join(', ') : ''),
+                (restore ? ['restore command: ' + restore] : []).concat(gitWhere));
             }
             // Tag-owning runs (Phase 26): verdicts on stdout with data.ok false.
             if (exit === 6 && data && data.ok === false && (data.outcome === 'tags_rolled_back' || data.outcome === 'rolled_back')) {
@@ -791,6 +804,19 @@ runs:
               if (err && err.code === 'destructive_change_refused' && /^provider_emptied\b/.test(str(err.message))) {
                 return result(false, 'destructive_refused',
                   prefix + ' refused: the release removes every tag the project\'s record lists for a provider, which no flag permits; nothing was written; drop the provider from tag_providers in deploy/project.yaml, or keep at least one of its nodes in the repo',
+                  errDetails());
+              }
+              // Phase 27 (WR-07): the git gates share the code and the exit with the other
+              // destructive refusals; the message starts with the gate word. This workflow has
+              // no input for the two flags that pass them, so they will occur in CI.
+              if (err && err.code === 'destructive_change_refused' && /^(git_unpushed|git_not_merged|git_dirty)\b/.test(str(err.message))) {
+                return result(false, 'git_work_refused',
+                  prefix + ' refused: the gateway repository holds work the release lacks (unpushed, unmerged or uncommitted changes); push it and merge it into the release, or an administrator runs the deploy by hand with --discard-gateway-changes; nothing was written',
+                  errDetails());
+              }
+              if (err && err.code === 'destructive_change_refused' && /^git_sync_hazard\b/.test(str(err.message))) {
+                return result(false, 'git_sync_hazard_refused',
+                  prefix + ' refused: the gateway\'s git module would run imports at its next start (git.yaml sync hazards); fix git.yaml, or an administrator runs the deploy by hand with --allow-git-sync-hazards; nothing was written',
                   errDetails());
               }
               if (err && err.code === 'destructive_change_refused') {

@@ -3766,6 +3766,140 @@ fn apply_action_classifies_git_restore_failed() {
     }
 }
 
+/// 27-36 (WR-07, the 27-26 checkpoint, option-a): the apply action names a git
+/// gate refusal by its own cause. `git_unpushed`, `git_not_merged` and
+/// `git_dirty` end as kind `git_work_refused`; `git_sync_hazard` as
+/// `git_sync_hazard_refused`. Both are matched before the generic destructive
+/// branch, which keeps "a downgrade or a first change" for the rest.
+#[test]
+fn apply_action_classifies_git_gate_refusals() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("action.yml lacks {needle:?}"))
+    };
+    let generic = at("the deploy is a downgrade or a first change");
+    let work = at("/^(git_unpushed|git_not_merged|git_dirty)\\b/");
+    let hazard = at("/^git_sync_hazard\\b/");
+    assert!(
+        work < generic && hazard < generic,
+        "both git branches come before the generic destructive branch"
+    );
+    let end = |from: usize| {
+        from + text[from..]
+            .find("\n              }\n")
+            .expect("the branch ends")
+    };
+    let work_branch = &text[work..end(work)];
+    for needle in [
+        "'git_work_refused'",
+        "the gateway repository holds work the release lacks",
+        "push it and merge it",
+        "--discard-gateway-changes",
+        "nothing was written",
+        "errDetails()",
+    ] {
+        assert!(
+            work_branch.contains(needle),
+            "{needle:?} is missing from {work_branch}"
+        );
+    }
+    let hazard_branch = &text[hazard..end(hazard)];
+    for needle in [
+        "'git_sync_hazard_refused'",
+        "git.yaml",
+        "--allow-git-sync-hazards",
+        "nothing was written",
+        "errDetails()",
+    ] {
+        assert!(
+            hazard_branch.contains(needle),
+            "{needle:?} is missing from {hazard_branch}"
+        );
+    }
+    // Neither is a downgrade or a first change.
+    assert!(
+        !work_branch.contains("downgrade") && !hazard_branch.contains("downgrade"),
+        "{work_branch} {hazard_branch}"
+    );
+    // The values stay strings: no shell, no run: block.
+    for branch in [work_branch, hazard_branch] {
+        assert!(
+            !branch.contains("${{") && !branch.contains("run:"),
+            "{branch}"
+        );
+    }
+    // The outcome output lists both kinds.
+    for rel in [
+        ".github/actions/deploy-projects-apply/action.yml",
+        ".github/workflows/deploy-projects.yml",
+    ] {
+        let file = repo_file(rel);
+        let desc = file
+            .lines()
+            .find(|l| l.contains("Classified outcome of the apply"))
+            .unwrap_or_else(|| panic!("{rel}: no outcome description"));
+        assert!(
+            desc.contains("git_work_refused") && desc.contains("git_sync_hazard_refused"),
+            "{rel}: {desc}"
+        );
+    }
+    // The README names the kinds, and no longer calls every
+    // `destructive_change_refused` a downgrade or a first change.
+    let readme = repo_file("README.md");
+    for kind in ["git_work_refused", "git_sync_hazard_refused"] {
+        assert!(readme.contains(kind), "README lacks {kind}");
+    }
+    assert!(
+        readme.contains("`git_unpushed`, `git_not_merged` or `git_dirty`")
+            && readme.contains("`git_sync_hazard`"),
+        "the README paragraph names the git gates"
+    );
+}
+
+/// 27-36 (WR-06, D-07): on an unverified import of a git-managed project the
+/// action says that the printed restore command's import removes the gateway
+/// `.git` again, that it must be copied aside first and put back after, and
+/// it carries a failed K11 git restore's reason and save path from
+/// `data.git.nodes[]` through `oneLine`.
+#[test]
+fn apply_action_k11_names_git_repository() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let start = text
+        .find("if (exit === 6 && data && (data.outcome === 'imported_unverified'")
+        .expect("the imported_unverified branch");
+    let end = start
+        + text[start..]
+            .find("\n            }\n")
+            .expect("the branch ends");
+    let branch = &text[start..end];
+    for needle in [
+        "data.git",
+        "removes the gateway\\'s .git again",
+        "copy it aside first and put it back after",
+        "n.restore.reason",
+        "n.save.path",
+        "oneLine(",
+        "restore command: ' + restore",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The values stay strings: no shell, no run: block.
+    assert!(
+        !branch.contains("${{") && !branch.contains("run:"),
+        "{branch}"
+    );
+    // The README says the same, next to the K11 text.
+    let readme = repo_file("README.md");
+    assert!(
+        readme.contains("removes the gateway's `.git` again"),
+        "README lacks the K11 git note"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 27-20 (D-23, checker W16): the composite actions and the git token.
 // ---------------------------------------------------------------------------

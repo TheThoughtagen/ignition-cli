@@ -3591,6 +3591,41 @@ mod published {
     }
 
     #[tokio::test]
+    async fn k11_git_warning_names_the_git_dir() {
+        // WR-06: the printed restore command is a plain overwrite import, and
+        // an import removes the gateway's .git again. The run says so, and
+        // that the repository must be copied aside first and put back after.
+        let rig = Rig::new();
+        rig.gateway.mutate_child_after_import(PROJECT, 1000);
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
+        let command = result
+            .restore_command
+            .as_deref()
+            .expect("an overwrite has a restore command");
+        assert!(
+            command.starts_with("ign project import ")
+                && command.contains("--collision-policy overwrite")
+                && !command.contains('\n')
+                && !command.contains("&&"),
+            "the command keeps its single-command form: {command}"
+        );
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains(&format!("data/projects/{PROJECT}/.git")))
+            .unwrap_or_else(|| panic!("a warning names the .git: {:?}", result.warnings));
+        assert!(
+            warning.contains("removes") && warning.contains("copy"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("aside") && warning.contains("put the copy back"),
+            "{warning}"
+        );
+    }
+
+    #[tokio::test]
     async fn designer_attached_at_restore() {
         let rig = Rig::with(|g| g.with_designers_after_verify(100_000));
         let result = rig

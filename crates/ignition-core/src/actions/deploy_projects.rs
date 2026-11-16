@@ -5482,6 +5482,16 @@ async fn execute(
             result.warnings.extend(step.after.warnings);
             result.warnings.extend(step.left);
         }
+        // WR-06 (D-07): the printed restore command is a plain overwrite
+        // import, and an import removes the gateway's `.git` again. Nothing
+        // saves it for that import, so the operator copies it aside first.
+        if result.git.is_some() && result.restore_command.is_some() {
+            result.warnings.push(format!(
+                "the restore command's import removes the gateway's data/projects/{project}/.git \
+                 again, and ign keeps no save for that import: copy that .git aside on the \
+                 gateway host before running the command, and put the copy back after it"
+            ));
+        }
     }
     // D-06, K7: a parent that was replaced is followed by a look at the
     // projects that inherit from it. Reads only, and nothing in it can change

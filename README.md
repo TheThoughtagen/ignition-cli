@@ -248,6 +248,13 @@ Decision A of the v1.6 milestone fixed:
   meant for, so run it from the repo root with the profile for that gateway. It
   is `null` when the project was created by the run (`overwrite=false`), because
   no pre-image exists to go back to.
+- For a project the git module manages (`data.git` is present) the command's
+  import removes the gateway's `.git` again, and ign keeps no save for that
+  import. Copy `data/projects/<name>/.git` aside on the gateway host before
+  running the command and put the copy back after it. The run adds a warning
+  that says so, and the command keeps its single-command form. While `.git` is
+  missing a Designer open recreates it, so put the copy back before anyone
+  opens the project.
 - A verified import has `data.outcome` `imported` (or `created`), `data.ok:
   true`, `data.slug: null` and `restore_command: null`, and exits 0.
 
@@ -6065,7 +6072,11 @@ never removed, so there is no restore) and removes the save.
 An import that reads back **different** (`imported_unverified`) puts the saved
 `.git` back exactly as it was if the import removed it, and never advances it:
 `restore` reports `restored: true`, `advanced: false`. A `.git` that is still
-there is left untouched.
+there is left untouched and reported as `restored: false`, `advanced: false`
+(the human form says `.git left in place (not advanced)`). The `restore_command`
+that run prints imports the pre-image over the project and so removes the
+gateway's `.git` again: copy it aside on the gateway host first and put the
+copy back after (the run's warning says so).
 
 **Designers (D-07).** The Designer check of the run happens before the import.
 Right before every write to `.git` after the import, the run checks again and
@@ -7022,7 +7033,8 @@ outputs `outcome` and `run_id`. `outcome` is one of `created`, `imported`,
 `tags_rolled_back`, `rolled_back` and `applied_backup_unsynced` (exit 6
 verdicts; the job fails), `rollback_failed` (the job fails), or a refusal
 such as `tag_removal_refused`, `tags_hash_missing`, `destructive_refused`,
-`hash_mismatch` or `plan_stale`.
+`git_work_refused`, `git_sync_hazard_refused`, `hash_mismatch` or
+`plan_stale`.
 
 Inputs of the `deploy-projects.yml` workflow (same-organization form):
 
@@ -7055,7 +7067,11 @@ deploy. Children are reported and never changed.
 **Failures.** An exit 6 `deploy_project_unverified` verdict (the gateway
 answered but the project read back is not the artifact) fails the job with the
 slug and the restore command from the envelope, or says nothing can be restored
-when no pre-image was saved. A tag-owning run that failed after its first tag
+when no pre-image was saved. For a project the git module manages the headline
+adds that the restore command's import removes the gateway's `.git` again and
+that it must be copied aside first and put back after, and it names a `.git`
+restore that failed (`data.git.nodes[].restore.reason` and the saved copy's
+path). A tag-owning run that failed after its first tag
 write and was restored and verified (`tags_rolled_back`, or `rolled_back` when
 the project import failed) fails the job with the rollback's cause; nothing of
 the release is live. `applied_backup_unsynced` fails the job too: the master
@@ -7086,7 +7102,19 @@ written, until the removal is reverted in the repo or applied outside CI under
 review. Neither the actions nor the workflow pass `--allow-downgrade` or
 `--allow-first-change`: a downgrade or a first change to a project, or the first
 `ign` deploy of an owned tag provider that adds or changes tags, is refused
-(`destructive_change_refused`) and an administrator runs it by hand.
+(`destructive_change_refused`, outcome `destructive_refused`) and an
+administrator runs it by hand. The git gates share that code and exit but have
+their own causes and outcomes, and neither the actions nor the workflow pass
+the flags that pass them:
+
+- `git_unpushed`, `git_not_merged` or `git_dirty` end the job as
+  `git_work_refused`: the gateway repository holds work the release lacks. Push
+  it and merge it into the release, or an administrator runs the deploy by hand
+  with `--discard-gateway-changes <reason>`. Nothing was written.
+- `git_sync_hazard` ends the job as `git_sync_hazard_refused`: the gateway's git
+  module would run imports at its next start (see `git.yaml`). Fix `git.yaml`,
+  or an administrator runs the deploy by hand with `--allow-git-sync-hazards
+  <reason>`. Nothing was written.
 
 The verdicts the projects apply classifies, as `ign` emits them:
 
@@ -7097,6 +7125,8 @@ The verdicts the projects apply classifies, as `ign` emits them:
 | exit 6, `applied_backup_unsynced` (`deploy_backup_unsynced`) | stdout `data.outcome`, `data.tags.backup.reason` | fails: master is live, backup lagging, do not rerun |
 | exit 6, `git_restore_failed` (`deploy_git_restore_failed`) | stdout `data.outcome`, `data.git.nodes[].save.path`, `data.git.nodes[].restore.reason` | fails: deployed and recorded, the gateway's `.git` was not restored; restore it by hand from the saved copy, do not rerun |
 | exit 6, `rollback_failed` | stderr `error.code`, `error.message` | fails: the gateway is partly changed; do not rerun; recover with the `--rollback-run` command the message names |
+| exit 2, `destructive_change_refused` with gate `git_unpushed`, `git_not_merged` or `git_dirty` | stderr `error.code`, `error.message` | fails as `git_work_refused`: the gateway repository holds work the release lacks; push and merge it, or an administrator runs the deploy by hand with `--discard-gateway-changes` |
+| exit 2, `destructive_change_refused` with gate `git_sync_hazard` | stderr `error.code`, `error.message` | fails as `git_sync_hazard_refused`: fix `git.yaml`, or an administrator runs the deploy by hand with `--allow-git-sync-hazards` |
 The job uploads `run.json`, `result.json` and `events.ndjson` of the run
 directory it created and the two `ign` envelopes, never the saved pre-image.
 
