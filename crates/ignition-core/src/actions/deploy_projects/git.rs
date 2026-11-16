@@ -60,7 +60,7 @@ use crate::deploy::ledger::{LedgerRoot, git_save_location};
 use crate::deploy::project_artifact::CanonicalDigest;
 use crate::deploy::tag_converge::BackupTags;
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitStateWriter, ImportDir, ProjectHost, git_entry_location,
+    GitEntry, GitHostRead, GitManifest, GitStateWriter, ImportDir, ProjectHost, git_entry_location,
     git_state_writer_for_node, local_data_dir_for_node, project_host_for_node,
 };
 use crate::error::{CoreError, PreflightFailure};
@@ -1781,13 +1781,56 @@ pub async fn git_after_verify(
     saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
 ) -> GitAfter {
+    after_verify(prepared, report, saved, inputs, None).await
+}
+
+/// What the advance hands to the backup's settle ([`advance_after`]).
+#[derive(Default)]
+struct SettleHold {
+    /// The save was kept because the `.git` was advanced in place.
+    held: bool,
+    /// The manifest of the advanced `.git`, read right after the read-back;
+    /// `None` when it could not be read.
+    advanced: Option<GitManifest>,
+}
+
+/// [`git_after_verify`], and for the backup of a pair the settle of 27-35
+/// (WR-08, D-19, D-G5): with `settle` set, a `.git` that was present at the
+/// end of the wait and advanced in place keeps its save through the advance
+/// and is probed again after `settle` ([`settle_backup_git`]); the master's
+/// path passes `None` and is unchanged.
+async fn after_verify(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    settle: Option<Duration>,
+) -> GitAfter {
     let mut polls = Vec::new();
     let gate =
         git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls).await;
+    let mut hold = SettleHold::default();
     let mut after = match gate {
         Err(failure) => failed_restore(report, &failure),
-        Ok(()) => advance_after(prepared, report, saved, inputs).await,
+        Ok(()) => {
+            let slot = settle.is_some().then_some(&mut hold);
+            advance_after(prepared, report, saved, inputs, slot).await
+        }
     };
+    if hold.held
+        && let Some(interval) = settle
+    {
+        after = settle_backup_git(
+            prepared,
+            report,
+            saved,
+            inputs,
+            interval,
+            hold.advanced,
+            after,
+        )
+        .await;
+    }
     after.events.splice(
         0..0,
         polls
@@ -1880,11 +1923,18 @@ pub async fn git_record_advance(
 }
 
 /// The advance itself, after the Designer gate passed.
+///
+/// `hold` is the backup's settle (27-35, WR-08): when given and the `.git`
+/// was advanced in place (not restored), the manifest of the advanced `.git`
+/// is read right after the advance was read back (before the post-advance
+/// status), the save is not removed here and `hold.held` is set, so the caller
+/// can look at `.git` again first.
 async fn advance_after(
     prepared: &PreparedGit,
     report: &mut GitReport,
     saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
+    mut hold: Option<&mut SettleHold>,
 ) -> GitAfter {
     let save_path = saved.path.clone();
     let node_name = report.master().node.clone();
@@ -1927,6 +1977,14 @@ async fn advance_after(
         Ok(done) => done,
         Err(failure) => return failed_restore(report, &failure),
     };
+    // The state the backup's settle compares against: the advanced `.git`,
+    // read as soon as the advance was read back. A read that fails (the sync
+    // already took the repository) leaves `None`: the probe decides.
+    if let Some(slot) = hold.as_deref_mut()
+        && !done.restored
+    {
+        slot.advanced = inputs.read.git_manifest(inputs.project).await.ok();
+    }
     // The advance wrote: what the override discards is gone from the live
     // repository now (27-35, WR-11), so only here does `discarded` replace
     // `would_discard`. The evidence file was written before the import.
@@ -2038,11 +2096,151 @@ async fn advance_after(
             discard_ref_name(&saved.run_id)
         ));
     } else {
-        remove_save(report, saved, inputs, &mut after).await;
+        match hold {
+            Some(slot) if !done.restored => slot.held = true,
+            _ => remove_save(report, saved, inputs, &mut after).await,
+        }
     }
     report.expected_drift = Some(drift);
     report.expected_drift_count = Some(drift_count);
     report.expected_drift_complete = true;
+    after
+}
+
+/// A failure found while the backup's `.git` settled: the advance had written
+/// and read back, so `advanced` and `verified` stay as reported; the reason is
+/// set, the save is kept and named, and the node ends `git_restore_failed`.
+fn settle_failed(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    after: &mut GitAfter,
+    reason: &'static str,
+    detail: &str,
+) {
+    let node = report.master().node.clone();
+    if let Some(restore) = report.master_mut().restore.as_mut() {
+        restore.reason = Some(reason.to_string());
+        restore.save_kept = true;
+    }
+    after.failed = true;
+    after.warnings.push(format!(
+        "project {}: git {reason} on {node}: {detail}; the saved .git is at {}",
+        saved.project, saved.path
+    ));
+    after.events.push(ProjectsEvent::GitRestoreFailed {
+        node,
+        reason: reason.to_string(),
+        path: Some(saved.path.clone()),
+    });
+}
+
+/// The backup's settle (27-35, WR-08, D-19, D-G5). Redundancy removes the
+/// backup's module-cloned `.git` when the master's change reaches it, and 27-04
+/// measured that a few seconds after the first content-changing import, not
+/// when the backup's REST export converges. A `.git` found present at the end
+/// of the wait and advanced in place may therefore still be deleted a moment
+/// later; removing the save on the strength of that read would leave the backup
+/// with neither. So the save was kept through the advance ([`advance_after`]
+/// with `hold`), and one poll interval later the `.git` is probed again
+/// through the backup's host:
+///
+/// - a directory whose manifest equals `advanced`, the one read right after the
+///   advance was read back:
+///   the save is removed ([`remove_save`]);
+/// - absent: the Designer gate runs (D-07) and the handover runs again from the
+///   save, which restores it and advances it, and the save is removed only
+///   after that;
+/// - anything else (a different manifest, a non-directory, a probe that
+///   failed): the node ends `git_recreated` (or `restore_failed` for a failed
+///   probe), `.git` is left as it is and the save is kept and named.
+async fn settle_backup_git(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    interval: Duration,
+    advanced: Option<GitManifest>,
+    mut after: GitAfter,
+) -> GitAfter {
+    let project = inputs.project;
+    tokio::time::sleep(interval).await;
+    let files = match inputs.read.read_git_state(project).await {
+        Ok(files) => files,
+        Err(err) => {
+            settle_failed(
+                report,
+                saved,
+                &mut after,
+                "restore_failed",
+                &format!(
+                    "the backup's .git could not be probed again after the advance ({}); it \
+                     was not touched",
+                    err.code()
+                ),
+            );
+            return after;
+        }
+    };
+    match files.kind {
+        GitEntry::Directory => match inputs.read.git_manifest(project).await {
+            Ok(now) if advanced.as_ref() == Some(&now) => {
+                remove_save(report, saved, inputs, &mut after).await;
+            }
+            Ok(_) => settle_failed(
+                report,
+                saved,
+                &mut after,
+                "git_recreated",
+                "the backup's .git changed after it was advanced (the redundancy sync reached \
+                 it late); it is left as it is",
+            ),
+            Err(err) => settle_failed(
+                report,
+                saved,
+                &mut after,
+                "restore_failed",
+                &format!(
+                    "the backup's .git could not be read again after the advance ({}); it was \
+                     not touched",
+                    err.code()
+                ),
+            ),
+        },
+        GitEntry::Absent => {
+            let mut polls = Vec::new();
+            let gate =
+                git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls)
+                    .await;
+            after.events.extend(
+                polls
+                    .into_iter()
+                    .map(|open| ProjectsEvent::DesignersPoll { open }),
+            );
+            let more = match gate {
+                Err(failure) => failed_restore(report, &failure),
+                Ok(()) => {
+                    after.warnings.push(format!(
+                        "project {}: the backup's .git was removed after the advance (the \
+                         redundancy sync reached it late); it was restored from the save and \
+                         advanced again",
+                        saved.project
+                    ));
+                    advance_after(prepared, report, saved, inputs, None).await
+                }
+            };
+            after.failed = more.failed;
+            after.warnings.extend(more.warnings);
+            after.events.extend(more.events);
+        }
+        GitEntry::File | GitEntry::Symlink | GitEntry::Other => settle_failed(
+            report,
+            saved,
+            &mut after,
+            "git_recreated",
+            "something other than the repository that was advanced is at the backup's .git; it \
+             is left as it is",
+        ),
+    }
     after
 }
 
@@ -2749,6 +2947,14 @@ pub async fn wait_for_backup_project(
 /// Designer gate, restore when absent, advance in place when present and equal
 /// to its saved state ([`git_after_verify`]); `report` holds the backup's
 /// single-node report.
+///
+/// The backup settles (27-35, WR-08): a `.git` advanced in place keeps its
+/// save through the advance, is probed again after one `wait.policy.interval`,
+/// and the save is removed only when it still equals the advanced state; a
+/// `.git` the sync removed in the meantime is restored from the save and
+/// advanced again, and a changed one ends the node `git_recreated` with the
+/// save kept ([`settle_backup_git`]). Implemented as a backup-only option of
+/// the shared step, so the master's path and timing are untouched.
 pub async fn git_after_backup(
     prepared: &PreparedGit,
     report: &mut GitReport,
@@ -2763,7 +2969,14 @@ pub async fn git_after_backup(
                 export_zip: &zip,
                 ..*inputs
             };
-            git_after_verify(prepared, report, saved, &converged).await
+            after_verify(
+                prepared,
+                report,
+                saved,
+                &converged,
+                Some(wait.policy.interval),
+            )
+            .await
         }
         Err(detail) => failed_restore(
             report,
@@ -2831,7 +3044,10 @@ pub async fn git_rollback_backup(
 /// The `record` action's advance on the backup (27-22): the project already is
 /// the artifact, so the backup is saved, then waited for (it may still be
 /// converging), then handled like the master's `record`: restored when the
-/// sync removed it, advanced in place otherwise.
+/// sync removed it, advanced in place otherwise. It goes through
+/// [`git_after_backup`], so it gets the same settle (27-35, WR-08): the save
+/// of a `.git` advanced in place goes only after one more poll interval and a
+/// second look at it.
 pub async fn git_record_backup(
     prepared: &PreparedGit,
     report: &mut GitReport,

@@ -1720,6 +1720,9 @@ mod published {
         /// The master's tree reader, for a tag-owning pair (27-22): the
         /// mode-collection check of a pair reads it.
         pub tree: Option<LocalFsTransport>,
+        /// The poll interval of the wait for the backup, which is also the
+        /// settle the backup's `.git` gets before its save goes (27-35).
+        pub backup_interval: std::time::Duration,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1851,6 +1854,7 @@ mod published {
                 discard: None,
                 hazard_ack: None,
                 tree: None,
+                backup_interval: std::time::Duration::from_millis(5),
             }
         }
 
@@ -1970,7 +1974,7 @@ mod published {
                     backup: backup.map(|(node, _)| node),
                     backup_policy: ignition_core::deploy::pair::BackupPolicy {
                         budget: backup.map_or(std::time::Duration::from_secs(1), |(_, b)| b),
-                        interval: std::time::Duration::from_millis(5),
+                        interval: self.backup_interval,
                     },
                     tag_delete_ready: std::time::Duration::from_millis(50),
                     tag_delete_poll: std::time::Duration::from_millis(5),
@@ -2064,6 +2068,14 @@ mod published {
         /// manages its project, so a sync deletes its `.git`, G5), that follows
         /// this rig's master after `lag` reads.
         pub fn backup_node(&self, lag: usize) -> FakeBackupNode<'_> {
+            self.backup_node_with(lag, true)
+        }
+
+        /// [`Rig::backup_node`] whose project the module does or does not
+        /// manage: with `managed` false the redundancy sync leaves the
+        /// backup's `.git` in place (R-6), so the run finds it present once
+        /// the backup's project converges.
+        pub fn backup_node_with(&self, lag: usize, managed: bool) -> FakeBackupNode<'_> {
             let members = members_of(&self.f.backup_project_dir());
             let borrowed: Vec<(&str, Vec<u8>)> = members
                 .iter()
@@ -2071,7 +2083,7 @@ mod published {
                 .collect();
             let gw = FakeProjects::new()
                 .with_project(PROJECT, None, false, &borrowed)
-                .with_disk_mirror(&self.f.backup_data_dir(), true);
+                .with_disk_mirror(&self.f.backup_data_dir(), managed);
             FakeBackupNode {
                 master: &self.gateway,
                 gw,
@@ -2128,7 +2140,7 @@ mod published {
                     backup: backup.map(|(node, _)| node),
                     backup_policy: ignition_core::deploy::pair::BackupPolicy {
                         budget: backup.map_or(std::time::Duration::from_secs(1), |(_, b)| b),
-                        interval: std::time::Duration::from_millis(5),
+                        interval: self.backup_interval,
                     },
                     tag_delete_ready: std::time::Duration::from_millis(50),
                     tag_delete_poll: std::time::Duration::from_millis(5),
@@ -2145,10 +2157,19 @@ mod published {
             backup: &dyn ignition_core::deploy::tag_converge::BackupTags,
             budget: std::time::Duration,
         ) -> Result<DeployProjectsResult, CoreError> {
-            let host = self.host();
-            let (loaded, prepared) = self.plan_with(&host).await?;
+            self.apply_pair_on(&self.host(), backup, budget).await
+        }
+
+        /// [`Rig::apply_pair`] through `host` (a host whose git is a stub).
+        pub async fn apply_pair_on(
+            &self,
+            host: &StubHost,
+            backup: &dyn ignition_core::deploy::tag_converge::BackupTags,
+            budget: std::time::Duration,
+        ) -> Result<DeployProjectsResult, CoreError> {
+            let (loaded, prepared) = self.plan_with(host).await?;
             self.run_prepared_full(
-                &host,
+                host,
                 &loaded,
                 prepared,
                 None,
@@ -6245,6 +6266,266 @@ mod published {
         // The backup's repository was never written.
         assert!(rig.f.backup_git_dir().exists());
         assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c1);
+    }
+
+    // ---- 27-35: the backup's `.git` settles before its save goes (WR-08) ----
+
+    /// A host git that runs git and then, once, after the post-advance status
+    /// of the backup's work tree (its `ls-files` call), runs `change`: the
+    /// redundancy sync reaching the backup's `.git` after the advance wrote
+    /// and read back, before the run looks again. The hook fires once, so the
+    /// advance that follows a restore is not touched. The settle never reads
+    /// the backup's REST export again, so the late write cannot ride on a
+    /// read count; it rides on the run's own last read of the work tree.
+    #[cfg(unix)]
+    fn late_backup_git(scratch: &std::path::Path, rig: &Rig, change: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = scratch.join("git-late");
+        let once = scratch.join("late-ran");
+        let work = rig.f.backup_project_dir();
+        let script = format!(
+            "#!/bin/sh\ngit \"$@\"\nrc=$?\ncase \"$*\" in\n  *\"--work-tree={work} ls-files\"*)\n    [ -e '{once}' ] || {{ : > '{once}'; {change}; }}\n    ;;\nesac\nexit $rc\n",
+            work = work.display(),
+            once = once.display(),
+        );
+        std::fs::write(&program, script).expect("script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        program
+    }
+
+    /// The `git_*` events that name the backup, in order.
+    fn backup_git_events(rig: &Rig, result: &DeployProjectsResult) -> Vec<String> {
+        rig.events(result)
+            .iter()
+            .filter(|e| e["node"] == "nodes.backup")
+            .filter_map(|e| e["event"].as_str())
+            .filter(|n| n.starts_with("git_"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// WR-08 (the finding's ordering): the redundancy sync's delete of the
+    /// backup's `.git` arrives after the backup's project converged, the
+    /// `.git` was advanced in place, and the run has read it back. Before the
+    /// settle the save was removed on the strength of that read and the sync
+    /// then took the repository: the backup had neither. Now the save stays
+    /// through the advance, the `.git` is probed again one poll interval
+    /// later, found absent, and restored from the save and advanced.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_backup_git_removed_after_convergence_is_restored() {
+        let mut rig = pair();
+        rig.backup_interval = std::time::Duration::from_millis(100);
+        let scratch = tempfile::tempdir().expect("scratch");
+        let program = late_backup_git(
+            scratch.path(),
+            &rig,
+            &format!("/bin/rm -rf '{}'", rig.f.backup_git_dir().display()),
+        );
+        let host = rig.host_with_program(&program);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig
+            .apply_pair_on(&host, &backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert!(
+            scratch.path().join("late-ran").exists(),
+            "the late delete reached the backup's .git"
+        );
+        assert!(
+            rig.f.backup_git_dir().exists(),
+            "the backup must not end without a .git: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.ok);
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert!(
+            restore.restored && restore.advanced && restore.verified,
+            "{restore:?}"
+        );
+        assert_eq!(restore.reason, None);
+        assert!(!restore.save_kept, "the save goes after the restore");
+        assert_eq!(restore.post_status, Some("matched"));
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+        // The save is removed only after the restore.
+        let events = backup_git_events(&rig, &result);
+        let at = |name: &str| {
+            events
+                .iter()
+                .rposition(|e| e == name)
+                .unwrap_or_else(|| panic!("{name} is logged: {events:?}"))
+        };
+        assert!(at("git_restored") < at("git_save_removed"), "{events:?}");
+        assert_eq!(events.last().map(String::as_str), Some("git_save_removed"));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("removed after the advance")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    /// WR-08, the quiet case: the sync leaves the backup's `.git` alone. It
+    /// is advanced in place, probed again after one poll interval, found equal
+    /// to the advanced state, and only then is the save removed.
+    #[tokio::test]
+    async fn pair_backup_git_in_place_settles_then_removes_save() {
+        let mut rig = pair();
+        rig.backup_interval = std::time::Duration::from_millis(150);
+        let backup = rig.backup_node_with(1, false);
+        let started = std::time::Instant::now();
+        let result = rig
+            .apply_pair(&backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert!(
+            started.elapsed() >= rig.backup_interval,
+            "the backup waited one poll interval before the save went: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        assert!(result.ok);
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert!(
+            !restore.restored && restore.advanced && restore.verified,
+            "{restore:?}"
+        );
+        assert!(!restore.save_kept);
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+        let events = backup_git_events(&rig, &result);
+        assert_eq!(
+            events,
+            [
+                "git_state_read",
+                "git_saved",
+                "git_advanced",
+                "git_save_removed"
+            ],
+            "{events:?}"
+        );
+    }
+
+    /// WR-08: the backup's `.git` is changed during the settle (the sync
+    /// rewrote the repository). It is not the state that was advanced: the
+    /// node fails `git_recreated`, the repository is left as it is and the
+    /// save is kept and named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_backup_git_changed_during_settle_is_left() {
+        let mut rig = pair();
+        rig.backup_interval = std::time::Duration::from_millis(100);
+        let scratch = tempfile::tempdir().expect("scratch");
+        let program = late_backup_git(
+            scratch.path(),
+            &rig,
+            &format!(
+                "printf '[late]\\n\\tchange = yes\\n' >> '{}/config'",
+                rig.f.backup_git_dir().display()
+            ),
+        );
+        let host = rig.host_with_program(&program);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig
+            .apply_pair_on(&host, &backup, WAIT)
+            .await
+            .expect("a verdict");
+        assert!(scratch.path().join("late-ran").exists());
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        assert!(!result.ok);
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert_eq!(restore.reason.as_deref(), Some("git_recreated"));
+        assert!(restore.save_kept, "{restore:?}");
+        assert!(node.save.is_some(), "the save is reported");
+        assert_eq!(rig.save_trees_in(&rig.f.backup_data_dir()).len(), 1);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("git_recreated") && w.contains("git-save")),
+            "{:?}",
+            result.warnings
+        );
+        // The repository is left as the sync made it.
+        let config = std::fs::read_to_string(rig.f.backup_git_dir().join("config"))
+            .expect("the backup's config");
+        assert!(config.contains("change = yes"), "{config}");
+        let events = backup_git_events(&rig, &result);
+        assert!(
+            !events.contains(&"git_save_removed".to_string()),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&"git_restore_failed".to_string()),
+            "{events:?}"
+        );
+    }
+
+    /// WR-08 on a `record`: the project already is the artifact, so the
+    /// backup's `.git` is saved, waited for and advanced in place; the same
+    /// late delete is found one poll interval later and restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_record_backup_settles() {
+        let mut rig = pair();
+        rig.backup_interval = std::time::Duration::from_millis(100);
+        rig.make_live_equal_artifact().await;
+        let scratch = tempfile::tempdir().expect("scratch");
+        let program = late_backup_git(
+            scratch.path(),
+            &rig,
+            &format!("/bin/rm -rf '{}'", rig.f.backup_git_dir().display()),
+        );
+        let host = rig.host_with_program(&program);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig
+            .apply_pair_on(&host, &backup, WAIT)
+            .await
+            .expect("the record completes");
+        assert!(scratch.path().join("late-ran").exists());
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Recorded,
+            "{:?}",
+            result.warnings
+        );
+        assert!(rig.gateway.import_calls().is_empty(), "no import");
+        assert!(rig.f.backup_git_dir().exists(), "{:?}", result.warnings);
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert!(
+            restore.restored && restore.advanced && restore.verified,
+            "{restore:?}"
+        );
+        assert!(!restore.save_kept);
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+        let events = backup_git_events(&rig, &result);
+        assert_eq!(events.last().map(String::as_str), Some("git_save_removed"));
+        assert!(events.contains(&"git_restored".to_string()), "{events:?}");
     }
 
     #[tokio::test]

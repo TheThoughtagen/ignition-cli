@@ -6216,7 +6216,13 @@ before the import, as it does for the master. After the master is verified,
 restored and advanced, it waits up to `--backup-timeout` (default 300 s) for
 the backup's project export to equal the release, then restores the backup's
 `.git` (when the sync deleted it) or advances it in place (when it is still the
-repository that was saved), and proves the result as for the master. A backup
+repository that was saved), and proves the result as for the master. A `.git`
+advanced in place keeps its save for one more backup poll interval
+(5 s): the sync can still delete it after the advance. It is then probed again;
+equal to the advanced state, the save is removed; absent, it is restored from
+the save and advanced again before the save goes; changed, the node ends
+`git_restore_failed` with `restore.reason` `git_recreated`, the repository is
+left as it is and the save is kept. A backup
 that does not converge, or whose restore or advance fails, ends the run
 `git_restore_failed` (exit 6, `data.ok` false) with
 `data.git.nodes[1].restore.reason` (`backup_unsynced` for the wait) and the
