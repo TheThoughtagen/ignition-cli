@@ -467,91 +467,135 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
     "printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
-/// 27-31 (WR-B3), step (c) of a POSIX `.git` write. The bytes are already in
-/// the private stage (`<stage>/<index>` for the write at that position); no
-/// path the gateway account can change is ever written by anything but this
-/// script. Arguments: the data dir, the `.git` path below it, the stage path,
-/// then (target, lock, size) triples; every value is data.
+/// 27-31 (WR-B3, WR-B1), step (c) of a POSIX `.git` write. The bytes are
+/// already in the private stage (`<stage>/<index>` for the write at that
+/// position). Arguments: the data dir, the `.git` path below it, the stage
+/// path, then (target, lock, size) triples; every value is data.
 ///
-/// 1. walk to `.git` level by level (each a real directory);
-/// 2. check every triple: parents are directories (a missing one is allowed),
-///    the target is absent or a regular non-symlink file, the lock is absent,
-///    the stage file is a regular non-symlink file of the sent size;
-/// 3. create the missing directories;
-/// 4. create every lock with an exclusive create that is filled from the stage
-///    in the same open (`set -C` redirection, so a planted link or an existing
-///    file fails the create and is never written through);
-/// 5. move each lock over its target in plan order;
-/// 6. remove the stage.
+/// No path the gateway account can change is written through. Every walk is
+/// level by level from the data dir: each level is a real directory (`[ -d ]`
+/// and not `[ -L ]`), is entered, and `pwd -P` must then equal the path
+/// expected, so a level swapped for a link between the check and the `cd` is
+/// refused. Every create, link and move then uses a basename in that checked
+/// current directory.
 ///
-/// The script removes the locks it made and the stage on every refusal and
-/// failure it reports itself (exit 3, 4, 5, 6); it never removes a lock it did
-/// not create. Exit 4 is a refusal, 5 a size mismatch, 3 a host failure.
+/// 1. check every triple: the stage file is a regular non-symlink file of the
+///    sent size, the target is absent or a regular file, the lock is absent,
+///    and the final mode is known (the target's permission bits without the
+///    execute bits; `0600` for a new `config`, `0644` otherwise);
+/// 2. when a directory has to be made and the gateway account (owner of
+///    `projects/<p>`) is neither root nor the deploy account, refuse with exit
+///    6 unless `setfacl` exists; make each missing directory with its
+///    parent's mode and give the gateway account the D-G1 named entry (access
+///    and default);
+/// 3. make a private `.git/.ign-write-<id>` (`mkdir -m 700`, owned by the
+///    deploy account, checked after `cd`) and copy each stage file into it,
+///    created under a umask that gives the file exactly its final mode;
+/// 4. create each lock by `ln -n` (a hard link: atomic, never follows a
+///    symlink at the lock path, never replaces anything, whatever the shell);
+///    a lock that is not the regular file just made is refused;
+/// 5. `mv -f` each lock over its target in plan order;
+/// 6. remove the private directory and the stage.
+///
+/// The script removes the locks it made, the directories it made (when still
+/// empty), the private directory and the stage on every refusal and failure it
+/// reports itself (exit 3, 4, 5, 6); it never removes a lock it did not
+/// create. Exit 4 is a refusal, 5 a size mismatch, 6 the ACL step, 3 a host
+/// failure.
 pub(super) const GIT_WRITE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in ls mkdir rmdir rm mv wc cat; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in ls mkdir rmdir rm mv wc cat ln id; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "[ -d \"$3\" ] && [ ! -L \"$3\" ] || { printf '%s is not a real stage directory\\n' \"$3\" >&2; exit 4; }; ",
-    "umask 022; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; stg=$3; ",
-    "ab() { IFS=$NL; for f in $made; do rm -f -- \"$f\"; done; for d in $mkd; do rmdir -- \"$d\" 2>/dev/null; done; unset IFS; rm -rf -- \"$stg\"; }; ",
+    "umask 077; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; pdn=''; nt=0; dd=$1; rr=$2; stg=$3; shift 3; ",
+    "wq() { bc=$dd; bm='cannot enter %s'; cd -- \"$dd\" 2>/dev/null || return 3; we=$(pwd -P) || return 3; IFS=/; ",
+    "for w in $1; do ",
+    "if [ -L \"$w\" ]; then bc=$w; bm='%s is a symlink'; unset IFS; return 4; ",
+    "elif [ -d \"$w\" ]; then :; ",
+    "elif [ -e \"$w\" ]; then bc=$w; bm='%s is not a directory'; unset IFS; return 4; ",
+    "else bc=$w; unset IFS; return 2; fi; ",
+    "cd -- \"$w\" 2>/dev/null || { bc=$w; bm='cannot enter %s'; unset IFS; return 3; }; ",
+    "we=${we%/}/$w; wp=$(pwd -P); [ \"$wp\" = \"$we\" ] || { bc=$w; bm='%s changed while it was entered'; unset IFS; return 4; }; ",
+    "done; unset IFS; return 0; }; ",
+    "rmpd() { [ -n \"$pdn\" ] || return 0; wq \"$rr\" || return 0; [ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ] || return 0; ",
+    "( cd -- \"./$pdn\" 2>/dev/null && [ -O . ] && { j=0; while [ $j -lt $nt ]; do rm -f -- \"./$j\"; j=$((j+1)); done; } ); rmdir -- \"./$pdn\" 2>/dev/null; return 0; }; ",
+    "ab() { IFS=$NL; for f in $made; do case $f in */*) d=${f%/*};; *) d='';; esac; wq \"$rr${d:+/$d}\" && rm -f -- \"./${f##*/}\"; done; ",
+    "IFS=$NL; for f in $mkd; do case $f in */*) d=${f%/*};; *) d='';; esac; wq \"$rr${d:+/$d}\" && rmdir -- \"./${f##*/}\" 2>/dev/null; done; unset IFS; rmpd; rm -rf -- \"$stg\"; return 0; }; ",
     "fl() { ab; printf \"$2\\n\" \"$3\" \"$4\" >&2; exit \"$1\"; }; ",
-    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
-    "case $o in *'No such file or directory') return 1;; esac; ",
-    "ab; printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "[ -d \"$1\" ] || fl 4 '%s is not a directory' \"$1\"; cd -- \"$1\" || fl 3 'cannot enter %s' \"$1\"; ",
-    "IFS=/; for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || fl 4 '%s is not a real directory' \"$c\"; ",
-    "cd -- \"$c\" || fl 3 'cannot enter %s' \"$c\"; done; unset IFS; ",
-    "shift 3; ",
-    "ck() { p=''; IFS=/; for c in $1; do p=${p:+$p/}$c; ",
-    "if [ -L \"$p\" ]; then fl 4 '%s is a symlink' \"$p\"; ",
-    "elif [ -d \"$p\" ]; then :; ",
-    "elif pr \"$p\"; then fl 4 '%s is not a directory' \"$p\"; ",
-    "else break; fi; done; unset IFS; }; ",
-    "md() { p=''; IFS=/; for c in $1; do p=${p:+$p/}$c; ",
-    "if [ -L \"$p\" ]; then fl 4 '%s is a symlink' \"$p\"; ",
-    "elif [ -d \"$p\" ]; then :; ",
-    "elif pr \"$p\"; then fl 4 '%s is not a directory' \"$p\"; ",
-    "else mkdir -- \"$p\" || fl 3 '%s cannot be created' \"$p\"; mkd=\"$p$NL$mkd\"; fi; done; unset IFS; }; ",
-    "n=$#; i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
-    "case $t in */*) par=${t%/*};; *) par='';; esac; ck \"$par\"; ",
-    "if pr \"$t\"; then [ -f \"$t\" ] && [ ! -L \"$t\" ] || fl 4 '%s is not a regular file; it is left alone' \"$t\"; fi; ",
-    "if pr \"$l\"; then fl 4 '%s exists; another writer holds it, nothing was written' \"$l\"; fi; ",
+    "ws() { wq \"$1\"; r=$?; case $r in 0) ;; 2) fl 4 '%s does not exist' \"$bc\";; 3) fl 3 \"$bm\" \"$bc\";; *) fl 4 \"$bm\" \"$bc\";; esac; }; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; case $o in *'No such file or directory') return 1;; esac; ab; printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "mo() { q=$(stat -c %a -- \"$1\" 2>/dev/null) || q=$(stat -f %Lp -- \"$1\" 2>/dev/null) || q=''; case $q in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) q=${q#${q%???}};; *) return 1;; esac; }; ",
+    "gm() { if [ \"$2\" = 1 ]; then mo \"$1\" || fl 3 'the mode of %s cannot be read' \"$t\"; m=$q; else case $t in config) m=600;; *) m=644;; esac; fi; m=$(printf '%03o' \"$((0$m & 0666))\"); }; ",
+    "ws \"$rr\"; gp=$(pwd -P); n=$#; nt=$((n/3)); i=0; nd=0; ms=''; ",
+    "while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; tb=${t##*/}; lb=${l##*/}; ",
     "[ -f \"$s\" ] && [ ! -L \"$s\" ] || fl 4 '%s is not a regular file' \"$s\"; ",
-    "[ $(( $(wc -c < \"$s\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$s\"; done; ",
+    "[ $(( $(wc -c < \"$s\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$s\"; ",
+    "wq \"$rr${par:+/$par}\"; r=$?; case $r in ",
+    "0) x=0; if pr \"$tb\"; then [ -f \"$tb\" ] && [ ! -L \"$tb\" ] || fl 4 '%s is not a regular file; it is left alone' \"$t\"; x=1; fi; ",
+    "if pr \"$lb\"; then fl 4 '%s exists; another writer holds it, nothing was written' \"$l\"; fi; gm \"$tb\" \"$x\";; ",
+    "2) nd=1; gm \"$tb\" 0;; 3) fl 3 \"$bm\" \"$bc\";; *) fl 4 \"$bm\" \"$bc\";; esac; ms=\"$ms$m$NL\"; done; ",
+    "fg=0; if [ $nd = 1 ]; then gu=$(ls -ldn -- \"$dd/${rr%/.git}\" 2>/dev/null | { read -r a b c d; printf '%s' \"$c\"; }); me=$(id -u); ",
+    "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then fg=1; ",
+    "command -v setfacl >/dev/null 2>&1 || fl 6 'the gateway account needs write access to the new directories in .git and the host has no setfacl'; fi; fi; ",
     "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
-    "case $t in */*) par=${t%/*};; *) par='';; esac; md \"$par\"; done; ",
-    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
-    "( set -C; exec 3> \"$l\" || exit 7; cat -- \"$s\" >&3 || exit 8 ) 2>/dev/null; r=$?; ",
-    "if [ $r = 8 ]; then made=\"$made$l$NL\"; fl 3 '%s cannot be filled from the stage' \"$l\"; ",
-    "elif [ $r != 0 ]; then fl 4 '%s exists or cannot be created; nothing was written' \"$l\"; fi; ",
-    "made=\"$made$l$NL\"; ",
-    "[ -f \"$l\" ] && [ ! -L \"$l\" ] || fl 4 '%s is not the regular file that was created' \"$l\"; ",
-    "[ $(( $(wc -c < \"$l\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$l\"; done; ",
+    "case $t in */*) rest=${t%/*};; *) rest='';; esac; pp=''; ",
+    "while [ -n \"$rest\" ]; do cn=${rest%%/*}; case $rest in */*) rest=${rest#*/};; *) rest='';; esac; ws \"$rr${pp:+/$pp}\"; ",
+    "if [ -L \"./$cn\" ]; then fl 4 '%s is a symlink' \"$cn\"; elif [ -d \"./$cn\" ]; then :; elif pr \"./$cn\"; then fl 4 '%s is not a directory' \"$cn\"; ",
+    "else mo . || fl 3 'the mode of the directory above %s cannot be read' \"$cn\"; mkdir -m \"$q\" -- \"./$cn\" 2>/dev/null || fl 3 '%s cannot be created' \"$cn\"; mkd=\"${pp:+$pp/}$cn$NL$mkd\"; ",
+    "if [ $fg = 1 ]; then setfacl -P -m \"u:$gu:rwX\" \"./$cn\" && setfacl -P -d -m \"u:$gu:rwX\" \"./$cn\" || fl 6 'setfacl failed on %s' \"$cn\"; fi; fi; ",
+    "pp=${pp:+$pp/}$cn; done; done; ",
+    "ws \"$rr\"; pdm=.ign-write-${stg##*/git-stage-}; mkdir -m 700 -- \"./$pdm\" 2>/dev/null || fl 4 '%s exists or cannot be created; it is left alone' \"$pdm\"; pdn=$pdm; ",
+    "[ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ] || fl 4 '%s is not a real directory' \"$pdn\"; cd -- \"./$pdn\" 2>/dev/null || fl 3 'cannot enter %s' \"$pdn\"; ",
+    "[ -O . ] && [ \"$(pwd -P)\" = \"$gp/$pdn\" ] || fl 4 '%s is not the directory that was made' \"$pdn\"; ",
+    "i=0; ml=$ms; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; k=$((i/3)); s=$stg/$k; i=$((i+3)); ",
+    "m=${ml%%\"$NL\"*}; ml=${ml#*\"$NL\"}; u=$(printf '%03o' \"$((0777 ^ 0$m))\"); ",
+    "( umask \"$u\"; set -C; cat -- \"$s\" > \"./$k\" ) 2>/dev/null || fl 3 '%s cannot be copied from the stage' \"$s\"; ",
+    "[ -f \"./$k\" ] && [ ! -L \"./$k\" ] || fl 4 '%s is not a regular file' \"$k\"; ",
+    "[ $(( $(wc -c < \"./$k\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$k\"; done; ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; k=$((i/3)); i=$((i+3)); ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; lb=${l##*/}; ws \"$rr${par:+/$par}\"; ",
+    "ln -n -- \"$gp/$pdn/$k\" \"./$lb\" 2>/dev/null || { if [ -e \"./$lb\" ] || [ -L \"./$lb\" ]; then fl 4 '%s exists or cannot be created; nothing was written' \"$l\"; else fl 3 '%s cannot be created' \"$l\"; fi; }; ",
+    "if [ -f \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ \"./$lb\" -ef \"$gp/$pdn/$k\" ]; then made=\"$made$l$NL\"; ",
+    "else if [ -d \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ \"./$lb/$k\" -ef \"$gp/$pdn/$k\" ]; then rm -f -- \"./$lb/$k\"; fi; ",
+    "fl 4 '%s is not the regular file that was created' \"$l\"; fi; done; ",
     "i=0; k=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
-    "mv -f -- \"$l\" \"$t\" 2>/dev/null || fl 3 '%s cannot be put in place; %s targets were moved before it' \"$t\" \"$k\"; ",
+    "case $t in */*) par=${t%/*};; *) par='';; esac; tb=${t##*/}; lb=${l##*/}; ws \"$rr${par:+/$par}\"; ",
+    "if [ -d \"./$tb\" ] && [ ! -L \"./$tb\" ]; then fl 3 '%s became a directory; %s targets were moved before it' \"$t\" \"$k\"; fi; ",
+    "mv -f -- \"./$lb\" \"./$tb\" 2>/dev/null || fl 3 '%s cannot be put in place; %s targets were moved before it' \"$t\" \"$k\"; ",
     "made=${made#*\"$NL\"}; k=$((k+1)); done; ",
-    "rm -rf -- \"$stg\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
+    "rmpd; rm -rf -- \"$stg\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
 /// 27-31 (WR-B2), the best-effort cleanup after a POSIX `.git` write whose
 /// connection died. Arguments: the data dir, the `.git` path, the stage path,
 /// then (lock, stage index) pairs. A lock is removed only when it is a regular
 /// non-symlink file whose bytes equal the matching stage file (`cmp -s`), so a
-/// lock another writer holds (JGit's `index.lock`) is never removed. The
-/// stage is removed last. Answers how many locks it removed and how many it
-/// left.
+/// lock another writer holds (JGit's `index.lock`) is never removed. Every
+/// walk is the verified level-by-level walk of `GIT_WRITE_SH`. The private
+/// `.git/.ign-write-<id>` and the stage are removed last. Answers how many
+/// locks it removed and how many it left.
 pub(super) const GIT_WRITE_CLEAN_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in ls rm cmp; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in ls rm rmdir cmp; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
-    "dd=$1; rr=$2; stg=$3; shift 3; set -f; ",
-    "rl() { [ -d \"$dd\" ] || return 4; cd -- \"$dd\" || return 3; IFS=/; ",
-    "for c in $rr; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || return 4; cd -- \"$c\" || return 3; done; unset IFS; ",
-    "a=0; b=0; while [ $# -ge 2 ]; do l=$1; s=$stg/$2; shift 2; ",
-    "if [ -f \"$l\" ] && [ ! -L \"$l\" ] && [ -f \"$s\" ] && [ ! -L \"$s\" ] && cmp -s -- \"$l\" \"$s\"; then rm -f -- \"$l\" || return 3; a=$((a+1)); ",
-    "elif [ -e \"$l\" ] || [ -L \"$l\" ]; then b=$((b+1)); fi; done; printf '%s %s' \"$a\" \"$b\"; }; ",
+    "dd=$1; rr=$2; stg=$3; shift 3; set -f; nt=$(($#/2)); ",
+    "wq() { bc=$dd; bm='cannot enter %s'; cd -- \"$dd\" 2>/dev/null || return 3; we=$(pwd -P) || return 3; IFS=/; ",
+    "for w in $1; do ",
+    "if [ -L \"$w\" ]; then bc=$w; bm='%s is a symlink'; unset IFS; return 4; ",
+    "elif [ -d \"$w\" ]; then :; ",
+    "elif [ -e \"$w\" ]; then bc=$w; bm='%s is not a directory'; unset IFS; return 4; ",
+    "else bc=$w; unset IFS; return 2; fi; ",
+    "cd -- \"$w\" 2>/dev/null || { bc=$w; bm='cannot enter %s'; unset IFS; return 3; }; ",
+    "we=${we%/}/$w; wp=$(pwd -P); [ \"$wp\" = \"$we\" ] || { bc=$w; bm='%s changed while it was entered'; unset IFS; return 4; }; ",
+    "done; unset IFS; return 0; }; ",
+    "rl() { a=0; b=0; wq \"$rr\" || return 4; while [ $# -ge 2 ]; do l=$1; s=$stg/$2; shift 2; case $l in */*) d=${l%/*};; *) d='';; esac; lb=${l##*/}; ",
+    "if wq \"$rr${d:+/$d}\"; then if [ -f \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ -f \"$s\" ] && [ ! -L \"$s\" ] && cmp -s -- \"./$lb\" \"$s\"; then rm -f -- \"./$lb\" || return 3; a=$((a+1)); ",
+    "elif [ -e \"./$lb\" ] || [ -L \"./$lb\" ]; then b=$((b+1)); fi; fi; done; ",
+    "wq \"$rr\" || return 4; pdn=.ign-write-${stg##*/git-stage-}; if [ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ]; then ",
+    "( cd -- \"./$pdn\" 2>/dev/null && [ -O . ] && { j=0; while [ $j -lt $nt ]; do rm -f -- \"./$j\"; j=$((j+1)); done; } ); rmdir -- \"./$pdn\" 2>/dev/null; fi; printf '%s %s' \"$a\" \"$b\"; }; ",
     "o=$(rl \"$@\"); r=$?; rm -rf -- \"$stg\" || { printf '%s cannot be removed\\n' \"$stg\" >&2; exit 3; }; ",
     "[ $r = 0 ] || { echo 'the locks could not be checked' >&2; exit $r; }; ",
     "set -- $o; printf 'IGN-RESULT:{\"removed\":%s,\"kept\":%s}\\n' \"$1\" \"$2\"",
@@ -1362,7 +1406,7 @@ impl SftpTransport {
 // | `GIT_RESTORE_SH` | `cp -a` of the save beside `.git`, the D-G1 ACL step, manifest compare, `mv` into place |
 // | `GIT_PROBE_W_SH` | exclusive create then remove of a probe file in the project directory and its `.git` |
 // | `GIT_STAGE_SH` | the private stage `ign-deploy/git-stage-<id>` of a `.git` write, in the account's ledger root |
-// | `GIT_WRITE_SH` | each lock created exclusively and filled from the stage in the same open, then moved over its target in plan order |
+// | `GIT_WRITE_SH` | each lock made by a non-following hard link of a private copy of the staged bytes, then moved over its target in plan order; modes kept, new directories get the D-G1 ACL |
 // | `GIT_WRITE_CLEAN_SH` | after a dead connection: removes the locks whose bytes equal the stage, then the stage |
 // | `GIT_SAVE_RM_SH` | removes `git-save/<run-id>/repo` and nothing else |
 // | `GIT_FREE_SH` | free bytes of the file system under the save root |
@@ -2404,8 +2448,9 @@ fn with_detail(err: CoreError, more: &str) -> CoreError {
 impl SftpTransport {
     /// The POSIX arm of `write_git_files` (27-31, D-10): the bytes go only into
     /// a private stage in the deploy account's ledger root, and one host script
-    /// creates each lock exclusively, fills it from the stage in the same open
-    /// and moves the locks over their targets.
+    /// makes each lock from a private copy of them by a non-following hard
+    /// link and moves the locks over their targets, every step in a checked
+    /// current directory.
     async fn write_git_files_posix(
         &self,
         rel: &str,

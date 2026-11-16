@@ -627,6 +627,21 @@ fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     builder.create(path)
 }
 
+/// Give the directory or file `path` exactly `mode`, without following a
+/// symlink at the final component (an `fchmod` on a no-follow open).
+fn set_mode_no_follow(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        open_no_follow(path)?.set_permissions(std::fs::Permissions::from_mode(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Ok(())
+    }
+}
+
 /// `path` opened for reading without following a symlink at the final
 /// component (Unix; elsewhere the caller's `symlink_metadata` checks stand).
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
@@ -1479,14 +1494,42 @@ impl LocalFsTransport {
                 dir.push(part);
                 match std::fs::symlink_metadata(&dir) {
                     Ok(_) => {}
-                    Err(_) => create_dir_mode(&dir, 0o755).map_err(|e| {
-                        self.git_fail(OP, format!("{part} cannot be created ({})", e.kind()))
-                    })?,
+                    Err(_) => {
+                        // WR-B1: a directory the advance makes takes its
+                        // parent directory's permission bits.
+                        let parent_mode = dir
+                            .parent()
+                            .and_then(|p| std::fs::symlink_metadata(p).ok())
+                            .map_or(0o755, |m| mode_of(&m));
+                        create_dir_mode(&dir, parent_mode)
+                            .and_then(|()| set_mode_no_follow(&dir, parent_mode))
+                            .map_err(|e| {
+                                self.git_fail(
+                                    OP,
+                                    format!("{part} cannot be created ({})", e.kind()),
+                                )
+                            })?;
+                    }
                 }
             }
             let rel = write.name.rel();
+            // WR-B1: the mode of the file this replaces, never wider (and
+            // never an execute bit); a new `config` is owner-only (it can hold
+            // a remote URL with userinfo), any other new file `0644`.
+            let file_mode = match std::fs::symlink_metadata(&target) {
+                Ok(m) => mode_of(&m) & 0o666,
+                Err(_) if matches!(write.name, GitWriteName::Config) => 0o600,
+                Err(_) => 0o644,
+            };
             let result = (|| -> std::io::Result<()> {
-                let mut file = create_new_file(&temp, 0o644)?;
+                let mut file = create_new_file(&temp, file_mode)?;
+                #[cfg(unix)]
+                {
+                    // the umask may have narrowed the create; the file gets
+                    // exactly the mode it replaces (an fchmod on the open file)
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(file_mode))?;
+                }
                 file.write_all(&write.bytes)?;
                 file.sync_all()?;
                 drop(file);
@@ -2446,6 +2489,89 @@ mod tests {
         for rel in ["HEAD", "config", "private/secret", "objects/ab/cdef"] {
             assert_eq!(mode(&git.join(rel)), 0o600, "{rel} without a record");
         }
+    }
+
+    /// 27-31 (WR-B1): an advanced file never gets a wider mode than the file
+    /// it replaces; a new `config` is owner-only, any other new file `0644`,
+    /// and a new directory takes its parent directory's mode.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_write_keeps_target_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        let dir = data_with_projects();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::create_dir_all(git.join("refs/heads")).expect("refs");
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/production\n").expect("HEAD");
+        std::fs::write(git.join("config"), b"[core]\n").expect("config");
+        std::fs::write(git.join("refs/heads/production"), b"0000\n").expect("ref");
+        set(&git.join("HEAD"), 0o600);
+        set(&git.join("config"), 0o600);
+        set(&git.join("refs/heads/production"), 0o640);
+        set(&git.join("refs"), 0o750);
+        set(&git.join("refs/heads"), 0o750);
+        let t = host(dir.path());
+        let hash = "a".repeat(40);
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Config,
+                bytes: b"[core]\n[remote \"origin\"]\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("production".to_string()),
+                bytes: b"1111\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("feature/x".to_string()),
+                bytes: b"2222\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::PackFile(hash),
+                bytes: vec![7u8; 16],
+            },
+        ];
+        t.write_git_files_blocking("CapApp", &writes)
+            .expect("write");
+        assert_eq!(mode(&git.join("HEAD")), 0o600, "HEAD stays owner-only");
+        assert_eq!(mode(&git.join("config")), 0o600, "config stays owner-only");
+        assert_eq!(
+            mode(&git.join("refs/heads/production")),
+            0o640,
+            "a 0640 ref is not widened to 0644"
+        );
+        assert_eq!(
+            mode(&git.join("refs/heads/feature/x")),
+            0o644,
+            "a new ref is 0644"
+        );
+        assert_eq!(
+            mode(&git.join("refs/heads/feature")),
+            0o750,
+            "a new directory takes its parent's mode"
+        );
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/production")).expect("ref"),
+            b"1111\n"
+        );
+
+        // a config that is absent is created owner-only
+        std::fs::remove_file(git.join("config")).expect("rm config");
+        t.write_git_files_blocking(
+            "CapApp",
+            &[GitWrite {
+                name: GitWriteName::Config,
+                bytes: b"[core]\n".to_vec(),
+            }],
+        )
+        .expect("new config");
+        assert_eq!(mode(&git.join("config")), 0o600, "a new config is 0600");
     }
 
     /// A data dir whose `projects/Plain` holds a `.git` of three files.

@@ -5008,6 +5008,433 @@ mod sftp_git {
         assert!(stages(&n).is_empty());
     }
 
+    /// 27-31 (security review 1): a lock path that holds a symlink at the
+    /// moment the lock is created is refused whatever it points at, the shell
+    /// does not matter: a dangling link, a link to a FIFO (a noclobber
+    /// redirect opens a non-regular file without `O_EXCL`) and a link to a
+    /// directory. Nothing is written through it.
+    #[tokio::test]
+    async fn sftp_git_write_create_refuses_a_planted_link_of_any_kind() {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        for kind in ["dangling", "fifo", "dir"] {
+            let fx = GitFixture::new();
+            let n = node(&fx.data_dir);
+            let outside = tempfile::tempdir().expect("outside");
+            let aim = outside.path().join("aim");
+            let mut reader = None;
+            match kind {
+                "dangling" => {}
+                "fifo" => {
+                    let made = std::process::Command::new("mkfifo")
+                        .arg(&aim)
+                        .status()
+                        .expect("mkfifo");
+                    assert!(made.success());
+                    // a reader, so an open for writing would not block
+                    reader = Some(
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                            .open(&aim)
+                            .expect("fifo reader"),
+                    );
+                }
+                _ => std::fs::create_dir(&aim).expect("aim dir"),
+            }
+            let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+            let shims = common::posix_exec::Shims::new();
+            shims.add(
+                "cat",
+                &format!(
+                    "case $2 in */git-stage-*/0) ln -s {} {}/refs/heads/feature/new.lock;; esac\n\
+                     exec \"$(real cat)\" \"$@\"",
+                    aim.display(),
+                    fx.git_dir().display()
+                ),
+            );
+            n.count.use_shims(&shims);
+            let why = detail(
+                n.t.write_git_files(PROJECT, &two_writes(&fx))
+                    .await
+                    .expect_err(kind),
+            );
+            assert!(why.contains("exit code 4"), "{kind}: {why}");
+            if let Some(mut reader) = reader {
+                let mut got = Vec::new();
+                let _ = reader.read_to_end(&mut got);
+                assert!(got.is_empty(), "{kind}: bytes reached the FIFO: {got:?}");
+            }
+            if kind == "dir" {
+                assert_eq!(
+                    std::fs::read_dir(&aim).expect("aim").count(),
+                    0,
+                    "nothing was put inside the directory the link points at"
+                );
+            } else if kind == "dangling" {
+                assert!(!aim.exists(), "the link's target was never created");
+            }
+            assert_eq!(
+                std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+                head_before
+            );
+            assert!(
+                !fx.git_dir().join("HEAD.lock").exists(),
+                "{kind}: our lock is taken away"
+            );
+            assert!(
+                std::fs::symlink_metadata(fx.git_dir().join("refs/heads/feature/new.lock"))
+                    .expect("planted link")
+                    .file_type()
+                    .is_symlink(),
+                "{kind}: what ign did not create is left alone"
+            );
+            assert!(stages(&n).is_empty(), "{kind}: {:?}", stages(&n));
+        }
+    }
+
+    /// 27-31 (security review 2): a parent directory that is swapped for a
+    /// symlink after it was checked is never written through, neither by the
+    /// create nor by the final move.
+    #[tokio::test]
+    async fn sftp_git_write_parent_swapped_after_its_check_is_refused() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        std::fs::create_dir_all(git.join("refs/heads/sub")).expect("sub");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("x");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head_before = std::fs::read(git.join("HEAD")).expect("head");
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "cat",
+            &format!(
+                "case $2 in */git-stage-*/0) cd {g}/refs/heads && mv sub sub.real && ln -s {o} sub;; esac\n\
+                 exec \"$(real cat)\" \"$@\"",
+                g = git.display(),
+                o = outside.path().display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/sub/x\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("sub/x".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ];
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a swapped parent"),
+        );
+        assert!(
+            why.contains("exit code 4") || why.contains("exit code 3"),
+            "{why}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "precious\n",
+            "nothing was written through the swapped parent"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).expect("outside").count() == 1,
+            "no lock or temporary was made through it"
+        );
+        assert_eq!(std::fs::read(git.join("HEAD")).expect("head"), head_before);
+        assert!(!git.join("HEAD.lock").exists());
+        assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// 27-31 (WR-B1): an advanced file never gets a wider mode than the file it
+    /// replaces, and a lock is never wider than its final mode.
+    #[tokio::test]
+    async fn sftp_git_write_keeps_target_modes() {
+        use ignition_core::deploy::git_advance::GitWriteName::{
+            BranchRef, Config, Head, RemoteRef,
+        };
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        let set = |rel: &str, mode: u32| {
+            std::fs::set_permissions(git.join(rel), std::fs::Permissions::from_mode(mode))
+                .expect("chmod")
+        };
+        set("HEAD", 0o600);
+        set("refs/heads/production", 0o600);
+        set("config", 0o600);
+
+        // every lock's mode, as it is when the script moves it
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "mv",
+            "printf '%s %s\\n' \"$3\" \"$(\"$(real ls)\" -l -- \"$3\" | cut -c1-10)\" \
+             >> \"$(dirname \"$0\")/mv.log\"\n\
+             exec \"$(real mv)\" \"$@\"",
+        );
+        n.count.use_shims(&shims);
+        let writes = vec![
+            GitWrite {
+                name: Head,
+                bytes: b"ref: refs/heads/production\n".to_vec(),
+            },
+            GitWrite {
+                name: BranchRef("production".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+            GitWrite {
+                name: Config,
+                bytes: b"[core]\n\trepositoryformatversion = 0\n".to_vec(),
+            },
+            GitWrite {
+                name: RemoteRef {
+                    remote: "origin".to_string(),
+                    branch: "feature".to_string(),
+                },
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ];
+        n.t.write_git_files(PROJECT, &writes).await.expect("write");
+        for rel in ["HEAD", "refs/heads/production", "config"] {
+            assert_eq!(mode_of(&git.join(rel)), 0o600, "{rel} is not widened");
+        }
+        assert_eq!(
+            mode_of(&git.join("refs/remotes/origin/feature")),
+            0o644,
+            "a new ref is 0644"
+        );
+        for write in &writes {
+            assert_eq!(
+                std::fs::read(git.join(write.name.rel())).expect("read back"),
+                write.bytes
+            );
+        }
+        let log = std::fs::read_to_string(shims.path().join("mv.log")).expect("mv log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), writes.len(), "{log}");
+        for (line, want) in
+            lines
+                .iter()
+                .zip(["-rw-------", "-rw-------", "-rw-------", "-rw-r--r--"])
+        {
+            assert!(
+                line.ends_with(want),
+                "a lock is made with its final mode: {line}"
+            );
+        }
+
+        // a config that is absent is created owner-only
+        std::fs::remove_file(git.join("config")).expect("rm config");
+        n.t.write_git_files(PROJECT, &writes[2..3])
+            .await
+            .expect("new config");
+        assert_eq!(mode_of(&git.join("config")), 0o600, "a new config is 0600");
+    }
+
+    /// 27-31 (WR-B1): a mode the host cannot report refuses the write before
+    /// anything is put in place.
+    #[tokio::test]
+    async fn sftp_git_write_refuses_an_unreadable_mode() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let head = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+        let shims = common::posix_exec::Shims::new();
+        shims.add("stat", "echo nonsense");
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &two_writes(&fx))
+                .await
+                .expect_err("no mode"),
+        );
+        assert!(why.contains("exit code 3"), "{why}");
+        assert!(why.contains("mode"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head
+        );
+        assert!(!fx.git_dir().join("HEAD.lock").exists());
+        assert!(stages(&n).is_empty());
+    }
+
+    /// The shims that make the project directory belong to `uid` and record
+    /// every `setfacl` call.
+    fn gateway_shims(uid: &str) -> common::posix_exec::Shims {
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ls",
+            &format!(
+                "case $1 in -ldn) printf 'drwxr-xr-x 2 {uid} {uid} 64 Jan  1 00:00 %s\\n' \"$3\";; \
+                 *) exec \"$(real ls)\" \"$@\";; esac"
+            ),
+        );
+        shims.add(
+            "setfacl",
+            "echo \"$*\" >> \"$(dirname \"$0\")/setfacl.log\"",
+        );
+        shims
+    }
+
+    /// Writes that make no directory: HEAD and the existing branch.
+    fn in_place(fx: &GitFixture) -> Vec<GitWrite> {
+        vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/production\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("production".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ]
+    }
+
+    fn discard(run: &str) -> Vec<GitWrite> {
+        vec![GitWrite {
+            name: GitWriteName::DiscardRef(run.to_string()),
+            bytes: b"0123456789012345678901234567890123456789\n".to_vec(),
+        }]
+    }
+
+    /// 27-31 (WR-B1, D-22): a directory the advance creates gets the D-G1 named
+    /// ACL entry for a gateway account that is neither root nor the deploy
+    /// account, access and default; with no `setfacl` the write refuses before
+    /// any lock exists.
+    #[tokio::test]
+    async fn sftp_git_write_new_dir_gets_gateway_acl() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let shims = gateway_shims("4242");
+        n.count.use_shims(&shims);
+        n.t.write_git_files(PROJECT, &discard("run1"))
+            .await
+            .expect("write");
+        assert!(fx.git_dir().join("refs/ign-discarded/run1").is_file());
+        let log = std::fs::read_to_string(shims.path().join("setfacl.log")).expect("setfacl log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines.contains(&"-P -m u:4242:rwX ./ign-discarded"),
+            "the access entry: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"-P -d -m u:4242:rwX ./ign-discarded"),
+            "the default entry: {lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "only the directory the advance made: {lines:?}"
+        );
+
+        // a write that makes no directory sets no ACL (the file replaces one
+        // the gateway already owns the right to)
+        std::fs::remove_file(shims.path().join("setfacl.log")).expect("rm log");
+        n.t.write_git_files(PROJECT, &in_place(&fx))
+            .await
+            .expect("no new directory");
+        assert!(!shims.path().join("setfacl.log").exists());
+
+        // a directory deeper down: every level the advance makes gets it
+        n.t.write_git_files(
+            PROJECT,
+            &[GitWrite {
+                name: GitWriteName::BranchRef("deep/er/x".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            }],
+        )
+        .await
+        .expect("deep");
+        let log = std::fs::read_to_string(shims.path().join("setfacl.log")).expect("setfacl log");
+        for dir in ["./deep", "./er"] {
+            for form in ["-P -m", "-P -d -m"] {
+                assert!(
+                    log.lines().any(|l| l == format!("{form} u:4242:rwX {dir}")),
+                    "{form} {dir}: {log}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_git_write_new_dir_refuses_without_setfacl() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        // a PATH with everything the scripts use except setfacl
+        let shims = gateway_shims("4242");
+        let tools = shims.path();
+        std::fs::remove_file(tools.join("setfacl")).expect("no setfacl");
+        for tool in [
+            "sh", "mkdir", "rmdir", "rm", "mv", "wc", "cat", "id", "stat", "cmp", "dirname", "cut",
+            "ln",
+        ] {
+            let found = std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .expect("sh");
+            let target = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            if found.status.success() && target.starts_with('/') {
+                std::os::unix::fs::symlink(&target, tools.join(tool)).expect("link");
+            }
+        }
+        *n.count.only_path.lock().expect("only") = Some(tools.to_path_buf());
+        let why = detail(
+            n.t.write_git_files(PROJECT, &discard("run1"))
+                .await
+                .expect_err("no setfacl"),
+        );
+        assert!(why.contains("exit code 6"), "{why}");
+        assert!(why.contains("setfacl"), "{why}");
+        assert!(
+            !fx.git_dir().join("refs/ign-discarded").exists(),
+            "no directory was made"
+        );
+        assert!(stages(&n).is_empty());
+        // a write that makes no directory does not need it
+        n.t.write_git_files(PROJECT, &in_place(&fx))
+            .await
+            .expect("no new directory, no setfacl needed");
+    }
+
+    /// 27-31 (WR-B1): with a gateway account that is root, or the deploy
+    /// account itself, no ACL is set.
+    #[tokio::test]
+    async fn sftp_git_write_new_dir_sets_no_acl_for_root_or_the_deploy_account() {
+        let fx = GitFixture::new();
+        for uid in ["0", ""] {
+            let n = node(&fx.data_dir);
+            // "" stands for the real owner: no `ls` shim, only the recorder
+            let shims = if uid.is_empty() {
+                let shims = common::posix_exec::Shims::new();
+                shims.add(
+                    "setfacl",
+                    "echo \"$*\" >> \"$(dirname \"$0\")/setfacl.log\"",
+                );
+                shims
+            } else {
+                gateway_shims(uid)
+            };
+            n.count.use_shims(&shims);
+            n.t.write_git_files(PROJECT, &discard(&format!("run{}", uid.len())))
+                .await
+                .expect("write");
+            assert!(
+                !shims.path().join("setfacl.log").exists(),
+                "uid {uid:?}: no setfacl call"
+            );
+        }
+    }
+
     /// Every file below `dir`, `/`-separated and relative.
     fn walk(dir: &Path) -> Vec<String> {
         fn go(base: &Path, dir: &Path, out: &mut Vec<String>) {
