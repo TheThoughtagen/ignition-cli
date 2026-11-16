@@ -27,6 +27,11 @@
 //! `ign-git27-rig`. Output carries names, counts and hashes, never a token or a
 //! repository URL.
 //!
+//! Every gate prints `LIVE-RAN <name>` on stderr as its LAST statement, after
+//! every assertion: the line means the gate passed (a gate that skips on its
+//! guard, or panics, prints nothing). The rig drivers accept only that line at
+//! the end of a log line, for the exact name.
+//!
 //! Both gates need the rig in the state `reset27` leaves (CapApp cloned by the
 //! module at v1.0.0). `git_restore_survival` runs right after
 //! `git_advance_status` in the same invocation (libtest orders by name under
@@ -607,7 +612,6 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_advance_status() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_advance_status");
     let api = rig.api();
     let (_work, config) = script_config(&api, &rig.url).await;
 
@@ -759,6 +763,7 @@ async fn git_advance_status() {
             "c2": advanced.c2,
         }),
     );
+    eprintln!("LIVE-RAN git_advance_status");
 }
 
 /// G9: the advanced `.git` survives a restart, a project scan and a status
@@ -768,7 +773,6 @@ async fn git_advance_status() {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_restore_survival() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_restore_survival");
     let api = rig.api();
     let host = HostGit::new();
     let (_keep, checkout, c2) = release_checkout(&rig, "v1.1.0");
@@ -882,6 +886,7 @@ async fn git_restore_survival() {
             "second_import_git_deleted_after_secs": gone,
         }),
     );
+    eprintln!("LIVE-RAN git_restore_survival");
 }
 
 // ------------------------------------------------------------------- 27-04
@@ -982,7 +987,6 @@ async fn classify_now(rig: &Rig, host: &HostGit) -> (GitState, usize, usize) {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_state_probe() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_state_probe");
     let host = HostGit::new();
     let (state, heads, remotes) = classify_now(&rig, &host).await;
     let files = rig
@@ -1005,6 +1009,7 @@ async fn git_state_probe() {
         files.index_present,
         files.loose_refs.len()
     );
+    eprintln!("LIVE-RAN git_state_probe");
 }
 
 /// Push a new commit on `production` of the rig remote (a temp clone changes
@@ -1205,7 +1210,6 @@ async fn assert_export_matches(
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_pull_push_roundtrip() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_pull_push_roundtrip");
     let api = rig.api();
     let host = HostGit::new();
     let (_work, config) = script_config(&api, &rig.url).await;
@@ -1510,6 +1514,7 @@ async fn git_pull_push_roundtrip() {
             "committed_deleted_files": deleted,
         }),
     );
+    eprintln!("LIVE-RAN git_pull_push_roundtrip");
 }
 
 // ------------------------------------------------------------------- 27-23
@@ -2278,7 +2283,6 @@ async fn commit_drift_and_push(
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_deploy_managed_e2e() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_deploy_managed_e2e");
     let api = rig.api();
     let host = HostGit::new();
 
@@ -2328,6 +2332,7 @@ async fn git_deploy_managed_e2e() {
             "production_push": pushed,
         }),
     );
+    eprintln!("LIVE-RAN git_deploy_managed_e2e");
 }
 
 /// 27-23 Task 1, D-17: the managed deploy under each `git.yaml` variant, each
@@ -2337,7 +2342,6 @@ async fn git_deploy_managed_e2e() {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_variants_e2e() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_variants_e2e");
     let api = rig.api();
     let mut recorded = Vec::new();
     for (mode, label) in [
@@ -2362,6 +2366,7 @@ async fn git_variants_e2e() {
         "git_variants_e2e",
         &serde_json::json!({ "variants": recorded }),
     );
+    eprintln!("LIVE-RAN git_variants_e2e");
 }
 
 /// Make the gateway's live project differ from its repository the way a
@@ -2399,7 +2404,6 @@ impl Drop for YamlGuard<'_> {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_refusals_live() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_refusals_live");
     let api = rig.api();
     let host = HostGit::new();
     let (state, refs) = gateway_state(&rig, &host).await;
@@ -2585,6 +2589,7 @@ async fn git_refusals_live() {
             },
         }),
     );
+    eprintln!("LIVE-RAN git_refusals_live");
 }
 
 // ------------------------------------------------------------------- 27-24
@@ -2776,7 +2781,6 @@ impl ProjectsObserver for Timeline {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_adopt_partial_e2e() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_adopt_partial_e2e");
     let api = rig.api();
     let host = HostGit::new();
     driver_reset("template");
@@ -2872,6 +2876,7 @@ async fn git_adopt_partial_e2e() {
             "pulled_tip": tip,
         }),
     );
+    eprintln!("LIVE-RAN git_adopt_partial_e2e");
 }
 
 /// 27-24 Task 1 (C3): after a managed deploy a gateway restart runs the
@@ -2881,7 +2886,6 @@ async fn git_adopt_partial_e2e() {
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_restart_pull_e2e() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_restart_pull_e2e");
     let api = rig.api();
     driver_reset("template");
     let deployed = managed_deploy(
@@ -2959,6 +2963,7 @@ async fn git_restart_pull_e2e() {
             "pulled_tip": tip,
         }),
     );
+    eprintln!("LIVE-RAN git_restart_pull_e2e");
 }
 
 /// 27-24 Task 1 (D-18): the rig remote was seeded by the production-shape
@@ -2970,7 +2975,6 @@ async fn git_restart_pull_e2e() {
 #[ignore = "needs the git-module rig seeded by seedprod27: IGNITION_LIVE_GIT=1"]
 async fn git_prodscale_rig() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_prodscale_rig");
     let api = rig.api();
     let host = HostGit::new();
     let (state, refs) = gateway_state(&rig, &host).await;
@@ -3132,6 +3136,7 @@ async fn git_prodscale_rig() {
             "post_status": restore["post_status"],
         }),
     );
+    eprintln!("LIVE-RAN git_prodscale_rig");
 }
 
 /// The provider an owned-tags release creates.
@@ -3158,7 +3163,6 @@ fn atomic_tags(export: &serde_json::Value) -> usize {
 #[ignore = "needs the git-module rig after seedtags27: IGNITION_LIVE_GIT=1"]
 async fn git_owned_tags_seed() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_owned_tags_seed");
     let api = rig.api();
     let tag = git(&rig.remote, &["tag", "--list", "v1.3.0"]);
     assert_eq!(tag, "v1.3.0", "run `capture27.sh seedtags27` first");
@@ -3201,6 +3205,7 @@ async fn git_owned_tags_seed() {
             "atomic_tags": tags,
         }),
     );
+    eprintln!("LIVE-RAN git_owned_tags_seed");
 }
 
 /// Every file below a gateway `.git`: its path, then the sha256 of its bytes,
@@ -3316,7 +3321,6 @@ fn short(value: &serde_json::Value) -> String {
 #[ignore = "needs the git-module rig after git_owned_tags_seed: IGNITION_LIVE_GIT=1"]
 async fn git_designer_evidence() {
     let Some(rig) = rig().await else { return };
-    eprintln!("LIVE-RAN git_designer_evidence");
     let api = rig.api();
     let mode = std::env::var("IGN_DESIGNER_EVIDENCE").unwrap_or_default();
     let stored = rig.evidence.join("designer-evidence.before.json");
@@ -3388,6 +3392,7 @@ async fn git_designer_evidence() {
         }
         other => panic!("IGN_DESIGNER_EVIDENCE is before or after, not {other:?}"),
     }
+    eprintln!("LIVE-RAN git_designer_evidence");
 }
 
 // ---- 27-25 Task 1: the pair rig, git module 2.3.4 on both nodes -----------------
@@ -3555,7 +3560,6 @@ impl ProjectsObserver for PairTimeline {
 #[ignore = "needs the pair rig with the git module on both nodes: IGNITION_LIVE_PAIR=1"]
 async fn git_pair_e2e() {
     let Some(rig) = pair_rig().await else { return };
-    eprintln!("LIVE-RAN git_pair_e2e");
     let backup = rig.backup.as_ref().expect("pair");
     let api_a = rig.api();
     let api_b = pair_api_b(&rig);
@@ -3863,6 +3867,7 @@ async fn git_pair_e2e() {
         problems.is_empty(),
         "findings of the pair run: {problems:#?}"
     );
+    eprintln!("LIVE-RAN git_pair_e2e");
 }
 
 // ---- 27-25 Task 3: the D-20 normalization of a real project repository ----------

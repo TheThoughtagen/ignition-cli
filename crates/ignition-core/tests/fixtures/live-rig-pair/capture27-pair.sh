@@ -22,7 +22,9 @@
 #            the rig is built from scratch.
 #   g5       the G5 steps (below); everything goes to
 #            $STATE/evidence/27-04-g5.log and the last line is
-#            `LIVE-RAN capture27-pair g5`, printed only when every step finished
+#            `LIVE-RAN capture27-pair g5`, printed only when every step
+#            succeeded (the steps run in a subshell with errexit, so the first
+#            failing step ends the run before the line)
 #   live LOG TEST...
 #            (27-25, checker W13) the pair gates of live_deploy_project_git:
 #            sources tokens.env, exports IGNITION_LIVE_PAIR=1, IGN_PAIR_DATA_A,
@@ -30,7 +32,9 @@
 #            IGN_LIVE_EVIDENCE_DIR, runs cargo test with
 #            `--ignored --nocapture --test-threads=1`, tees to
 #            $STATE/evidence/LOG.log and fails when cargo fails or a named
-#            test's `LIVE-RAN` line is missing
+#            test's `LIVE-RAN <name>` is not at the end of a log line. A gate
+#            prints that line as its last statement, so it means the gate
+#            passed; test names are `[a-z0-9_]+` and match whole
 #   down     remove the pair (compose down -v), the git server and the override
 #
 # G5 steps (each timed):
@@ -557,7 +561,13 @@ g5() {
   local log rc=0
   mkdir -p "$STATE/evidence"
   log=$STATE/evidence/27-04-g5.log
-  g5_steps 2>&1 | tee "$log" || rc=$?
+  # WR-D1: a function on the left of `||` runs with errexit off, so a failed
+  # step would not stop it and the LIVE-RAN line would still print. A subshell
+  # with its own errexit, outside any list, stops at the first failure.
+  set +e
+  ( set -e; g5_steps ) 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
   [ "$rc" -eq 0 ] || { echo "g5: failed ($rc); no LIVE-RAN line" >&2; exit "$rc"; }
   tail -n 1 "$log" | grep -qx 'LIVE-RAN capture27-pair g5' || { echo "g5: the log does not end with its LIVE-RAN line" >&2; exit 1; }
 }
@@ -568,6 +578,10 @@ live() {
   shift
   [ $# -gt 0 ] || die "live: name at least one test"
   [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "live: LOG-NAME is letters, digits, dot, dash, underscore"
+  # WR-D2: a test name is a bare identifier; it is matched as a whole name below
+  for t in "$@"; do
+    [[ $t =~ ^[a-z0-9_]+$ ]] || die "live: a test name is lowercase letters, digits and underscore"
+  done
   token_env
   mkdir -p "$STATE/evidence"
   log=$STATE/evidence/$name.log
@@ -582,7 +596,7 @@ live() {
     cargo test -p ignition-core --test live_deploy_project_git -- --ignored --nocapture --test-threads=1 "$@" 2>&1 | tee "$log"
   ) || rc=$?
   for t in "$@"; do
-    if ! grep -qF "LIVE-RAN $t" "$log"; then
+    if ! grep -qE "(^|[[:space:]])LIVE-RAN ${t}\$" "$log"; then
       echo "live: the log has no 'LIVE-RAN $t'" >&2
       missing=1
     fi

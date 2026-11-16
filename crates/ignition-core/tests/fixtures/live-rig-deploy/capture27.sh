@@ -25,7 +25,8 @@
 #   status27         JGit view of CapApp: uncommitted paths and branch counts
 #   live27 LOG TEST... run the #[ignore] live gates with IGNITION_LIVE_GIT=1,
 #                    tee everything to evidence/LOG.log, fail unless every named
-#                    test printed its LIVE-RAN line
+#                    test ended with its own `LIVE-RAN <name>` line (a gate prints
+#                    it as its last statement, so the line means the gate passed)
 #   g2real TAG       static counts of a real repository at a release tag
 #                    (G2_REAL_REPO, a local clone outside this repository)
 #   g2norm OUT-DIR   (27-25, D-20) the gateway-form normalization of a real
@@ -664,14 +665,19 @@ reset27() {
 # -------------------------------------------------------------------- live27
 
 # live27 LOG TEST...: the live gates, evidence teed to evidence/LOG.log. Fails
-# when cargo fails or when a named test's LIVE-RAN text is missing from the log
-# (matched unanchored: libtest with --nocapture may print it after
-# `test <name> ... ` on the same line).
+# when cargo fails or when a named test's `LIVE-RAN <name>` is not at the end of
+# a log line (anchored: libtest with --nocapture may print `test <name> ... `
+# before it on the same line, so it may follow whitespace). A gate prints that
+# line as its last statement, after every assertion: it means the gate passed.
+# A test name is `[a-z0-9_]+` and matches whole (WR-D2).
 live27() {
   local name=${1:?LOG-NAME} log rc=0 t missing=0
   shift
   [ $# -gt 0 ] || die "live27: name at least one test"
   [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "live27: LOG-NAME is letters, digits, dot, dash, underscore"
+  for t in "$@"; do
+    [[ $t =~ ^[a-z0-9_]+$ ]] || die "live27: a test name is lowercase letters, digits and underscore"
+  done
   token_env
   mkdir -p "$STATE/evidence"
   log=$STATE/evidence/$name.log
@@ -686,7 +692,7 @@ live27() {
     cargo test -p ignition-core --test live_deploy_project_git -- --ignored --nocapture --test-threads=1 "$@" 2>&1 | tee "$log"
   ) || rc=$?
   for t in "$@"; do
-    if ! grep -qF "LIVE-RAN $t" "$log"; then
+    if ! grep -qE "(^|[[:space:]])LIVE-RAN ${t}\$" "$log"; then
       echo "live27: the log has no 'LIVE-RAN $t'" >&2
       missing=1
     fi
@@ -961,9 +967,16 @@ shape27() {
 }
 
 # classify27 LABEL: what GitHostRead::read_git_state and classify make of .git
-# (the git_state_probe gate), the LIVE-CLASSIFY lines only.
+# (the git_state_probe gate), the LIVE-CLASSIFY lines only. A failed gate fails
+# the caller (WR-D3): the status is captured, not piped away.
 classify27() {
-  live27 "27-04-g6-$1" git_state_probe 2>&1 | grep -E '^LIVE-CLASSIFY' || true
+  local out rc=0
+  out=$(live27 "27-04-g6-$1" git_state_probe 2>&1) || rc=$?
+  printf '%s\n' "$out" | grep -E '^LIVE-CLASSIFY' || true
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" | tail -n 15 >&2
+    die "classify27 $1: the git_state_probe gate failed (exit $rc)"
+  fi
 }
 
 # require_advanced27: CapApp's HEAD is v1.1.0 and tags/ and images/ are absent.
