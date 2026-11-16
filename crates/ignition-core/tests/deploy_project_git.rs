@@ -5702,6 +5702,12 @@ mod published {
     async fn pair_branch_differs_refuses() {
         let rig = pair();
         rig.f.git_in_backup(&["branch", "-m", BRANCH, "staging"]);
+        // `branch -m` carries the section over with `merge` still naming the
+        // old branch; since 27-27 (WR-A5) that is `no_upstream`. The backup is
+        // a managed clone on `staging`, tracking `staging`, so only the branch
+        // name differs between the nodes.
+        rig.f
+            .git_in_backup(&["config", "branch.staging.merge", "refs/heads/staging"]);
         let err = refusal(rig.check().await);
         assert_eq!(reason_of(&err), "nodes_disagree");
         let text = err.to_string();
