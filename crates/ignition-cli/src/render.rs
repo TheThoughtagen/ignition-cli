@@ -1726,7 +1726,7 @@ fn deploy_projects_human_lines(
             lines.push(format!(
                 "verdict: {}: the project was deployed, read back equal and recorded; its git \
                  repository was not handed over and nothing was rolled back; restore the .git by \
-                 hand from the copy named above",
+                 hand from the copy named in the outcome line",
                 escape_control(slug)
             ));
         }
@@ -1849,15 +1849,23 @@ fn git_names(list: &[String], count: usize, short: bool) -> String {
 }
 
 /// The `outcome:` line of a `git_restore_failed` run (D-09): the deploy is
-/// kept, the reason word and the saved copy are named.
+/// kept; the node whose restore failed, its reason word and its saved copy are
+/// named (WR-04). On a pair that is the first node with a reason, not always
+/// the master; with none named it falls back to the master.
 fn git_restore_failed_line(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
 ) -> String {
-    let node = result.git.as_deref().map(|g| g.master());
+    let node = result.git.as_deref().and_then(|g| {
+        g.nodes
+            .iter()
+            .find(|n| n.restore.as_ref().is_some_and(|r| r.reason.is_some()))
+            .or_else(|| g.nodes.first())
+    });
     let restore = node.and_then(|n| n.restore.as_ref());
     let reason = restore
         .and_then(|r| r.reason.as_deref())
         .unwrap_or("unknown");
+    let name = node.map_or_else(|| "the gateway".to_string(), |n| escape_control(&n.node));
     let copy = match (node.and_then(|n| n.save.as_ref()), restore) {
         (Some(save), Some(restore)) if restore.save_kept => {
             format!("copy at {}", escape_control(&save.path))
@@ -1865,7 +1873,7 @@ fn git_restore_failed_line(
         _ => "nothing was changed in .git".to_string(),
     };
     format!(
-        "outcome: git_restore_failed (project deployed, .git not restored: {}; {copy})",
+        "outcome: git_restore_failed (project deployed, .git not handed over on {name}: {}; {copy})",
         escape_control(reason)
     )
 }
@@ -1964,6 +1972,11 @@ fn git_lines(
                 )),
                 None if restore.restored && !restore.advanced => {
                     lines.push("  restore: restored unchanged (not advanced)".to_string());
+                }
+                // WR-05: a repository that was left in place and not advanced
+                // (K11, a rollback that found it equal) is not "advanced".
+                None if !restore.advanced => {
+                    lines.push("  restore: .git left in place (not advanced)".to_string());
                 }
                 None => lines.push(format!(
                     "  restore: {}, advanced to the release{}",
@@ -5482,8 +5495,9 @@ mod tests {
         let text = deploy_projects_human_lines(&result).join("\n");
         assert!(
             text.contains(
-                "outcome: git_restore_failed (project deployed, .git not restored: \
-                 designer_attached; copy at ign-deploy/gw/projects/App/git-save/r1/repo)"
+                "outcome: git_restore_failed (project deployed, .git not handed over on \
+                 nodes.master: designer_attached; copy at \
+                 ign-deploy/gw/projects/App/git-save/r1/repo)"
             ),
             "{text}"
         );
@@ -5504,6 +5518,144 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("save kept"), "{text}");
+    }
+
+    /// A pair result: the master handed over green, the backup did not.
+    fn failed_pair_result(
+        backup_reason: &str,
+    ) -> ignition_core::actions::deploy_projects::DeployProjectsResult {
+        use ignition_core::actions::deploy_projects::ProjectOutcome;
+        use ignition_core::actions::deploy_projects::git::SaveInfo;
+        let mut master = git_node("managed");
+        master.save = Some(SaveInfo {
+            path: "ign-deploy/gw/projects/App/git-save/r1/repo".into(),
+            files: 12,
+            bytes: 3400,
+        });
+        // The master's save was removed after a green restore.
+        master.restore = Some(restore_info());
+        let mut backup = git_node("managed");
+        backup.node = "nodes.backup".into();
+        backup.save = Some(SaveInfo {
+            path: "ign-deploy/gw/projects/App/git-save/r1/backup-repo".into(),
+            files: 9,
+            bytes: 2100,
+        });
+        let mut restore = restore_info();
+        restore.restored = false;
+        restore.advanced = false;
+        restore.verified = false;
+        restore.post_status = None;
+        restore.reason = Some(backup_reason.into());
+        restore.save_kept = true;
+        backup.restore = Some(restore);
+        let mut report = git_report(master);
+        report.nodes.push(backup);
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ProjectOutcome::GitRestoreFailed;
+        result.ok = false;
+        result.slug = Some("deploy_git_restore_failed".into());
+        result.record_written = true;
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        result.git = Some(report);
+        result
+    }
+
+    #[test]
+    fn git_restore_failed_line_names_the_failed_backup() {
+        let result = failed_pair_result("backup_unsynced");
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains(
+                "outcome: git_restore_failed (project deployed, .git not handed over on \
+                 nodes.backup: backup_unsynced; copy at \
+                 ign-deploy/gw/projects/App/git-save/r1/backup-repo)"
+            ),
+            "{text}"
+        );
+        let outcome = text
+            .lines()
+            .find(|l| l.starts_with("outcome:"))
+            .expect("an outcome line");
+        assert!(!outcome.contains("unknown"), "{outcome}");
+        assert!(!outcome.contains("nothing was changed"), "{outcome}");
+        assert!(
+            !text.contains("named above"),
+            "the verdict points at the printed copy: {text}"
+        );
+        assert!(text.contains("copy named in the outcome line"), "{text}");
+    }
+
+    #[test]
+    fn git_restore_failed_line_master_failure_unchanged_shape() {
+        use ignition_core::actions::deploy_projects::git::SaveInfo;
+        let mut result = failed_pair_result("designer_attached");
+        let git = result.git.as_mut().expect("git");
+        // The master fails; the backup is green.
+        git.nodes[0].save = Some(SaveInfo {
+            path: "ign-deploy/gw/projects/App/git-save/r1/repo".into(),
+            files: 12,
+            bytes: 3400,
+        });
+        let mut failed = restore_info();
+        failed.restored = false;
+        failed.advanced = false;
+        failed.reason = Some("designer_attached".into());
+        failed.save_kept = true;
+        git.nodes[0].restore = Some(failed);
+        git.nodes[1].restore = Some(restore_info());
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains(
+                "outcome: git_restore_failed (project deployed, .git not handed over on \
+                 nodes.master: designer_attached; copy at \
+                 ign-deploy/gw/projects/App/git-save/r1/repo)"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn git_restore_failed_line_escapes_the_node_and_the_reason() {
+        let mut result = failed_pair_result("backup_unsynced\u{1b}[2J");
+        result.git.as_mut().expect("git").nodes[1].node = "nodes.b\u{7}".into();
+        let text = deploy_projects_human_lines(&result).join("\n");
+        let outcome = text
+            .lines()
+            .find(|l| l.starts_with("outcome:"))
+            .expect("an outcome line");
+        assert!(
+            !outcome.chars().any(|c| c.is_control()),
+            "no raw control character: {outcome:?}"
+        );
+        assert!(outcome.contains("\\u{1b}[2J"), "{outcome}");
+    }
+
+    #[test]
+    fn git_lines_unadvanced_kept_repo_is_not_called_advanced() {
+        // K11 and a rollback that found the repository in place and equal:
+        // nothing was put back and nothing was advanced.
+        let mut node = git_node("managed");
+        let mut restore = restore_info();
+        restore.restored = false;
+        restore.advanced = false;
+        restore.verified = false;
+        restore.post_status = None;
+        node.restore = Some(restore);
+        let mut result = projects_result();
+        result.check = false;
+        result.outcome = ignition_core::actions::deploy_projects::ProjectOutcome::Imported;
+        result.run_id = Some("r1".into());
+        result.run_dir = Some(".ign/deploy/gw/r1".into());
+        result.git = Some(git_report(node));
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            text.contains("restore: .git left in place (not advanced)"),
+            "{text}"
+        );
+        assert!(!text.contains("advanced to the release"), "{text}");
     }
 
     #[test]
