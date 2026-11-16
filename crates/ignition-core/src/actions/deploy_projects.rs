@@ -4299,23 +4299,34 @@ async fn sweep_children(
 
 /// Phase 27 (D-05): a run with `--discard-gateway-changes` that has something
 /// to discard puts the evidence on disk before the first write: the
-/// `git/discarded.json` file (0600: ids, paths and the operator's reason, no
-/// commit message and no file content), the `git_discarded` event naming it,
-/// and the `discarded` block of `data.git`. The live content itself is the
-/// pre-image export. Nothing is done without a [`git::DiscardPlan`].
+/// `git/discarded.json` file (0600: the node, ids, paths and the operator's
+/// reason, no commit message and no file content) and the `git_discarded`
+/// event naming it. The live content itself is the pre-image export. Nothing
+/// is done without a [`git::DiscardPlan`].
+///
+/// The plan is the master's when it has one, else the backup's (27-35, WR-09),
+/// and the evidence and the event name that node. The `discarded` block of
+/// `data.git` is not begun here: it follows the advance that wrote
+/// (`advance_after`, 27-35, WR-11), so a run that is rolled back or stops
+/// before it keeps `would_discard`.
 fn write_discard_evidence(
     git: Option<&GitRun<'_>>,
+    backup_git: Option<&BackupGit<'_>>,
     run_dir: &RunDir,
     run_id: &RunId,
     gateway: &str,
     project: &str,
-    result: &mut DeployProjectsResult,
     events: &mut RunEvents<'_>,
 ) -> Result<(), CoreError> {
-    let Some(plan) = git.and_then(|g| g.prepared.discard.as_ref()) else {
-        return Ok(());
+    let (plan, node) = match (
+        git.and_then(|g| g.prepared.discard.as_ref()),
+        backup_git.and_then(|b| b.prepared.discard.as_ref()),
+    ) {
+        (Some(plan), _) => (plan, git::MASTER),
+        (None, Some(plan)) => (plan, git::BACKUP),
+        (None, None) => return Ok(()),
     };
-    let evidence = plan.evidence_json(gateway, project, run_id.as_str());
+    let evidence = plan.evidence_json(node, gateway, project, run_id.as_str());
     let mut file = run_dir.create_private_file_in("git", "discarded.json")?;
     let bytes = serde_json::to_vec_pretty(&evidence).map_err(|e| {
         CoreError::Internal(format!("the discard evidence did not serialise ({e})"))
@@ -4328,15 +4339,21 @@ fn write_discard_evidence(
             problem: format!("could not write the discard evidence ({:?})", e.kind()),
         })?;
     events.emit(ProjectsEvent::GitDiscarded {
-        node: "nodes.master".to_string(),
+        node: node.to_string(),
         evidence: "git/discarded.json".to_string(),
         commits: plan.would.commits.len(),
         paths: plan.would.paths_count,
     })?;
-    if let Some(report) = result.git.as_mut() {
-        plan.begin(report);
-    }
     Ok(())
+}
+
+/// Whether the backup, not the master, owns the discard a run reports: it has
+/// a discard plan and the master has none (27-35, WR-09).
+fn backup_owns_discard(writers: &Writers<'_>) -> bool {
+    writers.git.is_none_or(|g| g.prepared.discard.is_none())
+        && writers
+            .backup_git
+            .is_some_and(|b| b.prepared.discard.is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4466,7 +4483,11 @@ async fn execute(
         // Phase 27 (D-05): a `record` that abandons gateway commits keeps its
         // evidence before the first write; the project already is the
         // artifact, so the live export is the pre-image.
-        if writers.git.is_some_and(|g| g.prepared.discard.is_some()) {
+        if writers.git.is_some_and(|g| g.prepared.discard.is_some())
+            || writers
+                .backup_git
+                .is_some_and(|b| b.prepared.discard.is_some())
+        {
             let mut file = run_dir.create_private_file_in("export", &format!("{project}.zip"))?;
             file.write_all(&zip)
                 .and_then(|()| file.sync_all())
@@ -4477,11 +4498,11 @@ async fn execute(
             events.emit(ProjectsEvent::PreImageExported { bytes: zip.len() })?;
             write_discard_evidence(
                 writers.git,
+                writers.backup_git,
                 run_dir,
                 run_id,
                 &plan.gateway,
                 project,
-                &mut result,
                 &mut events,
             )?;
         }
@@ -4658,7 +4679,7 @@ async fn execute(
                 &artifact.sha256,
             )
             .await;
-            git::merge_backup(report, single);
+            git::merge_backup(report, single, backup_owns_discard(&writers));
             for event in after.events {
                 events.emit_late(event);
             }
@@ -4720,11 +4741,11 @@ async fn execute(
         // pre-image just written, before the first write of the run.
         write_discard_evidence(
             writers.git,
+            writers.backup_git,
             run_dir,
             run_id,
             &plan.gateway,
             project,
-            &mut result,
             &mut events,
         )?;
         pre_zip = Some(pre);
@@ -5324,7 +5345,7 @@ async fn execute(
                 &artifact.sha256,
             )
             .await;
-            git::merge_backup(report, single);
+            git::merge_backup(report, single, backup_owns_discard(&writers));
             for event in after.events {
                 events.emit_late(event);
             }
@@ -5454,7 +5475,7 @@ async fn execute(
                 want.as_deref(),
             )
             .await;
-            git::merge_backup(report, single);
+            git::merge_backup(report, single, false);
             for event in step.after.events {
                 events.emit_late(event);
             }
@@ -8008,7 +8029,7 @@ async fn roll_back(
             want.as_deref(),
         )
         .await;
-        git::merge_backup(report, single);
+        git::merge_backup(report, single, false);
         for event in step.after.events {
             events.emit_late(event);
         }

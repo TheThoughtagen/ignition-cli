@@ -5898,13 +5898,22 @@ It does not delete, rename or recreate a `.git`.
   `paths`, `paths_count`, `commits`, `evidence`) and writes nothing. The human
   form prints a `would discard:` line with the counts, the first paths and
   commit ids, then the dirty paths.
-- **Evidence.** The run writes `git/discarded.json` (mode 0600: the reason,
-  the branch, the abandoned HEAD, the dirty paths, the commit ids, the
-  pre-image file name and the save path; no file content and no commit
-  message) in the run directory, and the live project as the pre-image
-  `export/<project>.zip`, before its first write to the gateway. `run.json`
-  records the reason as `discard_gateway_changes`, and the event
-  `git_discarded` carries counts and the evidence file name, never the reason.
+- **Evidence.** The run writes `git/discarded.json` (mode 0600: the node
+  `nodes.master` or `nodes.backup`, the reason, the branch, the abandoned HEAD,
+  the dirty paths, the commit ids, the pre-image file name and the save path;
+  no file content and no commit message) in the run directory, and the live
+  project as the pre-image `export/<project>.zip`, before its first write to
+  the gateway. `run.json` records the reason as `discard_gateway_changes`, and
+  the event `git_discarded` carries the node, counts and the evidence file
+  name, never the reason. On a pair the evidence describes the master's
+  repository, or the backup's when only the backup has anything to discard.
+- **When `data.git.discarded` appears.** Only once the advance wrote: a
+  present `data.git.discarded` means the repository was advanced and the work
+  it lists is no longer the gateway's. A run that was rolled back, or whose
+  import could not be verified (`imported_unverified`), put the project and the
+  repository back; it keeps `data.git.would_discard` and has no
+  `data.git.discarded`. `git/discarded.json` is written before the import
+  either way, so the listing exists even when nothing was discarded.
 - **Keep-alive.** When commits are abandoned (unpushed, or not merged into the
   release), the run writes `refs/ign-discarded/<run-id>` in the gateway's
   repository, naming the previous HEAD, so those commits stay reachable, and it
@@ -6212,7 +6221,11 @@ that does not converge, or whose restore or advance fails, ends the run
 `git_restore_failed` (exit 6, `data.ok` false) with
 `data.git.nodes[1].restore.reason` (`backup_unsynced` for the wait) and the
 saved copy named in `data.git.nodes[1].save.path`; the master is never undone
-for it, and the saved copy is kept. A rollback, and `--rollback-run`, put both
+for it, and the saved copy is kept. With `--discard-gateway-changes` the
+discard evidence is the master's, or the backup's when the master holds no
+repository to discard from: `git/discarded.json` carries `node` and the
+`git_discarded` event names `nodes.backup`, and `data.git.discarded` appears
+once the backup's advance wrote. A rollback, and `--rollback-run`, put both
 nodes' repositories back unchanged, the backup once its project has followed the
 master's. A run on a pair needs the backup's REST session only to read: its
 only call is the project export, a GET. The only things written on the backup

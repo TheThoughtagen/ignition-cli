@@ -4313,6 +4313,7 @@ mod published {
 
         let path = rig.run_path(&result).join("git/discarded.json");
         let evidence = discarded_json(&rig, &result);
+        assert_eq!(evidence["node"], "nodes.master");
         assert_eq!(evidence["reason"], REASON);
         assert_eq!(evidence["branch"], BRANCH);
         assert_eq!(evidence["abandoned_head"], rig.f.c1.as_str());
@@ -4342,6 +4343,7 @@ mod published {
                 "branch",
                 "commits",
                 "dirty",
+                "node",
                 "paths",
                 "paths_count",
                 "pre_image",
@@ -4473,17 +4475,25 @@ mod published {
 
     /// K11 with the override: the import replaced the live content (the
     /// pre-image has it) but the repo is put back as saved, so no commit was
-    /// abandoned and no keep-alive ref exists.
+    /// abandoned, no keep-alive ref exists and nothing was discarded: the
+    /// result keeps `would_discard` and carries no `discarded` block (27-35,
+    /// WR-11, D-05). The evidence file was written before the import.
     #[tokio::test]
-    async fn override_unverified_import_abandons_no_commit() {
+    async fn discarded_absent_after_unverified() {
         let rig = discarding();
         let d = rig.f.designer_commit(false);
         rig.sync_live();
         rig.gateway.mutate_child_after_import(PROJECT, 1000);
         let result = rig.apply().await.expect("the run ends with a verdict");
         assert_eq!(result.outcome, ProjectOutcome::ImportedUnverified);
-        let discarded = discarded_of(&result);
-        assert!(discarded.commits.is_empty() && discarded.keep_ref.is_none());
+        let git = git_of(&result);
+        assert!(
+            git.discarded.is_none(),
+            "nothing was discarded: {:?}",
+            git.discarded
+        );
+        let would = git.would_discard.as_ref().expect("would_discard stays");
+        assert_eq!(would.commits, std::slice::from_ref(&d));
         assert!(
             !refs_of(&rig).contains("ign-discarded"),
             "{}",
@@ -4492,6 +4502,77 @@ mod published {
         assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), d);
         assert!(rig.run_path(&result).join("git/discarded.json").exists());
         assert!(rig.run_path(&result).join("export/CapApp.zip").exists());
+        let json = serde_json::to_value(git).expect("json");
+        assert!(json["discarded"].is_null(), "{json}");
+        assert!(!json["would_discard"].is_null(), "{json}");
+    }
+
+    /// WR-11: a run that fails after a tag write and rolls back put the
+    /// project and the repository back, so `data.git.discarded` is null and
+    /// `would_discard` is still there. `git/discarded.json` was written before
+    /// the import and stays.
+    #[tokio::test]
+    async fn discarded_absent_after_rollback() {
+        let mut rig = Rig::tagged(true);
+        rig.discard = Some(REASON.to_string());
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let result = rig.apply().await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        let git = git_of(&result);
+        assert!(
+            git.discarded.is_none(),
+            "a rolled-back run discarded nothing: {:?}",
+            git.discarded
+        );
+        let would = git.would_discard.as_ref().expect("would_discard stays");
+        assert_eq!(would.paths, [VIEW_MEMBER.to_string()]);
+        let json = serde_json::to_value(git).expect("json");
+        assert!(json["discarded"].is_null(), "{json}");
+        assert_eq!(json["would_discard"]["dirty"], "listed", "{json}");
+        // The evidence was written before the import and stays.
+        let evidence = discarded_json(&rig, &result);
+        assert_eq!(evidence["reason"], REASON);
+        assert_eq!(evidence["paths"], serde_json::json!([VIEW_MEMBER]));
+        assert!(
+            rig.git_events(&result)
+                .contains(&"git_discarded".to_string())
+        );
+        assert!(!refs_of(&rig).contains("ign-discarded"));
+    }
+
+    /// WR-11, the unchanged half: a green override run reports `discarded`
+    /// with the commits and the keep-alive ref the advance wrote, and no
+    /// `would_discard`.
+    #[tokio::test]
+    async fn discarded_after_advance() {
+        let rig = discarding();
+        let d = rig.f.designer_commit(false);
+        rig.sync_live();
+        let result = rig.apply().await.expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        let git = git_of(&result);
+        assert!(git.would_discard.is_none(), "{:?}", git.would_discard);
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.commits, std::slice::from_ref(&d));
+        let run_id = result.run_id.clone().expect("run id");
+        assert_eq!(
+            discarded.keep_ref.as_deref(),
+            Some(format!("refs/ign-discarded/{run_id}").as_str())
+        );
+        assert_eq!(discarded.reason, REASON);
     }
 
     #[tokio::test]
@@ -5870,6 +5951,57 @@ mod published {
             "{restore:?}"
         );
         assert!(!rig.f.git_dir().exists(), "the master stays without a .git");
+        assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
+    }
+
+    /// WR-09 (27-35, D-05, D-19): the master holds no `.git`, the backup's
+    /// repository is dirty and the run gives `--discard-gateway-changes`. The
+    /// evidence names the backup, the event names it, and `data.git.discarded`
+    /// follows the backup's advance.
+    #[tokio::test]
+    async fn pair_backup_only_discard_writes_evidence() {
+        let mut rig = Rig::new();
+        rig.f
+            .live_change(VIEW_MEMBER, "{\"root\":{\"live\":true}}\n");
+        rig.sync_live();
+        rig.add_backup();
+        std::fs::remove_dir_all(rig.f.git_dir()).expect("no .git on the master");
+        rig.discard = Some(REASON.to_string());
+        let check = rig.check().await.expect("the check completes");
+        let would = git_of(&check)
+            .would_discard
+            .as_ref()
+            .expect("the backup's would_discard");
+        assert_eq!(would.paths, [VIEW_MEMBER.to_string()]);
+
+        let backup = rig.backup_node(1);
+        let result = rig
+            .apply_pair(&backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?}",
+            result.warnings
+        );
+        let evidence = discarded_json(&rig, &result);
+        assert_eq!(evidence["node"], "nodes.backup", "{evidence}");
+        assert_eq!(evidence["reason"], REASON);
+        assert_eq!(evidence["paths"], serde_json::json!([VIEW_MEMBER]));
+        let events = rig.events(&result);
+        let event = events
+            .iter()
+            .find(|e| e["event"] == "git_discarded")
+            .expect("git_discarded is emitted");
+        assert_eq!(event["node"], "nodes.backup", "{event}");
+        assert_eq!(event["evidence"], "git/discarded.json");
+        let git = git_of(&result);
+        assert!(git.would_discard.is_none(), "{:?}", git.would_discard);
+        let discarded = discarded_of(&result);
+        assert_eq!(discarded.reason, REASON);
+        assert_eq!(discarded.paths, [VIEW_MEMBER.to_string()]);
+        assert_eq!(git.nodes[0].state, "absent");
         assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c2);
     }
 

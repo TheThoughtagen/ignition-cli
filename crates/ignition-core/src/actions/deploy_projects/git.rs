@@ -1609,10 +1609,18 @@ impl DiscardPlan {
     /// The content of `git/discarded.json` (27-15, D-05): the operator's
     /// reason, the branch, the abandoned HEAD, the dirty paths, the commit ids,
     /// the pre-image that holds the live content and where the saved `.git`
-    /// will be. Ids, paths and the operator's text only: no commit message and
-    /// no file content.
-    pub fn evidence_json(&self, gateway: &str, project: &str, run_id: &str) -> serde_json::Value {
+    /// will be, and the node (`nodes.master` or `nodes.backup`) whose
+    /// repository it describes (27-35, WR-09). Ids, paths and the operator's
+    /// text only: no commit message and no file content.
+    pub fn evidence_json(
+        &self,
+        node: &str,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
+            "node": node,
             "reason": self.reason,
             "branch": self.branch,
             "abandoned_head": self.abandoned_head,
@@ -1625,9 +1633,11 @@ impl DiscardPlan {
         })
     }
 
-    /// Record on `report` that the run is discarding what the plan names: the
+    /// Record on `report` that the run discarded what the plan names: the
     /// `discarded` block (the commits and the keep-alive ref follow once the
-    /// advance wrote them) replaces `would_discard`.
+    /// advance wrote them) replaces `would_discard`. Called by `advance_after`
+    /// once the advance wrote and read back, never earlier: a run that was
+    /// rolled back or stopped keeps `would_discard` (27-35, WR-11, D-05).
     pub fn begin(&self, report: &mut GitReport) {
         report.would_discard = None;
         report.discarded = Some(DiscardedReport {
@@ -1917,12 +1927,17 @@ async fn advance_after(
         Ok(done) => done,
         Err(failure) => return failed_restore(report, &failure),
     };
-    if done.keep_save
-        && let (Some(plan), Some(discarded)) =
-            (prepared.discard.as_ref(), report.discarded.as_mut())
-    {
-        discarded.commits.clone_from(&plan.would.commits);
-        discarded.keep_ref = Some(discard_ref_name(&saved.run_id));
+    // The advance wrote: what the override discards is gone from the live
+    // repository now (27-35, WR-11), so only here does `discarded` replace
+    // `would_discard`. The evidence file was written before the import.
+    if let Some(plan) = prepared.discard.as_ref() {
+        plan.begin(report);
+        if done.keep_save
+            && let Some(discarded) = report.discarded.as_mut()
+        {
+            discarded.commits.clone_from(&plan.would.commits);
+            discarded.keep_ref = Some(discard_ref_name(&saved.run_id));
+        }
     }
 
     // The advance wrote: a partial repo is now adopted (27-17).
@@ -2442,7 +2457,8 @@ fn absent_node(node: &str) -> NodeGitReport {
 /// node as an `absent` entry (D-23: a node without `.git` stays without one).
 /// `None` when no node holds a repository. The block-level facts (`would_discard`,
 /// `discarded`, `hazards_acknowledged`, `expected_drift`) are the master's, or
-/// the backup's when the master holds no repository.
+/// the backup's when the master holds no repository; `would_discard` is the
+/// backup's whenever the master has none.
 pub fn pair_report(
     master: Option<&GitReport>,
     backup: Option<&GitReport>,
@@ -2458,6 +2474,12 @@ pub fn pair_report(
             .unwrap_or_else(|| absent_node(name))
     };
     report.nodes = vec![node_of(master, MASTER), node_of(backup, BACKUP)];
+    // The discard the run reports is the master's, else the backup's (27-35,
+    // WR-09): a backup that is the only repository to discard from still shows
+    // what the override passes.
+    if report.would_discard.is_none() {
+        report.would_discard = backup.and_then(|b| b.would_discard.clone());
+    }
     Some(report)
 }
 
@@ -2906,13 +2928,20 @@ pub fn backup_view(report: &GitReport) -> Option<GitReport> {
 
 /// Fold a single-node backup report back into the published pair report. The
 /// backup's drift becomes the block's only when the master advanced nothing
-/// (it holds no repository).
-pub fn merge_backup(report: &mut GitReport, single: GitReport) {
+/// (it holds no repository). The backup's `discarded` block becomes the
+/// block's only when `adopt_discard` says the backup owns the discard (the
+/// master holds no discard plan, 27-35, WR-09); it replaces `would_discard`
+/// only once the backup's advance wrote it.
+pub fn merge_backup(report: &mut GitReport, single: GitReport, adopt_discard: bool) {
     let Some(node) = single.nodes.into_iter().next() else {
         return;
     };
     if let Some(slot) = report.nodes.get_mut(1) {
         *slot = node;
+    }
+    if adopt_discard && report.discarded.is_none() && single.discarded.is_some() {
+        report.would_discard = None;
+        report.discarded = single.discarded;
     }
     if !report.expected_drift_complete && single.expected_drift_complete {
         report.expected_drift = single.expected_drift;
