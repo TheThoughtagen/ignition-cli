@@ -17,6 +17,7 @@
 use ignition_core::actions::apicall::ApiCallOutcome;
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
+use ignition_core::actions::deploy_projects::git::REASON_BACKUP_PROJECT_JSON_MISSING;
 use ignition_core::actions::diagnostics::{BundleDownloadResult, BundleStatusWire};
 use ignition_core::actions::eam::{
     EamDeleteResult, EamHistoryResult, EamLifecycleResult, EamModifyResult, EamTaskCreateResult,
@@ -1723,12 +1724,28 @@ fn deploy_projects_human_lines(
         // and recorded; only the gateway repository was not handed over.
         let git_failed = result.outcome == ProjectOutcome::GitRestoreFailed;
         if let Some(slug) = result.slug.as_ref().filter(|_| git_failed) {
-            lines.push(format!(
-                "verdict: {}: the project was deployed, read back equal and recorded; its git \
-                 repository was not handed over and nothing was rolled back; restore the .git by \
-                 hand from the copy named in the outcome line",
-                escape_control(slug)
-            ));
+            let (manifest, repository) = git_failure_kinds(result);
+            if manifest {
+                // 27-37: the repository is not the problem. The backup lost
+                // the project's manifest file, so no `.git` instruction.
+                lines.push(format!(
+                    "verdict: {}: the project was deployed, read back equal and recorded on the \
+                     master; the backup's project.json is missing, so the backup will lose the \
+                     project on its next restart; ign does not repair this (a git module and \
+                     redundancy defect): put project.json back on the backup before it restarts",
+                    escape_control(slug)
+                ));
+            }
+            // Any other reason (or none named) keeps the 27-36 verdict, also
+            // beside the finding when both kinds are present.
+            if repository || !manifest {
+                lines.push(format!(
+                    "verdict: {}: the project was deployed, read back equal and recorded; its \
+                     git repository was not handed over and nothing was rolled back; restore \
+                     the .git by hand from the copy named in the outcome line",
+                    escape_control(slug)
+                ));
+            }
         }
         if let Some(slug) = result
             .slug
@@ -1872,9 +1889,36 @@ fn git_restore_failed_line(
         }
         _ => "nothing was changed in .git".to_string(),
     };
+    // 27-37: the backup's project.json is the finding, not the repository.
+    if reason == REASON_BACKUP_PROJECT_JSON_MISSING {
+        return format!(
+            "outcome: git_restore_failed (project deployed, project.json not usable on {name}: {}; {})",
+            escape_control(reason),
+            copy.replacen("copy at", "saved .git copy at", 1)
+        );
+    }
     format!(
         "outcome: git_restore_failed (project deployed, .git not handed over on {name}: {}; {copy})",
         escape_control(reason)
+    )
+}
+
+/// Which kinds of failed node a `git_restore_failed` run holds (27-37): one
+/// with the backup's `project.json` finding, and one with any other reason.
+fn git_failure_kinds(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> (bool, bool) {
+    let reasons: Vec<&str> = result.git.as_deref().map_or_else(Vec::new, |g| {
+        g.nodes
+            .iter()
+            .filter_map(|n| n.restore.as_ref().and_then(|r| r.reason.as_deref()))
+            .collect()
+    });
+    (
+        reasons.contains(&REASON_BACKUP_PROJECT_JSON_MISSING),
+        reasons
+            .iter()
+            .any(|r| *r != REASON_BACKUP_PROJECT_JSON_MISSING),
     )
 }
 
@@ -5586,6 +5630,53 @@ mod tests {
             "the verdict points at the printed copy: {text}"
         );
         assert!(text.contains("copy named in the outcome line"), "{text}");
+    }
+
+    /// 27-37: the backup's `project.json` is gone after the deploy. The
+    /// verdict says what is at risk and what to do, and never sends the
+    /// operator to restore `.git` from the copy.
+    #[test]
+    fn git_verdict_for_backup_project_json_missing() {
+        let mut result = failed_pair_result("backup_project_json_missing");
+        // The repository was advanced; only the manifest file is the finding.
+        let backup = result.git.as_mut().expect("git").nodes[1]
+            .restore
+            .as_mut()
+            .expect("restore");
+        backup.restored = true;
+        backup.advanced = true;
+        backup.verified = true;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        let verdict = text
+            .lines()
+            .find(|l| l.starts_with("verdict:"))
+            .expect("a verdict line");
+        for needle in [
+            "verdict: deploy_git_restore_failed",
+            "the project was deployed, read back equal and recorded on the master",
+            "the backup's project.json is missing",
+            "the backup will lose the project on its next restart",
+            "ign does not repair this",
+            "put project.json back on the backup before it restarts",
+        ] {
+            assert!(verdict.contains(needle), "{needle:?} is missing: {verdict}");
+        }
+        assert!(
+            !verdict.contains("restore the .git") && !verdict.contains("copy named"),
+            "no .git restore instruction: {verdict}"
+        );
+        let outcome = text
+            .lines()
+            .find(|l| l.starts_with("outcome:"))
+            .expect("an outcome line");
+        assert!(
+            outcome.contains("nodes.backup: backup_project_json_missing"),
+            "{outcome}"
+        );
+        assert!(!outcome.contains(".git not handed over"), "{outcome}");
+        // Another reason keeps the 27-36 verdict.
+        let other = deploy_projects_human_lines(&failed_pair_result("backup_unsynced")).join("\n");
+        assert!(other.contains("restore the .git by hand"), "{other}");
     }
 
     #[test]

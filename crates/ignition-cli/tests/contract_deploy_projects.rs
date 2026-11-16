@@ -3766,6 +3766,49 @@ fn apply_action_classifies_git_restore_failed() {
     }
 }
 
+/// 27-37: when a node's reason is `backup_project_json_missing`, the headline
+/// carries the restart consequence and the put-back step, and does not send
+/// the operator to restore `.git` from the copy. Other reasons keep the
+/// restore-from-copy headline.
+#[test]
+fn apply_action_classifies_backup_project_json_missing() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let start = text
+        .find("if (exit === 6 && data && data.ok === false && data.outcome === 'git_restore_failed') {")
+        .expect("the git_restore_failed branch");
+    let end = start
+        + text[start..]
+            .find("\n            }\n")
+            .expect("the branch ends");
+    let branch = &text[start..end];
+    for needle in [
+        "backup_project_json_missing",
+        "next restart",
+        "put project.json back on the backup",
+        "ign does not repair",
+        "do not restart the backup or re-run this workflow until project.json is back",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The restore-from-copy headline stays for the other reasons.
+    for needle in [
+        "the gateway\\'s .git was not restored",
+        "do not re-run this workflow before the repository is restored from it",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The untrusted values are only strings in the message (T-27-48).
+    assert!(!branch.contains("${{"), "{branch}");
+    assert!(!branch.contains("run:"), "{branch}");
+    assert!(branch.contains("oneLine("), "{branch}");
+}
+
 /// 27-36 (WR-07, the 27-26 checkpoint, option-a): the apply action names a git
 /// gate refusal by its own cause. `git_unpushed`, `git_not_merged` and
 /// `git_dirty` end as kind `git_work_refused`; `git_sync_hazard` as

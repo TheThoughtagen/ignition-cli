@@ -354,7 +354,13 @@ advanced, the run is a finished run with a verdict, and it ends **exit 6**:
 - `restore.reason` is one of the words of the table in
   [Projects the git module manages](#projects-the-git-module-manages)
   (`restore_failed`, `advance_failed`, `status_unexpected`, `git_recreated`,
-  `post_status_mismatch`, `designer_attached`).
+  `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`).
+- `backup_project_json_missing` (on `nodes.backup` only) is not a `.git`
+  failure: after the backup's project converged, its
+  `data/projects/<project>/project.json` is absent or not a regular file, and the
+  backup will lose the project on its next restart. Do not restore a `.git` for
+  it; put `project.json` back on the backup before it restarts (see the pair
+  note under [Projects the git module manages](#projects-the-git-module-manages)).
 
 `deploy_git_restore_failed` lives only in `data.slug`. It is not a `CoreError`
 slug and is never a row of the exit-code table. An agent that deploys reads
@@ -6153,6 +6159,7 @@ word is a change to the repository, the checkout or the target file:
 | `backup_unsynced` | the backup's project did not equal the release within `--backup-timeout`, so its `.git` was not touched | wait for the pair to converge; the saved copy is `data.git.nodes[1].save.path` on the backup host |
 | `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |
 | `designer_attached` | a Designer session was attached at the check before a `.git` write | close the Designer session, deploy again |
+| `backup_project_json_missing` | the backup's `data/projects/<p>/project.json` is absent or not a regular file after the deploy; redundancy project sync removed it (a git module and redundancy defect) | put `project.json` back on the backup before it restarts; ign does not repair it |
 
 When a restore or the advance fails the run ends `git_restore_failed` (slug
 `deploy_git_restore_failed`, exit 6): see [the verdict
@@ -6233,8 +6240,22 @@ advanced in place keeps its save for one more backup poll interval
 equal to the advanced state, the save is removed; absent, it is restored from
 the save and advanced again before the save goes; changed, the node ends
 `git_restore_failed` with `restore.reason` `git_recreated`, the repository is
-left as it is and the save is kept. A backup
-that does not converge, or whose restore or advance fails, ends the run
+left as it is and the save is kept. After a pair deploy whose backup converged, `ign` also checks that
+the backup's `data/projects/<project>/project.json` is a regular file on disk.
+Redundancy project sync can delete it after the git module registered its
+paths on the master; the backup then still serves the project until it restarts
+and cannot load it after. That is a git module and redundancy defect, and `ign`
+only detects it: it never repairs the file, never writes to it and never hides
+its deletion from the index it writes. A finding ends the run
+`git_restore_failed` with `data.git.nodes[1].restore.reason`
+`backup_project_json_missing` (a post-advance status that flags only
+`project.json` takes the same word; with any other difference the reason stays
+`post_status_mismatch` and the finding is a warning), the backup's saved copy
+is kept, and the warning says to put `project.json` back on the backup (for
+example a copy of the master's) before the backup restarts. The master is
+unchanged. A check that could not run is reported the same way, never as
+present. A rollback and `--rollback-run` only warn about it. A backup that does
+not converge, or whose restore or advance fails, ends the run
 `git_restore_failed` (exit 6, `data.ok` false) with
 `data.git.nodes[1].restore.reason` (`backup_unsynced` for the wait) and the
 saved copy named in `data.git.nodes[1].save.path`; the master is never undone
@@ -7083,7 +7104,11 @@ The headline names the restore reason (`data.git.nodes[].restore.reason`) and
 the saved copy (`data.git.nodes[].save.path`, on that node's host) and says the
 workflow must not be run again before the repository is restored from it (see
 [Projects the git module manages](#projects-the-git-module-manages), **When a
-run fails**). A tag-owning run
+run fails**). For the reason `backup_project_json_missing` the headline says
+instead that the backup's `project.json` is missing, that the backup will lose
+the project on its next restart, that `ign` does not repair it, and that
+`project.json` must be put back on the backup before it restarts or the workflow
+is run again; it does not point at the saved `.git`. A tag-owning run
 whose automatic rollback did not finish (`rollback_failed`, exit 6, on stderr)
 fails the job with a headline that says the gateway is partly changed, that the
 workflow must not be re-run, and the `ign deploy projects --env <env>
@@ -7123,7 +7148,7 @@ The verdicts the projects apply classifies, as `ign` emits them:
 | exit 6, `imported_unverified` (`deploy_project_unverified`) | stdout `data.outcome`, `data.restore_command` | fails: the project read back is not the artifact; restore with the command |
 | exit 6, `tags_rolled_back` or `rolled_back` (`deploy_rolled_back`) | stdout `data.outcome`, `data.tags.rollback.cause` | fails: restored automatically and verified; the release is not live |
 | exit 6, `applied_backup_unsynced` (`deploy_backup_unsynced`) | stdout `data.outcome`, `data.tags.backup.reason` | fails: master is live, backup lagging, do not rerun |
-| exit 6, `git_restore_failed` (`deploy_git_restore_failed`) | stdout `data.outcome`, `data.git.nodes[].save.path`, `data.git.nodes[].restore.reason` | fails: deployed and recorded, the gateway's `.git` was not restored; restore it by hand from the saved copy, do not rerun |
+| exit 6, `git_restore_failed` (`deploy_git_restore_failed`) | stdout `data.outcome`, `data.git.nodes[].save.path`, `data.git.nodes[].restore.reason` | fails: deployed and recorded, the gateway's `.git` was not restored; restore it by hand from the saved copy, do not rerun. With `restore.reason` `backup_project_json_missing`: the backup's `project.json` is missing and the backup will lose the project on its next restart; put `project.json` back on the backup, do not restart it or rerun until then |
 | exit 6, `rollback_failed` | stderr `error.code`, `error.message` | fails: the gateway is partly changed; do not rerun; recover with the `--rollback-run` command the message names |
 | exit 2, `destructive_change_refused` with gate `git_unpushed`, `git_not_merged` or `git_dirty` | stderr `error.code`, `error.message` | fails as `git_work_refused`: the gateway repository holds work the release lacks; push and merge it, or an administrator runs the deploy by hand with `--discard-gateway-changes` |
 | exit 2, `destructive_change_refused` with gate `git_sync_hazard` | stderr `error.code`, `error.message` | fails as `git_sync_hazard_refused`: fix `git.yaml`, or an administrator runs the deploy by hand with `--allow-git-sync-hazards` |
