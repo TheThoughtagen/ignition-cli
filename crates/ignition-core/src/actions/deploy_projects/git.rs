@@ -53,7 +53,9 @@ use crate::deploy::git_handover::{
 use crate::deploy::git_objects::dirty_from_gateway;
 use crate::deploy::git_remote::HostGit;
 use crate::deploy::git_state::{GitFiles, GitHead, GitRefs, GitState, GitStateKind, classify};
-use crate::deploy::git_yaml::{Hazard, entry_for, hazards_for, parse_git_yaml, refuses};
+use crate::deploy::git_yaml::{
+    GIT_YAML_CHECK, Hazard, entry_for, hazards_for, parse_git_yaml, refuses,
+};
 use crate::deploy::ledger::{LedgerRoot, git_save_location};
 use crate::deploy::project_artifact::CanonicalDigest;
 use crate::deploy::tag_converge::BackupTags;
@@ -469,6 +471,23 @@ fn preflight(check: &str, detail: impl Into<String>) -> CoreError {
             check: check.to_string(),
             detail: detail.into(),
         }]),
+    }
+}
+
+/// The host read's refusal of `git.yaml` (`deploy_run_invalid` naming
+/// `git.yaml`) as the preflight failure of the adoption; any other error (an
+/// unreadable host is `transport_failed`) is unchanged.
+fn git_yaml_unreadable(err: CoreError) -> CoreError {
+    match err {
+        CoreError::DeployRunInvalid { problem, .. } => {
+            let detail = if problem.starts_with("git.yaml") {
+                problem
+            } else {
+                format!("git.yaml: {problem}")
+            };
+            preflight(GIT_YAML_CHECK, detail)
+        }
+        other => other,
     }
 }
 
@@ -913,7 +932,12 @@ async fn adoption_branch(
     project: &str,
     kind: &str,
 ) -> Result<Adoption, CoreError> {
-    let entries = match read.read_git_yaml().await? {
+    // A git.yaml the host read refuses (a symlink, a non-regular file, over the
+    // cap) and one that does not parse are the same refusal: a preflight
+    // failure with the check word `git_yaml`. No run exists and no run record
+    // is damaged, which is what a `deploy_run_invalid` hint would say (27-26,
+    // WR-A4). The text names `git.yaml` and why, never a value of the file.
+    let entries = match read.read_git_yaml().await.map_err(git_yaml_unreadable)? {
         Some(bytes) => parse_git_yaml(&bytes)?,
         None => Vec::new(),
     };

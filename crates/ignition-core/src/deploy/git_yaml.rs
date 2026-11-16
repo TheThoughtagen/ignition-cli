@@ -16,8 +16,15 @@
 //!   text is dropped as the entry is built;
 //! - `Debug` is written by hand and prints keys and booleans only.
 //!
-//! The module reads a boolean with `Boolean.parseBoolean`, so a YAML boolean
-//! and the strings `true` / `false` (any case) both read.
+//! The module loads the file with SnakeYAML, which is YAML 1.1, and reads a flag
+//! that is a Boolean (or, through `Boolean.parseBoolean`, the strings `true` /
+//! `false`, any case). In YAML 1.1 an unquoted `yes`, `on` (any case) is a
+//! Boolean true; ign's parser (YAML 1.2) hands it over as a string. `Scalar::truth`
+//! reads those spellings as true. A project name that is not a string matches
+//! no project, as in the module.
+//!
+//! A `git.yaml` that cannot be read is a `deploy_preflight_failed` check
+//! [`GIT_YAML_CHECK`] (27-26, WR-A4): no run exists, and no run record is damaged.
 
 use std::fmt;
 
@@ -26,7 +33,11 @@ use serde::de::IgnoredAny;
 
 use super::git_state::{redact_url, url_key};
 use super::yamlio::YAML_MAX_BYTES;
-use crate::error::CoreError;
+use crate::error::{CoreError, PreflightFailure};
+
+/// The published `deploy_preflight_failed` check word for a `git.yaml` that
+/// cannot be read (27-26 checkpoint, one-way at release).
+pub const GIT_YAML_CHECK: &str = "git_yaml";
 
 /// A scalar that may be a YAML string, integer or boolean, anything else
 /// ignored. `git.yaml` is written by hand and by a renderer; an entry of
@@ -50,10 +61,25 @@ impl Scalar {
         }
     }
 
+    /// Only a string: the module ignores a project name that is not a String.
+    fn string(self) -> Option<String> {
+        match self {
+            Scalar::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
     fn truth(self) -> Option<bool> {
         match self {
             Scalar::Bool(b) => Some(b),
-            Scalar::Str(s) => Some(s.trim().eq_ignore_ascii_case("true")),
+            // serde cannot tell a quoted "yes" (a string the module parses as
+            // false) from an unquoted one (a SnakeYAML Boolean true), so ign
+            // reads the stricter way: every YAML 1.1 truthy spelling is true.
+            // That over-reports a hazard, which is the safe direction.
+            Scalar::Str(s) => Some(matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on"
+            )),
             Scalar::Int(_) | Scalar::Other(_) => None,
         }
     }
@@ -123,7 +149,7 @@ impl From<RawEntry> for GitYamlEntry {
     fn from(raw: RawEntry) -> GitYamlEntry {
         let uri = raw.repo_uri.and_then(Scalar::text);
         GitYamlEntry {
-            project: raw.project.and_then(Scalar::text),
+            project: raw.project.and_then(Scalar::string),
             repo_url_redacted: uri.as_deref().map(redact_url),
             repo_url_key: uri.as_deref().map(url_key),
             repo_branch: raw.repo_branch.and_then(Scalar::text),
@@ -158,18 +184,21 @@ impl fmt::Debug for GitYamlEntry {
     }
 }
 
-/// The refusal of a `git.yaml` that cannot be read: `deploy_run_invalid`
-/// naming `git.yaml` and why, never a value from the file.
+/// The refusal of a `git.yaml` that cannot be read: `deploy_preflight_failed`
+/// check [`GIT_YAML_CHECK`] whose detail names `git.yaml` and why, never a
+/// value from the file.
 fn invalid(problem: impl fmt::Display) -> CoreError {
-    CoreError::DeployRunInvalid {
-        run_id: "unknown".to_string(),
-        problem: format!("git.yaml: {problem}"),
+    CoreError::DeployPreflightFailed {
+        failures: Box::new([PreflightFailure {
+            check: GIT_YAML_CHECK.to_string(),
+            detail: format!("git.yaml: {problem}"),
+        }]),
     }
 }
 
 /// Parse `bytes` as the module's `git.yaml`: a YAML list of maps. An empty
-/// file is an empty list. Refuses (`deploy_run_invalid`, naming `git.yaml`,
-/// echoing nothing from the file) bytes over [`YAML_MAX_BYTES`], text that is
+/// file is an empty list. Refuses (`deploy_preflight_failed` check `git_yaml`,
+/// naming `git.yaml`, echoing nothing from the file) bytes over [`YAML_MAX_BYTES`], text that is
 /// not UTF-8, YAML that does not parse and a top-level value that is not a
 /// list of maps.
 pub fn parse_git_yaml(bytes: &[u8]) -> Result<Vec<GitYamlEntry>, CoreError> {
@@ -204,7 +233,8 @@ pub fn parse_git_yaml(bytes: &[u8]) -> Result<Vec<GitYamlEntry>, CoreError> {
     Ok(raw.into_iter().map(GitYamlEntry::from).collect())
 }
 
-/// The entry of `project` (`ignition_projectName`, an exact match). When the
+/// The entry of `project` (`ignition_projectName`, an exact match on a string
+/// name). When the
 /// file names the project twice and the entries disagree on `repo_branch`,
 /// the file does not say which branch is meant, so there is no entry: the
 /// caller falls through to its next branch source.
@@ -372,10 +402,16 @@ mod tests {
         err.code()
     }
 
+    /// The detail of the one preflight failure, whose check word is the
+    /// published `git_yaml`.
     fn problem(err: &CoreError) -> String {
         match err {
-            CoreError::DeployRunInvalid { problem, .. } => problem.clone(),
-            other => panic!("expected deploy_run_invalid, got {other:?}"),
+            CoreError::DeployPreflightFailed { failures } => {
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert_eq!(failures[0].check, "git_yaml");
+                failures[0].detail.clone()
+            }
+            other => panic!("expected deploy_preflight_failed, got {other:?}"),
         }
     }
 
@@ -446,14 +482,14 @@ mod tests {
             format!("- ignition_projectName: A\n  user_password: [{SECRET}\n"),
         ] {
             let err = parse_git_yaml(bad.as_bytes()).expect_err("refused");
-            assert_eq!(code(&err), "deploy_run_invalid");
+            assert_eq!(code(&err), "deploy_preflight_failed");
             let text = problem(&err);
             assert!(text.contains("git.yaml"), "{text}");
             assert!(!text.contains(SECRET), "{text}");
             assert!(!err.to_string().contains(SECRET), "{err}");
         }
         let err = parse_git_yaml(&[0xff, 0xfe, b'x']).expect_err("not utf-8");
-        assert_eq!(code(&err), "deploy_run_invalid");
+        assert_eq!(code(&err), "deploy_preflight_failed");
     }
 
     #[test]
@@ -472,7 +508,7 @@ mod tests {
     fn git_yaml_over_cap() {
         let big = vec![b'#'; YAML_MAX_BYTES + 1];
         let err = parse_git_yaml(&big).expect_err("over the cap");
-        assert_eq!(code(&err), "deploy_run_invalid");
+        assert_eq!(code(&err), "deploy_preflight_failed");
         assert!(problem(&err).contains("git.yaml"));
         // At the cap the size is fine.
         assert!(parse_git_yaml(&vec![b'#'; YAML_MAX_BYTES]).is_ok());
@@ -515,6 +551,71 @@ mod tests {
 
     fn entries(text: &str) -> Vec<GitYamlEntry> {
         parse_git_yaml(text.as_bytes()).expect("parses")
+    }
+
+    #[test]
+    fn git_yaml_yaml11_booleans_are_hazards() {
+        // The module's SnakeYAML is YAML 1.1: an unquoted yes/on is a Boolean
+        // true there, so ign must refuse what the module would apply.
+        for (flag, hazard) in [
+            ("commissioning_enforceBranch: yes", Hazard::EnforceBranch),
+            ("commissioning_importTags: On", Hazard::ImportTags),
+            ("tags_importOnStartup: YES", Hazard::ImportTags),
+            ("commissioning_importImages: on", Hazard::ImportImages),
+            ("commissioning_importThemes: Yes", Hazard::ImportThemes),
+            ("commissioning_enforceBranch: ON", Hazard::EnforceBranch),
+            (
+                "commissioning_enforceBranch: \"  yes \"",
+                Hazard::EnforceBranch,
+            ),
+            (
+                "commissioning_enforceBranch: \" True\"",
+                Hazard::EnforceBranch,
+            ),
+        ] {
+            let e = entries(&format!("- ignition_projectName: A\n  {flag}\n"));
+            assert_eq!(hazards_for(&e, "A"), vec![hazard], "{flag}");
+        }
+        for flag in [
+            "commissioning_enforceBranch: \"no\"",
+            "commissioning_enforceBranch: off",
+            "commissioning_enforceBranch: Off",
+            "commissioning_enforceBranch: false",
+            "commissioning_enforceBranch: \"0\"",
+            "commissioning_enforceBranch: \"\"",
+            "commissioning_enforceBranch: n",
+        ] {
+            let e = entries(&format!("- ignition_projectName: A\n  {flag}\n"));
+            assert!(hazards_for(&e, "A").is_empty(), "{flag}");
+            assert_eq!(e[0].enforce_branch, Some(false), "{flag}");
+        }
+        // An integer is no Boolean to the module: not applied, so not read.
+        let e = entries("- ignition_projectName: A\n  commissioning_enforceBranch: 1\n");
+        assert_eq!(e[0].enforce_branch, None);
+        assert!(hazards_for(&e, "A").is_empty());
+    }
+
+    #[test]
+    fn git_yaml_project_name_must_be_a_string() {
+        // The module ignores a project name that is not a String.
+        let e = entries(
+            "- ignition_projectName: 123\n  commissioning_enforceBranch: true\n\
+             - ignition_projectName: true\n  commissioning_importImages: true\n\
+             - ignition_projectName: CapApp\n  repo_branch: production\n",
+        );
+        assert_eq!(e[0].project, None);
+        assert_eq!(e[1].project, None);
+        assert!(entry_for(&e, "123").is_none());
+        assert!(entry_for(&e, "true").is_none());
+        assert!(hazards_for(&e, "123").is_empty());
+        assert!(hazards_for(&e, "true").is_empty());
+        // A string name, quoted digits included, still matches exactly.
+        assert_eq!(
+            entry_for(&e, "CapApp").and_then(|x| x.repo_branch.as_deref()),
+            Some("production")
+        );
+        let quoted = entries("- ignition_projectName: \"123\"\n  repo_branch: main\n");
+        assert!(entry_for(&quoted, "123").is_some());
     }
 
     #[test]

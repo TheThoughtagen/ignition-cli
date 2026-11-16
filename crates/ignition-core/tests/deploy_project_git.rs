@@ -4646,6 +4646,60 @@ mod published {
         }
     }
 
+    /// WR-A4 (27-26): a git.yaml the adoption cannot read is a preflight
+    /// failure with the check word `git_yaml` (exit 6), never a damaged run
+    /// directory. It names `git.yaml` and a line, and echoes no file value.
+    #[tokio::test]
+    async fn adopt_malformed_git_yaml_refuses_preflight() {
+        use common::git_fixture::GIT_YAML_SECRET;
+        for body in [
+            format!("- ignition_projectName: [{GIT_YAML_SECRET}\n  repo_branch: x\n"),
+            format!("repo_branch: {GIT_YAML_SECRET}\n"),
+        ] {
+            let rig = adopting();
+            put_file(&rig.f.data_dir, "git.yaml", &body);
+            let before = rig.git_manifest().await;
+            let err = refused_alike(&rig).await;
+            assert_eq!(err.code(), "deploy_preflight_failed", "{err}");
+            assert_eq!(err.exit_code(), 6);
+            assert_eq!(preflight_checks(&err), ["git_yaml"]);
+            let text = err.to_string();
+            assert!(text.contains("git.yaml"), "{text}");
+            assert!(!text.contains(GIT_YAML_SECRET), "{text}");
+            assert!(!text.contains("run unknown"), "{text}");
+            let hint = err.hint().unwrap_or_default();
+            assert!(!hint.contains("run directory"), "{hint}");
+            assert_eq!(rig.git_manifest().await, before, ".git is untouched");
+        }
+        // A line is named for YAML that does not parse.
+        let rig = adopting();
+        put_file(&rig.f.data_dir, "git.yaml", "- a: [b\n");
+        let text = refusal(rig.check().await).to_string();
+        assert!(text.contains("line"), "{text}");
+
+        // The host read refuses a git.yaml that is a symlink or over the cap
+        // the same way: the same check word, not a damaged run directory.
+        #[cfg(unix)]
+        {
+            let rig = adopting();
+            put_file(&rig.f.data_dir, "real.yaml", "- ignition_projectName: A\n");
+            std::os::unix::fs::symlink("real.yaml", rig.f.data_dir.join("git.yaml"))
+                .expect("symlink");
+            let err = refused_alike(&rig).await;
+            assert_eq!(err.code(), "deploy_preflight_failed", "{err}");
+            assert_eq!(preflight_checks(&err), ["git_yaml"]);
+            assert!(err.to_string().contains("git.yaml"), "{err}");
+        }
+        let rig = adopting();
+        put_file(
+            &rig.f.data_dir,
+            "git.yaml",
+            &"#".repeat(ignition_core::deploy::yamlio::YAML_MAX_BYTES + 1),
+        );
+        let err = refused_alike(&rig).await;
+        assert_eq!(preflight_checks(&err), ["git_yaml"], "{err}");
+    }
+
     /// JGit's default `master` in the unborn HEAD is never taken as intent,
     /// even when the remote has a `master`.
     #[tokio::test]
@@ -4841,7 +4895,8 @@ mod published {
             &format!("- ignition_projectName: CapApp\n  user_password: [{GIT_YAML_SECRET}\n"),
         );
         let err = refusal(rig.apply().await);
-        assert_eq!(err.code(), "deploy_run_invalid");
+        assert_eq!(err.code(), "deploy_preflight_failed");
+        assert_eq!(preflight_checks(&err), ["git_yaml"]);
         let text = format!("{err} {err:?}");
         assert!(text.contains("git.yaml"), "{text}");
         assert!(!text.contains(GIT_YAML_SECRET), "{text}");
@@ -4854,7 +4909,8 @@ mod published {
             &"#".repeat(ignition_core::deploy::yamlio::YAML_MAX_BYTES + 1),
         );
         let err = refusal(rig.apply().await);
-        assert_eq!(err.code(), "deploy_run_invalid");
+        assert_eq!(err.code(), "deploy_preflight_failed");
+        assert_eq!(preflight_checks(&err), ["git_yaml"]);
         assert!(err.to_string().contains("git.yaml"));
     }
 

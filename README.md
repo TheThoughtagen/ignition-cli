@@ -5797,7 +5797,8 @@ be a full-history checkout (`fetch-depth: 0` in CI) whose `origin` URL equals
 the gateway repository's remote URL, and it must be at the release tag. An
 unreachable remote, a shallow or modified checkout or a missing host git is
 `deploy_preflight_failed`, with one of these checks: `git_host`, `git_checkout`,
-`git_remote`, `git_write_access`, `git_free_space`, `git_gateway_objects`.
+`git_remote`, `git_write_access`, `git_free_space`, `git_gateway_objects`,
+`git_yaml` (an adoption whose `git.yaml` cannot be read).
 
 **Write access and the grant.** The read-only grant above is enough to look at a
 project's `.git`, not to put it back: the restore creates a staging directory in
@@ -5887,7 +5888,7 @@ request) and the flag cannot be combined with `--rollback-run`. It passes the
 three gates `git_unpushed`, `git_not_merged` and `git_dirty`, and nothing else:
 `release_not_on_branch`, every other `project_git_managed` reason and every
 `deploy_preflight_failed` check (`git_host`, `git_checkout`, `git_remote`,
-`git_write_access`, `git_free_space`, `git_gateway_objects`) still stop the run.
+`git_write_access`, `git_free_space`, `git_gateway_objects`, `git_yaml`) still stop the run.
 It does not delete, rename or recreate a `.git`.
 
 - **Before it applies**, `--check --discard-gateway-changes <REASON>` lists what
@@ -5957,7 +5958,8 @@ and the words as its keys, in `--check` and in the apply alike, before anything
 is written. It applies to an `import` and a `record`, which hand the kept
 `.git` over; a `skip` hands nothing over, so it only warns. A `git.yaml` that
 is absent, cannot be read or does not parse leaves the hazards unknown: a
-warning, never a refusal.
+warning, never a refusal (an adoption reads the same file for its branch and
+refuses one it cannot read: `deploy_preflight_failed` check `git_yaml`).
 
 Two ways to clear it:
 
@@ -6008,9 +6010,15 @@ local branch or an index is still `unborn_head`.
   per project, and holds a credential: only the project name, the branch and the
   module's settings keys are read; every other key is skipped by the parser and
   never stored, logged or written, and `repo_uri` is reduced to its redacted
-  form. A file that is not a list of maps, is over 1 MiB, is not UTF-8 or is a
-  symlink refuses `deploy_run_invalid` naming `git.yaml`, and the message never
-  echoes a value of the file.
+  form. A file that is not a list of maps, is over 1 MiB, is not UTF-8, does not
+  parse or is a symlink refuses an adoption with `deploy_preflight_failed`
+  check `git_yaml` (exit 6) naming `git.yaml` and, for YAML that does not parse,
+  a line; the message never echoes a value of the file. The module reads the
+  file as YAML 1.1, so the hazard flags read `yes` and `on` (any case, quoted or
+  not) as true, as it does; a quoted `"yes"` is a string the module reads as
+  false, and `ign` still counts it as a hazard, which can only over-report. An
+  `ignition_projectName` that is not a string (a number, `true`) matches no
+  project.
 - **What the adoption writes**, as one advance after the import: the release
   objects the repository lacks (one pack), `refs/heads/<branch>` and
   `refs/remotes/<remote>/<branch>` at the release commit, a `[branch
