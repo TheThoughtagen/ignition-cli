@@ -7632,13 +7632,14 @@ async fn wincap_git_scripts() {
 // gate stays as a regression check after the fix. (d) plants a junction inside a save and
 // checks the removal fails closed and neither follows it nor changes the ReadOnly file behind it. `LIVE-RAN`
 // is its last line, printed only when (b) removed the save, (c) surfaced the real error
-// and left nothing, and (d) held.
+// and left nothing, (d) held and (e) held.
 
 const RO_GATEWAY: &str = "live-scratch27w";
 const RO_PROJECT: &str = "CapApp27w";
 const RO_RUN_B: &str = "20261116T090000Z-w33b";
 const RO_RUN_C: &str = "20261116T090100Z-w33c";
 const RO_RUN_D: &str = "20261116T090200Z-w33d";
+const RO_RUN_E: &str = "20261116T090300Z-w33e";
 
 /// One tree with one ReadOnly file, the raw delete, and the clean-up of what it
 /// leaves. `r` is `ok` or `threw`.
@@ -7649,6 +7650,11 @@ const RO_MAKE_GIT: &str = "$g=$p.x+$p.git;foreach($e in $p.dirs){[void][IO.Direc
 /// Hold a file open for reading with no sharing at all for `$p.s` seconds.
 /// A junction `$p.link` to the directory `$p.target`, which holds one ReadOnly file.
 const RO_MAKE_JUNCTION: &str = "[void][IO.Directory]::CreateDirectory($p.target);$f=$p.target+'\\precious.txt';[IO.File]::WriteAllText($f,'keep');[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly);cmd /c mklink /J $p.link $p.target|Out-Null;if($LASTEXITCODE -ne 0){throw 'mklink failed'};E @{ok=1}";
+/// A ReadOnly file `$p.target` and a hard link `$p.link` to it.
+const RO_MAKE_HARDLINK: &str = "[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p.target));[IO.File]::WriteAllText($p.target,'keep');[IO.File]::SetAttributes($p.target,[IO.FileAttributes]::ReadOnly);cmd /c mklink /H $p.link $p.target|Out-Null;if($LASTEXITCODE -ne 0){throw 'mklink failed'};E @{ok=1}";
+/// The link type PowerShell reports for `$p.path`, and its attribute bits.
+const RO_LINK_FACTS: &str =
+    "$i=Get-Item -LiteralPath $p.path -Force;E @{ok=1;t=[string]$i.LinkType;a=[int]$i.Attributes}";
 const RO_HOLD_EXCLUSIVE: &str = "$h=[IO.File]::Open($p.path,'Open','Read','None');Start-Sleep -Seconds $p.s;$h.Dispose();E @{ok=1}";
 
 #[tokio::test]
@@ -7839,6 +7845,59 @@ async fn wincap_git_readonly_delete() {
         .expect("drop the junction");
     remove_tree(&host_shell, &outside).await;
 
+    // (e) a ReadOnly file with a second hard link: clearing its attribute would change
+    // the other link too, so the removal leaves it, fails closed and names the leftover
+    let save_e = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_E}");
+    let shared = format!("{home_native}\\{SCRATCH}\\wr-b5-shared\\shared.txt");
+    node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_E)
+        .await
+        .expect("a fourth save");
+    host_shell
+        .exec_powershell(&script(
+            "ro_hardlink",
+            RO_MAKE_HARDLINK,
+            serde_json::json!({ "link": format!("{save_e}\\repo\\shared.txt"), "target": shared }),
+        ))
+        .await
+        .expect("plant a hard link in the save");
+    let facts = host_shell
+        .exec_powershell(&script(
+            "ro_link_facts",
+            RO_LINK_FACTS,
+            serde_json::json!({ "path": format!("{save_e}\\repo\\shared.txt") }),
+        ))
+        .await
+        .expect("link facts");
+    println!(
+        "WR-B5 hard link: PowerShell reports LinkType {} (attributes {})",
+        facts["t"], facts["a"]
+    );
+    let removed_e = node.remove_git_save(RO_GATEWAY, RO_PROJECT, RO_RUN_E).await;
+    let other = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": shared }),
+        ))
+        .await;
+    let other_ro = other
+        .as_ref()
+        .map(|v| v["a"].as_i64().unwrap_or(0) & 1 != 0)
+        .unwrap_or(false);
+    println!(
+        "WR-B5 hard link in a save: removal ok {}; the other link is still ReadOnly: {other_ro}",
+        removed_e.is_ok()
+    );
+    let e_ok = removed_e
+        .as_ref()
+        .is_err_and(|err| err.to_string().contains("could not be removed"))
+        && other_ro;
+    remove_tree(
+        &host_shell,
+        &format!("{home_native}\\{SCRATCH}\\wr-b5-shared"),
+    )
+    .await;
+
     let confirmed = raw_threw || !b_ok || !c_ok;
     println!(
         "WR-B5 verdict: {}",
@@ -7870,6 +7929,7 @@ async fn wincap_git_readonly_delete() {
         "(c) a failed save masked its real error or left a partial copy"
     );
     assert!(d_ok, "(d) a junction inside a save was entered or changed");
+    assert!(e_ok, "(e) a hard-linked file in a save was changed");
     println!("LIVE-RAN wincap_git_readonly_delete");
 }
 

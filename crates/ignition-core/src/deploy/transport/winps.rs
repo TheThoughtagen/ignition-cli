@@ -326,7 +326,7 @@ macro_rules! git_ps_base {
 }
 macro_rules! git_ps_yc {
     () => {
-        r##"function Yc($s,$d){& robocopy $s $d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ|Out-Null;if($LASTEXITCODE -ge 8){throw "robocopy failed with exit code $LASTEXITCODE"}};"##
+        r##"function Yc($s,$d){& robocopy $s $d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ|Out-Null;if($LASTEXITCODE -ge 8){throw "robocopy failed with exit $LASTEXITCODE"}};"##
     };
 }
 macro_rules! git_ps_x {
@@ -336,12 +336,12 @@ macro_rules! git_ps_x {
 }
 macro_rules! git_ps_m {
     () => {
-        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function M($d){$d=$p.x+$d;$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=0;$l=@();$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$d,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){$a=[int]$f.Attributes;if(($a -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()}};$l+=$r+"`0"+$v}}};[Array]::Sort($l,[StringComparer]::Ordinal);@{files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($(if($l.Length){($l-join"`n")+"`n"}else{''}))))}}"##
+        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function M($d){$d=$p.x+$d;$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=0;$l=@();$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$d,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){$a=[int]$f.Attributes;if(($a -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');$v=X $h.ComputeHash($m);$m.Dispose()};$l+=$r+"`0"+$v}}};[Array]::Sort($l,[StringComparer]::Ordinal);@{ok=1;files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($(if($l.Length){($l-join"`n")+"`n"}else{''}))))}}"##
     };
 }
 macro_rules! git_ps_dr {
     () => {
-        r##"function Dy($i){foreach($f in $i.GetFileSystemInfos()){$a=[int]$f.Attributes;if($a -band 1024){continue};if($a -band 16){Dy $f}else{$f.Attributes=128}}};function Dr($d){$d=$p.x+$d;Dy ([IO.DirectoryInfo]$d);[IO.Directory]::Delete($d,$true)};"##
+        r##"function Dy($i){foreach($f in $i.GetFileSystemInfos()){$a=[int]$f.Attributes;if($a -band 1024){}elseif($a -band 16){Dy $f}elseif($a -band 1){if(!(Z $f.FullName).LinkType){$f.Attributes=128}}}};function Dr($d){$null=K (Z $d);$d=$p.x+$d;Dy ([IO.DirectoryInfo]$d);[IO.Directory]::Delete($d,$true)};"##
     };
 }
 macro_rules! git_ps_l {
@@ -403,7 +403,7 @@ pub const GIT_SAVE: &str = concat!(
     git_ps_yc!(),
     git_ps_m!(),
     git_ps_dr!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){K $y|Out-Null}else{[IO.Directory]::CreateDirectory($q)|Out-Null}};$r=$q+$c+'repo';New-Item -Type Directory $r|Out-Null;try{Yc $a $r;if([int]$i.Attributes -band 2){$h=Z $r;$h.Attributes+=2};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};$n.ok=1;E $n"##,
+    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$r=$q+$c+'repo';$null=ni -Type Directory $r;try{Yc $a $r;if([int]$i.Attributes -band 2){(Z $r).Attributes+=2};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};E $n"##,
 );
 
 /// Restore the save of a run as the project's `.git` (Phase 27, D-06):
@@ -426,7 +426,7 @@ pub const GIT_RESTORE: &str = concat!(
     git_ps_yc!(),
     git_ps_m!(),
     git_ps_dr!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw '.git already exists; it is never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$m=M $q;$t=$a+$c+'.ign-restore-'+$p.i;ni -Type Directory $t|Out-Null;try{Yc $q $t;if([int]$i.Attributes -band 2){$h=Z $t;$h.Attributes+=2};$n=M $t;if($n.digest -ne $m.digest){throw 'the restored copy does not match the save'};[IO.Directory]::Move($t,$g)}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};$f=M $g;$f.ok=1;E $f"##,
+    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw 'the .git exists; never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$m=M $q;$t=$a+$c+'.ign-restore-'+$p.i;$null=ni -Type Directory $t;try{Yc $q $t;if([int]$i.Attributes -band 2){(Z $t).Attributes+=2};$n=M $t;if($n.digest -ne $m.digest){throw 'the copy differs from the save'};[IO.Directory]::Move($t,$g)}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};E (M $g)"##,
 );
 
 /// The manifest of a tree: file count, total bytes and one digest (Phase 27).
@@ -441,11 +441,7 @@ pub const GIT_RESTORE: &str = concat!(
 /// [`ENUMERATE`]); a reparse point or a name with a control character
 /// anywhere in the tree is a terminating error and nothing is followed. Files
 /// are hashed through a `FileShare.ReadWrite|Delete` stream.
-pub const GIT_MANIFEST: &str = concat!(
-    git_ps_base!(),
-    git_ps_m!(),
-    r##"$m=M $p.a;E @{ok=1;files=$m.files;bytes=$m.bytes;digest=$m.digest}"##,
-);
+pub const GIT_MANIFEST: &str = concat!(git_ps_base!(), git_ps_m!(), r##"E (M $p.a)"##,);
 
 /// How big a `.git` is, from one enumeration (Phase 27, checker W-5):
 /// file count and the sum of the file lengths. Parameters: `x`, `a` as

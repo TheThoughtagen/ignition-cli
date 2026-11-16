@@ -5981,6 +5981,24 @@ mod winps_git {
                 "{name}: Dr deletes"
             );
         }
+        // security review of e0159fb: the ROOT of a delete is checked to be a real
+        // directory first (a path swapped for a junction since the last check is
+        // refused, never walked or deleted), and a ReadOnly file with more than one
+        // hard link is left alone (clearing the bit would change the other link)
+        for (name, body) in [
+            ("GIT_SAVE", winps::GIT_SAVE),
+            ("GIT_RESTORE", winps::GIT_RESTORE),
+            ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
+        ] {
+            assert!(
+                body.contains("function Dr($d){$null=K (Z $d);"),
+                "{name}: Dr checks its root"
+            );
+            assert!(
+                body.contains("(Z $f.FullName).LinkType"),
+                "{name}: a hard-linked file is not changed"
+            );
+        }
         for name in ["GIT_SAVE", "GIT_RESTORE"] {
             let body = if name == "GIT_SAVE" {
                 winps::GIT_SAVE
@@ -6561,8 +6579,23 @@ mod winps_git {
             "the leftover is named: {why}"
         );
         assert!(repo.is_dir(), "nothing else was touched");
+        // a ReadOnly file that is also a hard link to a file outside the tree: its
+        // attribute is shared with the other link, so it is not changed
+        let shared = outside.path().join("shared");
+        std::fs::write(&shared, "keep").expect("shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o444)).expect("ro");
+        std::fs::hard_link(&shared, repo.join("shared")).expect("hard link");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
         let done = pwsh_exec::run(&rm()).expect("remove");
+        assert_eq!(
+            std::fs::metadata(&shared)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o222,
+            0,
+            "a hard-linked file was not changed"
+        );
         assert_eq!(done["removed"], 1);
         assert!(!repo.exists(), "the save is gone, ReadOnly file included");
         assert_eq!(
