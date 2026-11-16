@@ -5479,17 +5479,24 @@ async fn execute(
     }
     // 26-13: a green tag-owning run on a pair ends by proving the backup
     // holds the owned tags. The master is never undone for it.
-    if result.outcome == ProjectOutcome::Applied
-        && backup_step(
-            &mut result,
-            &owned_names,
-            surfaces,
-            opts,
-            backup_since_ms,
-            &mut events,
-        )
-        .await
-            == Some(false)
+    // 27-34 (WR-10): a run whose git step ended `git_restore_failed` checks
+    // and reports the backup's owned tags too (as `record` does), so
+    // `data.tags.backup` never depends on the action. The git verdict stays:
+    // only a run that is still `applied` becomes `applied_backup_unsynced`.
+    if matches!(
+        result.outcome,
+        ProjectOutcome::Applied | ProjectOutcome::GitRestoreFailed
+    ) && backup_step(
+        &mut result,
+        &owned_names,
+        surfaces,
+        opts,
+        backup_since_ms,
+        &mut events,
+    )
+    .await
+        == Some(false)
+        && result.outcome == ProjectOutcome::Applied
     {
         mark_backup_unsynced(&mut result);
     }

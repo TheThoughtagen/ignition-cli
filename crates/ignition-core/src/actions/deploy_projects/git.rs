@@ -2095,7 +2095,7 @@ pub async fn git_after_unverified(
         git_restore_designer_gate(inputs.api, inputs.designers, &saved.path, &mut polls).await;
     let mut after = match gate {
         Err(failure) => failed_restore(report, &failure),
-        Ok(()) => put_back_unchanged(report, saved, inputs).await,
+        Ok(()) => put_back_unchanged(report, saved, inputs).await.0,
     };
     after.events.splice(
         0..0,
@@ -2111,11 +2111,15 @@ pub async fn git_after_unverified(
 /// project step removed it ([`restore_unchanged`]), and is never advanced. A
 /// repo that is still present is left untouched. The save is removed only when
 /// the repo equals it, else it is kept and named.
+///
+/// Returns the step and whether the repository now in place equals the save
+/// (27-34, WR-03): a save that stays because its removal failed is a warning,
+/// not a repository that differs. `false` when the restore itself failed.
 async fn put_back_unchanged(
     report: &mut GitReport,
     saved: &GitSaveReport,
     inputs: &UnverifiedInputs<'_>,
-) -> GitAfter {
+) -> (GitAfter, bool) {
     let done = match restore_unchanged(
         inputs.read,
         inputs.write,
@@ -2125,7 +2129,7 @@ async fn put_back_unchanged(
     )
     .await
     {
-        Err(failure) => return failed_restore(report, &failure),
+        Err(failure) => return (failed_restore(report, &failure), false),
         Ok(done) => done,
     };
     let node_name = report.master().node.clone();
@@ -2160,7 +2164,7 @@ async fn put_back_unchanged(
             inputs.project, saved.path
         ));
     }
-    after
+    (after, equal)
 }
 
 async fn remove_saved_copy(
@@ -2184,7 +2188,8 @@ async fn remove_saved_copy(
             });
         }
         Err(err) => after.warnings.push(format!(
-            "project {}: the saved .git at {} could not be removed ({})",
+            "project {}: the saved .git at {} could not be removed ({}); the repository in \
+             place is the one saved, so the copy is safe to delete by hand",
             inputs.project,
             saved.path,
             err.code()
@@ -2230,8 +2235,8 @@ pub async fn git_after_rollback(
     } else {
         Ok(())
     };
-    let mut after = match gate {
-        Err(failure) => failed_restore(report, &failure),
+    let (mut after, equal) = match gate {
+        Err(failure) => (failed_restore(report, &failure), false),
         Ok(()) => put_back_unchanged(report, saved, inputs).await,
     };
     after.events.splice(
@@ -2246,7 +2251,10 @@ pub async fn git_after_rollback(
             "project {}: its git repository was not put back ({reason}); the saved .git is at {}",
             inputs.project, saved.path
         )]
-    } else if restore.is_some_and(|r| r.save_kept) {
+    } else if restore.is_some_and(|r| r.save_kept) && !equal {
+        // 27-34 (WR-03): only a repository that differs from the save is a
+        // `left` line. One put back equal to it whose saved copy could not be
+        // removed is a verified rollback; `remove_saved_copy` warned.
         vec![format!(
             "project {}: the git repository now in place is not the one saved and was left as \
              it is; the saved .git is at {}",

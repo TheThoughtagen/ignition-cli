@@ -2078,6 +2078,7 @@ mod published {
                 lag,
                 reads: std::sync::Mutex::new(Vec::new()),
                 drop_git_at_first_read: false,
+                tags_differ: false,
                 backup_git: self.f.backup_git_dir(),
             }
         }
@@ -5603,6 +5604,9 @@ mod published {
         /// first (the content changed during the run).
         pub drop_git_at_first_read: bool,
         pub backup_git: PathBuf,
+        /// The backup's copy of the owned tags is not the master's: one
+        /// documentation value differs (27-34).
+        pub tags_differ: bool,
     }
 
     impl FakeBackupNode<'_> {
@@ -5643,6 +5647,19 @@ mod published {
                 }
             }
             shape(&mut tree, false);
+            if self.tags_differ {
+                fn alter(node: &mut serde_json::Value) {
+                    if node["tagType"] == "AtomicTag"
+                        && let Some(object) = node.as_object_mut()
+                    {
+                        object.insert("documentation".into(), "the backup's own".into());
+                    }
+                    if let Some(children) = node.get_mut("tags").and_then(|t| t.as_array_mut()) {
+                        children.iter_mut().for_each(alter);
+                    }
+                }
+                alter(&mut tree);
+            }
             Ok(serde_json::to_vec(&tree).expect("json"))
         }
         async fn status(&self) -> Result<RedundancyStatusWire, CoreError> {
@@ -6655,5 +6672,131 @@ mod published {
             "{:?}",
             result.warnings
         );
+    }
+
+    /// WR-03 (D-08): the rollback put `.git` back equal to the save and only
+    /// the removal of the saved copy failed. The rollback stays verified; the
+    /// failure is a warning that names the copy, and no `left` line says the
+    /// repository differs.
+    #[tokio::test]
+    async fn rollback_save_cleanup_failure_is_a_warning() {
+        let rig = Rig::tagged_with(true, |g| g.with_project_import_denied());
+        let host = rig.host();
+        let writer = KeepsSaves(rig.f.node());
+        let before = rig.git_manifest().await;
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(rig.git_manifest().await, before, ".git is as saved");
+        let restore = git_of(&result)
+            .master()
+            .restore
+            .clone()
+            .expect("restore reported");
+        assert!(restore.save_kept, "{restore:?}");
+        assert!(restore.reason.is_none(), "{restore:?}");
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the copy is still there");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("could not be removed") && w.contains("git-save")),
+            "a warning names the copy: {:?}",
+            result.warnings
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("not the one saved")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    /// WR-03: a `.git` that differs from the save (the module recreated one
+    /// during the rollback's own import) is still a `left` line and
+    /// `rollback_failed`, with the save kept and named. Unchanged by WR-03.
+    #[tokio::test]
+    async fn rollback_differing_repo_is_left() {
+        let rig = Rig::tagged_with(true, |g| g.with_disk_mirror_recreates_git());
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let err = refusal(rig.apply().await);
+        let CoreError::RollbackFailed(failure) = &err else {
+            panic!("the rollback must end rollback_failed: {err:?}");
+        };
+        assert_eq!(err.code(), "rollback_failed");
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save is kept");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            failure.cause.contains(&save) && failure.cause.contains("not the one saved"),
+            "{}",
+            failure.cause
+        );
+    }
+
+    /// WR-10: a tag-owning pair run whose git step ended `git_restore_failed`
+    /// still checks the backup's owned tags and reports them in
+    /// `data.tags.backup`, and the git verdict stands.
+    #[tokio::test]
+    async fn pair_tag_backup_reported_after_git_restore_failed() {
+        // The backup's project never follows, so its repository stays unsynced
+        // and the git step ends `git_restore_failed`. Its tags do not hold.
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node(usize::MAX);
+        backup.tags_differ = true;
+        let result = rig
+            .apply_pair(&backup, std::time::Duration::from_millis(80))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        let report = result
+            .tags
+            .as_ref()
+            .and_then(|t| t.backup.as_ref())
+            .expect("data.tags.backup is reported");
+        assert!(!report.converged, "{report:?}");
+        assert!(report.reason.is_some(), "{report:?}");
+
+        // When the tags converge the report says so, and the verdict is the
+        // same.
+        let rig = Rig::tagged_pair(true);
+        let backup = rig.backup_node(usize::MAX);
+        let result = rig
+            .apply_pair(&backup, std::time::Duration::from_millis(80))
+            .await
+            .expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let report = result
+            .tags
+            .as_ref()
+            .and_then(|t| t.backup.as_ref())
+            .expect("data.tags.backup is reported");
+        assert!(report.converged, "{report:?}");
     }
 }
