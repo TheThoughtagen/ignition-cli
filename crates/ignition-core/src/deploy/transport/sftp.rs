@@ -9895,9 +9895,10 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             .fetch_git_objects("CapApp", &sized, again.path())
             .await
             .expect_err("hostile");
+        let d = detail(err);
         assert!(
-            detail(err).contains("projects/CapApp/.git/"),
-            "names the git read"
+            d.contains("projects/CapApp/.git/"),
+            "names the git read: {d}"
         );
         assert!(
             staged_left(&hostile).is_empty(),
