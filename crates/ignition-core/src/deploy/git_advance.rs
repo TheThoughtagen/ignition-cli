@@ -737,7 +737,7 @@ fn write_member(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), AdvanceFailu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::deploy::git_state::{GitFiles, GitHead, classify};
     use crate::deploy::transport::projects::GitEntry;
@@ -988,7 +988,7 @@ mod tests {
         }
     }
 
-    fn read_git_files(git_dir: &Path) -> GitFiles {
+    pub(crate) fn read_git_files(git_dir: &Path) -> GitFiles {
         let read = |rel: &str| std::fs::read(git_dir.join(rel)).ok();
         let mut files = GitFiles::without_contents(GitEntry::Directory);
         files.head = read("HEAD");

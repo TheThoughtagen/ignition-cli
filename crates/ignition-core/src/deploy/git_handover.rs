@@ -117,10 +117,13 @@ impl fmt::Display for GitRestoreFailure {
 impl std::error::Error for GitRestoreFailure {}
 
 /// Copy the project's `.git` to the host-local save of `run_id`, and check
-/// that the copy reads back as the manifest the writer reported.
+/// that the copy reads back as the manifest the writer reported. `root` is
+/// the node's ledger root ([`LedgerRoot::for_node`]), under which the writer
+/// keeps the save; the report's `path` names that location.
 pub async fn save(
     read: &dyn GitHostRead,
     write: &dyn GitStateWriter,
+    root: LedgerRoot,
     gateway: &str,
     project: &str,
     run_id: &str,
@@ -136,7 +139,7 @@ pub async fn save(
         gateway: gateway.to_string(),
         project: project.to_string(),
         run_id: run_id.to_string(),
-        path: git_save_location(LedgerRoot::DataDir, gateway, project, run_id),
+        path: git_save_location(root, gateway, project, run_id),
         manifest,
     })
 }
@@ -495,4 +498,162 @@ pub async fn restore_unchanged(
 
 fn describe(name: &GitWriteName) -> String {
     format!(".git/{}", name.rel())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deploy::git_advance::GitWrite;
+    use crate::deploy::git_advance::tests::read_git_files;
+    use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
+    use crate::deploy::transport::projects::{GitSize, ImportDir};
+    use std::path::PathBuf;
+
+    /// A host whose project `.git` is a directory on this machine; the save
+    /// is never read back here, so it answers one fixed manifest.
+    struct DirHost {
+        git_dir: PathBuf,
+    }
+
+    fn manifest() -> GitManifest {
+        GitManifest {
+            files: 1,
+            bytes: 1,
+            digest: "0".repeat(64),
+        }
+    }
+
+    fn not_used() -> CoreError {
+        CoreError::Internal("this host call is not part of the handover under test".to_string())
+    }
+
+    #[async_trait::async_trait]
+    impl GitHostRead for DirHost {
+        async fn read_git_state(
+            &self,
+            _project: &str,
+        ) -> Result<super::super::git_state::GitFiles, CoreError> {
+            Ok(read_git_files(&self.git_dir))
+        }
+        async fn git_manifest(&self, _project: &str) -> Result<GitManifest, CoreError> {
+            Err(not_used())
+        }
+        async fn save_manifest(
+            &self,
+            _gateway: &str,
+            _project: &str,
+            _run_id: &str,
+        ) -> Result<GitManifest, CoreError> {
+            Ok(manifest())
+        }
+        async fn git_file_digest(
+            &self,
+            _project: &str,
+            name: &GitWriteName,
+        ) -> Result<Option<String>, CoreError> {
+            Ok(std::fs::read(self.git_dir.join(name.rel()))
+                .ok()
+                .map(|bytes| format!("{:x}", Sha256::digest(bytes))))
+        }
+        async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+            Err(not_used())
+        }
+        async fn project_dir_entry(
+            &self,
+            _project: &str,
+            _dir: ImportDir,
+        ) -> Result<GitEntry, CoreError> {
+            Err(not_used())
+        }
+        async fn free_bytes(&self, _gateway: &str, _project: &str) -> Result<u64, CoreError> {
+            Err(not_used())
+        }
+        async fn git_size(&self, _project: &str) -> Result<GitSize, CoreError> {
+            Err(not_used())
+        }
+        async fn list_git_objects(&self, _project: &str) -> Result<GitObjectList, CoreError> {
+            Err(not_used())
+        }
+        async fn fetch_git_objects(
+            &self,
+            _project: &str,
+            _files: &[GitObjectFile],
+            _dest: &Path,
+        ) -> Result<(), CoreError> {
+            Err(not_used())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for DirHost {
+        async fn save_git(
+            &self,
+            _gateway: &str,
+            _project: &str,
+            _run_id: &str,
+        ) -> Result<GitManifest, CoreError> {
+            Ok(manifest())
+        }
+        async fn restore_git(
+            &self,
+            _gateway: &str,
+            _project: &str,
+            _run_id: &str,
+        ) -> Result<GitManifest, CoreError> {
+            Err(not_used())
+        }
+        async fn write_git_files(
+            &self,
+            _project: &str,
+            writes: &[GitWrite],
+        ) -> Result<(), CoreError> {
+            for write in writes {
+                let path = self.git_dir.join(write.name.rel());
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                std::fs::write(path, &write.bytes).expect("write");
+            }
+            Ok(())
+        }
+        async fn remove_git_save(
+            &self,
+            _gateway: &str,
+            _project: &str,
+            _run_id: &str,
+        ) -> Result<(), CoreError> {
+            Err(not_used())
+        }
+        async fn probe_write(&self, _project: &str, _run_id: &str) -> Result<(), CoreError> {
+            Err(not_used())
+        }
+    }
+
+    /// The save's path is named under the node's own ledger root: an `ssh`
+    /// node keeps it in the account home, a `local` node in its data dir.
+    #[tokio::test]
+    async fn save_path_follows_the_ledger_root() {
+        let host = DirHost {
+            git_dir: PathBuf::from("unused"),
+        };
+        let home = save(
+            &host,
+            &host,
+            LedgerRoot::AccountHome,
+            "gw-a",
+            "CapApp",
+            "r1",
+        )
+        .await
+        .expect("save");
+        assert_eq!(
+            home.path,
+            "~/ign-deploy/gw-a/projects/CapApp/git-save/r1/repo"
+        );
+        let data = save(&host, &host, LedgerRoot::DataDir, "gw-a", "CapApp", "r1")
+            .await
+            .expect("save");
+        assert_eq!(
+            data.path,
+            "ign-deploy/gw-a/projects/CapApp/git-save/r1/repo"
+        );
+    }
 }
