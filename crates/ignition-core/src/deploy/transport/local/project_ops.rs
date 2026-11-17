@@ -1055,7 +1055,7 @@ impl LocalFsTransport {
                 }
                 digest.update(format!("{:x}", hasher.finalize()).as_bytes());
             }
-            digest.update([b'\n']);
+            digest.update(*b"\n");
         }
         Ok(GitManifest {
             files,
@@ -2694,7 +2694,7 @@ mod tests {
             digest.update(path.as_bytes());
             digest.update([0u8]);
             digest.update(value.as_bytes());
-            digest.update([b'\n']);
+            digest.update(*b"\n");
         }
         assert_eq!(manifest.digest, format!("{:x}", digest.finalize()));
     }
