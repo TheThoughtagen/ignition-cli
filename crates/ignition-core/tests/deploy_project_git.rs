@@ -21,7 +21,9 @@ use ignition_core::deploy::git_handover::{
     GitRestoreFailure, GitRestoreReport, RESTORE_REASONS, restore_and_advance, save,
 };
 use ignition_core::deploy::git_remote::{GitDir, HostGit};
-use ignition_core::deploy::git_state::{GitState, url_key};
+use ignition_core::deploy::git_state::GitState;
+#[cfg(unix)]
+use ignition_core::deploy::git_state::url_key;
 use ignition_core::deploy::project_artifact::{CanonicalDigest, canonical_digest};
 use ignition_core::deploy::transport::projects::{GitHostRead, GitStateWriter};
 
@@ -1894,6 +1896,7 @@ mod published {
         }
 
         /// A host whose host git is `program`.
+        #[cfg(unix)]
         pub fn host_with_program(&self, program: &std::path::Path) -> StubHost {
             StubHost {
                 inner: self.f.node(),
@@ -2695,7 +2698,9 @@ mod published {
     }
 
     /// Makes a directory writable again so the temp dir can be removed.
+    #[cfg(unix)]
     struct Unlock(PathBuf);
+    #[cfg(unix)]
     impl Drop for Unlock {
         fn drop(&mut self) {
             #[cfg(unix)]

@@ -5872,7 +5872,8 @@ mod sftp_git {
 /// The Windows git scripts of 27-09 (`winps::GIT_*`): their size against the
 /// command budget, their parameter discipline, and their behaviour under the
 /// local `pwsh` against the same fixture the POSIX and local implementations
-/// are held to.
+/// are held to. Unix only: the `pwsh` driver and the mode checks are Unix.
+#[cfg(unix)]
 mod winps_git {
     use super::*;
     use common::git_fixture::{GATEWAY, GitFixture, PROJECT};

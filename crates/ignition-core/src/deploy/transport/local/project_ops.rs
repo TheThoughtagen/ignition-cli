@@ -616,15 +616,16 @@ fn mode_of(_meta: &std::fs::Metadata) -> u32 {
 
 /// Create the directory `path` (one level) with `mode` on Unix.
 fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(mode);
+        std::fs::DirBuilder::new().mode(mode).create(path)
     }
     #[cfg(not(unix))]
-    let _ = mode;
-    builder.create(path)
+    {
+        let _ = mode;
+        std::fs::DirBuilder::new().create(path)
+    }
 }
 
 /// Give the directory `path` exactly `mode` (27-31, security review 3).
@@ -2268,6 +2269,7 @@ mod tests {
     /// A data dir holding a complete save of run `RUN` for `gw`/`CapApp`
     /// and a project directory with no `.git` (the state after an import).
     const SAVE_RUN: &str = "20261114T101500Z-ab12";
+    #[cfg(unix)]
     const SAVE_LEVELS: [&str; 6] = [
         "ign-deploy",
         "gw",

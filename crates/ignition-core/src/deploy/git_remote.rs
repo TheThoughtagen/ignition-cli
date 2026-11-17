@@ -2940,6 +2940,7 @@ mod tests {
     }
 
     /// The raw bytes of `path` at `commit`, as git stores them.
+    #[cfg(unix)]
     fn blob_bytes(repo: &Path, commit: &str, path: &str) -> Vec<u8> {
         let out = Command::new("git")
             .args(["cat-file", "blob", &format!("{commit}:{path}")])
