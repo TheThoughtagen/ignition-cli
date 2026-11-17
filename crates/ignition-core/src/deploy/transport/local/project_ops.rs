@@ -1590,6 +1590,38 @@ impl LocalFsTransport {
         Ok(())
     }
 
+    /// `levels` below `git`, each a real directory, none followed: a symlink
+    /// or another kind of entry refuses, naming the level; `None` when a level
+    /// is absent (nothing below it exists). Path resolution follows a linked
+    /// ancestor, so a check of the final entry alone does not see one.
+    fn git_dirs_real(&self, git: &Path, levels: &[&str]) -> Result<Option<PathBuf>, CoreError> {
+        let mut path = git.to_path_buf();
+        for (index, part) in levels.iter().enumerate() {
+            path.push(part);
+            let shown = levels[..=index].join("/");
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_dir() => {}
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(self.fail(format!("{shown} is a symlink; symlinks are refused")));
+                }
+                Ok(_) => return Err(self.fail(format!("{shown} is not a directory"))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(self.fail(format!("{shown} cannot be inspected ({})", e.kind())));
+                }
+            }
+        }
+        Ok(Some(path))
+    }
+
+    /// `rel` below `git` once every directory above its last component passed
+    /// [`Self::git_dirs_real`]; `None` when one of them is absent.
+    fn git_file_path(&self, git: &Path, rel: &str) -> Result<Option<PathBuf>, CoreError> {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let (last, parents) = parts.split_last().unwrap_or((&"", &[]));
+        Ok(self.git_dirs_real(git, parents)?.map(|dir| dir.join(last)))
+    }
+
     /// A capped read of a regular file; `None` when it does not exist.
     fn read_git_small(
         &self,
@@ -1597,9 +1629,9 @@ impl LocalFsTransport {
         rel: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>, CoreError> {
-        let path = rel
-            .split('/')
-            .fold(git.to_path_buf(), |p, part| p.join(part));
+        let Some(path) = self.git_file_path(git, rel)? else {
+            return Ok(None);
+        };
         match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(self.fail(format!("{rel} cannot be inspected ({})", e.kind()))),
@@ -1698,8 +1730,10 @@ impl LocalFsTransport {
             }
         }
         for prefix in ["refs/heads", "refs/remotes"] {
-            let dir = prefix.split('/').fold(git.clone(), |p, part| p.join(part));
-            self.collect_loose_refs(&dir, prefix, &mut files.loose_refs)?;
+            let levels: Vec<&str> = prefix.split('/').collect();
+            if let Some(dir) = self.git_dirs_real(&git, &levels)? {
+                self.collect_loose_refs(&dir, prefix, &mut files.loose_refs)?;
+            }
         }
         files.head_log_tail = self.read_log_tail(&git)?;
         Ok(files)
@@ -1707,7 +1741,9 @@ impl LocalFsTransport {
 
     /// The last [`GIT_LOG_TAIL_MAX`] bytes of `logs/HEAD`.
     fn read_log_tail(&self, git: &Path) -> Result<Option<Vec<u8>>, CoreError> {
-        let path = git.join("logs").join("HEAD");
+        let Some(path) = self.git_file_path(git, "logs/HEAD")? else {
+            return Ok(None);
+        };
         let meta = match std::fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
@@ -2115,7 +2151,9 @@ impl GitHostRead for LocalFsTransport {
                 .map_err(|why| this.fail(format!("a .git file name is refused: {why}")))?;
             let git = this.live_git_dir("read", &project)?;
             let rel = name.rel();
-            let path = rel.split('/').fold(git, |p, part| p.join(part));
+            let Some(path) = this.git_file_path(&git, &rel)? else {
+                return Ok(None);
+            };
             match std::fs::symlink_metadata(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(this.fail(format!("{rel} cannot be inspected ({})", e.kind()))),
@@ -2740,6 +2778,67 @@ mod tests {
             std::fs::read(git.join("HEAD")).expect("HEAD"),
             b"ref: refs/heads/main\n"
         );
+    }
+
+    /// CodeRabbit #56: a symlinked directory above a `.git` file the state
+    /// read or the digest opens refuses, naming the level; nothing behind the
+    /// link is read as the repo's. `refs` and `refs/heads` (the roots of the
+    /// loose-ref walk), `logs` (above `logs/HEAD`) and a directory inside
+    /// `refs/heads` above a branch ref.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_git_reads_refuse_a_symlinked_parent_level() {
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("heads")).expect("heads");
+        std::fs::write(outside.path().join("heads/stolen"), "1111\n").expect("ref");
+        std::fs::write(outside.path().join("HEAD"), "0 1 x\n").expect("log");
+        std::fs::write(outside.path().join("b"), "2222\n").expect("leaf");
+        for (level, target) in [
+            ("refs/heads", outside.path().join("heads")),
+            ("refs", outside.path().to_path_buf()),
+            ("logs", outside.path().to_path_buf()),
+        ] {
+            let dir = data_with_projects();
+            let git = dir.path().join("projects/CapApp/.git");
+            std::fs::create_dir_all(git.join("refs/heads")).expect("refs");
+            std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+            let at = git.join(level);
+            if at.exists() {
+                std::fs::remove_dir_all(&at).expect("rm level");
+            }
+            std::os::unix::fs::symlink(&target, &at).expect("link");
+            let err = host(dir.path())
+                .read_git_state("CapApp")
+                .await
+                .expect_err(level);
+            assert_eq!(err.code(), "transport_failed", "{level}");
+            assert!(err.to_string().contains("symlink"), "{level}: {err}");
+        }
+        for (level, name) in [
+            ("refs/heads/a", GitWriteName::BranchRef("a/b".to_string())),
+            ("refs", GitWriteName::BranchRef("b".to_string())),
+        ] {
+            let dir = data_with_projects();
+            let git = dir.path().join("projects/CapApp/.git");
+            std::fs::create_dir_all(git.join("refs/heads")).expect("refs");
+            let at = git.join(level);
+            if at.exists() {
+                std::fs::remove_dir_all(&at).expect("rm level");
+            }
+            let target = if level == "refs" {
+                std::fs::create_dir_all(outside.path().join("r/heads")).expect("r");
+                std::fs::write(outside.path().join("r/heads/b"), "2222\n").expect("leaf");
+                outside.path().join("r")
+            } else {
+                outside.path().to_path_buf()
+            };
+            std::os::unix::fs::symlink(&target, &at).expect("link");
+            let err = host(dir.path())
+                .git_file_digest("CapApp", &name)
+                .await
+                .expect_err(level);
+            assert!(err.to_string().contains("symlink"), "{level}: {err}");
+        }
     }
 
     /// A data dir whose `projects/Plain` holds a `.git` of three files.
