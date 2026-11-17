@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::fake_projects::FakeProjects;
+use common::git_fixture::{GitFixture, members_of};
 use ignition_core::actions::deploy::load_target;
 use ignition_core::actions::deploy_projects::{
     DeployRehearsalResult, LoadedProject, NoProjectsObserver, ProjectGateway, ProjectsInput,
@@ -67,6 +68,10 @@ fn members() -> Vec<(&'static str, Vec<u8>)> {
 /// `rig-gw`), each with its own data directory.
 struct Checkout {
     _scratch: tempfile::TempDir,
+    /// The git fixture whose release checkout and gateway clone are `repo`
+    /// and `data` (27-20), kept alive here.
+    git: Option<GitFixture>,
+    release: String,
     repo: PathBuf,
     targets: PathBuf,
     data: PathBuf,
@@ -111,6 +116,57 @@ impl Checkout {
         );
         let checkout = Checkout {
             _scratch: scratch,
+            git: None,
+            release: "v1.0.0".to_string(),
+            repo,
+            targets,
+            data,
+            rig_data,
+        };
+        checkout.prod_target("");
+        checkout.rig_target("rig-gw", "");
+        checkout
+    }
+
+    /// As [`Checkout::new`], over a git fixture: the release checkout is at
+    /// `v1.1.0` and the production gateway's project directory is a module
+    /// clone at the commit before (a managed `.git`, 27-20).
+    fn managed() -> Self {
+        let git = GitFixture::new();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let targets = scratch.path().join("targets-root");
+        let rig_data = scratch.path().join("rig-data");
+        std::fs::create_dir_all(rig_data.join("projects")).expect("data dir");
+        let repo = git.checkout.clone();
+        let data = git.data_dir.clone();
+        put(
+            &repo,
+            "deploy/project.yaml",
+            format!(
+                "schema_version: 1\nproject: {PROJECT}\nenvironments: [dev]\ntag_providers: \
+                 [{PROVIDER}]\n"
+            )
+            .as_bytes(),
+        );
+        put(
+            &repo,
+            &format!("deploy/tag-providers/{PROVIDER}.json"),
+            serde_json::to_vec(
+                &json!({"schema_version": 1, "enabled": true, "config": standard()}),
+            )
+            .expect("json")
+            .as_slice(),
+        );
+        put(&repo, ".gitignore", b".ign/\n");
+        put(
+            &data,
+            "config/resources/core/ignition/system-properties/config.json",
+            br#"{"systemName":"capgw"}"#,
+        );
+        let checkout = Checkout {
+            _scratch: scratch,
+            git: Some(git),
+            release: "v1.1.0".to_string(),
             repo,
             targets,
             data,
@@ -163,9 +219,11 @@ impl Checkout {
             repo: self.repo.clone(),
             targets: self.targets.clone(),
             env: "dev".to_string(),
-            release: "v1.0.0".to_string(),
+            release: self.release.clone(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             allow_manual_undo: true,
             artifact_sha256: None,
@@ -223,6 +281,26 @@ impl Checkout {
 async fn production(repo: &Checkout, tree: Value) -> FakeProjects {
     let gateway = FakeProjects::new()
         .with_project(PROJECT, None, false, &members())
+        .with_tag_tree(PROVIDER, tree);
+    gateway.set_provider_settings(PROVIDER, true, None, standard());
+    let live = gateway.export_bytes(PROJECT).await.expect("export");
+    let digest =
+        ignition_core::deploy::project_artifact::canonical_digest(&live).expect("an export");
+    repo.records(&digest.sha256);
+    gateway
+}
+
+/// As [`production`], for a [`Checkout::managed`] repo: the live project is
+/// what the gateway clone's directory holds now.
+async fn managed_production(repo: &Checkout, tree: Value) -> FakeProjects {
+    let git = repo.git.as_ref().expect("a managed checkout");
+    let members = members_of(&git.project_dir());
+    let borrowed: Vec<(&str, Vec<u8>)> = members
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.clone()))
+        .collect();
+    let gateway = FakeProjects::new()
+        .with_project(PROJECT, None, false, &borrowed)
         .with_tag_tree(PROVIDER, tree);
     gateway.set_provider_settings(PROVIDER, true, None, standard());
     let live = gateway.export_bytes(PROJECT).await.expect("export");
@@ -375,7 +453,13 @@ async fn rehearse(
     let env = surfaces(&tap, &host);
     let target = rehearsal(repo, rig, &rig_host);
     let result = match deploy_projects_rehearse_prepare(&loaded, &input, &env, &target).await {
-        Ok(prepared) => {
+        Ok(mut prepared) => {
+            assert_eq!(
+                prepared.seed_settle,
+                Duration::from_secs(20),
+                "prepare sets the real seed settle"
+            );
+            prepared.seed_settle = Duration::ZERO;
             deploy_projects_rehearse(
                 prepared,
                 &loaded,
@@ -879,9 +963,10 @@ async fn manual_undo_is_reported_and_cleaned_up() {
     let rig = rig_gateway();
     let env = surfaces(&tap, &host);
     let target = rehearsal(&repo, &rig, &rig_host);
-    let prepared = deploy_projects_rehearse_prepare(&loaded, &strict, &env, &target)
+    let mut prepared = deploy_projects_rehearse_prepare(&loaded, &strict, &env, &target)
         .await
         .expect("prepared");
+    prepared.seed_settle = Duration::ZERO;
     let err = deploy_projects_rehearse(
         prepared,
         &loaded,
@@ -915,4 +1000,310 @@ async fn manual_undo_is_reported_and_cleaned_up() {
     .expect("a tree");
     assert!(!left.contains_key("Line1/Speed"), "{left:?}");
     assert!(left.contains_key("Line1"));
+}
+
+/// 27-20 (GITDEP-10): a rehearsal whose production project holds a
+/// module-managed `.git` keeps working. Its git reads run in report mode.
+mod git_rehearse {
+    use super::*;
+    use ignition_core::deploy::git_state::GitFiles;
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, GitHostRead, GitManifest, GitSize, ImportDir, ProjectHost,
+    };
+
+    /// A production host whose gateway-repo read fails like an unreadable
+    /// host does, and answers everything else like the local transport.
+    struct Unreadable(LocalFsTransport);
+
+    #[async_trait::async_trait]
+    impl ProjectHost for Unreadable {
+        async fn git_entry(&self, project: &str) -> Result<GitEntry, CoreError> {
+            self.0.git_entry(project).await
+        }
+        async fn read_release_record(
+            &self,
+            gateway: &str,
+            project: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            self.0.read_release_record(gateway, project).await
+        }
+        async fn read_tag_record(
+            &self,
+            gateway: &str,
+            provider: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            self.0.read_tag_record(gateway, provider).await
+        }
+        async fn read_journal(
+            &self,
+            gateway: &str,
+            project: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            ProjectHost::read_journal(&self.0, gateway, project).await
+        }
+        async fn read_pre_image(
+            &self,
+            gateway: &str,
+            project: &str,
+            name: &str,
+        ) -> Result<Option<Vec<u8>>, CoreError> {
+            self.0.read_pre_image(gateway, project, name).await
+        }
+        fn git(&self) -> Option<&dyn GitHostRead> {
+            Some(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitHostRead for Unreadable {
+        async fn read_git_state(&self, _project: &str) -> Result<GitFiles, CoreError> {
+            Err(CoreError::TransportFailed {
+                operation: "read".to_string(),
+                node: "nodes.master".to_string(),
+                detail: "the host did not answer".to_string(),
+            })
+        }
+        async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError> {
+            self.0.git_manifest(project).await
+        }
+        async fn save_manifest(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<GitManifest, CoreError> {
+            self.0.save_manifest(gateway, project, run_id).await
+        }
+        async fn git_file_digest(
+            &self,
+            project: &str,
+            name: &ignition_core::deploy::git_advance::GitWriteName,
+        ) -> Result<Option<String>, CoreError> {
+            self.0.git_file_digest(project, name).await
+        }
+        async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError> {
+            self.0.read_git_yaml().await
+        }
+        async fn project_dir_entry(
+            &self,
+            project: &str,
+            dir: ImportDir,
+        ) -> Result<GitEntry, CoreError> {
+            self.0.project_dir_entry(project, dir).await
+        }
+        async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError> {
+            self.0.free_bytes(gateway, project).await
+        }
+        async fn git_size(&self, project: &str) -> Result<GitSize, CoreError> {
+            self.0.git_size(project).await
+        }
+        async fn list_git_objects(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_objects::GitObjectList, CoreError> {
+            self.0.list_git_objects(project).await
+        }
+        async fn fetch_git_objects(
+            &self,
+            project: &str,
+            files: &[ignition_core::deploy::git_objects::GitObjectFile],
+            dest: &Path,
+        ) -> Result<(), CoreError> {
+            self.0.fetch_git_objects(project, files, dest).await
+        }
+    }
+
+    /// The repo owning `Scanner`/`S1` with the shape change of
+    /// [`shape_change`], over the git fixture.
+    fn tags(repo: &Checkout) {
+        repo.tag("_types_/Scale", SCALE_TYPE);
+        repo.tag("_types_/Scanner", SCANNER_INSTANCE);
+        repo.tag("Line1/S1", S1_INSTANCE);
+    }
+
+    fn warnings_of(result: &DeployRehearsalResult) -> String {
+        result.warnings.join("\n")
+    }
+
+    /// Every file under `dir` with its bytes, in path order.
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("below root")
+                    .display()
+                    .to_string()
+                    // `/` on every platform, as the assertions spell paths
+                    .replace('\\', "/");
+                if path.is_dir() {
+                    out.push((format!("{rel}/"), Vec::new()));
+                    walk(root, &path, out);
+                } else {
+                    out.push((rel, std::fs::read(&path).expect("read")));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    /// A dirty production repo (live changes since the gateway HEAD that the
+    /// apply would refuse to discard): the rehearsal runs, names the gate in
+    /// `data.git` and warns that the apply would refuse.
+    #[tokio::test]
+    async fn git_rehearse_managed_dirty_still_runs() {
+        let repo = Checkout::managed();
+        tags(&repo);
+        let view = "com.inductiveautomation.perspective/views/V/view.json";
+        let git = repo.git.as_ref().expect("git");
+        git.live_change(view, "{\"root\":{\"live\":true}}\n");
+        let prod = managed_production(&repo, scanner_tree(SCANNER_FOLDER, S1_FOLDER)).await;
+        let rig = rig_gateway();
+
+        // The apply's plan refuses this very repo.
+        let input = repo.input();
+        let loaded = load_project(&input).expect("loads");
+        let refused = deploy_projects_prepare(&loaded, &input, &surfaces(&prod, &repo.host()))
+            .await
+            .expect_err("the apply plan refuses a dirty repo");
+        assert_eq!(refused.code(), "destructive_change_refused", "{refused}");
+
+        let (result, writes) = rehearse(&repo, &prod, &rig).await;
+        let result = result.expect("a verdict, not a refusal");
+        assert_eq!(writes, 0, "production took no write");
+        let data = json_of(&result);
+        assert!(result.ok, "{data:#}");
+        assert_eq!(data["rehearsal"]["verdict"], "green", "{data:#}");
+        let node = &data["git"]["nodes"][0];
+        assert_eq!(node["state"], "managed", "{data:#}");
+        assert_eq!(node["reason"], "git_dirty", "{data:#}");
+        assert_eq!(node["dirty"], json!([view]), "{data:#}");
+        let warnings = warnings_of(&result);
+        assert!(
+            warnings.contains("the apply would refuse") && warnings.contains("gate git_dirty (1)"),
+            "{warnings}"
+        );
+        assert!(
+            !data.to_string().contains(&repo.repo.display().to_string()),
+            "no checkout path in the result"
+        );
+    }
+
+    /// A production repo the deploy cannot hand over (a detached HEAD): the
+    /// rehearsal runs and reports the `project_git_managed` reason.
+    #[tokio::test]
+    async fn git_rehearse_unsupported_still_runs() {
+        let repo = Checkout::managed();
+        tags(&repo);
+        repo.git
+            .as_ref()
+            .expect("git")
+            .git_in_project(&["checkout", "-q", "--detach"]);
+        let prod = managed_production(&repo, scanner_tree(SCANNER_FOLDER, S1_FOLDER)).await;
+        let rig = rig_gateway();
+
+        let (result, writes) = rehearse(&repo, &prod, &rig).await;
+        let result = result.expect("a verdict, not a refusal");
+        assert_eq!(writes, 0);
+        let data = json_of(&result);
+        assert!(result.ok, "{data:#}");
+        assert_eq!(data["rehearsal"]["verdict"], "green", "{data:#}");
+        let node = &data["git"]["nodes"][0];
+        assert_eq!(node["state"], "unsupported", "{data:#}");
+        assert_eq!(node["reason"], "detached_head", "{data:#}");
+        assert!(
+            warnings_of(&result).contains("project_git_managed, reason detached_head"),
+            "{}",
+            warnings_of(&result)
+        );
+    }
+
+    /// A clean managed production repo reports its facts and no refusal.
+    #[tokio::test]
+    async fn git_rehearse_clean_reports_the_facts() {
+        let repo = Checkout::managed();
+        tags(&repo);
+        let prod = managed_production(&repo, scanner_tree(SCANNER_FOLDER, S1_FOLDER)).await;
+        let rig = rig_gateway();
+
+        let (result, _) = rehearse(&repo, &prod, &rig).await;
+        let result = result.expect("a verdict");
+        let data = json_of(&result);
+        assert!(result.ok, "{data:#}");
+        let node = &data["git"]["nodes"][0];
+        assert_eq!(node["state"], "managed", "{data:#}");
+        assert_eq!(node["reason"], Value::Null, "{data:#}");
+        assert_eq!(node["dirty"], json!([]), "{data:#}");
+        assert!(
+            !warnings_of(&result).contains("would refuse"),
+            "{}",
+            warnings_of(&result)
+        );
+    }
+
+    /// A host read that fails is still a transport failure: report mode never
+    /// hides it.
+    #[tokio::test]
+    async fn git_rehearse_transport_failure_refuses() {
+        let repo = Checkout::managed();
+        tags(&repo);
+        let prod = managed_production(&repo, scanner_tree(SCANNER_FOLDER, S1_FOLDER)).await;
+        let rig = rig_gateway();
+        let input = repo.input();
+        let loaded = load_project(&input).expect("loads");
+        let tap = ReadOnlyTap::new(&prod);
+        let host = Unreadable(repo.host());
+        let rig_host = repo.rig_host();
+        let env = ProjectsSurfaces {
+            gateway: &tap,
+            host: &host,
+            tree: None,
+            apply_host: None,
+            deploy: None,
+            tag_delete: TagDeleteSurface::NotConfigured { missing: vec![] },
+        };
+        let target = rehearsal(&repo, &rig, &rig_host);
+        let err = deploy_projects_rehearse_prepare(&loaded, &input, &env, &target)
+            .await
+            .expect_err("a transport failure refuses");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert_eq!(tap.writes(), 0);
+    }
+
+    /// The rehearsal builds no git writer and writes nothing below the
+    /// production data directory: the gateway repo and everything else there
+    /// is byte-identical afterwards.
+    #[tokio::test]
+    async fn git_rehearse_no_writer() {
+        let repo = Checkout::managed();
+        tags(&repo);
+        let prod = managed_production(&repo, scanner_tree(SCANNER_FOLDER, S1_FOLDER)).await;
+        let rig = rig_gateway();
+        let before = snapshot(&repo.data);
+        assert!(
+            before.iter().any(|(p, _)| p.ends_with(".git/HEAD")),
+            "the fixture holds a gateway repo"
+        );
+
+        let (result, writes) = rehearse(&repo, &prod, &rig).await;
+        let result = result.expect("a verdict");
+        assert!(result.ok);
+        assert_eq!(writes, 0);
+        assert_eq!(
+            snapshot(&repo.data),
+            before,
+            "production's host is untouched"
+        );
+        assert!(
+            !include_str!("../src/actions/deploy_projects/rehearse.rs").contains("GitStateWriter"),
+            "the rehearsal names no git writer"
+        );
+    }
 }

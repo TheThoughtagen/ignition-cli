@@ -997,7 +997,7 @@ pub enum CoreError {
     /// location below the data directory and the kind (`directory`, `file`,
     /// `symlink`, `other`) only.
     #[error(
-        "project {project} is still managed by the git module: {location} is present ({kind}); an administrator removes it before this project is deployed"
+        "project {project}: its git repository at {location} cannot be handed over by this deploy ({reason})"
     )]
     ProjectGitManaged {
         /// The gateway project name.
@@ -1006,6 +1006,11 @@ pub enum CoreError {
         location: String,
         /// What the entry is.
         kind: String,
+        /// Why the repository cannot be handed over: one of the reason
+        /// words of the 27-12 contract (`git_state::HOST_REASONS`,
+        /// `remote_mismatch`, `release_not_on_branch`, `branch_required`,
+        /// `nodes_disagree`).
+        reason: String,
     },
 
     /// `deploy projects` refused a project whose parent cannot be used
@@ -1302,6 +1307,21 @@ fn destructive_change_refused_text(gate: &str, keys: &[String], count: usize) ->
         return format!(
             "{entries}; deploy projects never removes every tag a provider's record \
              lists, and no flag permits it"
+        );
+    }
+    // The git gates (27-12): the gateway holds work this release does not.
+    if matches!(gate, "git_unpushed" | "git_not_merged" | "git_dirty") {
+        return format!(
+            "{entries}; the gateway's own work is not in this release: push it and merge it \
+             into the release first, or pass --discard-gateway-changes <reason> to deploy \
+             projects to overwrite it"
+        );
+    }
+    // The module's start-sync hazards (27-18): the kept `.git` re-arms them.
+    if gate == "git_sync_hazard" {
+        return format!(
+            "{entries}; the gateway's git module would run these imports at its next start: \
+             pass --allow-git-sync-hazards <reason> to deploy projects to acknowledge them"
         );
     }
     let (flag, verb) = match gate {
@@ -2228,6 +2248,27 @@ impl CoreError {
                      tag-delete route, which webdev deploy --with-tag-delete installs; nothing \
                      was written"
                     .to_string(),
+                "git_unpushed" | "git_not_merged" | "git_dirty" => "the gateway's git \
+                     module holds work the release lacks (commits that are not on the remote, \
+                     not merged into the release, or live changes not committed); push and \
+                     merge it into the release first, then run the check again. To overwrite \
+                     it on purpose, rerun with --discard-gateway-changes and a reason of 1 to \
+                     500 characters: --check then lists what would go as data.git.would_discard, \
+                     and the run keeps the live project as the pre-image export in its run \
+                     directory, the abandoned commits under refs/ign-discarded/<run-id> in the \
+                     gateway repo, and the saved repository; the reason is recorded in run.json. \
+                     Nothing was written"
+                    .to_string(),
+                "git_sync_hazard" => "keeping the project's .git re-arms the git module's \
+                     start sync, and git.yaml sets the flags named above: import_tags imports \
+                     tag providers from tags/ over the gateway's at the next start (and tags/ \
+                     is present on the node); enforce_branch stashes uncommitted work, \
+                     switches the repository to the tracked branch and pulls. To remove the \
+                     hazard, set the flag false for the project in git.yaml (data directory); \
+                     to deploy anyway, rerun with --allow-git-sync-hazards and a reason of 1 \
+                     to 500 characters, which is recorded in data.git.hazards_acknowledged \
+                     and run.json. Nothing was written"
+                    .to_string(),
                 "provider_emptied" => "the plan would remove every tag this project's record \
                      lists for the provider; drop the provider from tag_providers in \
                      deploy/project.yaml, or keep at least one of its nodes in the repo; \
@@ -2305,10 +2346,31 @@ impl CoreError {
                  in the message by hand"
                     .to_string(),
             ),
-            Self::ProjectGitManaged { .. } => Some(
-                "follow the README cutover runbook: remove this project's .git on the \
-                 gateway (the deploy tool never deletes it), then run the check again"
-                    .to_string(),
+            Self::ProjectGitManaged { reason, .. } => Some(
+                match reason.as_str() {
+                    "remote_mismatch" => {
+                        "add a remote to the release checkout whose URL is the gateway \
+                         repo's origin, then run the check again"
+                    }
+                    "release_not_on_branch" => {
+                        "merge or tag the release on the tracked branch of the remote, then \
+                         run the check again"
+                    }
+                    "branch_required" => {
+                        "name the branch the partial repository is adopted onto: set \
+                         repo_branch for the project in the gateway's git.yaml, or git_branch \
+                         in the target file; the release must be on that branch of the remote"
+                    }
+                    "mid_operation" | "locked" => {
+                        "finish or abort the git operation on the gateway, then run the \
+                         check again"
+                    }
+                    _ => {
+                        "the README section `Projects the git module manages` lists what \
+                         each reason needs; the deploy tool never deletes or renames a .git"
+                    }
+                }
+                .to_string(),
             ),
             Self::ProjectParentInvalid { reason, .. } => Some(
                 match reason.as_str() {
@@ -3091,6 +3153,7 @@ mod tests {
                     project: "CapApp".into(),
                     location: "projects/CapApp/.git".into(),
                     kind: "directory".into(),
+                    reason: "locked".into(),
                 },
                 6,
                 "project_git_managed",
@@ -4081,6 +4144,7 @@ mod tests {
                     project: "CapApp".into(),
                     location: "projects/CapApp/.git".into(),
                     kind: "directory".into(),
+                    reason: "locked".into(),
                 },
                 6,
             ),
@@ -4294,22 +4358,50 @@ mod tests {
             project: "CapApp".into(),
             location: "projects/CapApp/.git".into(),
             kind: "directory".into(),
+            reason: "remote_mismatch".into(),
         };
         assert_eq!(err.code(), "project_git_managed");
         assert_eq!(err.exit_code(), 6);
         let message = err.to_string();
-        for needle in [
-            "CapApp",
-            "projects/CapApp/.git",
-            "directory",
-            "administrator",
-        ] {
+        for needle in ["CapApp", "projects/CapApp/.git", "remote_mismatch"] {
             assert!(message.contains(needle), "{needle}: {message}");
         }
         let hint = err.hint().expect("hint required");
         assert!(!hint.contains("ign "), "{hint}");
-        assert!(hint.contains(".git"), "{hint}");
+        assert!(hint.contains("remote"), "{hint}");
+        // Every reason has a hint that never tells anyone to delete the repo.
+        for reason in [
+            "release_not_on_branch",
+            "branch_required",
+            "locked",
+            "detached_head",
+            "x",
+        ] {
+            let hint = CoreError::ProjectGitManaged {
+                project: "CapApp".into(),
+                location: "projects/CapApp/.git".into(),
+                kind: "directory".into(),
+                reason: reason.into(),
+            }
+            .hint()
+            .expect("hint required");
+            assert!(!hint.contains("remove this project"), "{reason}: {hint}");
+        }
         assert!(CoreError::DEPLOY_SLUGS.contains(&"project_git_managed"));
+        // 27-17: the hint of `branch_required` names both places a branch can
+        // come from, in the order they are tried.
+        let hint = CoreError::ProjectGitManaged {
+            project: "CapApp".into(),
+            location: "projects/CapApp/.git".into(),
+            kind: "directory".into(),
+            reason: "branch_required".into(),
+        }
+        .hint()
+        .expect("hint required");
+        let yaml = hint.find("repo_branch").expect("names repo_branch");
+        let target = hint.find("git_branch").expect("names git_branch");
+        assert!(yaml < target, "{hint}");
+        assert!(!hint.contains("ign "), "{hint}");
     }
 
     /// 25-10: the four-place rule for `project_parent_invalid` (variant,

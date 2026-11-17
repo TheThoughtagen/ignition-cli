@@ -90,6 +90,8 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             // Most runs here create tags in the existing `PlantA` without a
             // tag-delete route: they accept the manual undo, so each keeps
@@ -367,6 +369,7 @@ async fn run_paired(
             tag_verify_poll: Duration::from_millis(5),
             tag_delete_ready: Duration::from_millis(300),
             tag_delete_poll: Duration::from_millis(5),
+            git_writer: None,
             backup: backup.map(|(node, _)| node),
             backup_policy: backup.map(|(_, policy)| policy).unwrap_or_default(),
         },
@@ -4132,6 +4135,7 @@ async fn run_logged(
             tag_verify_poll: Duration::from_millis(5),
             tag_delete_ready: Duration::from_millis(300),
             tag_delete_poll: Duration::from_millis(5),
+            git_writer: None,
             backup: None,
             backup_policy: BackupPolicy::default(),
         },
@@ -4452,6 +4456,7 @@ async fn rollback_run_with(
             tag_verify_poll: Duration::from_millis(5),
             tag_delete_ready: Duration::from_millis(300),
             tag_delete_poll: Duration::from_millis(5),
+            git_writer: None,
             backup: None,
             backup_policy: BackupPolicy::default(),
         },
@@ -6055,6 +6060,7 @@ fn fast_options(input: &ProjectsInput, loaded: &LoadedProject) -> ProjectsRunOpt
         tag_verify_poll: Duration::from_millis(5),
         tag_delete_ready: Duration::from_millis(300),
         tag_delete_poll: Duration::from_millis(5),
+        git_writer: None,
         backup: None,
         backup_policy: BackupPolicy::default(),
     }
@@ -8073,6 +8079,8 @@ async fn created_provider_needs_no_allow_manual_undo() {
     let gateway = without_provider(&repo).await;
     let input = ProjectsInput {
         allow_first_change: Some("a new provider".to_string()),
+        discard_gateway_changes: None,
+        allow_git_sync_hazards: None,
         ..no_manual_undo(&repo)
     };
 

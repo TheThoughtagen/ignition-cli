@@ -49,6 +49,10 @@ inputs:
   targets-token:
     description: Token with contents read on targets-repository only.
     required: true
+  git-token:
+    description: "A token with read access to the project repo's remote over https, used only by ign's own git reads of that remote (the gateway repo's origin); ign scopes it to that remote's host. Leave it empty for an ssh remote, where the runner needs ssh access instead. It reaches ign only as the step environment variable IGNITION_GIT_TOKEN."
+    required: false
+    default: ''
   repo-dir:
     description: Project repo root, relative to the project checkout.
     required: false
@@ -88,7 +92,7 @@ inputs:
 
 outputs:
   outcome:
-    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, rollback_failed, and so on).
+    description: Classified outcome of the apply (created, imported, recorded, skipped, applied, imported_unverified, tags_rolled_back, rolled_back, applied_backup_unsynced, git_restore_failed, git_work_refused, git_sync_hazard_refused, rollback_failed, and so on).
     value: ${{ steps.report.outputs.outcome }}
   run_id:
     description: ign run id of the apply (empty when no run directory was written).
@@ -199,6 +203,7 @@ runs:
         GIT_CONFIG_VALUE_0: 'false'
       with:
         path: project
+        fetch-depth: 0
         persist-credentials: false
 
     - name: Checkout targets
@@ -412,6 +417,7 @@ runs:
         IGN_SSH_KEY: ${{ inputs.ssh-key }}
         IGN_MASTER_TOKEN: ${{ inputs.master-token }}
         IGN_BACKUP_TOKEN: ${{ inputs.backup-token }}
+        IGNITION_GIT_TOKEN: ${{ inputs.git-token }}
         IGN_ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
         IGN_TAGS_SHA256: ${{ inputs.tags-sha256 }}
         IGN_DESIGNERS_TIMEOUT: ${{ inputs.designers-timeout }}
@@ -651,6 +657,10 @@ runs:
             try { return JSON.parse(lines.slice(i).join('\n')); } catch (e) { return null; }
           };
           const list = (v) => (Array.isArray(v) ? v : []);
+          // A value that came out of ign's JSON (a save path, a reason) is untrusted
+          // data: kept as a string, never passed to a shell or into a run: block, and
+          // flattened to one capped line so it cannot add markdown or log commands.
+          const oneLine = (v) => str(v).replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]+/g, ' ').replace(/`/g, "'").trim().slice(0, 300);
 
           // Pure classification of one apply, from the exit code plus the envelopes
           // exactly as ign emits them.
@@ -682,10 +692,23 @@ runs:
             }
             if (exit === 6 && data && (data.outcome === 'imported_unverified' || data.slug === 'deploy_project_unverified')) {
               const restore = data.restore_command ? str(data.restore_command) : '';
+              // Phase 27 (WR-06, D-07): the restore command is a plain overwrite import. It
+              // removes the gateway's .git again, which ign put back unchanged, so the
+              // operator copies it aside first. A K11 git restore that failed is named too,
+              // from data.git.nodes[]; the values stay strings, flattened by oneLine.
+              const gitNodes = data.git && Array.isArray(data.git.nodes) ? data.git.nodes : [];
+              const gitFailed = gitNodes.filter((n) => n && typeof n === 'object' && n.restore && typeof n.restore === 'object' && n.restore.reason);
+              const gitWhere = gitFailed.map((n) => 'node ' + oneLine(n.node) + ': the .git restore failed (' + oneLine(n.restore.reason) +
+                '); saved copy at ' + (n.save && n.save.path ? oneLine(n.save.path) : 'unknown') + ' on that node\'s host');
+              const gitNote = data.git && restore
+                ? '; the restore command\'s import removes the gateway\'s .git again: copy it aside first and put it back after'
+                : '';
               return result(false, 'imported_unverified',
                 prefix + ' deploy_project_unverified: the gateway answered but the project read back is not the artifact' +
-                  (restore ? '; restore the saved pre-image with: ' + restore : '; no pre-image was saved, so there is nothing to restore'),
-                restore ? ['restore command: ' + restore] : []);
+                  (restore ? '; restore the saved pre-image with: ' + restore : '; no pre-image was saved, so there is nothing to restore') +
+                  gitNote +
+                  (gitFailed.length ? '; the gateway\'s .git was not put back on ' + gitFailed.map((n) => oneLine(n.node) + ' (' + oneLine(n.restore.reason) + ', saved copy at ' + (n.save && n.save.path ? oneLine(n.save.path) : 'an unknown path') + ')').join(', ') : ''),
+                (restore ? ['restore command: ' + restore] : []).concat(gitWhere));
             }
             // Tag-owning runs (Phase 26): verdicts on stdout with data.ok false.
             if (exit === 6 && data && data.ok === false && (data.outcome === 'tags_rolled_back' || data.outcome === 'rolled_back')) {
@@ -701,6 +724,34 @@ runs:
                 prefix + ' applied_backup_unsynced (' + str(data.slug) + '): the master applied and recorded the release, the backup did not hold the owned tags (' +
                   str(bk.reason) + '); do not re-run; check the redundant pair',
                 []);
+            }
+            // Phase 27 (D-09): the project is deployed and its release recorded, but the
+            // gateway's .git was not put back. ign names the saved copy; a re-run would
+            // import over a repository that is still missing or changed.
+            if (exit === 6 && data && data.ok === false && data.outcome === 'git_restore_failed') {
+              const nodes = data.git && Array.isArray(data.git.nodes) ? data.git.nodes : [];
+              const failed = nodes.filter((n) => n && typeof n === 'object' && n.restore && typeof n.restore === 'object' && n.restore.reason);
+              const where = failed.map((n) => 'node ' + oneLine(n.node) + ': ' + oneLine(n.restore.reason) +
+                '; saved copy at ' + (n.save && n.save.path ? oneLine(n.save.path) : 'unknown') + ' on that node\'s host');
+              // 27-37: a backup whose project.json is missing or not a regular file will lose
+              // the project on its next restart. ign only detects it; the repository is not
+              // the problem, so this reason gets its own headline and no restore-from-copy step.
+              const isManifest = (n) => oneLine(n.restore.reason) === 'backup_project_json_missing';
+              const manifestNodes = failed.filter(isManifest);
+              const repoNodes = failed.filter((n) => !isManifest(n));
+              const manifestText = 'the backup\'s project.json is missing or not a regular file (backup_project_json_missing) on ' +
+                manifestNodes.map((n) => oneLine(n.node)).join(', ') +
+                ', so the backup will lose the project on its next restart; ign does not repair this (a git module and redundancy defect): ' +
+                'put project.json back on the backup, and do not restart the backup or re-run this workflow until project.json is back';
+              const repoText = 'the gateway\'s .git was not restored' +
+                (repoNodes.length ? ' (' + repoNodes.map((n) => oneLine(n.restore.reason)).join(', ') + ')' : '') +
+                '; the saved copy is at ' + (repoNodes.length ? repoNodes.map((n) => (n.save && n.save.path ? oneLine(n.save.path) : 'an unknown path')).join(', ') : 'the path the run output names') +
+                '; do not re-run this workflow before the repository is restored from it';
+              return result(false, 'git_restore_failed',
+                prefix + ' git_restore_failed (' + oneLine(data.slug) + '): the project is deployed and its release is recorded' +
+                  (manifestNodes.length ? ', but ' + manifestText : '') +
+                  (repoNodes.length || !manifestNodes.length ? (manifestNodes.length ? '; also ' : ', but ') + repoText : ''),
+                where);
             }
             // A tag-owning run whose automatic rollback, or a --rollback-run undo, did not
             // finish: ign's only shape is the stderr error envelope, code rollback_failed,
@@ -766,6 +817,19 @@ runs:
               if (err && err.code === 'destructive_change_refused' && /^provider_emptied\b/.test(str(err.message))) {
                 return result(false, 'destructive_refused',
                   prefix + ' refused: the release removes every tag the project\'s record lists for a provider, which no flag permits; nothing was written; drop the provider from tag_providers in deploy/project.yaml, or keep at least one of its nodes in the repo',
+                  errDetails());
+              }
+              // Phase 27 (WR-07): the git gates share the code and the exit with the other
+              // destructive refusals; the message starts with the gate word. This workflow has
+              // no input for the two flags that pass them, so they will occur in CI.
+              if (err && err.code === 'destructive_change_refused' && /^(git_unpushed|git_not_merged|git_dirty)\b/.test(str(err.message))) {
+                return result(false, 'git_work_refused',
+                  prefix + ' refused: the gateway repository holds work the release lacks (unpushed, unmerged or uncommitted changes); push it and merge it into the release, or an administrator runs the deploy by hand with --discard-gateway-changes; nothing was written',
+                  errDetails());
+              }
+              if (err && err.code === 'destructive_change_refused' && /^git_sync_hazard\b/.test(str(err.message))) {
+                return result(false, 'git_sync_hazard_refused',
+                  prefix + ' refused: the gateway\'s git module would run imports at its next start (git.yaml sync hazards); fix git.yaml, or an administrator runs the deploy by hand with --allow-git-sync-hazards; nothing was written',
                   errDetails());
               }
               if (err && err.code === 'destructive_change_refused') {
