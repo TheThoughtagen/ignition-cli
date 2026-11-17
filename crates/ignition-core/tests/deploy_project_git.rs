@@ -3832,7 +3832,8 @@ mod published {
             .strip_prefix(&rig.f.data_dir)
             .expect("below the data dir")
             .to_string_lossy()
-            .to_string();
+            // ign names a host path with `/` on every platform
+            .replace('\\', "/");
         assert!(
             failure.cause.contains("designer_attached") && failure.cause.contains(&save),
             "the left list names the save path and the reason: {}",
@@ -3994,7 +3995,8 @@ mod published {
             .strip_prefix(&rig.f.data_dir)
             .expect("below the data dir")
             .to_string_lossy()
-            .to_string();
+            // ign names a host path with `/` on every platform
+            .replace('\\', "/");
         assert!(
             failure.cause.contains(&save) && failure.cause.contains("not the one saved"),
             "{}",
@@ -6745,7 +6747,8 @@ mod published {
         assert!(!reads.is_empty());
         assert!(reads.iter().all(|r| r.starts_with("GET ")), "{reads:?}");
         // The source guard: the backup handle's trait has reads only.
-        let trait_src = include_str!("../src/deploy/tag_converge.rs");
+        // LF line ends whatever the checkout gave
+        let trait_src = include_str!("../src/deploy/tag_converge.rs").replace("\r\n", "\n");
         let start = trait_src.find("pub trait BackupTags").expect("trait");
         let end = start + trait_src[start..].find("\n}\n").expect("end of trait");
         for write in ["post", "put", "delete", "import", "resync", "write"] {
@@ -7008,7 +7011,8 @@ mod published {
             .strip_prefix(&rig.f.data_dir)
             .expect("below the data dir")
             .to_string_lossy()
-            .to_string();
+            // ign names a host path with `/` on every platform
+            .replace('\\', "/");
         let text = err.to_string();
         assert!(text.contains(&save), "the save path is named: {text}");
         assert!(text.contains("nodes.master"), "the node is named: {text}");
@@ -7039,7 +7043,8 @@ mod published {
             .strip_prefix(&rig.f.data_dir)
             .expect("below the data dir")
             .to_string_lossy()
-            .to_string();
+            // ign names a host path with `/` on every platform
+            .replace('\\', "/");
         assert!(err.to_string().contains(&save), "{err}");
     }
 
@@ -7217,7 +7222,8 @@ mod published {
             .strip_prefix(&rig.f.data_dir)
             .expect("below the data dir")
             .to_string_lossy()
-            .to_string();
+            // ign names a host path with `/` on every platform
+            .replace('\\', "/");
         assert!(
             failure.cause.contains(&save) && failure.cause.contains("not the one saved"),
             "{}",
