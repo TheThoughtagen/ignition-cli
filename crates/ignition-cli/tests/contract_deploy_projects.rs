@@ -3947,12 +3947,15 @@ fn apply_action_k11_names_git_repository() {
 // 27-20 (D-23, checker W16): the composite actions and the git token.
 // ---------------------------------------------------------------------------
 
-/// The text of a file below the repo root.
+/// The text of a file below the repo root, with LF line ends (a Windows
+/// checkout converts them to CRLF, and the needles here are LF).
 fn repo_file(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// The two composite actions, as `(path, text)`.
