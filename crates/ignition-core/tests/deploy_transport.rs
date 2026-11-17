@@ -4222,7 +4222,7 @@ mod sftp_git {
     }
 
     /// Whether this process ignores mode bits (root), so denial cases cannot run.
-    fn ignores_modes(dir: &Path) -> bool {
+    pub(super) fn ignores_modes(dir: &Path) -> bool {
         let probe = dir.join(".mode-probe");
         std::fs::create_dir_all(&probe).expect("probe dir");
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).expect("chmod");
@@ -6678,6 +6678,12 @@ mod winps_git {
         }
         let fx = GitFixture::new();
         let home = tempfile::tempdir().expect("home");
+        if super::sftp_git::ignores_modes(home.path()) {
+            println!(
+                "running with privileges that ignore mode bits; the 0555 denial case cannot run"
+            );
+            return;
+        }
         let (data, home_s) = (s(&fx.data_dir), s(home.path()));
         pwsh_exec::run(&WinScript::git_save(
             "", &data, PROJECT, &home_s, GATEWAY, RUN,
