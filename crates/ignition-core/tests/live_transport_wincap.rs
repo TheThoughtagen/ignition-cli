@@ -99,6 +99,8 @@ use ignition_core::deploy::tree::{RenderedTree, sha256_hex};
 use ignition_core::error::CoreError;
 use ignition_core::session::Session;
 
+mod common;
+
 const DEFAULT_DATA_DIR: &str = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
 const KEY_ENV: &str = "IGN_WINCAP_KEY";
 /// The scratch tree below the account home; the only thing the write test
@@ -6223,8 +6225,7 @@ async fn wincap_record_replace_blocked_by_reader() {
 // `IGN_WINCAP_GATEWAY_NAME`, default `Ignition-ignwin836`). The guard
 // sends no gateway request, so no API token leaves the machine.
 
-#[path = "common/prod_shape.rs"]
-mod prod_shape;
+use common::prod_shape;
 
 const PROD_SHAPE_ENV: &str = "IGNITION_LIVE_PROD_SHAPE";
 /// Below the account home: the backup, the manifest, the tar and the stage.
@@ -7196,4 +7197,1130 @@ async fn wincap_prod_shape_restore() {
     assert!(remove_tree(&shell, &work).await, "{work} is not gone");
     timed("wincap_prod_shape_restore total", started, ());
     eprintln!("PASS wincap_prod_shape_restore: manifest hash and counts equal");
+}
+
+// ---- the git host scripts of 27-09 (checker W14) ------------------------------
+//
+// Every WinScript of the Windows git host channel (`winps::GIT_*`), run through
+// `SftpTransport` as the deploy account on the production-shape `.git` that
+// 27-07 uploaded (`ign-live-scratch\git27\src.git`, kept for 27-11), before the
+// 27-12 contract checkpoint. The gateway's own data directory is never touched:
+// everything happens below the scratch data root `ign-live-scratch\data27`
+// (project `CapApp27`) and the saves below `ign-deploy\live-scratch27` of the
+// account home; both are removed at the start and at the end.
+//
+// ```text
+// source ~/.config/ign-azure-win/env
+// IGNITION_LIVE_WINCAP=1 IGN_WINCAP_HOST=$IGN_WINVM_HOST IGN_WINCAP_KEY=$IGN_WINVM_KEY \
+//   IGN_WINCAP_PROFILE=$IGN_WINVM_PROFILE \
+//   cargo test -p ignition-core --test live_transport_wincap wincap_git_scripts -- --ignored --nocapture --test-threads=1
+// ```
+
+/// The gateway name the saves of the git gate use, so its `ign-deploy` tree is
+/// its own and its cleanup never touches another gate's.
+const GIT_GATEWAY: &str = "live-scratch27";
+const GIT_PROJECT: &str = "CapApp27";
+const GIT_RUN: &str = "20261114T101500Z-w27a";
+/// The 27-06 Windows host budgets (`HOST_WINDOWS_*` in `common/prod_shape_git.rs`;
+/// `wincap_git_budgets_are_the_27_06_ones` keeps the copies honest).
+const GIT_SAVE_BUDGET: Duration = Duration::from_secs(120);
+const GIT_RESTORE_VERIFY_BUDGET: Duration = Duration::from_secs(120);
+const GIT_PREFLIGHT_BUDGET: Duration = Duration::from_secs(20);
+/// Listing plus fetch of the gateway-object read, and the resolve and digest
+/// after it (`HOST_WINDOWS_GATEWAY_OBJECTS`, `OFFLINE_GATEWAY_DIGEST`).
+const GIT_OBJECTS_BUDGET: Duration = Duration::from_secs(120);
+const GIT_OBJECTS_DIGEST_BUDGET: Duration = Duration::from_secs(15);
+
+/// Copy a tree host-locally with the tool G4 chose.
+const GIT_HOST_COPY: &str = "& robocopy $p.s $p.d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP|Out-Null;if($LASTEXITCODE -ge 8){throw ('robocopy failed with exit code '+$LASTEXITCODE)};E @{ok=1}";
+/// Mark a directory Hidden, as the module's `.git` is (G8).
+const GIT_HOST_HIDE: &str =
+    "$d=$p.path;[IO.File]::SetAttributes($d,[IO.File]::GetAttributes($d) -bor 2);E @{ok=1}";
+/// The attribute bits of one entry.
+const GIT_HOST_ATTR: &str = "E @{ok=1;a=[int][IO.File]::GetAttributes($p.path)}";
+/// Create an empty file (a held lock a second writer would leave).
+const GIT_HOST_TOUCH: &str = "[IO.File]::WriteAllBytes($p.path,[byte[]]@());E @{ok=1}";
+const GIT_HOST_UNTOUCH: &str =
+    "if([IO.File]::Exists($p.path)){[IO.File]::Delete($p.path)};E @{ok=1}";
+/// What `FileMode.CreateNew` does at a path that is a junction, and at one that is a
+/// dangling symbolic link (the deploy account may not hold the privilege to make
+/// one): the observation behind the pre-check and the re-check of `GIT_LOCK`.
+const GIT_HOST_CREATENEW: &str = "$d=$p.dir;[void][IO.Directory]::CreateDirectory($d);$t1=$d+'\\tgt1';[void][IO.Directory]::CreateDirectory($t1);$j=$d+'\\jl.lock';cmd /c mklink /J $j $t1|Out-Null;$r1='ok';try{$s=[IO.File]::Open($j,'CreateNew','Write','None');$s.Dispose()}catch{$r1=$_.Exception.GetType().Name};$k=$d+'\\sl.lock';$m=$d+'\\nothing';$mk=1;try{cmd /c mklink $k $m 2>&1|Out-Null;$mk=[int]$LASTEXITCODE}catch{};$r2='no link made';if($mk -eq 0){$r2='ok';try{$s=[IO.File]::Open($k,'CreateNew','Write','None');$s.Dispose()}catch{$r2=$_.Exception.GetType().Name}};$made=[int][IO.File]::Exists($m);if($mk -eq 0){[IO.File]::Delete($k)};if([IO.File]::Exists($m)){[IO.File]::Delete($m)};[IO.Directory]::Delete($j);[IO.Directory]::Delete($t1);E @{ok=1;junction=$r1;mklink=$mk;symlink=$r2;behind=$made}";
+const GIT_HOST_FACTS: &str = "E @{ok=1;e=[string]$PSVersionTable.PSEdition;v=[string]$PSVersionTable.PSVersion;c=$env:COMPUTERNAME}";
+
+fn git_step(name: &str, took: Duration, budget: Option<Duration>) {
+    match budget {
+        Some(budget) => {
+            println!(
+                "wincap_git_scripts {name}: measured {} ms budget {} ms",
+                took.as_millis(),
+                budget.as_millis()
+            );
+            assert!(
+                took <= budget,
+                "{name}: measured {} ms is over the budget of {} ms",
+                took.as_millis(),
+                budget.as_millis()
+            );
+        }
+        None => println!("wincap_git_scripts {name}: ok in {} ms", took.as_millis()),
+    }
+}
+
+#[test]
+fn wincap_git_budgets_are_the_27_06_ones() {
+    let source = include_str!("common/prod_shape_git.rs");
+    for (name, budget) in [
+        ("HOST_WINDOWS_SAVE", GIT_SAVE_BUDGET),
+        ("HOST_WINDOWS_RESTORE_VERIFY", GIT_RESTORE_VERIFY_BUDGET),
+        ("HOST_WINDOWS_PREFLIGHT", GIT_PREFLIGHT_BUDGET),
+        ("HOST_WINDOWS_GATEWAY_OBJECTS", GIT_OBJECTS_BUDGET),
+        ("OFFLINE_GATEWAY_DIGEST", GIT_OBJECTS_DIGEST_BUDGET),
+    ] {
+        let line = format!(
+            "pub const {name}: Duration = Duration::from_secs({});",
+            budget.as_secs()
+        );
+        assert!(source.contains(&line), "{line}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1 and ign-live-scratch\\git27\\src.git from capture27-vm.sh upload"]
+async fn wincap_git_scripts() {
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, GitHostRead, GitStateWriter, ProjectHost,
+    };
+
+    let Some(live) = live() else { return };
+    let host_repo = repo(&live, "git27-home", &live.data_dir, None);
+    let host_shell = shell_of(host_repo.path(), "git27-home");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let data27 = format!("{home_native}\\{SCRATCH}\\data27");
+    let src_git = format!("{home_native}\\{SCRATCH}\\git27\\src.git");
+    let saves = format!("{home_native}\\ign-deploy\\{GIT_GATEWAY}");
+    let project_dir = format!("{data27}\\projects\\{GIT_PROJECT}");
+    let git_dir = format!("{project_dir}\\.git");
+    // the scratch root is the account's own, never the gateway's data directory
+    assert!(!data27.to_ascii_lowercase().contains("program files"));
+    assert!(data27.contains(SCRATCH));
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    println!(
+        "wincap_git_scripts host: PSEdition {} PSVersion {} computer {}",
+        facts["e"], facts["v"], facts["c"]
+    );
+    assert_eq!(
+        facts["e"], "Desktop",
+        "the deploy account's ssh runs Windows PowerShell"
+    );
+
+    // leftovers of an earlier run, then the source must exist
+    remove_tree(&host_shell, &data27).await;
+    remove_tree(&host_shell, &saves).await;
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "{src_git} is missing: run capture27-vm.sh upload first"
+    );
+
+    let repo_dir = repo(&live, "git27", &data27, None);
+    let shell = shell_of(repo_dir.path(), "git27");
+    let (_, ssh, _) = ssh_of(repo_dir.path(), "git27");
+    let node = SftpTransport::new_windows(
+        shell,
+        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
+        "nodes.master",
+    );
+
+    // the production-shape `.git` goes in with the host copy tool, Hidden as
+    // the module's is
+    let copy = script(
+        "git_host_copy",
+        GIT_HOST_COPY,
+        serde_json::json!({ "s": src_git, "d": git_dir }),
+    );
+    host_shell
+        .exec_powershell(&copy)
+        .await
+        .expect("copy src.git in");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_hide",
+            GIT_HOST_HIDE,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("hide");
+
+    // 1. read_git_state: the entry probe and one GIT_STATE call
+    let started = Instant::now();
+    let state = node.read_git_state(GIT_PROJECT).await.expect("state");
+    git_step("read_git_state", started.elapsed(), None);
+    assert_eq!(state.kind, GitEntry::Directory);
+    assert!(state.head.is_some(), "HEAD is read");
+    assert!(state.config.is_some(), "config is read");
+
+    // 2. read_git_yaml: absent
+    assert_eq!(node.read_git_yaml().await.expect("yaml"), None);
+    git_step("read_git_yaml", Duration::ZERO, None);
+
+    // 3. free_bytes
+    let free = node
+        .free_bytes(GIT_GATEWAY, GIT_PROJECT)
+        .await
+        .expect("free");
+    assert!(free > 0);
+    println!("wincap_git_scripts free_bytes: {free} bytes free");
+
+    // 4. git_size from one enumeration, against the manifest
+    let started = Instant::now();
+    let size = node.git_size(GIT_PROJECT).await.expect("size");
+    git_step("git_size", started.elapsed(), Some(GIT_PREFLIGHT_BUDGET));
+    let started = Instant::now();
+    let manifest = node.git_manifest(GIT_PROJECT).await.expect("manifest");
+    git_step("git_manifest", started.elapsed(), None);
+    assert_eq!((size.files, size.bytes), (manifest.files, manifest.bytes));
+    println!(
+        "wincap_git_scripts shape: {} files, {} bytes",
+        manifest.files, manifest.bytes
+    );
+
+    // 5. probe_write
+    node.probe_write(GIT_PROJECT, GIT_RUN).await.expect("probe");
+    git_step("probe_write", Duration::ZERO, None);
+
+    // 6. save_git
+    let started = Instant::now();
+    let saved = node
+        .save_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("save");
+    git_step("save_git", started.elapsed(), Some(GIT_SAVE_BUDGET));
+    assert_eq!(saved, manifest, "the save equals the gateway .git");
+    assert_eq!(
+        node.save_manifest(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+            .await
+            .expect("save manifest"),
+        manifest
+    );
+    // a save is never overwritten
+    assert!(
+        node.save_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+            .await
+            .is_err()
+    );
+
+    // 7. the import deletes `.git`; restore plus the manifest of the result
+    assert!(remove_tree(&host_shell, &git_dir).await);
+    assert_eq!(
+        node.read_git_state(GIT_PROJECT).await.expect("gone").kind,
+        GitEntry::Absent
+    );
+    let started = Instant::now();
+    let back = node
+        .restore_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("restore");
+    let after = node.git_manifest(GIT_PROJECT).await.expect("after");
+    git_step(
+        "restore_git_and_manifest",
+        started.elapsed(),
+        Some(GIT_RESTORE_VERIFY_BUDGET),
+    );
+    assert_eq!(back, manifest);
+    assert_eq!(after, manifest, "the manifests are equal");
+    // the module's `.git` is Hidden; so is the restored one (G8)
+    let attrs = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("attributes");
+    let attrs = attrs["a"].as_i64().expect("attributes");
+    println!("wincap_git_scripts restored .git attributes: {attrs}");
+    assert_ne!(attrs & 2, 0, "the restored .git is Hidden again");
+    assert_eq!(
+        node.read_git_state(GIT_PROJECT).await.expect("state").kind,
+        GitEntry::Directory
+    );
+    let stage = format!("{project_dir}\\.ign-restore-{GIT_RUN}");
+    assert!(
+        enumerate(&host_shell, &stage).await.is_none(),
+        "no restore stage is left behind"
+    );
+
+    // 8. a restore over a present `.git` is refused
+    let why = node
+        .restore_git(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect_err("present");
+    assert!(why.to_string().contains("never replaced"), "{why}");
+    assert_eq!(
+        node.git_manifest(GIT_PROJECT).await.expect("intact"),
+        manifest
+    );
+    println!("wincap_git_scripts restore over a present .git: refused");
+
+    // 9. write_git_files through the lock-and-replace path, read back equal
+    let hash = "ab".repeat(20);
+    let writes = vec![
+        GitWrite {
+            name: GitWriteName::PackFile(hash.clone()),
+            bytes: vec![b'P'; 70_000],
+        },
+        GitWrite {
+            name: GitWriteName::PackIndex(hash),
+            bytes: vec![b'I'; 1_200],
+        },
+        GitWrite {
+            name: GitWriteName::BranchRef("production".to_string()),
+            bytes: b"0123456789abcdef0123456789abcdef01234567\n".to_vec(),
+        },
+        GitWrite {
+            name: GitWriteName::Head,
+            bytes: b"ref: refs/heads/production\n".to_vec(),
+        },
+    ];
+    let started = Instant::now();
+    node.write_git_files(GIT_PROJECT, &writes)
+        .await
+        .expect("write");
+    git_step("write_git_files", started.elapsed(), None);
+    for write in &writes {
+        let digest = node
+            .git_file_digest(GIT_PROJECT, &write.name)
+            .await
+            .expect("digest");
+        assert_eq!(digest, Some(sha256_hex(&write.bytes)), "{:?}", write.name);
+    }
+    let leftovers: Vec<String> = enumerate(&host_shell, &git_dir)
+        .await
+        .expect("git dir")
+        .into_iter()
+        .map(|(rel, _, _)| rel)
+        .filter(|rel| rel.ends_with(".lock") || rel.ends_with(".ign-tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no lock is left behind: {leftovers:?}"
+    );
+    // 27-33: the private stage of the write is gone (the replace removed it)
+    let ledger = enumerate(&host_shell, &format!("{home_native}\\ign-deploy"))
+        .await
+        .expect("ign-deploy");
+    let stages: Vec<&str> = ledger
+        .iter()
+        .map(|(rel, _, _)| rel.as_str())
+        .filter(|rel| rel.starts_with("git-stage-"))
+        .collect();
+    assert!(stages.is_empty(), "a stage is left behind: {stages:?}");
+    println!("wincap_git_scripts write: no lock and no stage left");
+    // a lock another writer holds refuses the write and leaves the file alone
+    let held = format!("{git_dir}\\refs\\heads\\production.lock");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_touch",
+            GIT_HOST_TOUCH,
+            serde_json::json!({ "path": held }),
+        ))
+        .await
+        .expect("plant a lock");
+    let again = vec![GitWrite {
+        name: GitWriteName::BranchRef("production".to_string()),
+        bytes: b"fedcba9876543210fedcba9876543210fedcba98\n".to_vec(),
+    }];
+    assert!(node.write_git_files(GIT_PROJECT, &again).await.is_err());
+    let kept = node
+        .git_file_digest(
+            GIT_PROJECT,
+            &GitWriteName::BranchRef("production".to_string()),
+        )
+        .await
+        .expect("digest");
+    assert_eq!(
+        kept,
+        Some(sha256_hex(&writes[2].bytes)),
+        "the ref is unchanged"
+    );
+    host_shell
+        .exec_powershell(&script(
+            "git_host_untouch",
+            GIT_HOST_UNTOUCH,
+            serde_json::json!({ "path": held }),
+        ))
+        .await
+        .expect("remove the planted lock");
+    println!("wincap_git_scripts write over a held lock: refused, ref unchanged");
+
+    // 27-33 (WR-B3): a junction planted at the lock path, and one in a level above
+    // the lock, are refused; nothing is written through them and the stage is
+    // removed by the cleanup
+    let outside_lock = format!("{data27}\\outside-lock");
+    let outside_level = format!("{data27}\\outside-level");
+    let planted = [
+        (
+            format!("{git_dir}\\refs\\heads\\production.lock"),
+            outside_lock.clone(),
+            GitWriteName::BranchRef("production".to_string()),
+        ),
+        (
+            format!("{git_dir}\\refs\\heads\\feature"),
+            outside_level.clone(),
+            GitWriteName::BranchRef("feature/x".to_string()),
+        ),
+    ];
+    for (link, target, name) in &planted {
+        host_shell
+            .exec_powershell(&script(
+                "make_junction",
+                MAKE_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link, "target": target }),
+            ))
+            .await
+            .expect("plant a junction");
+        let attempt = vec![GitWrite {
+            name: name.clone(),
+            bytes: b"fedcba9876543210fedcba9876543210fedcba98\n".to_vec(),
+        }];
+        let why = node
+            .write_git_files(GIT_PROJECT, &attempt)
+            .await
+            .expect_err("a planted junction");
+        println!("wincap_git_scripts write over a planted junction: refused: {why}");
+        assert_eq!(
+            enumerate(&host_shell, target).await,
+            Some(Vec::new()),
+            "nothing was written through the junction {link}"
+        );
+        host_shell
+            .exec_powershell(&script(
+                "drop_junction",
+                DROP_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link }),
+            ))
+            .await
+            .expect("drop the junction");
+        let ledger = enumerate(&host_shell, &format!("{home_native}\\ign-deploy"))
+            .await
+            .expect("ign-deploy");
+        assert!(
+            !ledger
+                .iter()
+                .any(|(rel, _, _)| rel.starts_with("git-stage-")),
+            "a refused write leaves no stage"
+        );
+    }
+    println!("wincap_git_scripts write over planted junctions: refused, nothing written through");
+    let created = host_shell
+        .exec_powershell(&script(
+            "createnew_at_links",
+            GIT_HOST_CREATENEW,
+            serde_json::json!({ "dir": format!("{data27}\\createnew") }),
+        ))
+        .await
+        .expect("CreateNew at links");
+    println!(
+        "wincap_git_scripts CreateNew at a junction: {}; at a dangling symlink (mklink exit {}): {}; a file created behind the symlink: {}",
+        created["junction"], created["mklink"], created["symlink"], created["behind"]
+    );
+
+    // 10. remove_git_save: a path that is not the save's is refused before
+    //     anything is touched, then the real one is removed
+    let home_sftp_path = home_sftp(&host_shell).await;
+    let _ = home_sftp_path;
+    let rel = format!("ign-deploy/{GIT_GATEWAY}/projects/{GIT_PROJECT}/git-save/{GIT_RUN}");
+    for foreign in [
+        format!("{rel}/other"),
+        format!("{rel}/repo/objects"),
+        format!("ign-deploy/{GIT_GATEWAY}/projects/{GIT_PROJECT}/git-save/x/repo"),
+    ] {
+        let refused = host_shell
+            .exec_powershell(&WinScript::git_save_rm(
+                LONG_PATH_PREFIX,
+                &home_native,
+                &foreign,
+                GIT_RUN,
+            ))
+            .await;
+        assert!(refused.is_err(), "{foreign} was accepted");
+    }
+    assert_eq!(
+        node.save_manifest(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+            .await
+            .expect("the save survived the refusals"),
+        manifest
+    );
+    node.remove_git_save(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("remove");
+    assert!(
+        enumerate(
+            &host_shell,
+            &format!("{saves}\\projects\\{GIT_PROJECT}\\git-save\\{GIT_RUN}")
+        )
+        .await
+        .is_none(),
+        "the run directory is gone"
+    );
+    node.remove_git_save(GIT_GATEWAY, GIT_PROJECT, GIT_RUN)
+        .await
+        .expect("absent is a success");
+    println!("wincap_git_scripts remove_git_save: foreign paths refused, the save removed");
+
+    // the entry probe of the project host still answers
+    assert_eq!(
+        node.git_entry(GIT_PROJECT).await.expect("entry"),
+        GitEntry::Directory
+    );
+
+    // cleanup: the scratch root and the saves, both quoted
+    let data_gone = remove_tree(&host_shell, &data27).await;
+    let saves_gone = remove_tree(&host_shell, &saves).await;
+    host_shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    println!("wincap_git_scripts cleanup: data27 gone {data_gone}, saves gone {saves_gone}");
+    assert!(data_gone && saves_gone);
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "the 27-07 source is kept for 27-11"
+    );
+    println!("LIVE-RAN wincap_git_scripts");
+}
+
+// ---- WR-B5: ReadOnly files and the recursive deletes of the git scripts (27-33) ---
+//
+// Plan 27-33 Task 1. `[IO.Directory]::Delete(path, $true)` in Windows PowerShell 5.1
+// is the commonly reported cause of "Access to the path ... is denied" on a tree that
+// holds ReadOnly files. The gate records three observations on the real host family
+// before any script changes, each as a `WR-B5 ...` line:
+//
+// (a) the raw call, on a one-off tree with one ReadOnly file;
+// (b) the shipped `save_git` of a `.git` whose pack, idx and one loose object are
+//     ReadOnly (robocopy `/COPY:DAT` keeps the attribute), then the shipped
+//     `remove_git_save`: is the save gone;
+// (c) a `save_git` forced to fail after a partial copy (a loose object held open for
+//     reading with no sharing makes robocopy fail on it after the pack was copied): does the error
+//     that comes back name robocopy (the real error), and is the partial copy gone.
+//
+// It works only below `ign-live-scratch\data27w` (project `CapApp27w`) and the saves
+// below `ign-deploy\live-scratch27w`, both removed at the start and at the end. The
+// gate stays as a regression check after the fix. (d) plants a junction inside a save and
+// checks the removal fails closed and neither follows it nor changes the ReadOnly file behind it. `LIVE-RAN`
+// is its last line, printed only when (b) removed the save, (c) surfaced the real error
+// and left nothing, (d) held and (e) held.
+
+const RO_GATEWAY: &str = "live-scratch27w";
+const RO_PROJECT: &str = "CapApp27w";
+const RO_RUN_B: &str = "20261116T090000Z-w33b";
+const RO_RUN_C: &str = "20261116T090100Z-w33c";
+const RO_RUN_D: &str = "20261116T090200Z-w33d";
+const RO_RUN_E: &str = "20261116T090300Z-w33e";
+
+/// One tree with one ReadOnly file, the raw delete, and the clean-up of what it
+/// leaves. `r` is `ok` or `threw`.
+const RO_RAW_DELETE: &str = "$d=$p.x+$p.path;[void][IO.Directory]::CreateDirectory($d+'\\sub');$f=$d+'\\sub\\ro.pack';[IO.File]::WriteAllText($f,'x');[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly);$r='ok';$m='';try{[IO.Directory]::Delete($d,$true)}catch{$r='threw';$m=$_.Exception.GetType().Name+': '+$_.Exception.Message};$left=[int][IO.Directory]::Exists($d);if($left){foreach($e in [IO.Directory]::EnumerateFiles($d,'*',[IO.SearchOption]::AllDirectories)){[IO.File]::SetAttributes($e,[IO.FileAttributes]::Normal)};[IO.Directory]::Delete($d,$true)};E @{ok=1;r=$r;m=$m;left=$left}";
+/// A small `.git` below `$p.git` (native); the files named in `$p.ro` are 4096 bytes
+/// and ReadOnly, the rest are small text files.
+const RO_MAKE_GIT: &str = "$g=$p.x+$p.git;foreach($e in $p.dirs){[void][IO.Directory]::CreateDirectory($g+'\\'+$e.Replace('/','\\'))};foreach($e in $p.text){[IO.File]::WriteAllText($g+'\\'+$e.Replace('/','\\'),'x'+[char]10)};foreach($e in $p.ro){$f=$g+'\\'+$e.Replace('/','\\');[IO.File]::WriteAllBytes($f,(New-Object byte[] 4096));[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly)};E @{ok=1}";
+/// Hold a file open for reading with no sharing at all for `$p.s` seconds.
+/// A junction `$p.link` to the directory `$p.target`, which holds one ReadOnly file.
+const RO_MAKE_JUNCTION: &str = "[void][IO.Directory]::CreateDirectory($p.target);$f=$p.target+'\\precious.txt';[IO.File]::WriteAllText($f,'keep');[IO.File]::SetAttributes($f,[IO.FileAttributes]::ReadOnly);cmd /c mklink /J $p.link $p.target|Out-Null;if($LASTEXITCODE -ne 0){throw 'mklink failed'};E @{ok=1}";
+/// A ReadOnly file `$p.target` and a hard link `$p.link` to it.
+const RO_MAKE_HARDLINK: &str = "[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($p.target));[IO.File]::WriteAllText($p.target,'keep');[IO.File]::SetAttributes($p.target,[IO.FileAttributes]::ReadOnly);cmd /c mklink /H $p.link $p.target|Out-Null;if($LASTEXITCODE -ne 0){throw 'mklink failed'};E @{ok=1}";
+/// The link type PowerShell reports for `$p.path`, and its attribute bits.
+const RO_LINK_FACTS: &str =
+    "$i=Get-Item -LiteralPath $p.path -Force;E @{ok=1;t=[string]$i.LinkType;a=[int]$i.Attributes}";
+const RO_HOLD_EXCLUSIVE: &str = "$h=[IO.File]::Open($p.path,'Open','Read','None');Start-Sleep -Seconds $p.s;$h.Dispose();E @{ok=1}";
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_git_readonly_delete() {
+    use ignition_core::deploy::transport::projects::GitStateWriter;
+
+    let Some(live) = live() else { return };
+    let host_repo = repo(&live, "git27w-home", &live.data_dir, None);
+    let host_shell = shell_of(host_repo.path(), "git27w-home");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let data = format!("{home_native}\\{SCRATCH}\\data27w");
+    let saves = format!("{home_native}\\ign-deploy\\{RO_GATEWAY}");
+    let probe = format!("{home_native}\\{SCRATCH}\\wr-b5-raw");
+    let git_dir = format!("{data}\\projects\\{RO_PROJECT}\\.git");
+    assert!(!data.to_ascii_lowercase().contains("program files"));
+    assert!(data.contains(SCRATCH));
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    println!(
+        "WR-B5 host: PSEdition {} PSVersion {}",
+        facts["e"], facts["v"]
+    );
+    assert_eq!(
+        facts["e"], "Desktop",
+        "the deploy account's ssh runs Windows PowerShell"
+    );
+
+    for tree in [&data, &saves, &probe] {
+        remove_tree(&host_shell, tree).await;
+    }
+
+    // (a) the raw observation
+    let raw = host_shell
+        .exec_powershell(&script("ro_raw", RO_RAW_DELETE, path_params(&probe)))
+        .await
+        .expect("raw delete probe");
+    let raw_threw = raw["r"] == "threw";
+    println!(
+        "WR-B5 raw-delete {} (tree left {}): {}",
+        raw["r"].as_str().unwrap_or("?"),
+        raw["left"],
+        raw["m"].as_str().unwrap_or("")
+    );
+
+    // the `.git` with ReadOnly packs
+    let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
+    let idx = format!("objects/pack/pack-{}.idx", "a".repeat(40));
+    let loose = format!("objects/ab/{}", "c".repeat(38));
+    host_shell
+        .exec_powershell(&script(
+            "ro_make_git",
+            RO_MAKE_GIT,
+            serde_json::json!({
+                "x": LONG_PATH_PREFIX, "git": git_dir,
+                "dirs": ["objects/pack", "objects/ab", "refs/heads"],
+                "text": ["HEAD", "config", "refs/heads/main"],
+                "ro": [pack, idx, loose],
+            }),
+        ))
+        .await
+        .expect("build the .git");
+
+    let repo_dir = repo(&live, "git27w", &data, None);
+    let shell = shell_of(repo_dir.path(), "git27w");
+    let (_, ssh, _) = ssh_of(repo_dir.path(), "git27w");
+    let node = SftpTransport::new_windows(
+        shell,
+        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
+        "nodes.master",
+    );
+
+    // (b) the shipped save and its removal
+    let save_b = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_B}");
+    node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_B)
+        .await
+        .expect("save with ReadOnly packs");
+    let attrs = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": format!("{save_b}\\repo\\{}", pack.replace('/', "\\")) }),
+        ))
+        .await
+        .expect("attributes of the saved pack");
+    let ro_kept = attrs["a"].as_i64().unwrap_or(0) & 1 != 0;
+    println!(
+        "WR-B5 save carries ReadOnly on the pack: {ro_kept} (attributes {})",
+        attrs["a"]
+    );
+    let removed = node.remove_git_save(RO_GATEWAY, RO_PROJECT, RO_RUN_B).await;
+    let left_b = enumerate(&host_shell, &save_b).await.is_some();
+    match &removed {
+        Ok(()) => println!("WR-B5 remove_git_save ok; save left on the host: {left_b}"),
+        Err(err) => println!("WR-B5 remove_git_save threw: {err}; save left on the host: {left_b}"),
+    }
+    let b_ok = removed.is_ok() && !left_b;
+
+    // (c) a save that fails after a partial copy: one loose object is held open with
+    // no sharing while robocopy runs (the manifest does not open objects, it reads
+    // their length), so robocopy fails on it after copying the pack beside it
+    let held = format!("{git_dir}\\{}", loose.replace('/', "\\"));
+    let hold_script = script(
+        "ro_hold",
+        RO_HOLD_EXCLUSIVE,
+        serde_json::json!({ "path": held, "s": 40 }),
+    );
+    let holder = host_shell.exec_powershell(&hold_script);
+    let forced = async {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_C).await
+    };
+    let (hold_answer, failed) = tokio::join!(holder, forced);
+    hold_answer.expect("the holder ran");
+    let save_c = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_C}\\repo");
+    let partial_left = enumerate(&host_shell, &save_c).await.is_some();
+    let (c_forced, real_error) = match &failed {
+        Ok(_) => {
+            println!("WR-B5 forced save failure: the save SUCCEEDED, the failure was not forced");
+            (false, false)
+        }
+        Err(err) => {
+            let text = err.to_string();
+            let real = text.to_ascii_lowercase().contains("robocopy failed");
+            println!("WR-B5 forced save failure: {text}");
+            (true, real)
+        }
+    };
+    println!(
+        "WR-B5 failed save: the real error (robocopy) came back: {real_error}; partial copy left on the host: {partial_left}"
+    );
+    let c_ok = c_forced && real_error && !partial_left;
+
+    // (d) a junction inside a save is never entered: the removal fails closed, naming
+    // the leftover, and the ReadOnly file behind the link is neither removed nor changed
+    let save_d = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_D}");
+    let outside = format!("{home_native}\\{SCRATCH}\\wr-b5-outside");
+    remove_tree(&host_shell, &outside).await;
+    node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_D)
+        .await
+        .expect("a third save");
+    host_shell
+        .exec_powershell(&script(
+            "ro_junction",
+            RO_MAKE_JUNCTION,
+            serde_json::json!({ "link": format!("{save_d}\\repo\\link"), "target": outside }),
+        ))
+        .await
+        .expect("plant a junction in the save");
+    let removed_d = node.remove_git_save(RO_GATEWAY, RO_PROJECT, RO_RUN_D).await;
+    let left_d = enumerate(&host_shell, &save_d).await.is_some();
+    let behind = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": format!("{outside}\\precious.txt") }),
+        ))
+        .await;
+    let behind_ro = behind
+        .as_ref()
+        .map(|v| v["a"].as_i64().unwrap_or(0) & 1 != 0)
+        .unwrap_or(false);
+    println!(
+        "WR-B5 junction in a save: removal ok {}; save left {left_d}; the file behind the link still exists and is still ReadOnly: {behind_ro}",
+        removed_d.is_ok()
+    );
+    if let Err(err) = &removed_d {
+        println!("WR-B5 junction in a save: the removal said: {err}");
+    }
+    // .NET's recursive delete refuses a junction inside the tree ("Access to the path
+    // 'link' is denied"): the removal fails closed and names the leftover; the link is
+    // never followed
+    let d_ok = removed_d
+        .as_ref()
+        .is_err_and(|err| err.to_string().contains("could not be removed"))
+        && left_d
+        && behind_ro;
+    host_shell
+        .exec_powershell(&script(
+            "drop_junction",
+            DROP_JUNCTION,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "link": format!("{save_d}\\repo\\link") }),
+        ))
+        .await
+        .expect("drop the junction");
+    remove_tree(&host_shell, &outside).await;
+
+    // (e) a ReadOnly file with a second hard link: clearing its attribute would change
+    // the other link too, so the removal leaves it, fails closed and names the leftover
+    let save_e = format!("{saves}\\projects\\{RO_PROJECT}\\git-save\\{RO_RUN_E}");
+    let shared = format!("{home_native}\\{SCRATCH}\\wr-b5-shared\\shared.txt");
+    node.save_git(RO_GATEWAY, RO_PROJECT, RO_RUN_E)
+        .await
+        .expect("a fourth save");
+    host_shell
+        .exec_powershell(&script(
+            "ro_hardlink",
+            RO_MAKE_HARDLINK,
+            serde_json::json!({ "link": format!("{save_e}\\repo\\shared.txt"), "target": shared }),
+        ))
+        .await
+        .expect("plant a hard link in the save");
+    let facts = host_shell
+        .exec_powershell(&script(
+            "ro_link_facts",
+            RO_LINK_FACTS,
+            serde_json::json!({ "path": format!("{save_e}\\repo\\shared.txt") }),
+        ))
+        .await
+        .expect("link facts");
+    println!(
+        "WR-B5 hard link: PowerShell reports LinkType {} (attributes {})",
+        facts["t"], facts["a"]
+    );
+    let removed_e = node.remove_git_save(RO_GATEWAY, RO_PROJECT, RO_RUN_E).await;
+    let other = host_shell
+        .exec_powershell(&script(
+            "git_host_attr",
+            GIT_HOST_ATTR,
+            serde_json::json!({ "path": shared }),
+        ))
+        .await;
+    let other_ro = other
+        .as_ref()
+        .map(|v| v["a"].as_i64().unwrap_or(0) & 1 != 0)
+        .unwrap_or(false);
+    println!(
+        "WR-B5 hard link in a save: removal ok {}; the other link is still ReadOnly: {other_ro}",
+        removed_e.is_ok()
+    );
+    let e_ok = removed_e
+        .as_ref()
+        .is_err_and(|err| err.to_string().contains("could not be removed"))
+        && other_ro;
+    remove_tree(
+        &host_shell,
+        &format!("{home_native}\\{SCRATCH}\\wr-b5-shared"),
+    )
+    .await;
+
+    let confirmed = raw_threw || !b_ok || !c_ok;
+    println!(
+        "WR-B5 verdict: {}",
+        if confirmed {
+            "confirmed"
+        } else {
+            "not reproduced"
+        }
+    );
+
+    for tree in [&data, &saves, &probe] {
+        remove_tree(&host_shell, tree).await;
+    }
+    host_shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    assert!(
+        c_forced,
+        "(c) was not forced: pick another way to fail the save"
+    );
+    assert!(b_ok, "(b) a save with ReadOnly packs was not removed");
+    assert!(
+        c_ok,
+        "(c) a failed save masked its real error or left a partial copy"
+    );
+    assert!(d_ok, "(d) a junction inside a save was entered or changed");
+    assert!(e_ok, "(e) a hard-linked file in a save was changed");
+    println!("LIVE-RAN wincap_git_readonly_delete");
+}
+
+// ---- the gateway-object read of 27-11 (checker W14, D-24) ---------------------
+//
+// `list_git_objects` and the worst case of `gateway_head_digest` through
+// `SftpTransport` as the deploy account, on the production-shape `.git` that
+// 27-07 uploaded, before the 27-12 contract checkpoint. The worst case is the
+// override over an unpushed Designer commit with ign's own object store empty:
+// every pack that holds an object of the HEAD's tree is fetched, as one archive
+// per round, staged below the account home. Bound to the scratch data root
+// `ign-live-scratch\data27` (project `CapApp27`), removed at the start and at
+// the end; the gateway's own data directory is never named.
+//
+// Run it through the driver (27-29), which tunnels the gateway to 127.0.0.1, exports
+// `IGN_WINVM_GATEWAY_URL` and the gate's environment, redacts the output and writes the
+// log to the private evidence directory. The gate refuses an `http://` URL whose host is
+// not loopback, and an unset `IGN_WINVM_GATEWAY_URL`:
+//
+// ```text
+// set -a; . "$HOME/.config/ign-azure-win/env"; set +a
+// export PRODSHAPE_GIT_OUT=...
+// CAPTURE27_VMS=win bash crates/ignition-core/tests/fixtures/live-vm/capture27-vm.sh winvm-handover
+// ```
+
+const HANDOVER_RUN: &str = "20261115T120000Z-w27h";
+
+/// Whether `name` is the `name` of an object anywhere in `value`.
+fn mentions_name(value: &serde_json::Value, name: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("name").and_then(|n| n.as_str()) == Some(name)
+                || map.values().any(|v| mentions_name(v, name))
+        }
+        serde_json::Value::Array(items) => items.iter().any(|v| mentions_name(v, name)),
+        _ => false,
+    }
+}
+
+/// The gateway URL of the VM gates (27-29, WR-D5): `https://` anywhere, `http://` only to a
+/// loopback host, and never the VM's own address. The driver exports the tunnel URL.
+#[test]
+fn vm_gateway_url_guard() {
+    use common::vm_git_handover::vm_gateway_url_check;
+    let check = |raw: Option<&str>| {
+        vm_gateway_url_check(
+            raw,
+            "IGN_WINVM_GATEWAY_URL",
+            "capture27-vm.sh winvm-handover or vm-gate",
+        )
+    };
+    for ok in [
+        "http://127.0.0.1:18088",
+        "http://[::1]:18088",
+        "https://192.0.2.15:8043",
+    ] {
+        assert_eq!(check(Some(ok)).as_deref(), Ok(ok), "must accept {ok}");
+    }
+    for bad in [
+        Some("http://192.0.2.15:8088"),
+        Some("http://user@127.0.0.1.evil:8088"),
+        Some("http://127.0.0.1@192.0.2.15:8088"),
+        Some("http://127.0.0.1:18088 /x"),
+        Some("http://127.0.0.1:18088\n"),
+        Some(" http://127.0.0.1:18088"),
+        Some("ftp://127.0.0.1:18088"),
+        Some(""),
+        None,
+    ] {
+        let err = check(bad).expect_err("must refuse");
+        assert!(
+            err.contains("capture27-vm.sh winvm-handover or vm-gate")
+                && err.contains("IGN_WINVM_GATEWAY_URL"),
+            "the refusal names the variable and the driver steps: {err}"
+        );
+        assert!(
+            !err.contains("192.0.2.15"),
+            "the refusal never echoes the address: {err}"
+        );
+    }
+}
+
+/// One call of the installed `ign` at the gateway URL the driver exports in `IGN_WINVM_GATEWAY_URL` (a
+/// loopback tunnel, guarded by [`vm_gateway_url`](common::vm_git_handover::vm_gateway_url)):
+/// exit code and JSON envelope.
+async fn guard_call(profile: &str, args: &[&str]) -> (i32, serde_json::Value) {
+    let url = common::vm_git_handover::vm_gateway_url(
+        "IGN_WINVM_GATEWAY_URL",
+        "capture27-vm.sh winvm-handover or vm-gate",
+    );
+    let out = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new("ign")
+            .args(["--profile", profile, "--json"])
+            .args(args)
+            .env("IGNITION_URL", &url)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("ign answers in time")
+    .expect("ign runs");
+    let raw = if out.stdout.iter().any(|b| !b.is_ascii_whitespace()) {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    (
+        out.status.code().unwrap_or(-1),
+        serde_json::from_slice(raw).expect("ign printed a JSON envelope"),
+    )
+}
+
+/// The gateway-name guard of 27-07: gateway-info through the driver's loopback tunnel
+/// names the expected test gateway, and the disposable project exists.
+async fn handover_guard() {
+    let profile = std::env::var("IGN_WINCAP_PROFILE").expect("IGN_WINCAP_PROFILE");
+    let expected = std::env::var("IGN_WINVM_GATEWAY_NAME")
+        .unwrap_or_else(|_| "Ignition-ignwin836".to_string());
+    let (code, info) = guard_call(
+        &profile,
+        &[
+            "api",
+            "call",
+            "--method",
+            "GET",
+            "--path",
+            "/data/api/v1/gateway-info",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "gateway-info answered exit {code}");
+    assert_eq!(
+        info["data"]["result"]["data"]["name"].as_str(),
+        Some(expected.as_str()),
+        "refusing: gateway-info does not name the {expected} test gateway"
+    );
+    let (code, list) = guard_call(&profile, &["project", "list"]).await;
+    assert_eq!(code, 0);
+    assert!(
+        mentions_name(&list, GIT_PROJECT),
+        "{GIT_PROJECT} is not on the gateway: run capture27-vm.sh project-up first"
+    );
+    println!("wincap_git_handover guard: gateway-info names {expected}; {GIT_PROJECT} is present");
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host, IGNITION_LIVE_WINCAP=1, PRODSHAPE_GIT_OUT, capture27-vm.sh project-up and upload and the grant on CapApp27"]
+async fn wincap_git_handover() {
+    use common::vm_git_handover::{Budgets, Handover, finish, fixture_dir, note, release_checkout};
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, git_state_writer_for_node, project_host_for_node,
+    };
+
+    let Some(live) = live() else { return };
+    handover_guard().await;
+    let started = Instant::now();
+    let fixture = fixture_dir();
+    let release = release_checkout(&fixture);
+
+    let repo_dir = repo(&live, "git27h", &live.data_dir, None);
+    let host_shell = shell_of(repo_dir.path(), "git27h");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let (target_file, _, node) = ssh_of(repo_dir.path(), "git27h");
+    let host = project_host_for_node(repo_dir.path(), &target_file, "nodes.master", &node)
+        .expect("the ssh project host");
+    let writer = git_state_writer_for_node(repo_dir.path(), &target_file, "nodes.master", &node)
+        .expect("the ssh git writer");
+
+    let project_dir = format!(
+        "{}\\projects\\{GIT_PROJECT}",
+        live.data_dir.trim_end_matches('\\')
+    );
+    let git_dir = format!("{project_dir}\\.git");
+    let src_git = format!("{home_native}\\{SCRATCH}\\git27\\src.git");
+    let saves = format!("{home_native}\\ign-deploy\\{GIT_GATEWAY}");
+    assert!(
+        project_dir.ends_with("\\projects\\CapApp27"),
+        "only the disposable project is touched"
+    );
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    note(
+        "wincap_git_handover",
+        &format!("host: PSEdition {} PSVersion {}", facts["e"], facts["v"]),
+    );
+    assert_eq!(facts["e"], "Desktop");
+    remove_tree(&host_shell, &saves).await;
+    assert!(
+        enumerate(&host_shell, &src_git).await.is_some(),
+        "{src_git} is missing: run capture27-vm.sh upload first"
+    );
+    assert_eq!(
+        host.git_entry(GIT_PROJECT).await.expect("entry"),
+        GitEntry::Absent,
+        "{GIT_PROJECT} holds a .git from an earlier run: run project-down and project-up"
+    );
+
+    // The production-shape `.git` goes into the project with the host copy
+    // tool, Hidden as the module's is.
+    let copied = Instant::now();
+    host_shell
+        .exec_powershell(&script(
+            "git_host_copy",
+            GIT_HOST_COPY,
+            serde_json::json!({ "s": src_git, "d": git_dir }),
+        ))
+        .await
+        .expect("copy src.git into the project (is the grant on the project directory?)");
+    host_shell
+        .exec_powershell(&script(
+            "git_host_hide",
+            GIT_HOST_HIDE,
+            serde_json::json!({ "path": git_dir }),
+        ))
+        .await
+        .expect("hide");
+    note(
+        "wincap_git_handover",
+        &format!(
+            "robocopy into the project: {} ms",
+            copied.elapsed().as_millis()
+        ),
+    );
+
+    let handover = Handover {
+        label: "wincap_git_handover",
+        host: host.as_ref(),
+        writer: writer.as_ref(),
+        gateway: GIT_GATEWAY,
+        project: GIT_PROJECT,
+        run: HANDOVER_RUN,
+        budgets: Budgets::WINDOWS,
+    };
+    let body = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let before = handover.before_import(&release, "w27h").await;
+        // The import removes `.git`: one host command, on the disposable project.
+        assert!(remove_tree(&host_shell, &git_dir).await, ".git is removed");
+        let report = handover.after_import(&release, &before).await;
+
+        // G8: the restored `.git` is Hidden again.
+        let attrs = host_shell
+            .exec_powershell(&script(
+                "git_host_attr",
+                GIT_HOST_ATTR,
+                serde_json::json!({ "path": git_dir }),
+            ))
+            .await
+            .expect("attributes");
+        let attrs = attrs["a"].as_i64().expect("attributes");
+        note(
+            "wincap_git_handover",
+            &format!("restored .git attributes: {attrs}"),
+        );
+        assert_ne!(attrs & 2, 0, "the restored .git is Hidden (G8)");
+        let stage = format!("{project_dir}\\.ign-restore-{HANDOVER_RUN}");
+        assert!(
+            enumerate(&host_shell, &stage).await.is_none(),
+            "no restore stage is left behind"
+        );
+        assert_eq!(
+            host.git_entry(GIT_PROJECT).await.expect("entry"),
+            GitEntry::Directory
+        );
+        handover.remove_save().await;
+        assert!(
+            enumerate(
+                &host_shell,
+                &format!("{saves}\\projects\\{GIT_PROJECT}\\git-save\\{HANDOVER_RUN}")
+            )
+            .await
+            .is_none(),
+            "the save's run directory is gone"
+        );
+        report
+    }))
+    .await;
+
+    // Cleanup, also after a failure: the saves below `ign-deploy`.
+    let saves_gone = remove_tree(&host_shell, &saves).await;
+    host_shell
+        .exec_powershell(&script(
+            "remove_if_empty",
+            REMOVE_IF_EMPTY,
+            path_params(&format!("{home_native}\\ign-deploy")),
+        ))
+        .await
+        .expect("remove ign-deploy if empty");
+    note(
+        "wincap_git_handover",
+        &format!("cleanup: saves gone {saves_gone}"),
+    );
+    if let Err(panic) = body {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(saves_gone);
+    println!(
+        "wincap_git_handover total: {} ms",
+        started.elapsed().as_millis()
+    );
+    finish();
+    println!("LIVE-RAN wincap_git_handover");
 }

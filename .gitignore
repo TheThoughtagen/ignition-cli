@@ -42,3 +42,7 @@
 # Raw tag-import answers written by the rig capture script (capture26.sh).
 # Only the named fixtures the tests read are committed.
 /crates/ignition-core/tests/fixtures/tag-import/answer-*
+
+# A hand-run VM or rig gate log teed into the repo root (27-*.log). The drivers write their
+# redacted logs to a private evidence directory instead; this is the backstop.
+/27-*.log

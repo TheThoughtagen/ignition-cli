@@ -2680,3 +2680,1217 @@ fn project_tags_real_corpus() {
         }
     }
 }
+
+// ---- the module-style `.git` handover at scale (plan 27-06, D-18) ------------
+//
+// `common::prod_shape_git` builds a remote, a release checkout and a gateway
+// data dir from a `GitShape`. CI runs the neutral defaults; a production-scale
+// run sets `IGN_PROD_SHAPE_FILE` to a private TOML file outside this
+// repository. Every row below prints `measured <ms> budget <ms>` and fails over
+// budget with both numbers. Rows take `GIT_PRODSHAPE_SERIAL` so two rows never
+// time each other's disk and CPU, and each generates its own fixture outside
+// the timed span.
+
+use common::git_fixture::{BRANCH, GATEWAY, PROJECT, git as run_git, in_scope};
+use common::prod_shape_git::{self as shape_git, GitShape, ProdShapeGit};
+use ignition_core::deploy::git_advance::{GitWrite, GitWriteName, pack_bases, predict_drift};
+use ignition_core::deploy::git_handover::{restore_and_advance, save};
+use ignition_core::deploy::git_remote::HostGit;
+use ignition_core::deploy::ledger::LedgerRoot;
+use ignition_core::deploy::transport::projects::{GitHostRead, GitStateWriter};
+
+static GIT_PRODSHAPE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One git-shape row at a time.
+fn prodshape_serial() -> std::sync::MutexGuard<'static, ()> {
+    GIT_PRODSHAPE_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Drive `future` on a private runtime, so the row's lock is held by a
+/// synchronous function and never across an await.
+fn prodshape_block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(future)
+}
+
+/// The shape this run uses, and a generated fixture of it in `dir`.
+fn prodshape_fixture(dir: &std::path::Path) -> (GitShape, ProdShapeGit) {
+    let shape = GitShape::from_env();
+    let started = Instant::now();
+    let fixture = ProdShapeGit::generate(dir, &shape);
+    eprintln!(
+        "git_prodshape: generated in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    (shape, fixture)
+}
+
+/// Print a row's time beside its budget and fail over it.
+fn prodshape_within(row: &str, measured: Duration, budget: Duration) {
+    eprintln!(
+        "{row}: measured {} ms budget {} ms",
+        measured.as_millis(),
+        budget.as_millis()
+    );
+    assert!(
+        measured <= budget,
+        "{row}: measured {} ms is over the budget of {} ms",
+        measured.as_millis(),
+        budget.as_millis()
+    );
+}
+
+/// `got` is within 5% of `want`.
+fn prodshape_near(what: &str, got: u64, want: u64) {
+    eprintln!("git_prodshape_shape: {what}: measured {got}, parameter {want}");
+    assert!(
+        got.abs_diff(want) * 20 <= want,
+        "{what}: measured {got} is not within 5% of the parameter {want}"
+    );
+}
+
+#[test]
+fn git_prodshape_shape() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+
+    let measured = shape_git::measure_git_dir(&f.git_dir());
+    prodshape_near("gateway .git bytes", measured.bytes, shape.git_bytes);
+    prodshape_near(
+        "gateway .git files",
+        measured.files as u64,
+        shape.git_files as u64,
+    );
+    prodshape_near("packs", measured.packs as u64, shape.packs as u64);
+    prodshape_near(
+        "loose objects",
+        measured.loose as u64,
+        shape.loose_objects as u64,
+    );
+    prodshape_near("commits", f.gateway_commits() as u64, shape.commits as u64);
+    let (in_scope, out_of_scope) = f.tree_scope_counts();
+    prodshape_near(
+        "tracked",
+        (in_scope + out_of_scope) as u64,
+        shape.tracked as u64,
+    );
+    prodshape_near("in scope", in_scope as u64, shape.in_scope as u64);
+    prodshape_near(
+        "out of scope",
+        out_of_scope as u64,
+        shape.out_of_scope as u64,
+    );
+    prodshape_near(
+        "advance commits",
+        f.advance_count() as u64,
+        shape.advance_commits as u64,
+    );
+
+    // The artifact carries every in-scope path, and the remote holds the tag.
+    assert_eq!(f.artifact_members().len(), shape.in_scope);
+    assert_eq!(
+        run_git(
+            &f.checkout,
+            &["rev-parse", &format!("{}^{{commit}}", f.release_tag)]
+        ),
+        f.release_head
+    );
+    assert_eq!(
+        run_git(
+            &f.remote,
+            &["rev-parse", &format!("{}^{{commit}}", f.release_tag)]
+        ),
+        f.release_head
+    );
+    // The in-scope files are on disk; the gateway's HEAD is not the release.
+    assert!(f.project.join("project.json").is_file());
+    assert_ne!(f.gateway_head, f.release_head);
+}
+
+#[test]
+fn git_prodshape_emit() {
+    let Some(out) = std::env::var_os("PRODSHAPE_GIT_OUT").filter(|v| !v.is_empty()) else {
+        return;
+    };
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let written = f.emit_to(std::path::Path::new(&out));
+    eprintln!(
+        "git_prodshape_emit: remote {}/capapp.git, gateway data {}/data, release tag {}, gateway head {}, release {}",
+        written.display(),
+        written.display(),
+        f.release_tag,
+        f.gateway_head,
+        f.release_head
+    );
+}
+
+#[test]
+fn git_prodshape_refuses_a_path_inside_the_repository() {
+    let root = repository_root();
+    assert!(shape_git::outside_repository(&root).is_err());
+    assert!(shape_git::outside_repository(&root.join("crates")).is_err());
+    assert!(shape_git::outside_repository(&root.join("not-there-yet/sub")).is_err());
+    assert!(shape_git::outside_repository(&root.join("crates/../crates")).is_err());
+    let outside = tempfile::tempdir().expect("tempdir");
+    assert!(shape_git::outside_repository(outside.path()).is_ok());
+    assert!(shape_git::outside_repository(&outside.path().join("later/dir")).is_ok());
+}
+
+#[test]
+fn git_prodshape_shape_file_refuses_unknown_keys_and_bad_relations() {
+    let neutral = GitShape::neutral();
+    let text = |extra: &str, tracked: usize| {
+        format!(
+            "git_bytes = {}\ngit_files = {}\npacks = {}\nloose_objects = {}\ncommits = {}\n\
+             tracked = {tracked}\nin_scope = {}\nout_of_scope = {}\nadvance_commits = {}\n{extra}",
+            neutral.git_bytes,
+            neutral.git_files,
+            neutral.packs,
+            neutral.loose_objects,
+            neutral.commits,
+            neutral.in_scope,
+            neutral.out_of_scope,
+            neutral.advance_commits,
+        )
+    };
+    assert_eq!(
+        GitShape::from_toml(&text("", neutral.tracked)).expect("parses"),
+        neutral
+    );
+    assert!(GitShape::from_toml(&text("surprise = 1\n", neutral.tracked)).is_err());
+    assert!(GitShape::from_toml(&text("", neutral.tracked + 1)).is_err());
+}
+
+/// WR-D9, D-18: a parse error never repeats a value (or a key) from the shape
+/// file. serde's own messages do: ``invalid type: floating point `1500000000`,
+/// expected u64`` and ``invalid value: integer `-1`, expected usize``.
+#[test]
+fn git_prodshape_shape_file_errors_never_echo_values() {
+    let neutral = GitShape::neutral();
+    // The neutral shape with one line replaced (or one line added).
+    let with = |key: &str, value: &str| {
+        let mut rows: Vec<(String, String)> = vec![
+            ("git_bytes".into(), neutral.git_bytes.to_string()),
+            ("git_files".into(), neutral.git_files.to_string()),
+            ("packs".into(), neutral.packs.to_string()),
+            ("loose_objects".into(), neutral.loose_objects.to_string()),
+            ("commits".into(), neutral.commits.to_string()),
+            ("tracked".into(), neutral.tracked.to_string()),
+            ("in_scope".into(), neutral.in_scope.to_string()),
+            ("out_of_scope".into(), neutral.out_of_scope.to_string()),
+            (
+                "advance_commits".into(),
+                neutral.advance_commits.to_string(),
+            ),
+        ];
+        match rows.iter_mut().find(|(k, _)| k == key) {
+            Some(row) => row.1 = value.to_string(),
+            None => rows.push((key.to_string(), value.to_string())),
+        }
+        rows.iter()
+            .map(|(k, v)| format!("{k} = {v}\n"))
+            .collect::<String>()
+    };
+    let cases = [
+        (with("git_bytes", "1.5e9"), vec!["1.5e9", "1500000000"]),
+        (with("packs", "-1"), vec!["-1"]),
+        (
+            with("surprise_private_key", "7777777"),
+            vec!["surprise_private_key", "7777777"],
+        ),
+        (
+            with("git_files", "\"private-string-value\""),
+            vec!["private-string-value"],
+        ),
+    ];
+    for (text, forbidden) in cases {
+        let err = GitShape::from_toml(&text).expect_err("the shape file does not parse");
+        assert!(
+            err.contains("the shape file does not parse"),
+            "the error says what failed: {err}"
+        );
+        for value in forbidden {
+            assert!(!err.contains(value), "the error repeats {value:?}: {err}");
+        }
+    }
+}
+
+/// The run id every save in these rows uses.
+const GIT_PRODSHAPE_RUN: &str = "20261113T101500Z-ab12";
+
+#[test]
+fn git_prodshape_read_state() {
+    use shape_git::OFFLINE_READ_STATE;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let node = f.node();
+        let host = HostGit::new();
+        let started = Instant::now();
+        let files = node.read_git_state(PROJECT).await.expect("host read");
+        files.check_caps().expect("caps");
+        let config = host
+            .parse_config(files.config.as_deref().expect("config"))
+            .await
+            .expect("config");
+        let refs = host
+            .parse_refs(&files)
+            .await
+            .expect("refs")
+            .expect("some refs");
+        let took = started.elapsed();
+        assert_eq!(config.remotes.len(), 1);
+        assert_eq!(refs.head.commit(), Some(f.gateway_head.as_str()));
+        prodshape_within("git_prodshape_read_state", took, OFFLINE_READ_STATE);
+    });
+}
+
+#[test]
+fn git_prodshape_save() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let node = f.node();
+        let before = node.git_manifest(PROJECT).await.expect("manifest");
+        let started = Instant::now();
+        let report = save(
+            &node,
+            &node,
+            LedgerRoot::DataDir,
+            GATEWAY,
+            PROJECT,
+            GIT_PRODSHAPE_RUN,
+        )
+        .await
+        .expect("save");
+        let took = started.elapsed();
+        assert_eq!(report.manifest, before, "the save equals the gateway .git");
+        assert!(f.data_dir.join(&report.path).is_dir());
+        prodshape_within("git_prodshape_save", took, shape_git::OFFLINE_SAVE);
+    });
+}
+
+#[test]
+fn git_prodshape_restore_verify() {
+    use shape_git::OFFLINE_RESTORE_VERIFY;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let node = f.node();
+        let saved = save(
+            &node,
+            &node,
+            LedgerRoot::DataDir,
+            GATEWAY,
+            PROJECT,
+            GIT_PRODSHAPE_RUN,
+        )
+        .await
+        .expect("save");
+        // The import deletes `.git` (R-3).
+        std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
+        let started = Instant::now();
+        let back = node
+            .restore_git(GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("restore");
+        let live = node.git_manifest(PROJECT).await.expect("manifest");
+        let took = started.elapsed();
+        assert_eq!(back, saved.manifest);
+        assert_eq!(live, saved.manifest);
+        prodshape_within("git_prodshape_restore_verify", took, OFFLINE_RESTORE_VERIFY);
+    });
+}
+
+#[test]
+fn git_prodshape_pack() {
+    use shape_git::OFFLINE_PACK;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let (_state, refs) = f.gateway_state(&host).await;
+        let bases = pack_bases(&host, &f.checkout, &refs).await.expect("bases");
+        assert!(bases.contains(&f.gateway_head), "{bases:?}");
+        let started = Instant::now();
+        let pack = host
+            .build_pack(&f.checkout, &f.release_head, &bases)
+            .await
+            .expect("pack")
+            .expect("the release has objects the gateway lacks");
+        let took = started.elapsed();
+        prodshape_within("git_prodshape_pack", took, OFFLINE_PACK);
+        eprintln!(
+            "git_prodshape_pack: {} advance commits, {} pack bytes",
+            shape.advance_commits,
+            pack.pack.len()
+        );
+
+        // The pack holds every object the gateway lacked: with it and the new
+        // branch ref the gateway repo is connected.
+        let node = f.node();
+        node.write_git_files(
+            PROJECT,
+            &[
+                GitWrite {
+                    name: GitWriteName::PackFile(pack.name.clone()),
+                    bytes: pack.pack.clone(),
+                },
+                GitWrite {
+                    name: GitWriteName::PackIndex(pack.name.clone()),
+                    bytes: pack.idx.clone(),
+                },
+                GitWrite {
+                    name: GitWriteName::BranchRef(BRANCH.to_string()),
+                    bytes: format!("{}\n", f.release_head).into_bytes(),
+                },
+            ],
+        )
+        .await
+        .expect("write the advance");
+        run_git(&f.project, &["fsck", "--connectivity-only"]);
+        assert_eq!(
+            run_git(&f.project, &["rev-parse", &format!("refs/heads/{BRANCH}")]),
+            f.release_head
+        );
+    });
+}
+
+#[test]
+fn git_prodshape_index() {
+    use shape_git::OFFLINE_INDEX;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let tree = host
+            .tree_paths(&f.checkout, &f.release_head)
+            .await
+            .expect("tree");
+        let assume: Vec<String> = tree.iter().filter(|p| !in_scope(p)).cloned().collect();
+        assert_eq!(assume.len(), shape.out_of_scope);
+        let started = Instant::now();
+        let index = host
+            .build_index(&f.checkout, &f.release_head, &assume)
+            .await
+            .expect("index");
+        let took = started.elapsed();
+        prodshape_within("git_prodshape_index", took, OFFLINE_INDEX);
+        assert_eq!(&index[..4], b"DIRC");
+        let entries = u32::from_be_bytes([index[8], index[9], index[10], index[11]]);
+        assert_eq!(entries as usize, shape.tracked);
+    });
+}
+
+/// One timed gateway-object read (27-10): `list_git_objects` plus the fetches
+/// within `objects_budget` ([`OFFLINE_GATEWAY_OBJECTS`](shape_git::OFFLINE_GATEWAY_OBJECTS)
+/// for the local node, the host budget of the transport under test for a
+/// remote one), and everything else (scratch dir, the walk for missing ids,
+/// the index reads, the digest of the tree at G) within
+/// [`OFFLINE_GATEWAY_DIGEST`](shape_git::OFFLINE_GATEWAY_DIGEST). Prints both
+/// times and the fetch counts, never the shape. Returns the fetch counts.
+fn prodshape_gateway_objects_over<R: ignition_core::deploy::transport::projects::GitHostRead>(
+    row: &str,
+    f: &ProdShapeGit,
+    checkout: &std::path::Path,
+    d: &str,
+    read: &shape_git::TimedRead<R>,
+    objects_budget: Duration,
+) -> ignition_core::deploy::git_objects::FetchStats {
+    use ignition_core::deploy::git_gate::dirty_paths;
+    use ignition_core::deploy::git_objects::gateway_head_digest;
+    use ignition_core::deploy::project_artifact::canonical_digest;
+    use shape_git::OFFLINE_GATEWAY_DIGEST;
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let started = Instant::now();
+        let (digest, stats) = gateway_head_digest(&host, checkout, read, PROJECT, d)
+            .await
+            .expect("the gateway's objects supply G");
+        let total = started.elapsed();
+        let objects = read.spent();
+        let resolve = total.saturating_sub(objects);
+        eprintln!(
+            "{row}: fetched {} loose objects, {} indexes, {} packs, {} bytes",
+            stats.loose, stats.idx, stats.packs, stats.bytes
+        );
+        // The listing against the three caps (27-27, WR-A6). Counts and bytes
+        // go to the test output only, never to a file.
+        if let Some((loose, packs, bytes)) = read.listing() {
+            use ignition_core::deploy::git_objects::{
+                GIT_OBJECTS_FETCH_MAX_BYTES, GIT_OBJECTS_LOOSE_MAX, GIT_OBJECTS_PACKS_MAX,
+            };
+            eprintln!(
+                "GATEWAY-OBJECT-CAPS {row} loose {loose}/{GIT_OBJECTS_LOOSE_MAX} packs {packs}/{GIT_OBJECTS_PACKS_MAX} bytes {bytes}/{GIT_OBJECTS_FETCH_MAX_BYTES}"
+            );
+        }
+        // Correct before fast: the tree at G equals the live export (the
+        // work tree holds the designer commit), so nothing is dirty.
+        let live = canonical_digest(&f.export_zip()).expect("live digest");
+        assert_eq!(dirty_paths(&live, &digest), Vec::<String>::new());
+        prodshape_within(&format!("{row}_objects"), objects, objects_budget);
+        prodshape_within(&format!("{row}_digest"), resolve, OFFLINE_GATEWAY_DIGEST);
+        stats
+    })
+}
+
+fn prodshape_gateway_objects_row(row: &str, f: &ProdShapeGit, checkout: &std::path::Path, d: &str) {
+    use shape_git::{OFFLINE_GATEWAY_OBJECTS, TimedRead};
+    let read = TimedRead::new(f.node());
+    prodshape_gateway_objects_over(row, f, checkout, d, &read, OFFLINE_GATEWAY_OBJECTS);
+}
+
+#[test]
+fn git_prodshape_gateway_objects_typical() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    // The unpushed commit is loose and ign's checkout is at the release, so
+    // only loose objects are read. Generation and the commit are untimed.
+    let d = f.designer_commit(false);
+    prodshape_gateway_objects_row("git_prodshape_gateway_objects_typical", &f, &f.checkout, &d);
+}
+
+#[test]
+fn git_prodshape_gateway_objects_worst() {
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    // The unpushed commit is packed and ign's store is empty, so every pack
+    // that holds an object of G's tree is read.
+    let d = f.designer_commit(true);
+    let empty = tempfile::tempdir().expect("tempdir");
+    run_git(empty.path(), &["init", "-q"]);
+    prodshape_gateway_objects_row("git_prodshape_gateway_objects_worst", &f, empty.path(), &d);
+}
+
+#[test]
+fn git_prodshape_drift() {
+    use shape_git::OFFLINE_DRIFT;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let (_state, prep) = f.prepare(&host).await;
+        let targets = f.gateway_form_targets();
+        f.simulate_import(true, &targets);
+        let export = f.export_members();
+        assert_eq!(export.len(), shape.in_scope);
+        let started = Instant::now();
+        let prediction = predict_drift(&prep, &export);
+        let took = started.elapsed();
+        prodshape_within("git_prodshape_drift", took, OFFLINE_DRIFT);
+        let mut want = targets.clone();
+        want.sort();
+        assert_eq!(prediction.modified, want);
+        assert!(
+            prediction.untracked.is_empty(),
+            "{:?}",
+            prediction.untracked
+        );
+        assert!(prediction.unexpected.is_empty());
+        assert!(prediction.dropped.is_empty());
+    });
+}
+
+#[test]
+fn git_prodshape_handover() {
+    use shape_git::{
+        OFFLINE_DRIFT, OFFLINE_INDEX, OFFLINE_PACK, OFFLINE_READ_STATE, OFFLINE_RESTORE_VERIFY,
+        OFFLINE_SAVE,
+    };
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let node = f.node();
+        let targets = f.gateway_form_targets();
+
+        let started = Instant::now();
+        let (state, prep) = f.prepare(&host).await;
+        let prepared = started.elapsed();
+
+        let started = Instant::now();
+        let saved = save(
+            &node,
+            &node,
+            LedgerRoot::DataDir,
+            GATEWAY,
+            PROJECT,
+            GIT_PRODSHAPE_RUN,
+        )
+        .await
+        .expect("save");
+        let save_took = started.elapsed();
+
+        f.simulate_import(false, &targets);
+        let export = f.export_zip();
+
+        let started = Instant::now();
+        let report = restore_and_advance(
+            &node,
+            &node,
+            &host,
+            &f.checkout,
+            &state,
+            &saved,
+            &prep,
+            &export,
+            None,
+        )
+        .await
+        .expect("restore and advance");
+        let restore_took = started.elapsed();
+
+        eprintln!(
+            "git_prodshape_handover: prepare (read, pack, blobs) {} ms, save {} ms, restore and advance (index, status, restore, write, verify) {} ms",
+            prepared.as_millis(),
+            save_took.as_millis(),
+            restore_took.as_millis()
+        );
+        prodshape_within(
+            "git_prodshape_handover",
+            prepared + save_took + restore_took,
+            OFFLINE_READ_STATE
+                + OFFLINE_PACK
+                + OFFLINE_SAVE
+                + OFFLINE_INDEX
+                + OFFLINE_DRIFT
+                + OFFLINE_RESTORE_VERIFY,
+        );
+
+        assert!(report.restored && report.advanced && report.verified);
+        let mut want = targets.clone();
+        want.sort();
+        assert_eq!(report.expected_drift, want);
+        assert!(report.dropped.is_empty());
+        assert_eq!(run_git(&f.project, &["rev-parse", "HEAD"]), f.release_head);
+        let status = run_git(
+            &f.project,
+            &["status", "--porcelain", "--untracked-files=all"],
+        );
+        let mut paths: Vec<String> = status
+            .lines()
+            .filter_map(|l| l.trim_start().split_once(' '))
+            .map(|(_, path)| path.to_string())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, want);
+    });
+}
+
+/// The prepare's whole git step at production shape (27-13): read and classify
+/// the gateway repo, check the release checkout, ask the `file://` remote for
+/// its heads, the ancestry and dirty gates over the shape's in-scope members,
+/// and the advance preparation (pack and blobs). Everything `deploy projects`
+/// does with git before any gateway write, timed together against
+/// [`OFFLINE_PREPARE`](shape_git::OFFLINE_PREPARE). Prints the time, never the
+/// shape.
+/// The write preflight (27-19, D-22) on the production-shape `.git`: the
+/// probe in the project directory and in `.git`, the size-only listing and
+/// the free-space read, with the prepared pack in the need. Within
+/// [`OFFLINE_PREFLIGHT`](shape_git::OFFLINE_PREFLIGHT) on the local transport;
+/// the host columns are carried by `git_prodshape_posix_size` and the Windows
+/// size row. The preflight never computes a manifest (checker W-5), which is
+/// what keeps it this cheap at 450 MB of `.git`.
+#[test]
+fn git_prodshape_preflight() {
+    use ignition_core::actions::deploy_projects::git::{git_free_need, git_preflight, read_state};
+    use ignition_core::deploy::git_advance::prepare_advance;
+    use shape_git::OFFLINE_PREFLIGHT;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let members = f.artifact_members();
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let node = f.node();
+        // Untimed: the prepare builds the advance input (and its pack) before
+        // the run's first write; the preflight only reads its size.
+        let found = read_state(&node, &host, PROJECT).await.expect("read state");
+        let refs = found.refs.clone().expect("refs");
+        let prep = prepare_advance(
+            &host,
+            &f.checkout,
+            &found.state,
+            &refs,
+            &f.release_head,
+            &members,
+        )
+        .await
+        .expect("advance prep");
+        let started = Instant::now();
+        git_preflight(
+            &node,
+            &node,
+            GATEWAY,
+            PROJECT,
+            Some(&prep),
+            "20261113T101500Z-pf01",
+        )
+        .await
+        .expect("the preflight passes on a writable host with room");
+        let took = started.elapsed();
+        // Correct before fast: the need is the one the rule gives, the probe
+        // left nothing behind, and `.git` is as it was.
+        let size = node.git_size(PROJECT).await.expect("size");
+        let need = git_free_need(size.bytes, Some(&prep));
+        assert!(need > 2 * size.bytes, "the need counts the slack");
+        for dir in [f.project.clone(), f.project.join(".git")] {
+            let left: Vec<String> = std::fs::read_dir(&dir)
+                .expect("read_dir")
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(".ign-probe-"))
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
+        eprintln!(
+            "git_prodshape_preflight: {} files, {} bytes of .git, need {} bytes",
+            size.files, size.bytes, need
+        );
+        prodshape_within("git_prodshape_preflight", took, OFFLINE_PREFLIGHT);
+    });
+}
+
+#[test]
+fn git_prodshape_prepare() {
+    use ignition_core::actions::deploy_projects::git::read_state;
+    use ignition_core::deploy::git_advance::prepare_advance;
+    use ignition_core::deploy::git_gate::{check_release_checkout, gate_node, remote_view};
+    use ignition_core::deploy::project_artifact::canonical_digest;
+    use shape_git::OFFLINE_PREPARE;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    // Untimed: the fixture's release checkout holds only the in-scope files, so
+    // it is completed to a clean full checkout (what `fetch-depth: 0` and a
+    // tag checkout give a real run), then what the live export reads as and
+    // the artifact's members.
+    run_git(&f.checkout, &["checkout-index", "-a", "-f"]);
+    let live = canonical_digest(&f.export_zip()).expect("live digest");
+    let members = f.artifact_members();
+    prodshape_block_on(async {
+        let host = HostGit::new();
+        let node = f.node();
+        let started = Instant::now();
+        let found = read_state(&node, &host, PROJECT).await.expect("read state");
+        let refs = found.refs.clone().expect("refs");
+        let remote = found.state.remote.clone().expect("the module's remote");
+        let checkout = check_release_checkout(&host, &f.checkout, &f.release_tag, &remote.url_key)
+            .await
+            .expect("the checkout is at the release");
+        let view = remote_view(&host, &checkout).await.expect("remote view");
+        let prep = prepare_advance(
+            &host,
+            &f.checkout,
+            &found.state,
+            &refs,
+            &checkout.commit,
+            &members,
+        )
+        .await
+        .expect("advance prep");
+        let gates = gate_node(
+            &host,
+            &checkout,
+            &view,
+            &found.state,
+            found.files.head_log_tail.as_deref(),
+            &live,
+        )
+        .await
+        .expect("gates");
+        let took = started.elapsed();
+        // Correct before fast: the shape is a clean, pushed, merged module
+        // clone, so nothing is unpushed, unmerged or dirty.
+        assert!(gates.unpushed.is_empty(), "{:?}", gates.unpushed);
+        assert_eq!(gates.not_merged_count, 0);
+        assert_eq!(gates.dirty_count, 0, "{:?}", gates.dirty);
+        assert!(gates.release_on_branch);
+        assert_eq!(checkout.commit, f.release_head);
+        drop(prep);
+        prodshape_within("git_prodshape_prepare", took, OFFLINE_PREPARE);
+    });
+}
+
+// ---- the same handover through the POSIX host scripts (plan 27-08) -----------
+//
+// The POSIX scripts of `SftpTransport` (save, restore, manifest, size) run
+// under the local `sh` (the `local_exec` seam) on the same generated `.git`
+// the rows above use, so the numbers are the scripts' own on this machine, and
+// the ssh connection count is asserted to be fixed: one exec per operation, no
+// sftp session, whatever the file count.
+
+#[cfg(unix)]
+mod prodshape_posix {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ignition_core::deploy::transport::process::{
+        ProcessOutput, ProcessRunner, TokioProcessRunner,
+    };
+    use ignition_core::deploy::transport::remote::RemoteShell;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+
+    /// Counts the exec calls (`sh -c`) and the sftp sessions.
+    #[derive(Default)]
+    pub struct Count {
+        execs: Mutex<Vec<String>>,
+        sftp: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Count {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program == "sh" {
+                self.execs.lock().expect("execs").push(
+                    args.last()
+                        .map(|a| a.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+            } else {
+                self.sftp.fetch_add(1, Ordering::Relaxed);
+            }
+            let (program, args) = common::posix_exec::shimmed(program, args);
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    impl Count {
+        pub fn execs(&self) -> usize {
+            self.execs.lock().expect("execs").len()
+        }
+        pub fn sftp(&self) -> usize {
+            self.sftp.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The POSIX transport over the fixture's data dir, with a fresh account
+    /// home outside it.
+    pub fn posix_node(
+        data_dir: &std::path::Path,
+        home: &std::path::Path,
+    ) -> (SftpTransport, Arc<Count>) {
+        let count = Arc::new(Count::default());
+        let shell = RemoteShell::local_sftp_server(
+            &common::sftp_server::sftp_server_path(),
+            count.clone(),
+            Duration::from_secs(900),
+        )
+        .local_exec();
+        let data = posix_root(&data_dir.display().to_string()).expect("posix root");
+        let home = posix_root(&home.display().to_string()).expect("home root");
+        (
+            SftpTransport::new(shell, data, "nodes.posix").with_home(&home),
+            count,
+        )
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_save_restore() {
+    use prodshape_posix::posix_node;
+    use shape_git::{HOST_LINUX_RESTORE_VERIFY, HOST_LINUX_SAVE};
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (node, count) = posix_node(&f.data_dir, home.path());
+        let reference = f.node().git_manifest(PROJECT).await.expect("reference");
+
+        // the live manifest, then the save (the script compares both itself)
+        let live = node.git_manifest(PROJECT).await.expect("live manifest");
+        assert_eq!(live, reference, "the host digest equals the local one");
+        let started = Instant::now();
+        let saved = node
+            .save_git(GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("save");
+        let save_took = started.elapsed();
+        assert_eq!(saved, reference, "the save equals the gateway .git");
+        prodshape_within("git_prodshape_posix_save", save_took, HOST_LINUX_SAVE);
+
+        // the import deletes `.git`; restore plus the manifest of the result
+        std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
+        let started = Instant::now();
+        let back = node
+            .restore_git(GATEWAY, PROJECT, GIT_PRODSHAPE_RUN)
+            .await
+            .expect("restore");
+        let after = node.git_manifest(PROJECT).await.expect("manifest after");
+        let restore_took = started.elapsed();
+        assert_eq!(back, reference);
+        assert_eq!(after, reference);
+        prodshape_within(
+            "git_prodshape_posix_restore_verify",
+            restore_took,
+            HOST_LINUX_RESTORE_VERIFY,
+        );
+
+        // a fixed number of connections: one exec per operation (manifest,
+        // save, restore, manifest) and no sftp session at all
+        assert_eq!(count.execs(), 4, "one ssh connection per operation");
+        assert_eq!(count.sftp(), 0, "no per-file sftp traffic");
+        eprintln!(
+            "git_prodshape_posix_save_restore: {} ssh connections for {} files",
+            count.execs(),
+            reference.files
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_size() {
+    use prodshape_posix::posix_node;
+    use shape_git::HOST_LINUX_PREFLIGHT;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (node, count) = posix_node(&f.data_dir, home.path());
+        let reference = f.node().git_manifest(PROJECT).await.expect("reference");
+        let started = Instant::now();
+        let size = node.git_size(PROJECT).await.expect("size");
+        let took = started.elapsed();
+        assert_eq!(size.files, reference.files);
+        assert_eq!(size.bytes, reference.bytes);
+        assert_eq!(count.execs(), 1, "one ssh connection");
+        assert_eq!(count.sftp(), 0, "no sftp session");
+        prodshape_within("git_prodshape_posix_size", took, HOST_LINUX_PREFLIGHT);
+    });
+}
+
+/// The worst case of the gateway-object read through the POSIX host scripts
+/// (27-11): the unpushed commit is packed and ign's store is empty, so every
+/// pack that holds an object of G's tree is read, through the listing script
+/// and the chunked sftp download of the local sftp-server. Listing plus fetch
+/// within [`HOST_LINUX_GATEWAY_OBJECTS`](shape_git::HOST_LINUX_GATEWAY_OBJECTS);
+/// the connection count does not follow the object or the pack count.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_gateway_objects() {
+    use prodshape_posix::posix_node;
+    use shape_git::{HOST_LINUX_GATEWAY_OBJECTS, TimedRead};
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let d = f.designer_commit(true);
+    let empty = tempfile::tempdir().expect("tempdir");
+    run_git(empty.path(), &["init", "-q"]);
+    let (node, count) = posix_node(&f.data_dir, home.path());
+    let read = TimedRead::new(node);
+    let stats = prodshape_gateway_objects_over(
+        "git_prodshape_posix_gateway_objects",
+        &f,
+        empty.path(),
+        &d,
+        &read,
+        HOST_LINUX_GATEWAY_OBJECTS,
+    );
+    // one listing exec; one download session for the loose objects, one for
+    // the indexes and one per round of packs, never one per object or pack
+    assert_eq!(count.execs(), 1, "one ssh connection for the listing");
+    let sessions = count.sftp();
+    eprintln!(
+        "git_prodshape_posix_gateway_objects: {} ssh connections ({sessions} sftp sessions) for {} loose objects, {} packs",
+        count.execs() + sessions,
+        stats.loose,
+        stats.packs
+    );
+    assert!(sessions <= 6, "{sessions} sftp sessions");
+    assert!(
+        stats.packs > sessions,
+        "the packs ({}) outnumber the sessions ({sessions}): not one session per pack",
+        stats.packs
+    );
+}
+
+/// The same worst case with the Windows bodies under the local `pwsh`
+/// (27-11): the listing WinScript, then one archive per fetch (BUNDLE with
+/// `NoCompression` and `bundle::extract`) through the transport's own staging
+/// below an account home spelled as a Windows host spells it. Listing plus
+/// fetch within
+/// [`HOST_WINDOWS_GATEWAY_OBJECTS`](shape_git::HOST_WINDOWS_GATEWAY_OBJECTS).
+/// A runner without `pwsh` prints `PWSH-SKIPPED git_prodshape_pwsh_gateway_objects (no pwsh)`.
+/// This is PowerShell 7 on a unix file system; the Windows VM run
+/// (`wincap_git_objects`) times Windows PowerShell 5.1 on NTFS and never
+/// replaces it.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_pwsh_gateway_objects() {
+    use ignition_core::deploy::transport::remote::RemoteShell;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use shape_git::{HOST_WINDOWS_GATEWAY_OBJECTS, TimedRead};
+    if !common::pwsh_exec::gate("git_prodshape_pwsh_gateway_objects") {
+        return;
+    }
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    let d = f.designer_commit(true);
+    let empty = tempfile::tempdir().expect("tempdir");
+    run_git(empty.path(), &["init", "-q"]);
+    let runner = common::pwsh_exec::PwshHomeRunner {
+        home: home.path().to_path_buf(),
+    };
+    let shell = RemoteShell::local_sftp_server(
+        &common::sftp_server::sftp_server_path(),
+        Arc::new(runner),
+        Duration::from_secs(900),
+    )
+    .local_exec();
+    let data = posix_root(&f.data_dir.display().to_string()).expect("posix root");
+    let node = Arc::new(
+        SftpTransport::new_windows(shell, data, "nodes.pwsh")
+            .with_home(common::pwsh_exec::SEAM_HOME),
+    );
+    let read = TimedRead::new(SharedRead(node.clone()));
+    let stats = prodshape_gateway_objects_over(
+        "git_prodshape_pwsh_gateway_objects",
+        &f,
+        empty.path(),
+        &d,
+        &read,
+        HOST_WINDOWS_GATEWAY_OBJECTS,
+    );
+    // The listing, then one fetch each for the loose objects and the indexes
+    // (three or four connections), then one fetch per round of packs. A fetch of
+    // 64 MiB or more is split into up to four parts of two connections each
+    // plus two for the staging directory (`2 * parts + 2`, `PARTS_MAX` is 4), so a
+    // round costs at most 10 whatever the object or pack count. Three rounds are
+    // far more than the worst case needs (it takes two).
+    let connections = node.sessions();
+    eprintln!(
+        "git_prodshape_pwsh_gateway_objects: {connections} ssh connections for {} loose objects, {} packs",
+        stats.loose, stats.packs
+    );
+    let bound = 1 + 4 + 4 + 3 * (2 * 4 + 2 + 1);
+    assert!(
+        connections <= bound,
+        "{connections} connections, bound {bound}"
+    );
+    assert!(
+        stats.packs > 6,
+        "the packs ({}) outnumber what a connection bound could hide",
+        stats.packs
+    );
+}
+
+/// An `Arc<SftpTransport>` as a [`GitHostRead`](ignition_core::deploy::transport::projects::GitHostRead),
+/// so a row can read the connection count after the run.
+#[cfg(unix)]
+struct SharedRead(Arc<ignition_core::deploy::transport::sftp::SftpTransport>);
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl ignition_core::deploy::transport::projects::GitHostRead for SharedRead {
+    async fn read_git_state(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_state::GitFiles, ignition_core::error::CoreError> {
+        self.0.read_git_state(project).await
+    }
+    async fn git_manifest(
+        &self,
+        project: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.0.git_manifest(project).await
+    }
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<
+        ignition_core::deploy::transport::projects::GitManifest,
+        ignition_core::error::CoreError,
+    > {
+        self.0.save_manifest(gateway, project, run_id).await
+    }
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &ignition_core::deploy::git_advance::GitWriteName,
+    ) -> Result<Option<String>, ignition_core::error::CoreError> {
+        self.0.git_file_digest(project, name).await
+    }
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, ignition_core::error::CoreError> {
+        self.0.read_git_yaml().await
+    }
+    async fn project_dir_entry(
+        &self,
+        project: &str,
+        dir: ignition_core::deploy::transport::projects::ImportDir,
+    ) -> Result<ignition_core::deploy::transport::projects::GitEntry, ignition_core::error::CoreError>
+    {
+        self.0.project_dir_entry(project, dir).await
+    }
+    async fn free_bytes(
+        &self,
+        gateway: &str,
+        project: &str,
+    ) -> Result<u64, ignition_core::error::CoreError> {
+        self.0.free_bytes(gateway, project).await
+    }
+    async fn git_size(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::transport::projects::GitSize, ignition_core::error::CoreError>
+    {
+        self.0.git_size(project).await
+    }
+    async fn list_git_objects(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_objects::GitObjectList, ignition_core::error::CoreError>
+    {
+        self.0.list_git_objects(project).await
+    }
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[ignition_core::deploy::git_objects::GitObjectFile],
+        dest: &std::path::Path,
+    ) -> Result<(), ignition_core::error::CoreError> {
+        self.0.fetch_git_objects(project, files, dest).await
+    }
+}
+
+/// The Windows git scripts (`winps::GIT_*`) under the local `pwsh` over the
+/// production-shape `.git`: size, save, and restore plus the manifest of the
+/// result, against the Windows host budgets. A runner without `pwsh` prints
+/// `PWSH-SKIPPED git_prodshape_pwsh_save_restore (no pwsh)`.
+///
+/// What the time means: the walk, the hashing, the manifest compare and the
+/// stage logic are the scripts' own and run here under PowerShell 7; the copy
+/// itself is the stand-in `robocopy` of `common::pwsh_exec` (a local `cp -R`),
+/// not robocopy. This row complements the Windows VM run
+/// (`wincap_git_scripts`), which times the real tool under PowerShell 5.1, and
+/// never replaces it.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_pwsh_save_restore() {
+    use common::pwsh_exec;
+    use ignition_core::deploy::transport::winps::WinScript;
+    use shape_git::{HOST_WINDOWS_PREFLIGHT, HOST_WINDOWS_RESTORE_VERIFY, HOST_WINDOWS_SAVE};
+    if !pwsh_exec::gate("git_prodshape_pwsh_save_restore") {
+        return;
+    }
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (data, home_s) = (
+            f.data_dir.display().to_string(),
+            home.path().display().to_string(),
+        );
+        let git = f.git_dir().display().to_string();
+        let reference = f.node().git_manifest(PROJECT).await.expect("reference");
+        let manifest_of = |answer: &serde_json::Value| {
+            (
+                answer["files"].as_u64().expect("files") as usize,
+                answer["bytes"].as_u64().expect("bytes"),
+                answer["digest"].as_str().expect("digest").to_string(),
+            )
+        };
+        let want = (reference.files, reference.bytes, reference.digest.clone());
+
+        // the preflight: one enumeration, no file read
+        let started = Instant::now();
+        let size = pwsh_exec::run(&WinScript::git_size("", &git)).expect("size");
+        let size_took = started.elapsed();
+        assert_eq!(size["files"].as_u64(), Some(reference.files as u64));
+        assert_eq!(size["bytes"].as_u64(), Some(reference.bytes));
+        prodshape_within("git_prodshape_pwsh_size", size_took, HOST_WINDOWS_PREFLIGHT);
+
+        let live = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("live manifest");
+        assert_eq!(
+            manifest_of(&live),
+            want,
+            "the Windows digest equals the local one"
+        );
+
+        let started = Instant::now();
+        let saved = pwsh_exec::run(&WinScript::git_save(
+            "",
+            &data,
+            PROJECT,
+            &home_s,
+            GATEWAY,
+            GIT_PRODSHAPE_RUN,
+        ))
+        .expect("save");
+        let save_took = started.elapsed();
+        assert_eq!(
+            manifest_of(&saved),
+            want,
+            "the save equals the gateway .git"
+        );
+        prodshape_within("git_prodshape_pwsh_save", save_took, HOST_WINDOWS_SAVE);
+
+        // the import deletes `.git`; restore plus the manifest of the result
+        std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
+        let started = Instant::now();
+        let back = pwsh_exec::run(&WinScript::git_restore(
+            "",
+            &data,
+            PROJECT,
+            &home_s,
+            GATEWAY,
+            GIT_PRODSHAPE_RUN,
+        ))
+        .expect("restore");
+        let after = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("manifest after");
+        let restore_took = started.elapsed();
+        assert_eq!(manifest_of(&back), want);
+        assert_eq!(manifest_of(&after), want);
+        prodshape_within(
+            "git_prodshape_pwsh_restore_verify",
+            restore_took,
+            HOST_WINDOWS_RESTORE_VERIFY,
+        );
+        eprintln!(
+            "git_prodshape_pwsh_save_restore: {} files, size {} ms, save {} ms, restore plus manifest {} ms",
+            reference.files,
+            size_took.as_millis(),
+            save_took.as_millis(),
+            restore_took.as_millis()
+        );
+    });
+}

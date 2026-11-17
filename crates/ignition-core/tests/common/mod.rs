@@ -25,9 +25,11 @@ pub mod native_shape;
 pub mod plan_fixture;
 pub mod posix_exec;
 pub mod prod_shape;
+pub mod prod_shape_git;
 #[cfg(unix)]
 pub mod pwsh_exec;
 pub mod sftp_server;
+pub mod vm_git_handover;
 
 /// Wraps a [`wiremock::MockServer`] with Ignition-shaped fixture builders.
 pub struct IgnitionMock {
