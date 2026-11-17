@@ -2554,7 +2554,12 @@ mod tests {
             "[remote \"other\"]\n\turl = https://git.example/o/r\n",
         )
         .expect("write");
-        let text = format!("{MODULE_CONFIG}[include]\n\tpath = {}\n", extra.display());
+        // git config reads a backslash as an escape: give the path with `/`
+        // (a Windows temp path otherwise makes the line unreadable)
+        let text = format!(
+            "{MODULE_CONFIG}[include]\n\tpath = {}\n",
+            extra.display().to_string().replace('\\', "/")
+        );
         let config = HostGit::new()
             .parse_config(text.as_bytes())
             .await
@@ -2644,7 +2649,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let extra = dir.path().join("extra");
         std::fs::write(&extra, "[branch \"production\"]\n\tremote = elsewhere\n").expect("write");
-        let text = format!("{PARTIAL_CONFIG}[include]\n\tpath = {}\n", extra.display());
+        // git config reads a backslash as an escape: give the path with `/`
+        // (a Windows temp path otherwise makes the line unreadable)
+        let text = format!(
+            "{PARTIAL_CONFIG}[include]\n\tpath = {}\n",
+            extra.display().to_string().replace('\\', "/")
+        );
         let out = host
             .adopt_branch_config(text.as_bytes(), "production", "origin")
             .await
