@@ -6349,6 +6349,26 @@ mod winps_git {
         let why = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
             .expect_err("a linked HEAD");
         assert!(why.contains("not a regular file"), "{why}");
+        std::fs::remove_file(&head).expect("rm link");
+        std::fs::rename(fx.git_dir().join("HEAD.real"), &head).expect("restore HEAD");
+        // CodeRabbit #56: a linked directory above a file or a ref root is a
+        // refusal too, never read through (`logs` above `logs/HEAD`, `refs`
+        // above `refs/heads` and `refs/remotes`)
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("heads")).expect("heads");
+        std::fs::write(outside.path().join("heads/stolen"), "1\n").expect("ref");
+        std::fs::write(outside.path().join("HEAD"), "0 1 x\n").expect("log");
+        for level in ["logs", "refs"] {
+            let at = fx.git_dir().join(level);
+            let aside = fx.git_dir().join(format!("{level}.real"));
+            std::fs::rename(&at, &aside).expect("aside");
+            std::os::unix::fs::symlink(outside.path(), &at).expect("link");
+            let why = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
+                .expect_err(level);
+            assert!(why.contains("not a real directory"), "{level}: {why}");
+            std::fs::remove_file(&at).expect("rm link");
+            std::fs::rename(&aside, &at).expect("back");
+        }
     }
 
     #[tokio::test]
@@ -6403,6 +6423,12 @@ mod winps_git {
         std::fs::remove_file(fx.git_dir().join("link")).expect("rm");
         std::fs::write(fx.git_dir().join("bad\u{7}name"), "x").expect("bell");
         assert!(pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).is_err());
+        std::fs::remove_file(fx.git_dir().join("bad\u{7}name")).expect("rm");
+        // CodeRabbit #56: a linked root is refused, not walked as its target
+        let linked = fx.data_dir.join("linked-git");
+        std::os::unix::fs::symlink(fx.git_dir(), &linked).expect("link root");
+        let why = pwsh_exec::run(&WinScript::git_manifest("", &s(&linked))).expect_err("root");
+        assert!(why.contains("not a real directory"), "{why}");
     }
 
     /// The listing of the object WinScript as the entries it reports.

@@ -379,10 +379,14 @@ macro_rules! git_ps_sx {
 /// oversized one. A reparse point, a directory where a file belongs or a name
 /// with a control character is a terminating error, never an absent file:
 /// presence is decided by `Get-Item -Force`, which throws unless the error is
-/// `ObjectNotFound` (the 25-03 captures). Loose refs stop at 4097 entries.
+/// `ObjectNotFound` (the 25-03 captures). Every directory above a file and
+/// above each loose-ref root (`logs`, `refs`) must be a real directory too,
+/// checked before anything below it is touched (CodeRabbit #56: `Get-Item` on
+/// the final path does not see a junction above it); an absent one is an
+/// absent file. Loose refs stop at 4097 entries.
 pub const GIT_STATE: &str = concat!(
     git_ps_base!(),
-    r##"$g=$p.a;K (Z $g)|Out-Null;function F($f,$k,$t){$q=$g+$c+$f.Replace('/',$c);$y=Z $q;if(!$y){return $null};if($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$f is not a regular file"};$n=$y.Length;$e=[int][Math]::Min([long]$n,[long]$k);$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{if($t -and $n -gt $e){[void]$s.Seek($n-$e,0)};$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};@{n=$n;b=[Convert]::ToBase64String($u,0,$o)}};$k=@();foreach($m in @($p.m)){if(Z ($g+$c+$m.Replace('/',$c))){$k+=$m}};$u=@();$z=0;foreach($d in 'refs/heads','refs/remotes'){$y=Z ($g+$c+$d.Replace('/',$c));if($y){K $y|Out-Null;$s=New-Object Collections.Stack;$s.Push(@($y,$d));while($s.Count -and $z -le 4097){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'refs holds a link or a name with a control character'};$r=$q[1]+'/'+$f.Name;if($a -band 16){$s.Push(@($f,$r))}else{$z++;if($z -le 4097){$v=F $r 65537 $false;$v.p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r));$u+=,$v}}}}}};E @{ok=1;head=(F 'HEAD' 65537 $false);config=(F 'config' 65537 $false);packed=(F 'packed-refs' 8388609 $false);log=(F 'logs/HEAD' 65536 $true);index=[bool](Z ($g+$c+'index'));markers=$k;refs=$u}"##,
+    r##"$g=$p.a;K (Z $g)|Out-Null;function P($f){$x=$f.Split('/');$h=$g;for($i=0;$i -lt $x.Length-1;$i++){$h+=$c+$x[$i];$j=Z $h;if(!$j){return $false};$null=K $j};$true};function F($f,$k,$t){if(!(P $f)){return $null};$q=$g+$c+$f.Replace('/',$c);$y=Z $q;if(!$y){return $null};if($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$f is not a regular file"};$n=$y.Length;$e=[int][Math]::Min([long]$n,[long]$k);$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{if($t -and $n -gt $e){[void]$s.Seek($n-$e,0)};$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};@{n=$n;b=[Convert]::ToBase64String($u,0,$o)}};$k=@();foreach($m in @($p.m)){if(Z ($g+$c+$m.Replace('/',$c))){$k+=$m}};$u=@();$z=0;foreach($d in 'refs/heads','refs/remotes'){$y=$null;if(P $d){$y=Z ($g+$c+$d.Replace('/',$c))};if($y){K $y|Out-Null;$s=New-Object Collections.Stack;$s.Push(@($y,$d));while($s.Count -and $z -le 4097){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'refs holds a link or a name with a control character'};$r=$q[1]+'/'+$f.Name;if($a -band 16){$s.Push(@($f,$r))}else{$z++;if($z -le 4097){$v=F $r 65537 $false;$v.p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r));$u+=,$v}}}}}};E @{ok=1;head=(F 'HEAD' 65537 $false);config=(F 'config' 65537 $false);packed=(F 'packed-refs' 8388609 $false);log=(F 'logs/HEAD' 65536 $true);index=[bool](Z ($g+$c+'index'));markers=$k;refs=$u}"##,
 );
 
 /// Save a project's `.git` below the account home with ONE host-local copy
@@ -455,9 +459,15 @@ pub const GIT_RESTORE: &str = concat!(
 /// with `/` separators, so the three host families compute one value. The
 /// relative path is built from entry names during the walk (as in
 /// [`ENUMERATE`]); a reparse point or a name with a control character
-/// anywhere in the tree is a terminating error and nothing is followed. Files
-/// are hashed through a `FileShare.ReadWrite|Delete` stream.
-pub const GIT_MANIFEST: &str = concat!(git_ps_base!(), git_ps_m!(), r##"E (M $p.a)"##,);
+/// anywhere in the tree is a terminating error and nothing is followed; the
+/// root itself must be a real directory, so a junction at `a` is refused
+/// rather than walked as its target. Files are hashed through a
+/// `FileShare.ReadWrite|Delete` stream.
+pub const GIT_MANIFEST: &str = concat!(
+    git_ps_base!(),
+    git_ps_m!(),
+    r##"$null=K (Z $p.a);E (M $p.a)"##,
+);
 
 /// How big a `.git` is, from one enumeration (Phase 27, checker W-5):
 /// file count and the sum of the file lengths. Parameters: `x`, `a` as
