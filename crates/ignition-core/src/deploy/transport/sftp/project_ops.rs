@@ -2616,8 +2616,10 @@ impl SftpTransport {
     /// deploy account's home. One script per chunk of the plan creates each lock
     /// with `CreateNew` and fills it from the stage after a reparse check, one
     /// more per chunk puts the locks over their targets (the last removes the
-    /// stage), and a failure runs the cleanup, which removes only locks equal to
-    /// the staged bytes.
+    /// stage), and a failure runs the cleanup on the chunks whose locks this
+    /// write created (none after a stage or upload failure), removing only
+    /// locks equal to the staged bytes there; a chunk that never ran is never
+    /// touched (CodeRabbit #56).
     async fn write_git_files_windows(
         &self,
         project: &str,
@@ -2662,7 +2664,7 @@ impl SftpTransport {
             return Err(if git_win_script_settled(&err) {
                 err
             } else {
-                self.git_win_leftovers(err, &ctx, false).await
+                self.git_win_leftovers(err, &ctx, false, 0..0).await
             });
         }
         // (b) the bytes over sftp, into the stage and nowhere else
@@ -2676,7 +2678,8 @@ impl SftpTransport {
             })
             .collect();
         if let Err(err) = self.run_batch("write", ops).await {
-            return Err(self.git_win_leftovers(err, &ctx, false).await);
+            // no lock exists yet: only the stage goes
+            return Err(self.git_win_leftovers(err, &ctx, false, 0..0).await);
         }
         // (c) every lock created exclusively and filled, chunk by chunk
         for (n, chunk) in sized.chunks(GIT_WIN_CHUNK).enumerate() {
@@ -2684,9 +2687,14 @@ impl SftpTransport {
                 WinScript::git_lock(&data, project, &home, &stage, n * GIT_WIN_CHUNK, chunk);
             if let Err(err) = self.git_win("write_git_files", script, limit).await {
                 // a script that ran to its own failure took its own locks away;
-                // the cleanup still removes the ones of the chunks before it
+                // the cleanup removes the ones of the chunks before it, which
+                // this write created. A chunk that never ran is not touched: a
+                // lock there is another writer's, whatever bytes it holds
+                // (CodeRabbit #56). After a dropped connection this chunk's
+                // locks may be ours and are cleaned too.
                 let named = !git_win_script_settled(&err);
-                return Err(self.git_win_leftovers(err, &ctx, named).await);
+                let owned = if named { 0..n + 1 } else { 0..n };
+                return Err(self.git_win_leftovers(err, &ctx, named, owned).await);
             }
         }
         // (d) each lock over its file, after a size check; the last chunk
@@ -2703,8 +2711,10 @@ impl SftpTransport {
                 n + 1 == chunks,
             );
             if let Err(err) = self.git_win("write_git_files", script, limit).await {
+                // the chunks before this one were moved over their targets: a
+                // lock there now is not ours
                 let named = !git_win_script_settled(&err);
-                return Err(self.git_win_leftovers(err, &ctx, named).await);
+                return Err(self.git_win_leftovers(err, &ctx, named, n..chunks).await);
             }
         }
         drop(staged);
@@ -2712,7 +2722,8 @@ impl SftpTransport {
     }
 
     /// A Windows write that failed: run the cleanup (remove the locks that hold
-    /// ign's own bytes, then the stage) and fold what it did, or that it failed
+    /// ign's own bytes in the `owned` chunks, the ones whose locks this write
+    /// created, then the stage) and fold what it did, or that it failed
     /// too, into `err`. When the failed script may not have cleaned up after
     /// itself (`named`: a dropped connection, a timeout) the error also names
     /// every lock of the plan.
@@ -2721,6 +2732,7 @@ impl SftpTransport {
         err: CoreError,
         ctx: &WinWrite<'_>,
         named: bool,
+        owned: std::ops::Range<usize>,
     ) -> CoreError {
         let mut more = String::new();
         if named {
@@ -2746,18 +2758,31 @@ impl SftpTransport {
             ctx.home, ctx.stage
         ));
         let limit = self.shell.op_timeout();
-        let chunks = ctx.sized.chunks(GIT_WIN_CHUNK).count();
+        // only the chunks whose locks this write may have created (`owned`);
+        // the last call also removes the stage, and with no such chunk one
+        // call with no locks removes just the stage
+        let mut calls: Vec<(usize, &[(String, u64)])> = ctx
+            .sized
+            .chunks(GIT_WIN_CHUNK)
+            .enumerate()
+            .filter(|(n, _)| owned.contains(n))
+            .map(|(n, chunk)| (n * GIT_WIN_CHUNK, chunk))
+            .collect();
+        if calls.is_empty() {
+            calls.push((0, &[]));
+        }
+        let last = calls.len() - 1;
         let (mut removed, mut kept) = (0, 0);
         let mut failure = None;
-        for (n, chunk) in ctx.sized.chunks(GIT_WIN_CHUNK).enumerate() {
+        for (index, (offset, chunk)) in calls.into_iter().enumerate() {
             let script = WinScript::git_unlock(
                 ctx.data,
                 ctx.project,
                 ctx.home,
                 ctx.stage,
-                n * GIT_WIN_CHUNK,
+                offset,
                 chunk,
-                n + 1 == chunks,
+                index == last,
             );
             match self.git_win("write_git_files", script, limit).await {
                 Ok(answer) => {

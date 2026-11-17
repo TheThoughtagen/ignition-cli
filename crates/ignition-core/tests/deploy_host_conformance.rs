@@ -3358,6 +3358,48 @@ mod git_rows {
         assert!(left.is_empty(), "{after} left a stage behind: {left:?}");
     }
 
+    /// CodeRabbit #56 round 2: a lock another writer holds that carries
+    /// exactly the bytes this write would put there is still that writer's.
+    /// The write is refused at that lock, and neither the refusal nor any
+    /// cleanup after it removes the lock (on Windows the cleanup used to match
+    /// locks by length and SHA-256).
+    pub async fn git_write_keeps_an_equal_byte_foreign_lock(c: &GitCtx) {
+        let head = std::fs::read(c.fx.git_dir().join("HEAD")).expect("head");
+        let bytes = b"ref: refs/heads/other\n".to_vec();
+        let foreign = c.fx.git_dir().join("HEAD.lock");
+        std::fs::write(&foreign, &bytes).expect("foreign lock");
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Config,
+                bytes: b"[core]\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: bytes.clone(),
+            },
+        ];
+        let err = c
+            .write
+            .write_git_files(PROJECT, &writes)
+            .await
+            .expect_err("HEAD.lock is held");
+        assert!(is_transport_failed(&err), "{err:?}");
+        assert_eq!(
+            std::fs::read(&foreign).expect("the foreign lock is still there"),
+            bytes
+        );
+        assert!(
+            !c.fx.git_dir().join("config.lock").exists(),
+            "no lock of ours is left"
+        );
+        assert_eq!(
+            std::fs::read(c.fx.git_dir().join("HEAD")).expect("head"),
+            head
+        );
+        assert_no_git_stage(c, "a refused write");
+        std::fs::remove_file(&foreign).expect("rm lock");
+    }
+
     pub async fn git_write_lock_refuses(c: &GitCtx) {
         let head = std::fs::read(c.fx.git_dir().join("HEAD")).expect("head");
         std::fs::write(c.fx.git_dir().join("config.lock"), "held").expect("lock");
@@ -3860,6 +3902,7 @@ mod git_rows {
         conformance_git_local_git_save_restore_round_trip, GitCtx::local, git_save_restore_round_trip;
         conformance_git_local_git_restore_refuses_present, GitCtx::local, git_restore_refuses_present;
         conformance_git_local_git_write_lock_refuses, GitCtx::local, git_write_lock_refuses;
+        conformance_git_local_git_write_keeps_an_equal_byte_foreign_lock, GitCtx::local, git_write_keeps_an_equal_byte_foreign_lock;
         conformance_git_local_git_probe_denied_names_path, GitCtx::local, git_probe_denied_names_path;
         conformance_git_local_git_save_rm_refuses_foreign_path, GitCtx::local, git_save_rm_refuses_foreign_path;
         conformance_git_local_git_save_rm_named_repo, GitCtx::local, git_save_rm_named_repo;
@@ -3874,6 +3917,7 @@ mod git_rows {
         conformance_git_sh_git_save_restore_round_trip, GitCtx::posix, git_save_restore_round_trip;
         conformance_git_sh_git_restore_refuses_present, GitCtx::posix, git_restore_refuses_present;
         conformance_git_sh_git_write_lock_refuses, GitCtx::posix, git_write_lock_refuses;
+        conformance_git_sh_git_write_keeps_an_equal_byte_foreign_lock, GitCtx::posix, git_write_keeps_an_equal_byte_foreign_lock;
         conformance_git_sh_git_probe_denied_names_path, GitCtx::posix, git_probe_denied_names_path;
         conformance_git_sh_git_save_rm_refuses_foreign_path, GitCtx::posix, git_save_rm_refuses_foreign_path;
         conformance_git_sh_git_save_rm_named_repo, GitCtx::posix, git_save_rm_named_repo;
@@ -3903,6 +3947,7 @@ mod git_rows {
         conformance_git_pwsh_git_save_restore_round_trip, git_save_restore_round_trip;
         conformance_git_pwsh_git_restore_refuses_present, git_restore_refuses_present;
         conformance_git_pwsh_git_write_lock_refuses, git_write_lock_refuses;
+        conformance_git_pwsh_git_write_keeps_an_equal_byte_foreign_lock, git_write_keeps_an_equal_byte_foreign_lock;
         conformance_git_pwsh_git_probe_denied_names_path, git_probe_denied_names_path;
         conformance_git_pwsh_git_save_rm_refuses_foreign_path, git_save_rm_refuses_foreign_path;
         conformance_git_pwsh_git_save_rm_named_repo, git_save_rm_named_repo;
@@ -3922,6 +3967,7 @@ mod git_rows {
             "git_save_restore_round_trip",
             "git_restore_refuses_present",
             "git_write_lock_refuses",
+            "git_write_keeps_an_equal_byte_foreign_lock",
             "git_probe_denied_names_path",
             "git_save_rm_refuses_foreign_path",
             "git_save_rm_named_repo",
