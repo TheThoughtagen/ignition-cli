@@ -389,6 +389,18 @@ pub const GIT_STATE: &str = concat!(
     r##"$g=$p.a;K (Z $g)|Out-Null;function P($f){$x=$f.Split('/');$h=$g;for($i=0;$i -lt $x.Length-1;$i++){$h+=$c+$x[$i];$j=Z $h;if(!$j){return $false};$null=K $j};$true};function F($f,$k,$t){if(!(P $f)){return $null};$q=$g+$c+$f.Replace('/',$c);$y=Z $q;if(!$y){return $null};if($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$f is not a regular file"};$n=$y.Length;$e=[int][Math]::Min([long]$n,[long]$k);$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{if($t -and $n -gt $e){[void]$s.Seek($n-$e,0)};$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};@{n=$n;b=[Convert]::ToBase64String($u,0,$o)}};$k=@();foreach($m in @($p.m)){if(Z ($g+$c+$m.Replace('/',$c))){$k+=$m}};$u=@();$z=0;foreach($d in 'refs/heads','refs/remotes'){$y=$null;if(P $d){$y=Z ($g+$c+$d.Replace('/',$c))};if($y){K $y|Out-Null;$s=New-Object Collections.Stack;$s.Push(@($y,$d));while($s.Count -and $z -le 4097){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'refs holds a link or a name with a control character'};$r=$q[1]+'/'+$f.Name;if($a -band 16){$s.Push(@($f,$r))}else{$z++;if($z -le 4097){$v=F $r 65537 $false;$v.p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r));$u+=,$v}}}}}};E @{ok=1;head=(F 'HEAD' 65537 $false);config=(F 'config' 65537 $false);packed=(F 'packed-refs' 8388609 $false);log=(F 'logs/HEAD' 65536 $true);index=[bool](Z ($g+$c+'index'));markers=$k;refs=$u}"##,
 );
 
+/// `<data>\git.yaml` read into the answer (CodeRabbit #56): the Windows half of
+/// the POSIX `GIT_YAML_SH`. Parameters: `a` the native data directory, `m` the
+/// byte cap. Answers `k` = `none`, `symlink` (a reparse point, never opened),
+/// `other` (a directory), `big` (with `n`) or `file` with `n` and `b`, the
+/// base64 of at most one byte past the cap, read through a
+/// `FileShare.ReadWrite|Delete` stream. The bytes may hold a credential: they
+/// travel only in the answer, never in a file.
+pub const GIT_YAML: &str = concat!(
+    git_ps_base!(),
+    r##"$null=K (Z $p.a);$q=$p.a+$c+'git.yaml';$y=Z $q;if(!$y){E @{ok=1;k='none'}}elseif(([int]$y.Attributes -band 1024) -ne 0){E @{ok=1;k='symlink'}}elseif($y.PSIsContainer){E @{ok=1;k='other'}}elseif($y.Length -gt $p.m){E @{ok=1;k='big';n=$y.Length}}else{$n=$y.Length;$e=[int]$p.m+1;$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};E @{ok=1;k='file';n=$n;b=[Convert]::ToBase64String($u,0,$o)}}"##,
+);
+
 /// Save a project's `.git` below the account home with ONE host-local copy
 /// (Phase 27, D-06): `robocopy /E /COPY:DAT /R:1 /W:1 /XJ`, the tool G4
 /// measured at 1.4 s for the production-shape `.git` (the same files as
@@ -899,6 +911,16 @@ impl WinScript {
             name: "git_digest",
             body: GIT_DIGEST,
             params: serde_json::json!({ "a": git, "f": file }),
+        }
+    }
+
+    /// The script that reads `git.yaml` of the native data directory `data`,
+    /// up to one byte past `cap` ([`GIT_YAML`]).
+    pub fn git_yaml(data: &str, cap: u64) -> WinScript {
+        WinScript {
+            name: "git_yaml",
+            body: GIT_YAML,
+            params: serde_json::json!({ "a": data, "m": cap }),
         }
     }
 

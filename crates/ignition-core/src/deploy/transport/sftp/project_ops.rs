@@ -304,6 +304,29 @@ pub(super) const GIT_DIGEST_SH: &str = concat!(
     "else printf 'IGN-RESULT:{\"digest\":null}\\n'; fi",
 );
 
+/// `<data>/git.yaml` read into the answer itself (CodeRabbit #56): the bytes
+/// may hold a credential and are never written to a file on either side.
+/// `$1` the data directory, `$2` the byte cap. Answers `{"k":"none"}`,
+/// `{"k":"symlink"}`, `{"k":"other"}` (not a regular file), `{"k":"big",
+/// "n":size}` or `{"k":"file","n":size,"b":base64}` (at most one byte past
+/// the cap, so a file that grew is seen).
+pub(super) const GIT_YAML_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; set -f; ",
+    "for c in ls wc head base64 tr; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
+    "case $o in *'No such file or directory') return 1;; esac; ",
+    "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
+    "[ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; cd -- \"$1\" || exit 3; ",
+    "if [ -L git.yaml ]; then printf 'IGN-RESULT:{\"k\":\"symlink\"}\\n'; exit 0; fi; ",
+    "if ! pr git.yaml; then printf 'IGN-RESULT:{\"k\":\"none\"}\\n'; exit 0; fi; ",
+    "[ -f git.yaml ] || { printf 'IGN-RESULT:{\"k\":\"other\"}\\n'; exit 0; }; ",
+    "[ -r git.yaml ] || { echo 'git.yaml cannot be read' >&2; exit 3; }; ",
+    "z=$(wc -c < git.yaml) || exit 3; z=$((z)); ",
+    "if [ \"$z\" -gt \"$2\" ]; then printf 'IGN-RESULT:{\"k\":\"big\",\"n\":%s}\\n' \"$z\"; exit 0; fi; ",
+    "b=$(head -c $(($2+1)) < git.yaml | base64 | tr -d '\\n') || exit 3; ",
+    "printf 'IGN-RESULT:{\"k\":\"file\",\"n\":%s,\"b\":\"%s\"}\\n' \"$z\" \"$b\"",
+);
+
 pub(super) const GIT_SAVE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk sort tr ls cp rm mkdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
@@ -1666,21 +1689,49 @@ impl SftpTransport {
         Ok(files)
     }
 
-    /// `git.yaml` in the data directory, one capped `get`.
+    /// `git.yaml` in the data directory, read by one host command whose answer
+    /// carries the bytes (`GIT_YAML_SH`, `winps::GIT_YAML`): they may hold a
+    /// credential, so they are held in memory only and never pass through a
+    /// download file (CodeRabbit #56).
     async fn read_git_yaml_file(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        const OP: &str = "read_git_yaml";
         let bad = |problem: String| CoreError::DeployRunInvalid {
             run_id: "unknown".to_string(),
             problem: format!("git.yaml: {problem}"),
         };
-        self.read_file_below(
-            Some(&self.data_dir),
-            "git.yaml",
-            YAML_MAX_BYTES,
-            "git.yaml",
-            &[],
-            &bad,
-        )
-        .await
+        let cap = YAML_MAX_BYTES;
+        let limit = self.shell.op_timeout();
+        let answer = if self.windows {
+            let script = WinScript::git_yaml(&self.win_data(), cap as u64);
+            self.git_win(OP, script, limit).await?
+        } else {
+            let cap_text = cap.to_string();
+            self.git_run(OP, GIT_YAML_SH, &[&self.data_dir, &cap_text], limit)
+                .await?
+        };
+        match answer.get("k").and_then(serde_json::Value::as_str) {
+            Some("none") => Ok(None),
+            Some("symlink") => Err(bad(
+                "is not a regular file (symlinks are refused)".to_string()
+            )),
+            Some("other") => Err(bad("is not a regular file".to_string())),
+            Some("big") => match answer.get("n").and_then(serde_json::Value::as_u64) {
+                Some(n) => Err(bad(format!("is {n} bytes, over the {cap} byte cap"))),
+                None => Err(self.git_unusable(OP, "the size of git.yaml")),
+            },
+            Some("file") => {
+                let bytes = self
+                    .git_file_bytes(OP, "git.yaml", Some(&answer), cap + 1)?
+                    .unwrap_or_default();
+                if bytes.len() > cap {
+                    return Err(bad(format!(
+                        "grew past the {cap} byte cap while it was read"
+                    )));
+                }
+                Ok(Some(bytes))
+            }
+            _ => Err(self.git_unusable(OP, "the kind of git.yaml")),
+        }
     }
 
     /// The `ign-deploy/.../git-save/<run>` directory below the account home.
@@ -3290,8 +3341,9 @@ mod tests {
         }
     }
 
-    const ALL_GIT_SCRIPTS: [(&str, &str); 13] = [
+    const ALL_GIT_SCRIPTS: [(&str, &str); 14] = [
         ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
+        ("GIT_YAML_SH", GIT_YAML_SH),
         ("GIT_STATE_SH", GIT_STATE_SH),
         ("GIT_MANIFEST_SH", GIT_MANIFEST_SH),
         ("GIT_SIZE_SH", GIT_SIZE_SH),

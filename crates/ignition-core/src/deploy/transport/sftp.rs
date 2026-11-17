@@ -2892,8 +2892,9 @@ impl SftpTransport {
     }
 
     /// [`read_home_file`](Self::read_home_file) below `base` (`None`: the
-    /// account home). `git.yaml` in the data directory (Phase 27) reads
-    /// through here with the data directory as `base`.
+    /// account home). The bytes pass through a private download file, so
+    /// nothing that may hold a credential reads through here (`git.yaml` is
+    /// read in memory by a host script, CodeRabbit #56).
     async fn read_file_below(
         &self,
         base: Option<&str>,

@@ -5527,9 +5527,21 @@ mod sftp_git {
         assert_eq!(n.t.read_git_yaml().await.expect("absent"), None);
         let yaml = fx.data_dir.join("git.yaml");
         std::fs::write(&yaml, "repos: {}\n").expect("yaml");
+        // CodeRabbit #56: the bytes may hold a credential, so they come back
+        // in the answer of one host command, never as a file `get` into a
+        // local download directory
+        let batches = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = batches.clone();
+        n.count
+            .on_batch(move |batch| seen.lock().expect("batches").push(batch.to_string()));
         assert_eq!(
             n.t.read_git_yaml().await.expect("present"),
             Some(b"repos: {}\n".to_vec())
+        );
+        let batches = batches.lock().expect("batches").clone();
+        assert!(
+            batches.iter().all(|b| !b.contains("git.yaml")),
+            "git.yaml went through sftp: {batches:?}"
         );
         // a symlink refuses, naming git.yaml
         std::fs::rename(&yaml, fx.data_dir.join("real.yaml")).expect("rename");
@@ -5951,13 +5963,14 @@ mod winps_git {
             WinScript::git_probe(data, &project, &format!(".ign-probe-{}", "R".repeat(128))),
             WinScript::git_save_rm(prefix, home, &format!("{save_rel}/repo"), &run),
             WinScript::git_free(home, &save_rel),
+            WinScript::git_yaml(data, 1_048_576),
         ]
     }
 
     #[test]
     fn winps_git_scripts_fit_budget() {
         let scripts = maximal();
-        assert_eq!(scripts.len(), 14);
+        assert_eq!(scripts.len(), 15);
         for script in &scripts {
             let command = winps::encoded_command(script, COMMAND_BUDGET)
                 .unwrap_or_else(|why| panic!("{}: {why}", script.name));
@@ -6082,6 +6095,7 @@ mod winps_git {
             ("GIT_PROBE", winps::GIT_PROBE),
             ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
             ("GIT_FREE", winps::GIT_FREE),
+            ("GIT_YAML", winps::GIT_YAML),
         ];
         for (name, body) in bodies {
             assert!(!body.contains('\n'), "{name}: one line");
@@ -6390,6 +6404,35 @@ mod winps_git {
             .expect("link");
         let why = pwsh_exec::run(&WinScript::git_size("", &s(&fx.git_dir()))).expect_err("link");
         assert!(why.contains("link"), "{why}");
+    }
+
+    /// CodeRabbit #56: `git.yaml` comes back in the answer, as the local read
+    /// gives it; absent, a link, a directory and an oversized file are told
+    /// apart, never read through.
+    #[tokio::test]
+    async fn pwsh_git_yaml() {
+        if !pwsh_exec::gate("pwsh_git_yaml") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let data = s(&fx.data_dir);
+        let run = |cap: u64| pwsh_exec::run(&WinScript::git_yaml(&data, cap)).expect("git_yaml");
+        assert_eq!(run(64)["k"], "none");
+        let yaml = fx.data_dir.join("git.yaml");
+        std::fs::write(&yaml, "repos: {}\n").expect("yaml");
+        let answer = run(64);
+        assert_eq!(answer["k"], "file");
+        assert_eq!(
+            file_of(&answer),
+            fx.node().read_git_yaml().await.expect("local")
+        );
+        assert_eq!(run(4)["k"], "big");
+        std::fs::rename(&yaml, fx.data_dir.join("real.yaml")).expect("aside");
+        std::os::unix::fs::symlink("real.yaml", &yaml).expect("link");
+        assert_eq!(run(64)["k"], "symlink");
+        std::fs::remove_file(&yaml).expect("rm");
+        std::fs::create_dir(&yaml).expect("dir");
+        assert_eq!(run(64)["k"], "other");
     }
 
     /// The manifest of a Windows script is the one the local walk computes,
