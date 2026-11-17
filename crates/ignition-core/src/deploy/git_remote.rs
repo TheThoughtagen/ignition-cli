@@ -349,11 +349,19 @@ impl HostGit {
         let mut stderr = child.stderr.take().expect("stderr is piped");
         let max = call.stdout_max;
         let work = async {
-            let (out, err) = tokio::join!(
-                read_capped(&mut stdout, max),
-                read_stderr(&mut stderr, STDERR_KEEP)
-            );
-            let out = out?;
+            // A stdout over its cap ends both reads at once: git, blocked on
+            // the full pipe, would otherwise hold stderr open until the
+            // timeout. The child is killed and reaped before the error.
+            let read = tokio::try_join!(read_capped(&mut stdout, max), async {
+                Ok(read_stderr(&mut stderr, STDERR_KEEP).await)
+            });
+            let (out, err) = match read {
+                Ok(both) => both,
+                Err(e) => {
+                    let _ = child.kill().await;
+                    return Err(e);
+                }
+            };
             let status = child
                 .wait()
                 .await
@@ -2528,6 +2536,24 @@ mod tests {
 \tfetch = +refs/heads/production:refs/remotes/capapp/production\n\
 [branch \"production\"]\n\tremote = capapp\n\tmerge = refs/heads/production\n\
 [http]\n\tsslVerify = false\n";
+
+    /// A git that writes past the stdout cap and keeps writing is stopped and
+    /// reported as over the cap at once: nothing waits for its stderr to close
+    /// while it blocks on a full stdout pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_over_cap_stops_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flood = stub(dir.path(), "git", "head -c 67108864 /dev/zero");
+        let mut call = Call::new(["anything"]).max_output(16);
+        call.timeout = Duration::from_secs(30);
+        let err = match HostGit::with_program(&flood).run(call).await {
+            Ok(_) => panic!("a flood over the cap is refused"),
+            Err(err) => err,
+        };
+        let text = err.to_string();
+        assert!(text.contains("16 byte output limit"), "{text}");
+    }
 
     #[tokio::test]
     async fn parse_config_module_clone() {
