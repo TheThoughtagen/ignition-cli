@@ -500,7 +500,29 @@ pub fn redact_url(url: &str) -> String {
 /// Redact every URL-shaped token of free text (git's stderr, a path list):
 /// a token holding `://`, or an `@` before a `:`, goes through
 /// [`redact_url`]. Used on every message that may carry a gateway URL.
+///
+/// The userinfo of every `scheme://` authority is removed first, with the
+/// authority running to the first `/`, `?`, `#` or whitespace: a quote mark
+/// is legal in userinfo, so splitting at quotes first could leave part of a
+/// password in a token with no `@` or `://` left to find.
 pub fn redact_text(text: &str) -> String {
+    let mut no_userinfo = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, after) = rest.split_at(at + 3);
+        no_userinfo.push_str(head);
+        let end = after
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(after.len());
+        let (authority, tail) = after.split_at(end);
+        let host = authority
+            .rfind('@')
+            .map_or(authority, |i| &authority[i + 1..]);
+        no_userinfo.push_str(host);
+        rest = tail;
+    }
+    no_userinfo.push_str(rest);
+    let text = no_userinfo.as_str();
     let mut out = String::with_capacity(text.len());
     let mut token = String::new();
     let flush = |token: &mut String, out: &mut String| {
@@ -961,6 +983,26 @@ mod tests {
         assert_eq!(redact_url("/srv/git/repo.git"), "/srv/git/repo.git");
         assert_eq!(
             redact_text("fatal: unable to access 'https://u:p@host/org/repo.git/': nope"),
+            "fatal: unable to access 'https://host/org/repo.git/': nope"
+        );
+    }
+
+    /// An apostrophe is legal in URI userinfo: it must not split the URL
+    /// before its credentials are removed.
+    #[test]
+    fn redact_text_apostrophe_in_userinfo() {
+        for text in [
+            "fatal: unable to access 'https://alice:pa'ss@host/org/repo.git/': nope",
+            "https://alice:pa'ss@host/org/repo.git",
+            "\"https://al'ice:pass@host\": refused",
+        ] {
+            let out = redact_text(text);
+            assert!(!out.contains("pa'ss") && !out.contains("ss@"), "{out}");
+            assert!(!out.contains("alice") && !out.contains("al'ice"), "{out}");
+            assert!(out.contains("host"), "{out}");
+        }
+        assert_eq!(
+            redact_text("fatal: unable to access 'https://alice:pa'ss@host/org/repo.git/': nope"),
             "fatal: unable to access 'https://host/org/repo.git/': nope"
         );
     }
