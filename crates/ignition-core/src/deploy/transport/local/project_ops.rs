@@ -1201,17 +1201,28 @@ impl LocalFsTransport {
             .map(|m| mode_of(&m))
             .map_err(|e| self.git_fail(OP, format!(".git cannot be inspected ({})", e.kind())))?;
         let created_run = self.ensure_save_run_dir(OP, gateway, project, run_id)?;
+        #[cfg(test)]
+        tests::AFTER_RUN_DIR.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let repo = self.git_save_repo(gateway, project, run_id);
         let run_dir = repo.parent().map(Path::to_path_buf).unwrap_or_default();
         let modes_path = run_dir.join(GIT_SAVE_MODES_FILE);
-        // `repo` is removed only when this call made it: a save that loses a
-        // race to another save of the run never removes the winner's.
+        // `repo` and the `modes` record are removed only when this call made
+        // them: a save that loses a race to another save of the run never
+        // removes the winner's. The run directories go only when this call
+        // made them and they are empty.
+        let made_modes = std::cell::Cell::new(false);
         let cleanup = |made_repo: bool| {
             if made_repo {
                 let _ = std::fs::remove_dir_all(&repo);
             }
-            if created_run {
+            if made_modes.get() {
                 let _ = std::fs::remove_file(&modes_path);
+            }
+            if created_run {
                 let _ = std::fs::remove_dir(&run_dir);
                 if let Some(save_dir) = run_dir.parent() {
                     // Only when this run made it and nothing else lives there.
@@ -1254,6 +1265,7 @@ impl LocalFsTransport {
                     format!("the modes record cannot be created ({})", e.kind()),
                 )
             })?;
+            made_modes.set(true);
             modes
                 .write_all(modes_text(root_mode, &entries).as_bytes())
                 .and_then(|()| modes.sync_all())
@@ -2308,6 +2320,13 @@ impl GitStateWriter for LocalFsTransport {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Run once on this thread right after a save has its run directory
+        /// (a test orders a second save into that point deterministically).
+        pub(super) static AFTER_RUN_DIR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
     fn host(data: &Path) -> LocalFsTransport {
         LocalFsTransport::new(data.to_path_buf(), "nodes.master")
     }
@@ -2687,6 +2706,54 @@ mod tests {
         )
         .expect("new config");
         assert_eq!(mode(&git.join("config")), 0o600, "a new config is 0600");
+    }
+
+    /// CodeRabbit #56 round 2: a save that made the run directory and then
+    /// lost `repo` to another save leaves that save's `modes` record alone, so
+    /// a restore of the winner puts back the recorded modes, not the
+    /// owner-only fallback. The run directory is not made beforehand: save A
+    /// makes it, save B runs whole at that point (it finds the run directory,
+    /// makes `repo` and writes `modes`), then A finds `repo` and gives up.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_save_that_loses_repo_keeps_the_winners_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        let dir = data_with_projects();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::create_dir_all(git.join("objects/ab")).expect("objects");
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        std::fs::write(git.join("objects/ab/cdef"), b"o").expect("object");
+        std::fs::set_permissions(git.join("HEAD"), std::fs::Permissions::from_mode(0o644))
+            .expect("chmod");
+        let t = host(dir.path());
+        let winner = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (b, seen) = (t.clone(), winner.clone());
+        AFTER_RUN_DIR.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let won = std::thread::spawn(move || b.save_git_blocking("gw", "CapApp", "r1"))
+                    .join()
+                    .expect("save B");
+                *seen.lock().expect("winner") = Some(won);
+            }));
+        });
+        let lost = t.save_git_blocking("gw", "CapApp", "r1");
+        let won = winner.lock().expect("winner").take().expect("save B ran");
+        let saved = won.expect("save B wins");
+        assert!(lost.is_err(), "save A finds repo and gives up");
+        let run = t.git_save_repo("gw", "CapApp", "r1");
+        let modes = run.parent().expect("run dir").join(GIT_SAVE_MODES_FILE);
+        assert!(modes.is_file(), "the winner's modes record is there");
+        std::fs::rename(&git, dir.path().join("projects/CapApp/git-aside")).expect("aside");
+        let restored = t
+            .restore_git_blocking("gw", "CapApp", "r1")
+            .expect("restore");
+        assert_eq!(restored, saved);
+        assert_eq!(
+            mode(&git.join("HEAD")),
+            0o644,
+            "the recorded mode, not owner-only"
+        );
     }
 
     /// CodeRabbit #56: two saves of one run into a run directory that already
