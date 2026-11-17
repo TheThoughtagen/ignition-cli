@@ -192,11 +192,22 @@ impl ReadBase {
     }
 
     /// An archive-extraction message (`bundle::extract` names every file under
-    /// `config/resources/`) with the host path of this base instead.
+    /// `config/resources/`) with the host path of this base instead. A message
+    /// that names no file under the base (an unlisted archive entry names only
+    /// the entry) gets the base appended, so a git read always says which
+    /// `.git` it read.
     fn rename_extract_error(&self, why: &str) -> String {
         match self {
             ReadBase::Resources => why.to_string(),
-            ReadBase::ProjectGit(_) => why.replace("config/resources/", &self.shown("")),
+            ReadBase::ProjectGit(_) => {
+                let base = self.shown("");
+                let renamed = why.replace("config/resources/", &base);
+                if renamed.contains(&base) {
+                    renamed
+                } else {
+                    format!("{renamed} (reading {base})")
+                }
+            }
         }
     }
 
@@ -9783,6 +9794,33 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let two = vec![file("a", 70 * mib), file("b", 70 * mib), file("c", mib)];
         let parts = split_into_parts(&two, PARTS_MAX, PART_TARGET_BYTES);
         assert_eq!(parts.len(), 2);
+    }
+
+    /// Every extraction message of a git read names the `.git` it read,
+    /// including the one whose entry name carries no path of its own (an
+    /// unlisted archive entry). A split read reports whichever part failed
+    /// first, so the location must not depend on which message it was.
+    #[test]
+    fn git_read_extract_errors_name_the_git_dir() {
+        let base = ReadBase::ProjectGit("CapApp".to_string());
+        let unlisted = base.rename_extract_error(
+            "the read archive holds \"objects/00/0000\", which was not listed",
+        );
+        assert!(unlisted.contains("projects/CapApp/.git/"), "{unlisted}");
+        assert!(unlisted.contains("which was not listed"), "{unlisted}");
+        let listed = base.rename_extract_error(
+            "config/resources/objects/00/0000 was listed but is not in the read archive",
+        );
+        assert_eq!(
+            listed,
+            "projects/CapApp/.git/objects/00/0000 was listed but is not in the read archive"
+        );
+        let resources = ReadBase::Resources
+            .rename_extract_error("the read archive holds \"x\", which was not listed");
+        assert_eq!(
+            resources,
+            "the read archive holds \"x\", which was not listed"
+        );
     }
 
     /// 27-11: a Windows object read of enough bytes is fetched as parts at the
