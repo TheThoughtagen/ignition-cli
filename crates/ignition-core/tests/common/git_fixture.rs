@@ -70,12 +70,30 @@ pub fn in_scope(path: &str) -> bool {
         || path.starts_with("com.inductiveautomation.")
 }
 
-/// Run host git in `dir`, with no user or system config, and return its
-/// trimmed stdout. Panics on a non-zero exit.
-pub fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
+/// Repository-selection variables a test process may inherit (a git hook,
+/// an IDE, `git rebase --exec`). Any of them makes git ignore the working
+/// directory and act on the caller's repository instead of the fixture's.
+const GIT_LOCATION_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+];
+
+/// Host git in `dir` on the fixture's repository only: the inherited
+/// repository-selection variables cleared, no user or system config, no
+/// background maintenance or auto gc, and a fixed identity.
+fn git_command(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(dir);
+    for var in GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
+    command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         // no background maintenance or auto gc: git 2.5x repacks a many-pack
@@ -88,9 +106,14 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .output()
-        .expect("git runs");
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid");
+    command
+}
+
+/// Run host git in `dir` ([`git_command`]) and return its trimmed stdout.
+/// Panics on a non-zero exit.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let out = git_command(dir).args(args).output().expect("git runs");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -515,11 +538,8 @@ impl GitFixture {
         let mut args = vec!["rev-list"];
         args.extend_from_slice(rev_list);
         let listing = git(project, &args);
-        let mut child = Command::new("git")
+        let mut child = git_command(project)
             .args(["pack-objects", "-q", ".git/objects/pack/pack"])
-            .current_dir(project)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -582,10 +602,9 @@ impl GitFixture {
     /// the release checkout at it. Returns the commit id.
     pub fn tag_release_on(&self, branch: &str, tag: &str) -> String {
         let checkout = &self.checkout;
-        let exists = Command::new("git")
+        let exists = git_command(checkout)
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{branch}"))
-            .current_dir(checkout)
             .output()
             .expect("git runs")
             .status
