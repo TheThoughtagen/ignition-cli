@@ -194,6 +194,29 @@ pub fn release_record_rel(gateway: &str, project: &str) -> String {
     format!("ign-deploy/{gateway}/projects/{project}/{RELEASE_RECORD_FILE}")
 }
 
+/// Directory beside the release record that holds host-local copies of a
+/// project's `.git` taken before an import that deletes it (Phase 27). Its
+/// name is never `.git`, so removing a save can never remove a `.git`.
+pub const GIT_SAVE_DIR: &str = "git-save";
+
+/// The leaf of a save: the copy of the `.git` directory. Never named `.git`.
+pub const GIT_SAVE_LEAF: &str = "repo";
+
+/// Where run `run_id` saves the `.git` of `project` on `gateway`, below its
+/// root: `ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo`.
+///
+/// Beside the release record, outside `data/projects/<name>`, so the import
+/// that deletes the gateway's `.git` cannot reach it. The names must already
+/// be single path components.
+pub fn git_save_rel(gateway: &str, project: &str, run_id: &str) -> String {
+    format!("ign-deploy/{gateway}/projects/{project}/{GIT_SAVE_DIR}/{run_id}/{GIT_SAVE_LEAF}")
+}
+
+/// The save location as an error and a log name it (see [`location_of`]).
+pub fn git_save_location(root: LedgerRoot, gateway: &str, project: &str, run_id: &str) -> String {
+    location_of(root, &git_save_rel(gateway, project, run_id))
+}
+
 /// The release record location as an error and a log name it (see
 /// [`ledger_location`]).
 pub fn release_record_location(root: LedgerRoot, gateway: &str, project: &str) -> String {
@@ -590,6 +613,24 @@ mod tests {
             assert!(!rel.contains("config/resources"), "{rel}");
             assert!(rel.split('/').all(|p| !p.starts_with('.')), "{rel}");
         }
+    }
+
+    /// 27-02: a git save sits beside the release record and its leaf is
+    /// `repo`, never `.git`, so removing a save cannot remove a `.git`.
+    #[test]
+    fn save_dir_is_not_dot_git() {
+        let rel = git_save_rel("gw-a", "CapApp", "20261113T101500Z-ab12");
+        assert_eq!(
+            rel,
+            "ign-deploy/gw-a/projects/CapApp/git-save/20261113T101500Z-ab12/repo"
+        );
+        assert!(rel.ends_with("git-save/20261113T101500Z-ab12/repo"));
+        assert!(rel.split('/').all(|p| p != ".git"), "{rel}");
+        assert!(!rel.contains("config/resources"), "{rel}");
+        assert_eq!(
+            git_save_location(LedgerRoot::AccountHome, "gw-a", "CapApp", "r1"),
+            "~/ign-deploy/gw-a/projects/CapApp/git-save/r1/repo"
+        );
     }
 
     /// Decision B(i) (22-12): ssh nodes keep the ledger, the journal and the

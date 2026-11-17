@@ -47,6 +47,9 @@ use super::winps::windows_component_problem;
 use super::{NodeAccess, local, node_access, sftp_transport};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
+use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
+use crate::deploy::git_state::GitFiles;
 use crate::deploy::project_run::{PRE_IMAGE_MAX_BYTES, PreImageFile, PreImageRun};
 use crate::deploy::target::{NodeTarget, TargetOs};
 use crate::error::CoreError;
@@ -92,6 +95,36 @@ impl GitEntry {
 /// reads below the data directory, whatever root the release record uses.
 pub fn git_entry_location(project: &str) -> String {
     format!("projects/{project}/.git")
+}
+
+/// An entry probed directly below `projects/<project>`: the directories the
+/// git module's start sync imports from (Phase 27, 27-18) and, since 27-37,
+/// the project's `project.json` (a backup that lost it cannot load the project
+/// at its next restart). A fixed set of names, so no path is ever built from
+/// outside input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportDir {
+    /// `tags/`: tag providers the module imports at the start.
+    Tags,
+    /// `images/`.
+    Images,
+    /// `themes/`.
+    Themes,
+    /// `project.json`, the project's manifest file (27-37). Probed, never
+    /// read or written: a regular file is what a loadable project has.
+    ProjectJson,
+}
+
+impl ImportDir {
+    /// The directory's name below the project directory.
+    pub fn name(self) -> &'static str {
+        match self {
+            ImportDir::Tags => "tags",
+            ImportDir::Images => "images",
+            ImportDir::Themes => "themes",
+            ImportDir::ProjectJson => "project.json",
+        }
+    }
 }
 
 /// The read-only host surface of `deploy projects`.
@@ -165,6 +198,25 @@ pub trait ProjectHost: Send + Sync {
         project: &str,
         name: &str,
     ) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// The read-only git surface of this host (Phase 27), when it has one.
+    ///
+    /// The one `ProjectHost` method Phase 27 adds, with a default body so
+    /// every existing implementation (and test fake) compiles unchanged and
+    /// answers `None`. A caller that finds a `.git` on a host that answers
+    /// `None` must treat the state as unreadable (`transport_failed`), never
+    /// as absent. The write half is never reachable from here.
+    fn git(&self) -> Option<&dyn GitHostRead> {
+        None
+    }
+
+    /// The git program ign runs on its own machine for the release checkout
+    /// and for the advance of a gateway `.git` (Phase 27, 27-12). The
+    /// default is `git` on `PATH`; a test host answers a stub program. It
+    /// never runs on the gateway host (D-02).
+    fn host_git(&self) -> crate::deploy::git_remote::HostGit {
+        crate::deploy::git_remote::HostGit::new()
+    }
 }
 
 /// The host writes of a tag-owning `deploy projects` run besides its records
@@ -210,6 +262,197 @@ pub trait ProjectRunWriter: Send + Sync {
         name: &str,
         bytes: &[u8],
     ) -> Result<(), CoreError>;
+}
+
+/// What a copy of a gateway `.git` holds, as one comparable value (Phase 27).
+///
+/// `digest` is the sha256 over the lines `path NUL size LF` for every file
+/// below `objects/` and `path NUL sha256 LF` for every other file, in the byte
+/// order of the whole path (the order `LC_ALL=C sort` gives, so every host
+/// family computes the same value), so a save and its restore are proven
+/// equal without hashing every object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitManifest {
+    /// Regular files in the tree.
+    pub files: usize,
+    /// Their total size in bytes.
+    pub bytes: u64,
+    /// Lowercase hex sha256, as described above.
+    pub digest: String,
+}
+
+/// How big a gateway `.git` is, from file sizes alone (Phase 27, checker
+/// W-5): nothing is read or hashed, so the free-space preflight stays cheap at
+/// production shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GitSize {
+    /// Regular files in the tree.
+    pub files: usize,
+    /// Their total size in bytes.
+    pub bytes: u64,
+}
+
+/// The read-only host surface for the gateway's `.git` (Phase 27).
+///
+/// Separate from [`ProjectHost`] so no existing implementation changes and
+/// the writer ([`GitStateWriter`]) is never reachable from a read-only
+/// surface. Nothing here writes, deletes or renames.
+///
+/// Every answer is fail-closed: a `.git` that cannot be read is
+/// [`CoreError::TransportFailed`], never an absent one.
+#[async_trait::async_trait]
+pub trait GitHostRead: Send + Sync {
+    /// The fixed files of `<data_dir>/projects/<project>/.git`, under the
+    /// caps of [`GitFiles::check_caps`] (a file over a cap is returned one
+    /// byte over, so the caller's cap check names it). An absent, symlinked
+    /// or non-directory `.git` is answered by its kind, without contents.
+    async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError>;
+
+    /// The [`GitManifest`] of the project's live `.git`. A symlink anywhere
+    /// inside it refuses.
+    async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError>;
+
+    /// The [`GitManifest`] of the save of run `run_id`.
+    async fn save_manifest(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError>;
+
+    /// Lowercase hex sha256 of the bytes of one file an advance writes, read
+    /// back from the project's `.git` (`None` when the file does not exist).
+    /// A symlink or a non-regular file there is refused.
+    async fn git_file_digest(
+        &self,
+        project: &str,
+        name: &GitWriteName,
+    ) -> Result<Option<String>, CoreError>;
+
+    /// The bytes of `<data_dir>/git.yaml`, the git module's settings file.
+    /// `None` only when it does not exist; a symlink, a non-regular file or
+    /// more than [`YAML_MAX_BYTES`](crate::deploy::yamlio::YAML_MAX_BYTES)
+    /// bytes is [`CoreError::DeployRunInvalid`] naming `git.yaml`, an
+    /// unreadable host is [`CoreError::TransportFailed`]. The bytes may hold a
+    /// credential: they are held in memory only and never logged or stored.
+    async fn read_git_yaml(&self) -> Result<Option<Vec<u8>>, CoreError>;
+
+    /// What `<data_dir>/projects/<project>/<dir>` is (27-18, D-G3): whether
+    /// the module's start sync would find content to import. Probed like
+    /// [`ProjectHost::git_entry`], one level deeper: nothing is followed or
+    /// read, [`GitEntry::Absent`] only when the project directory or the entry
+    /// does not exist, and any other failure is
+    /// [`CoreError::TransportFailed`], never `Absent`.
+    async fn project_dir_entry(&self, project: &str, dir: ImportDir)
+    -> Result<GitEntry, CoreError>;
+
+    /// Free bytes on the file system that holds the save root of `gateway`'s
+    /// `project` (the nearest existing ancestor of
+    /// [`git_save_rel`](crate::deploy::ledger::git_save_rel)'s directory).
+    async fn free_bytes(&self, gateway: &str, project: &str) -> Result<u64, CoreError>;
+
+    /// The [`GitSize`] of the project's live `.git`, from a listing alone:
+    /// no file is opened for reading and nothing is hashed, unlike
+    /// [`git_manifest`](Self::git_manifest). A symlink anywhere inside
+    /// refuses.
+    async fn git_size(&self, project: &str) -> Result<GitSize, CoreError>;
+
+    /// The object files of `<data_dir>/projects/<project>/.git/objects`
+    /// (Phase 27, 27-10, D-24), restricted to the fixed shapes of
+    /// [`GitObjectList`]: loose objects `objects/<2 hex>/<38 hex>` and the
+    /// packs `objects/pack/pack-<40 hex>.pack` with their `.idx`. Nothing
+    /// outside `objects/` is listed and no file is opened. A symlink anywhere
+    /// below `objects/`, or a name that is not a plain relative path, refuses
+    /// the whole listing ([`GitObjectList::from_entries`]); an unreadable
+    /// host is [`CoreError::TransportFailed`], never an empty list.
+    async fn list_git_objects(&self, project: &str) -> Result<GitObjectList, CoreError>;
+
+    /// Copy exactly the listed object `files` of the project's `.git` into
+    /// `dest/<rel>`, each exactly its listed size, never following a
+    /// symlink. Every `rel` is re-checked with
+    /// [`check_object_rel`](crate::deploy::git_objects::check_object_rel)
+    /// before any path is built, and a size that differs from the listing
+    /// refuses. Read-only on the host; `dest` is a directory ign made, and a
+    /// file already there is never overwritten.
+    async fn fetch_git_objects(
+        &self,
+        project: &str,
+        files: &[GitObjectFile],
+        dest: &Path,
+    ) -> Result<(), CoreError>;
+}
+
+/// The writes `deploy projects` makes to a project's `.git` and to its
+/// host-local save (Phase 27).
+///
+/// Separate from [`ProjectHost`] and [`GitHostRead`] on purpose: no read-only
+/// surface can reach it, and the source scan `git_state_writer_is_confined`
+/// lets only `deploy/transport/`, `deploy/git_handover.rs` and the project
+/// deploy action name it.
+///
+/// What an implementation may do, and nothing else:
+///
+/// - [`save_git`](Self::save_git) copies the `.git` directory to
+///   [`git_save_rel`](crate::deploy::ledger::git_save_rel) below the ledger
+///   root. It never follows a symlink and refuses one anywhere inside `.git`,
+///   leaving no save behind. The save is private (0700 directories on Unix).
+/// - [`restore_git`](Self::restore_git) creates `.git` from that save only when
+///   `.git` is absent; it never replaces, deletes or renames an existing one.
+/// - [`write_git_files`](Self::write_git_files) writes the fixed
+///   [`GitWriteName`](crate::deploy::git_advance::GitWriteName) files inside an
+///   existing `.git`, each through `<name>.lock` created exclusively and then
+///   renamed over the file (packs through a private sibling). An existing lock
+///   refuses the write and nothing is written.
+/// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
+///   of one run and nothing else; no save directory is named `.git`.
+/// - [`probe_write`](Self::probe_write) creates and removes one probe file in
+///   the project directory and in its `.git`, to prove the grant before any
+///   other write.
+///
+/// Every name passes [`component_problem`] before a path is built.
+#[async_trait::async_trait]
+pub trait GitStateWriter: Send + Sync {
+    /// Copy the project's `.git` to the save of run `run_id`; the returned
+    /// manifest is the copy's, equal to the source's before the copy.
+    async fn save_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError>;
+
+    /// Create the project's `.git` from the save of run `run_id`. Refused
+    /// when `.git` exists. Returns the restored tree's manifest.
+    async fn restore_git(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError>;
+
+    /// Write `writes`, in order, inside the project's existing `.git`.
+    async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError>;
+
+    /// Remove the `repo` tree of the save of run `run_id` (absent is a
+    /// success).
+    async fn remove_git_save(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<(), CoreError>;
+
+    /// Create exclusively, then remove, `.ign-probe-<run-id>` in
+    /// `projects/<project>` and in `projects/<project>/.git`. A denial is
+    /// [`CoreError::TransportFailed`] naming which of the two paths refused.
+    /// Nothing is left behind on success; a probe file that already exists is
+    /// refused and left alone.
+    async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError>;
+}
+
+/// The name of the probe file [`GitStateWriter::probe_write`] creates.
+pub fn git_probe_name(run_id: &str) -> String {
+    format!(".ign-probe-{run_id}")
 }
 
 /// Why `gateway`, `project` or the pre-image file `name` cannot be used for
@@ -542,6 +785,15 @@ mod tests {
         release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
             .map(|_| ())
             .expect("an ssh node has a writer");
+    }
+
+    /// The probe file name is fixed by the run id.
+    #[test]
+    fn git_probe_name_is_fixed() {
+        assert_eq!(
+            git_probe_name("20261114T101500Z-ab12"),
+            ".ign-probe-20261114T101500Z-ab12"
+        );
     }
 
     /// 26-06: the tag record writer is built for a local and an ssh node the
