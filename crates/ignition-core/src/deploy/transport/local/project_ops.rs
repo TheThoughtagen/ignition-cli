@@ -1204,8 +1204,12 @@ impl LocalFsTransport {
         let repo = self.git_save_repo(gateway, project, run_id);
         let run_dir = repo.parent().map(Path::to_path_buf).unwrap_or_default();
         let modes_path = run_dir.join(GIT_SAVE_MODES_FILE);
-        let cleanup = || {
-            let _ = std::fs::remove_dir_all(&repo);
+        // `repo` is removed only when this call made it: a save that loses a
+        // race to another save of the run never removes the winner's.
+        let cleanup = |made_repo: bool| {
+            if made_repo {
+                let _ = std::fs::remove_dir_all(&repo);
+            }
             if created_run {
                 let _ = std::fs::remove_file(&modes_path);
                 let _ = std::fs::remove_dir(&run_dir);
@@ -1217,7 +1221,7 @@ impl LocalFsTransport {
         };
         if std::fs::symlink_metadata(&repo).is_ok() {
             if created_run {
-                cleanup();
+                cleanup(false);
             }
             return Err(self.git_fail(
                 OP,
@@ -1227,13 +1231,14 @@ impl LocalFsTransport {
                 ),
             ));
         }
+        if let Err(e) = create_dir_mode(&repo, CopyMode::Private.dir_mode()) {
+            cleanup(false);
+            return Err(self.git_fail(
+                OP,
+                format!("the save directory cannot be created ({})", e.kind()),
+            ));
+        }
         let outcome = (|| {
-            create_dir_mode(&repo, CopyMode::Private.dir_mode()).map_err(|e| {
-                self.git_fail(
-                    OP,
-                    format!("the save directory cannot be created ({})", e.kind()),
-                )
-            })?;
             self.copy_git(OP, &entries, &repo, &CopyMode::Private)?;
             let after = self.manifest_blocking(OP, &repo)?;
             if after != before {
@@ -1261,7 +1266,7 @@ impl LocalFsTransport {
             Ok(after)
         })();
         if outcome.is_err() {
-            cleanup();
+            cleanup(true);
         }
         outcome
     }
@@ -2644,6 +2649,51 @@ mod tests {
         )
         .expect("new config");
         assert_eq!(mode(&git.join("config")), 0o600, "a new config is 0600");
+    }
+
+    /// CodeRabbit #56: two saves of one run into a run directory that already
+    /// exists. When both pass the existence check, the one whose `mkdir` of
+    /// `repo` fails must leave the other's save alone: exactly one succeeds
+    /// and its save is there afterwards, whole.
+    #[test]
+    fn local_git_save_race_keeps_the_winners_save() {
+        let dir = data_with_projects();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::create_dir_all(git.join("objects/ab")).expect("objects");
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        std::fs::write(git.join("config"), b"[core]\n").expect("config");
+        for i in 0..8 {
+            std::fs::write(git.join("objects/ab").join(format!("o{i}")), [i as u8; 64])
+                .expect("object");
+        }
+        let t = host(dir.path());
+        for round in 0..100 {
+            let run = format!("race-{round}");
+            let repo = t.git_save_repo("gw", "CapApp", &run);
+            std::fs::create_dir_all(repo.parent().expect("run dir")).expect("run dir");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (t, run, barrier) = (t.clone(), run.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        t.save_git_blocking("gw", "CapApp", &run)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = racers
+                .into_iter()
+                .map(|r| r.join().expect("racer"))
+                .collect();
+            let won: Vec<&GitManifest> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+            assert_eq!(won.len(), 1, "round {round}: {results:?}");
+            assert!(repo.is_dir(), "round {round}: the winner's save is gone");
+            assert_eq!(
+                &t.manifest_blocking("read", &repo).expect("manifest"),
+                won[0],
+                "round {round}"
+            );
+        }
     }
 
     /// CodeRabbit #56: a lock another writer takes after the preflight makes
