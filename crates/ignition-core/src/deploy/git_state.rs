@@ -563,19 +563,10 @@ pub fn url_key(url: &str) -> String {
         Some(slash) => (&host_and_path[..slash], &host_and_path[slash..]),
         None => (host_and_path.as_str(), ""),
     };
-    let mut path = path.to_string();
-    loop {
-        let before = path.len();
-        while path.ends_with('/') {
-            path.pop();
-        }
-        if let Some(trimmed) = path.strip_suffix(".git") {
-            path = trimmed.to_string();
-        }
-        if path.len() == before {
-            break;
-        }
-    }
+    // One `.git` is dropped, after the trailing `/`s: `repo.git.git` names
+    // another repo than `repo.git`.
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
     format!("{}{}", host.to_ascii_lowercase(), path)
 }
 
@@ -1021,6 +1012,16 @@ mod tests {
             assert_eq!(url_key(url), want, "{url}");
         }
         assert_ne!(url_key("https://host.example/org/other"), want);
+        // One `.git` suffix is dropped, never two: `repo.git.git` is another
+        // repo than `repo.git`.
+        assert_eq!(
+            url_key("https://host.example/org/repo.git.git/"),
+            "host.example/org/repo.git"
+        );
+        assert_ne!(
+            url_key("https://host.example/org/repo.git.git"),
+            url_key("https://host.example/org/repo.git")
+        );
     }
 
     #[test]
