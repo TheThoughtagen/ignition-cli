@@ -573,14 +573,17 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
 /// 27-31 (WR-B2), the best-effort cleanup after a POSIX `.git` write whose
 /// connection died. Arguments: the data dir, the `.git` path, the stage path,
 /// then (lock, stage index) pairs. A lock is removed only when it is a regular
-/// non-symlink file whose bytes equal the matching stage file (`cmp -s`), so a
-/// lock another writer holds (JGit's `index.lock`) is never removed. Every
+/// non-symlink file that is the same file (`-ef`, one inode) as the write
+/// script's private copy `.git/.ign-write-<id>/<index>` in a private
+/// directory this account owns: the hard link `GIT_WRITE_SH` made. Equal
+/// bytes are not ownership (CodeRabbit #56), so a lock another writer holds
+/// (JGit's `index.lock`) is never removed, whatever it contains. Every
 /// walk is the verified level-by-level walk of `GIT_WRITE_SH`. The private
 /// `.git/.ign-write-<id>` and the stage are removed last. Answers how many
 /// locks it removed and how many it left.
 pub(super) const GIT_WRITE_CLEAN_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
-    "for c in ls rm rmdir cmp; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "for c in ls rm rmdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "dd=$1; rr=$2; stg=$3; shift 3; set -f; nt=$(($#/2)); ",
@@ -593,10 +596,12 @@ pub(super) const GIT_WRITE_CLEAN_SH: &str = concat!(
     "cd -- \"$w\" 2>/dev/null || { bc=$w; bm='cannot enter %s'; unset IFS; return 3; }; ",
     "we=${we%/}/$w; wp=$(pwd -P); [ \"$wp\" = \"$we\" ] || { bc=$w; bm='%s changed while it was entered'; unset IFS; return 4; }; ",
     "done; unset IFS; return 0; }; ",
-    "rl() { a=0; b=0; wq \"$rr\" || return 4; while [ $# -ge 2 ]; do l=$1; s=$stg/$2; shift 2; case $l in */*) d=${l%/*};; *) d='';; esac; lb=${l##*/}; ",
-    "if wq \"$rr${d:+/$d}\"; then if [ -f \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ -f \"$s\" ] && [ ! -L \"$s\" ] && cmp -s -- \"./$lb\" \"$s\"; then rm -f -- \"./$lb\" || return 3; a=$((a+1)); ",
+    "rl() { a=0; b=0; wq \"$rr\" || return 4; gp=$(pwd -P) || return 3; pdn=.ign-write-${stg##*/git-stage-}; ",
+    "ok=0; [ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ] && [ -O \"./$pdn\" ] && ok=1; ",
+    "while [ $# -ge 2 ]; do l=$1; s=$gp/$pdn/$2; shift 2; case $l in */*) d=${l%/*};; *) d='';; esac; lb=${l##*/}; ",
+    "if wq \"$rr${d:+/$d}\"; then if [ $ok = 1 ] && [ -f \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ -f \"$s\" ] && [ ! -L \"$s\" ] && [ \"./$lb\" -ef \"$s\" ]; then rm -f -- \"./$lb\" || return 3; a=$((a+1)); ",
     "elif [ -e \"./$lb\" ] || [ -L \"./$lb\" ]; then b=$((b+1)); fi; fi; done; ",
-    "wq \"$rr\" || return 4; pdn=.ign-write-${stg##*/git-stage-}; if [ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ]; then ",
+    "wq \"$rr\" || return 4; if [ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ]; then ",
     "( cd -- \"./$pdn\" 2>/dev/null && [ -O . ] && { j=0; while [ $j -lt $nt ]; do rm -f -- \"./$j\"; j=$((j+1)); done; } ); rmdir -- \"./$pdn\" 2>/dev/null; fi; printf '%s %s' \"$a\" \"$b\"; }; ",
     "o=$(rl \"$@\"); r=$?; rm -rf -- \"$stg\" || { printf '%s cannot be removed\\n' \"$stg\" >&2; exit 3; }; ",
     "[ $r = 0 ] || { echo 'the locks could not be checked' >&2; exit $r; }; ",
@@ -1409,7 +1414,7 @@ impl SftpTransport {
 // | `GIT_PROBE_W_SH` | exclusive create then remove of a probe file in the project directory and its `.git` |
 // | `GIT_STAGE_SH` | the private stage `ign-deploy/git-stage-<id>` of a `.git` write, in the account's ledger root |
 // | `GIT_WRITE_SH` | each lock made by a non-following hard link of a private copy of the staged bytes, then moved over its target in plan order; modes kept, new directories get the D-G1 ACL |
-// | `GIT_WRITE_CLEAN_SH` | after a dead connection: removes the locks whose bytes equal the stage, then the stage |
+// | `GIT_WRITE_CLEAN_SH` | after a dead connection: removes the locks it made (one inode with its private copies), then the stage |
 // | `GIT_SAVE_RM_SH` | removes `git-save/<run-id>/repo` and nothing else |
 // | `GIT_FREE_SH` | free bytes of the file system under the save root |
 //
@@ -2485,8 +2490,9 @@ impl SftpTransport {
 
     /// A write whose host script may have died half way: name what may be
     /// left (every lock of the plan when the write script may have run, and
-    /// the stage), then run the best-effort cleanup, which removes only locks
-    /// whose bytes equal the stage's (WR-B2). A cleanup that fails is folded
+    /// the stage), then run the best-effort cleanup, which removes only the
+    /// locks the write script made (WR-B2; by identity, CodeRabbit #56). A
+    /// cleanup that fails is folded
     /// into the same error.
     async fn git_write_leftovers(
         &self,
@@ -2531,7 +2537,7 @@ impl SftpTransport {
                 let count = |key: &str| answer.get(key).and_then(serde_json::Value::as_u64);
                 if let (Some(removed), Some(kept)) = (count("removed"), count("kept")) {
                     more.push_str(&format!(
-                        "; the cleanup removed {removed} lock(s) that held ign's own bytes and the stage, and left {kept} lock(s) that hold other bytes"
+                        "; the cleanup removed {removed} lock(s) that ign made and the stage, and left {kept} lock(s) that ign did not make"
                     ));
                 }
             }
@@ -4720,12 +4726,20 @@ mod tests {
             assert!(outside.join("0").is_file(), "nothing outside was removed");
         }
 
+        /// A lock is this write's only when it is the hard link the write
+        /// script made of its private copy (`.git/.ign-write-<id>/<k>`);
+        /// equal bytes do not make it ours (CodeRabbit #56): a foreign
+        /// `config.lock` holding exactly the staged bytes stays.
         #[test]
-        fn clean_script_removes_only_locks_equal_to_the_stage() {
+        fn clean_script_removes_only_locks_it_made() {
             let rig = Rig::new();
             let stage = stage_with(&rig, &["ours\n", "theirs\n"]);
-            std::fs::write(rig.git().join("HEAD.lock"), "ours\n").expect("own");
+            let private = rig.git().join(".ign-write-t");
+            std::fs::create_dir(&private).expect("private");
+            std::fs::write(private.join("0"), "ours\n").expect("private copy");
+            std::fs::hard_link(private.join("0"), rig.git().join("HEAD.lock")).expect("own");
             std::fs::write(rig.git().join("index.lock"), "someone else\n").expect("foreign");
+            std::fs::write(rig.git().join("config.lock"), "theirs\n").expect("same bytes");
             let out = run(
                 GIT_WRITE_CLEAN_SH,
                 &[
@@ -4743,12 +4757,18 @@ mod tests {
             );
             assert_eq!(out.code, 0, "{}", out.stderr);
             assert!(out.stdout.contains("\"removed\":1"), "{}", out.stdout);
-            assert!(out.stdout.contains("\"kept\":1"), "{}", out.stdout);
+            assert!(out.stdout.contains("\"kept\":2"), "{}", out.stdout);
             assert!(!rig.git().join("HEAD.lock").exists());
             assert_eq!(
                 std::fs::read_to_string(rig.git().join("index.lock")).expect("foreign"),
                 "someone else\n"
             );
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config.lock"))
+                    .expect("a foreign lock with the staged bytes"),
+                "theirs\n"
+            );
+            assert!(!private.exists(), "the private copy is gone");
             assert!(!Path::new(&stage).exists(), "the stage is gone");
         }
 

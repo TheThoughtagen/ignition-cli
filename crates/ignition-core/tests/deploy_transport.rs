@@ -4905,15 +4905,18 @@ mod sftp_git {
 
     /// 27-31 (WR-B2): a connection that dies while the write script runs
     /// leaves an error that names every lock and the stage, and a cleanup that
-    /// removes the locks that hold ign's own bytes.
+    /// removes the locks the write script made (CodeRabbit #56: by identity
+    /// with its private copies, not by their bytes).
     #[tokio::test]
     async fn sftp_git_write_transport_failure_names_locks() {
         let fx = GitFixture::new();
         let n = node(&fx.data_dir);
         let writes = two_writes(&fx);
-        // the connection drops after the first lock was made and filled
-        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("own lock");
-        n.count.kill_exec("HEAD.lock", 1);
+        // the script dies after every lock was made and filled, at its first
+        // move over a target (its shell is killed: no answer comes back)
+        let shims = common::posix_exec::Shims::new();
+        shims.add("mv", "kill -9 $PPID");
+        n.count.use_shims(&shims);
         let why = detail(
             n.t.write_git_files(PROJECT, &writes)
                 .await
@@ -4928,9 +4931,21 @@ mod sftp_git {
         }
         assert!(why.contains("git-stage-"), "the stage is named: {why}");
         assert!(
-            !fx.git_dir().join("HEAD.lock").exists(),
-            "the lock that held ign's bytes was removed by the cleanup"
+            why.contains("removed 2 lock(s) that ign made"),
+            "both locks were there and were the script's: {why}"
         );
+        for lock in ["HEAD.lock", "refs/heads/feature/new.lock"] {
+            assert!(
+                !fx.git_dir().join(lock).exists(),
+                "{lock}, made by the write script, was removed by the cleanup"
+            );
+        }
+        let private: Vec<_> = std::fs::read_dir(fx.git_dir())
+            .expect("ls .git")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".ign-write-"))
+            .collect();
+        assert!(private.is_empty(), "the private copies are gone");
         assert!(stages(&n).is_empty(), "the cleanup took the stage away");
 
         // a cleanup that dies as well is told in the same error, and the stage
@@ -4985,10 +5000,11 @@ mod sftp_git {
         assert!(!fx.git_dir().join("HEAD.lock").exists());
         assert!(stages(&n).is_empty());
 
-        // a dead connection: the cleanup runs, removes the lock that holds
-        // ign's bytes and spares the foreign one
+        // a dead connection: the cleanup runs and spares both foreign locks,
+        // the one with other bytes and the one that holds exactly ign's bytes
+        // (CodeRabbit #56: equal bytes are not ownership; ign did not make it)
         let n = node(&fx.data_dir);
-        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("own lock");
+        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("same bytes");
         n.count.kill_exec("index.lock", 1);
         let why = detail(
             n.t.write_git_files(PROJECT, &writes)
@@ -5001,9 +5017,10 @@ mod sftp_git {
             "JGit holds this\n",
             "a lock with other bytes is never removed"
         );
-        assert!(
-            !fx.git_dir().join("HEAD.lock").exists(),
-            "the lock with ign's own bytes is"
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD.lock")).expect("kept"),
+            writes[0].bytes,
+            "a lock ign did not make is never removed, whatever it holds"
         );
         assert!(stages(&n).is_empty());
     }
