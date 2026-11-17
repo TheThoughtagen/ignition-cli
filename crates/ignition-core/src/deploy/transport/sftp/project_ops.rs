@@ -165,7 +165,7 @@ const GIT_PROBE_NAME: &str = "ign-git-probe";
 // same text under the local `sh`.
 
 pub(super) const GIT_MANIFEST_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk sort tr ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
     "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
@@ -193,7 +193,7 @@ pub(super) const GIT_MANIFEST_SH: &str = concat!(
 );
 
 pub(super) const GIT_SIZE_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find ls awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
     "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
@@ -223,7 +223,7 @@ const GIT_OBJECTS_REPORT_MAX: usize = GIT_OBJECTS_LOOSE_MAX + 2 * GIT_OBJECTS_PA
 /// system), and no name is interpreted by a shell: the names are read from the
 /// output of `find` by `awk`.
 pub(super) const GIT_OBJECTS_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
     "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
@@ -246,7 +246,7 @@ pub(super) const GIT_OBJECTS_SH: &str = concat!(
 );
 
 pub(super) const GIT_STATE_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc head tail base64 tr ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
@@ -255,7 +255,7 @@ pub(super) const GIT_STATE_SH: &str = concat!(
     "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
     "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
     "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; shift 2; set -f; NL=$(printf '\\nx'); NL=${NL%x}; ",
+    "wk \"$1\" \"$2\"; shift 2; NL=$(printf '\\nx'); NL=${NL%x}; ",
     "rd() { if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
     "if pr \"$1\"; then [ -f \"$1\" ] || { printf '%s is not a regular file\\n' \"$1\" >&2; exit 4; }; ",
     "[ -r \"$1\" ] || { printf '%s cannot be read\\n' \"$1\" >&2; exit 3; }; ",
@@ -283,7 +283,7 @@ pub(super) const GIT_STATE_SH: &str = concat!(
 );
 
 pub(super) const GIT_DIGEST_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
     "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
@@ -303,7 +303,7 @@ pub(super) const GIT_DIGEST_SH: &str = concat!(
 );
 
 pub(super) const GIT_SAVE_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk sort tr ls cp rm mkdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
     "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
@@ -344,7 +344,7 @@ pub(super) const GIT_SAVE_SH: &str = concat!(
 );
 
 pub(super) const GIT_RESTORE_SH: &str = concat!(
-    "LC_ALL=C; export LC_ALL; ",
+    "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk sort tr ls cp mv rm id mkdir; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
     "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
@@ -4748,6 +4748,43 @@ mod tests {
                 "someone else\n"
             );
             assert!(!Path::new(&stage).exists(), "the stage is gone");
+        }
+
+        /// CodeRabbit #56: a project named with a glob character (`proj*`
+        /// passes the name checks) is walked as that literal name, never
+        /// expanded against the directory the walk starts in (from the data
+        /// directory `proj*` would match `projects`).
+        #[test]
+        fn traversal_scripts_take_a_glob_character_literally() {
+            let rig = Rig::new();
+            let glob = rig.root.path().join("data/projects/proj*/.git");
+            std::fs::create_dir_all(glob.join("refs/heads")).expect("glob project");
+            std::fs::create_dir_all(glob.join("objects")).expect("objects");
+            std::fs::write(glob.join("HEAD"), "ref: refs/heads/glob\n").expect("head");
+            let (data, home) = (rig.data(), rig.home());
+            let git = "projects/proj*/.git";
+            let save = "ign-deploy/gw/projects/proj*/git-save/r1";
+            let cases: [(&str, &str, Vec<&str>); 6] = [
+                ("GIT_MANIFEST_SH", GIT_MANIFEST_SH, vec![&data, git]),
+                ("GIT_SIZE_SH", GIT_SIZE_SH, vec![&data, git]),
+                ("GIT_DIGEST_SH", GIT_DIGEST_SH, vec![&data, git, "HEAD"]),
+                ("GIT_STATE_SH", GIT_STATE_SH, vec![&data, git]),
+                (
+                    "GIT_OBJECTS_SH",
+                    GIT_OBJECTS_SH,
+                    vec![&data, "projects/proj*/.git/objects", "9", "9"],
+                ),
+                ("GIT_SAVE_SH", GIT_SAVE_SH, vec![&data, git, &home, save]),
+            ];
+            for (name, script, args) in cases {
+                let out = run(script, &args, &system_path());
+                assert_eq!(out.code, 0, "{name}: {}", out.stderr);
+            }
+            let saved = rig.root.path().join("home").join(save).join("repo/HEAD");
+            assert_eq!(
+                std::fs::read_to_string(saved).expect("the literal project was saved"),
+                "ref: refs/heads/glob\n"
+            );
         }
 
         #[test]
