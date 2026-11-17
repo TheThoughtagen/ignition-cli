@@ -759,7 +759,6 @@ async fn remote_mismatch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn remote_unreachable_redacted() {
-    use std::os::unix::fs::PermissionsExt;
     let f = GitFixture::new();
     let url = "https://user:secret@127.0.0.1:9/x.git";
     assert_eq!(f.checkout_with_userinfo_remote(url), "origin");
@@ -768,17 +767,13 @@ async fn remote_unreachable_redacted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let log = dir.path().join("argv.log");
     let recorder = dir.path().join("git-recorder");
-    std::fs::write(
+    write_exec(
         &recorder,
-        format!(
+        &format!(
             "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\nexec git \"$@\"\n",
             log.display()
         ),
-    )
-    .expect("write recorder");
-    let mut perms = std::fs::metadata(&recorder).expect("stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&recorder, perms).expect("chmod");
+    );
     let host = HostGit::with_program(&recorder);
 
     let checkout = check_release_checkout(&host, &f.checkout, RELEASE, &url_key(url))
@@ -890,18 +885,13 @@ async fn release_not_on_tracked_branch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn moved_tip_fails_closed() {
-    use std::os::unix::fs::PermissionsExt;
     let f = GitFixture::new();
     let dir = tempfile::tempdir().expect("tempdir");
     let wrapper = dir.path().join("git-moved");
-    std::fs::write(
+    write_exec(
         &wrapper,
         "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = ls-remote ]; then\n    printf 'ffffffffffffffffffffffffffffffffffffffff\\trefs/heads/production\\n'\n    exit 0\n  fi\ndone\nexec git \"$@\"\n",
-    )
-    .expect("write wrapper");
-    let mut perms = std::fs::metadata(&wrapper).expect("stat").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&wrapper, perms).expect("chmod");
+    );
 
     let host = HostGit::new();
     let (state, _) = f.gateway_state(&host).await;
@@ -7644,4 +7634,23 @@ mod published {
             assert!(failed.starts_with("could not be checked ("), "{failed}");
         }
     }
+}
+
+/// Write the executable script `path`. The file is written by `cp`, not by
+/// this process: a write handle held here can be inherited by a child another
+/// test thread forks at that moment, and Linux then refuses to run the script
+/// (`ETXTBSY`, "executable file busy").
+#[cfg(unix)]
+fn write_exec(path: &std::path::Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let name = path.file_name().expect("a file name").to_string_lossy();
+    let src = path.with_file_name(format!(".{name}.src"));
+    std::fs::write(&src, text).expect("write script");
+    let copied = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .expect("cp runs");
+    assert!(copied.success(), "cp the script");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }

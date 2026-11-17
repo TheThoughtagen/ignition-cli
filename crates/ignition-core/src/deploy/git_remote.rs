@@ -2418,14 +2418,23 @@ mod tests {
         (dir, commit)
     }
 
+    /// A `#!/bin/sh` stub at `dir/name`. The file is written by `cp`, not by
+    /// this process: a write handle held here can be inherited by a child
+    /// another test thread forks at that moment, and Linux then refuses to
+    /// run the stub (`ETXTBSY`, "executable file busy").
     #[cfg(unix)]
     fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write stub");
-        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).expect("chmod");
+        let src = dir.join(format!(".{name}.src"));
+        std::fs::write(&src, format!("#!/bin/sh\n{body}\n")).expect("write stub");
+        let copied = Command::new("cp")
+            .arg(&src)
+            .arg(&path)
+            .status()
+            .expect("cp runs");
+        assert!(copied.success(), "cp the stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         path
     }
 
