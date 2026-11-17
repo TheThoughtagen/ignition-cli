@@ -2128,7 +2128,12 @@ impl SftpTransport {
             .iter()
             .enumerate()
             .map(|(k, part)| self.bundle_part(base, ctl, k, part, &shas[k], need, tmp));
-        futures_util::future::try_join_all(runs).await?;
+        // every part is awaited, a failed one too: a part dropped while its
+        // extraction runs would keep writing below `tmp` after the read
+        // returned; the failure of the lowest such part is then the read's
+        for result in futures_util::future::join_all(runs).await {
+            result?;
+        }
         drop(local);
 
         self.run_batch(
@@ -4429,6 +4434,9 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         /// BUNDLE exits with this code and CLIXML on stderr, leaving the list
         /// and a 3-byte partial archive, as a killed script would.
         bundle_fail: Option<i32>,
+        /// Only a BUNDLE whose list path ends with this fails, as
+        /// `bundle_fail` (exit 1), after the others' effects (one failing part).
+        bundle_fail_list: Option<String>,
         /// BUNDLE_CLEAN exits 1 and leaves everything.
         clean_fail: bool,
         /// The bytes of every list BUNDLE read, in call order.
@@ -4785,6 +4793,15 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             let zip_path = fake_path(&text("z"));
             let need = params["f"].as_u64().expect("free bytes needed");
             self.knobs().bundle_params.push(params.clone());
+            let failing = self
+                .knobs()
+                .bundle_fail_list
+                .as_ref()
+                .is_some_and(|tail| list_path.ends_with(tail.as_str()));
+            if failing {
+                self.put(&zip_path, Node::File(b"PK\x03".to_vec()));
+                return clixml_failure(1);
+            }
             if let Some(code) = self.knobs().bundle_fail {
                 // killed mid-build: the list and a partial archive stay
                 self.put(&zip_path, Node::File(b"PK\x03".to_vec()));
@@ -9945,6 +9962,38 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             staged_left(&hostile)
         );
         assert_eq!(std::fs::read_dir(again.path()).expect("ls").count(), 0);
+    }
+
+    /// CodeRabbit #56: a split read whose first part fails still waits for
+    /// every other part (an extraction under way is never left running after
+    /// the read returns), then reports the failure and cleans the staging dir.
+    #[tokio::test]
+    async fn windows_git_objects_fetch_waits_for_every_part_after_a_failure() {
+        use crate::deploy::git_objects::GitObjectFile;
+        use crate::deploy::transport::projects::GitHostRead;
+        let git = format!("{WDATA}/projects/CapApp/.git");
+        let fake = windows_fake();
+        let mut files = Vec::new();
+        for i in 0..24u32 {
+            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
+            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
+            fake.file(&format!("{git}/{rel}"), &body);
+            files.push(GitObjectFile {
+                rel,
+                size: body.len() as u64,
+            });
+        }
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        fake.knobs().bundle_fail_list = Some("read-0.tsv".to_string());
+        let t = windows_transport(&fake).with_part_target_bytes(total / 4);
+        let dest = tempfile::tempdir().expect("dest");
+        t.fetch_git_objects("CapApp", &files, dest.path())
+            .await
+            .expect_err("part 0 fails");
+        assert_eq!(fake.knobs().bundle_params.len(), 4, "every part ran");
+        assert_eq!(get_lines(&fake).len(), 3, "every other part was downloaded");
+        assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
+        assert_eq!(std::fs::read_dir(dest.path()).expect("ls").count(), 0);
     }
 
     /// 27-11: the archive of a Windows object read is hostile data: a size
