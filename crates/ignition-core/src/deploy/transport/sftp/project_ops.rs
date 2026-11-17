@@ -256,7 +256,8 @@ pub(super) const GIT_STATE_SH: &str = concat!(
     "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
     "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
     "wk \"$1\" \"$2\"; shift 2; NL=$(printf '\\nx'); NL=${NL%x}; ",
-    "rd() { if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
+    "pd() { q=''; OI=$IFS; IFS=/; for w in $1; do if [ -n \"$q\" ] && [ -L \"$q\" ]; then printf '%s is a symlink\\n' \"$q\" >&2; exit 4; fi; q=${q:+$q/}$w; done; IFS=$OI; }; ",
+    "rd() { pd \"$1\"; if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
     "if pr \"$1\"; then [ -f \"$1\" ] || { printf '%s is not a regular file\\n' \"$1\" >&2; exit 4; }; ",
     "[ -r \"$1\" ] || { printf '%s cannot be read\\n' \"$1\" >&2; exit 3; }; ",
     "z=$(wc -c < \"$1\") || exit 3; z=$((z)); ",
@@ -269,7 +270,7 @@ pub(super) const GIT_STATE_SH: &str = concat!(
     "printf ',\"index\":'; if pr index; then printf true; else printf false; fi; ",
     "printf ',\"markers\":['; s=''; for m in \"$@\"; do if pr \"$m\"; then printf '%s\"%s\"' \"$s\" \"$m\"; s=,; fi; done; printf ']'; ",
     "printf ',\"refs\":['; s=''; c=0; ",
-    "for d in refs/heads refs/remotes; do if pr \"$d\"; then ",
+    "for d in refs/heads refs/remotes; do pd \"$d\"; if pr \"$d\"; then ",
     "[ -d \"$d\" ] && [ ! -L \"$d\" ] || { printf '%s is not a real directory\\n' \"$d\" >&2; exit 4; }; ",
     "x=$(find -P \"$d\" \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { printf '%s holds a symlink, a special file or a name with a control character\\n' \"$d\" >&2; exit 4; }; ",
@@ -295,7 +296,8 @@ pub(super) const GIT_DIGEST_SH: &str = concat!(
     "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
     "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
     "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; f=$3; ",
+    "pd() { q=''; OI=$IFS; IFS=/; for w in $1; do if [ -n \"$q\" ] && [ -L \"$q\" ]; then printf '%s is a symlink\\n' \"$q\" >&2; exit 4; fi; q=${q:+$q/}$w; done; IFS=$OI; }; ",
+    "wk \"$1\" \"$2\"; f=$3; pd \"$f\"; ",
     "if [ -L \"$f\" ]; then printf '%s is a symlink\\n' \"$f\" >&2; exit 4; fi; ",
     "if pr \"$f\"; then [ -f \"$f\" ] || { printf '%s is not a regular file\\n' \"$f\" >&2; exit 4; }; ",
     "h=$($H -- \"./$f\") || exit 3; printf 'IGN-RESULT:{\"digest\":\"%s\"}\\n' \"${h%% *}\"; ",
@@ -4785,6 +4787,52 @@ mod tests {
                 std::fs::read_to_string(saved).expect("the literal project was saved"),
                 "ref: refs/heads/glob\n"
             );
+        }
+
+        /// CodeRabbit #56: the state and digest scripts refuse a symlinked
+        /// directory above the file they read (`logs` above `logs/HEAD`,
+        /// `refs` above the loose-ref roots, a directory inside `refs/heads`
+        /// above a branch ref); a check of the final entry does not see it.
+        #[test]
+        fn state_and_digest_scripts_refuse_a_symlinked_parent() {
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::create_dir_all(outside.path().join("heads")).expect("heads");
+            std::fs::write(outside.path().join("heads/stolen"), "1\n").expect("ref");
+            std::fs::write(outside.path().join("HEAD"), "0 1 x\n").expect("log");
+            std::fs::write(outside.path().join("b"), "2\n").expect("leaf");
+            for level in ["logs", "refs"] {
+                let rig = Rig::new();
+                let at = rig.git().join(level);
+                if at.exists() {
+                    std::fs::remove_dir_all(&at).expect("rm");
+                }
+                std::os::unix::fs::symlink(outside.path(), &at).expect("link");
+                let out = run(
+                    GIT_STATE_SH,
+                    &[&rig.data(), "projects/CapApp/.git"],
+                    &system_path(),
+                );
+                assert_eq!(out.code, 4, "{level}: {} {}", out.stdout, out.stderr);
+                assert!(out.stderr.contains("symlink"), "{level}: {}", out.stderr);
+            }
+            let rig = Rig::new();
+            std::os::unix::fs::symlink(outside.path(), rig.git().join("refs/heads/a"))
+                .expect("link");
+            let out = run(
+                GIT_DIGEST_SH,
+                &[&rig.data(), "projects/CapApp/.git", "refs/heads/a/b"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 4, "{} {}", out.stdout, out.stderr);
+            assert!(out.stderr.contains("symlink"), "{}", out.stderr);
+            // an absent parent is still an absent file
+            let out = run(
+                GIT_DIGEST_SH,
+                &[&rig.data(), "projects/CapApp/.git", "refs/heads/none/b"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.contains("\"digest\":null"), "{}", out.stdout);
         }
 
         #[test]
