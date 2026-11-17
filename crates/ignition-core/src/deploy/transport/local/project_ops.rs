@@ -1554,8 +1554,17 @@ impl LocalFsTransport {
                 Err(_) if matches!(write.name, GitWriteName::Config) => 0o600,
                 Err(_) => 0o644,
             };
+            // A lock this call failed to create is another writer's: only a
+            // failure after the create removes it.
+            let mut file = match create_new_file(&temp, file_mode) {
+                Ok(file) => file,
+                Err(e) => {
+                    return Err(
+                        self.git_fail(OP, format!("{rel} cannot be written ({})", e.kind()))
+                    );
+                }
+            };
             let result = (|| -> std::io::Result<()> {
-                let mut file = create_new_file(&temp, file_mode)?;
                 #[cfg(unix)]
                 {
                     // the umask may have narrowed the create; the file gets
@@ -2635,6 +2644,52 @@ mod tests {
         )
         .expect("new config");
         assert_eq!(mode(&git.join("config")), 0o600, "a new config is 0600");
+    }
+
+    /// CodeRabbit #56: a lock another writer takes after the preflight makes
+    /// this write's exclusive create fail, and that writer's lock stays. The
+    /// other writer here waits for `index.lock` (the first write of the pass,
+    /// so the preflight is over) and then takes `HEAD.lock`.
+    #[test]
+    fn local_git_write_leaves_a_lock_it_failed_to_create() {
+        let dir = data_with_projects();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::create_dir_all(&git).expect("git");
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").expect("HEAD");
+        let t = host(dir.path());
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Index,
+                bytes: vec![1u8; 64 * 1024 * 1024],
+            },
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            },
+        ];
+        let (index_lock, head_lock) = (git.join("index.lock"), git.join("HEAD.lock"));
+        let index = git.join("index");
+        let other = std::thread::spawn(move || {
+            while std::fs::symlink_metadata(&index_lock).is_err()
+                && std::fs::symlink_metadata(&index).is_err()
+            {
+                std::hint::spin_loop();
+            }
+            create_new_file(&head_lock, 0o644).expect("the other writer's lock");
+        });
+        let err = t
+            .write_git_files_blocking("CapApp", &writes)
+            .expect_err("HEAD.lock is held");
+        other.join().expect("other writer");
+        assert!(err.to_string().contains("HEAD"), "{err}");
+        assert!(
+            git.join("HEAD.lock").is_file(),
+            "the other writer's lock is left alone"
+        );
+        assert_eq!(
+            std::fs::read(git.join("HEAD")).expect("HEAD"),
+            b"ref: refs/heads/main\n"
+        );
     }
 
     /// A data dir whose `projects/Plain` holds a `.git` of three files.
