@@ -11,6 +11,13 @@
 
 pub mod apply;
 pub mod exclude;
+pub mod git_advance;
+pub mod git_gate;
+pub mod git_handover;
+pub mod git_objects;
+pub mod git_remote;
+pub mod git_state;
+pub mod git_yaml;
 pub mod layout;
 pub mod ledger;
 pub mod lint;
