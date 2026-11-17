@@ -1138,7 +1138,9 @@ mod git_rehearse {
                     .strip_prefix(root)
                     .expect("below root")
                     .display()
-                    .to_string();
+                    .to_string()
+                    // `/` on every platform, as the assertions spell paths
+                    .replace('\\', "/");
                 if path.is_dir() {
                     out.push((format!("{rel}/"), Vec::new()));
                     walk(root, &path, out);
