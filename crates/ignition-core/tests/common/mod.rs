@@ -20,9 +20,13 @@ pub mod fake_projects;
 pub mod faulty_deploy;
 pub mod faulty_host;
 pub mod forbid_writes;
+pub mod git_fixture;
 pub mod native_shape;
 pub mod plan_fixture;
+pub mod posix_exec;
 pub mod prod_shape;
+#[cfg(unix)]
+pub mod pwsh_exec;
 pub mod sftp_server;
 
 /// Wraps a [`wiremock::MockServer`] with Ignition-shaped fixture builders.

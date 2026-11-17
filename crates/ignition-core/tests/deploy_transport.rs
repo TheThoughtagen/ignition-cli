@@ -2900,6 +2900,8 @@ fn write_half_unreachable() {
         "tag_record_writer_for_node",
         "ProjectRunWriter",
         "project_run_writer_for_node",
+        "GitStateWriter",
+        "git_state_writer_for_node",
     ];
     for (file, text) in sources {
         assert!(text.len() > 1000, "{file} was not read");
@@ -2913,6 +2915,7 @@ fn write_half_unreachable() {
     apply_host_is_confined();
     release_writer_is_confined();
     tag_record_writer_is_confined();
+    git_state_writer_is_confined();
 }
 
 /// 24-05 (D-01, T-24-15): `deploy/pair.rs` is the only door to the backup
@@ -3115,6 +3118,65 @@ fn tag_record_writer_is_confined() {
         assert!(
             naming.iter().any(|shown| shown.contains(expected)),
             "{expected} does not name the tag record writer: the walk is not looking where it should; saw {naming:?}"
+        );
+    }
+}
+
+/// The positive half for the `.git` writer (27-02, T-27-02, T-27-03): only
+/// files under `deploy/transport/`, `deploy/git_handover.rs` and the project
+/// deploy action (`actions/deploy_projects.rs` and `actions/deploy_projects/`)
+/// name `GitStateWriter`; the CLI crate names nothing. Also run at the end of
+/// `write_half_unreachable`.
+///
+/// The action does not name it yet (27-12 wires the verb), so the walk is
+/// required to see the trait's home, the local implementation and the
+/// handover, not the action.
+#[test]
+fn git_state_writer_is_confined() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_sources(&manifest.join("src"), &mut files);
+    rust_sources(&manifest.join("../ignition-cli/src"), &mut files);
+    assert!(
+        files.len() > 50,
+        "the walk found only {} files",
+        files.len()
+    );
+    let allowed = [
+        "ignition-core/src/deploy/transport/",
+        "ignition-core/src/deploy/git_handover.rs",
+        "ignition-core/src/actions/deploy_projects.rs",
+        "ignition-core/src/actions/deploy_projects/",
+    ];
+    let mut naming = Vec::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        if !text.contains("GitStateWriter") {
+            continue;
+        }
+        let shown = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.clone())
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            allowed.iter().any(|ok| shown.contains(ok)),
+            "{shown} names `GitStateWriter` but is outside deploy/transport/, \
+             deploy/git_handover.rs and the project deploy action"
+        );
+        naming.push(shown);
+    }
+    // The walk really saw the trait's home, its local implementation and the
+    // handover (a path typo would make the confinement check vacuous).
+    for expected in [
+        "ignition-core/src/deploy/transport/projects.rs",
+        "ignition-core/src/deploy/transport/local/project_ops.rs",
+        "ignition-core/src/deploy/git_handover.rs",
+    ] {
+        assert!(
+            naming.iter().any(|shown| shown.contains(expected)),
+            "{expected} does not name the git state writer: the walk is not looking where it should; saw {naming:?}"
         );
     }
 }
@@ -3995,5 +4057,3043 @@ fn project_run_writer_is_confined() {
             naming.iter().any(|shown| shown.contains(expected)),
             "{expected} does not name the project run writer: the walk is not looking where it should; saw {naming:?}"
         );
+    }
+}
+
+/// 27-08: the git host channel over the sftp transport on a POSIX node, against
+/// the in-repo local `sftp-server` and the local `sh` (the exec seam). The
+/// scripts under test are the very text a Linux host would run, so each result
+/// is also compared with the local-filesystem implementation on the same
+/// `.git`.
+#[cfg(unix)]
+mod sftp_git {
+    use super::*;
+    use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use ignition_core::deploy::git_state::GitFiles;
+    use ignition_core::deploy::transport::projects::{
+        GitEntry, GitHostRead, GitStateWriter, ProjectHost,
+    };
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use ignition_core::deploy::tree::sha256_hex;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const RUN: &str = "20261114T101500Z-ab12";
+
+    type BatchHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+    /// Counts the exec calls (`sh -c`) and the sftp sessions a transport makes
+    /// and keeps the exec command texts.
+    #[derive(Default)]
+    struct Count {
+        execs: Mutex<Vec<String>>,
+        sftp: AtomicUsize,
+        /// A per-test directory of shim programs put first on `sh`'s PATH.
+        shims: Mutex<Option<PathBuf>>,
+        /// A directory that is the whole PATH of `sh` (a host without a tool).
+        only_path: Mutex<Option<PathBuf>>,
+        /// Exec commands holding a needle that fail like a dead connection
+        /// (exit 255, nothing run): the needle and how many calls still fail.
+        dead: Mutex<Vec<(String, usize)>>,
+        /// Every `put` of every sftp batch: the remote path and the mode of its
+        /// parent directory at the moment the batch was sent.
+        puts: Mutex<Vec<(String, Option<u32>)>>,
+        /// Called with the batch text just before an sftp batch runs.
+        before_batch: Mutex<Option<BatchHook>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for Count {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if program == "sh" {
+                let command = args
+                    .last()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.execs.lock().expect("execs").push(command.clone());
+                let dead = {
+                    let mut dead = self.dead.lock().expect("dead");
+                    dead.iter_mut()
+                        .find(|(needle, left)| *left > 0 && command.contains(needle.as_str()))
+                        .map(|(_, left)| *left -= 1)
+                        .is_some()
+                };
+                if dead {
+                    return ProcessOutput {
+                        stdout: Vec::new(),
+                        stderr: b"Connection reset by peer".to_vec(),
+                        code: 255,
+                        timed_out: false,
+                    };
+                }
+            } else {
+                self.sftp.fetch_add(1, Ordering::Relaxed);
+                let batch =
+                    String::from_utf8_lossy(stdin.as_deref().unwrap_or_default()).into_owned();
+                let hook = self.before_batch.lock().expect("hook").clone();
+                if let Some(hook) = hook {
+                    hook(&batch);
+                }
+                for line in batch.lines().filter(|l| l.starts_with("put ")) {
+                    if let Some(remote) = line.rsplit('"').nth(1) {
+                        let parent = Path::new(remote).parent().and_then(|p| {
+                            std::fs::metadata(p)
+                                .ok()
+                                .map(|m| m.permissions().mode() & 0o777)
+                        });
+                        self.puts
+                            .lock()
+                            .expect("puts")
+                            .push((remote.to_string(), parent));
+                    }
+                }
+            }
+            let only = self.only_path.lock().expect("only").clone();
+            if program == "sh"
+                && let Some(only) = only
+            {
+                let mut wrapped = vec![
+                    OsString::from(format!("PATH={}", only.display())),
+                    OsString::from("/bin/sh"),
+                ];
+                wrapped.extend(args.iter().cloned());
+                return TokioProcessRunner
+                    .run(OsStr::new("env"), &wrapped, stdin, timeout)
+                    .await;
+            }
+            let extra = self.shims.lock().expect("shims").clone();
+            let (program, args) = common::posix_exec::shimmed_with(program, args, extra.as_deref());
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    impl Count {
+        fn use_shims(&self, shims: &common::posix_exec::Shims) {
+            *self.shims.lock().expect("shims") = Some(shims.path().to_path_buf());
+        }
+        /// The next `times` exec commands holding `needle` die like a dropped
+        /// connection.
+        fn kill_exec(&self, needle: &str, times: usize) {
+            self.dead
+                .lock()
+                .expect("dead")
+                .push((needle.to_string(), times));
+        }
+        fn puts(&self) -> Vec<(String, Option<u32>)> {
+            self.puts.lock().expect("puts").clone()
+        }
+        fn on_batch(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+            *self.before_batch.lock().expect("hook") = Some(Arc::new(hook));
+        }
+        fn execs(&self) -> usize {
+            self.execs.lock().expect("execs").len()
+        }
+        fn sftp(&self) -> usize {
+            self.sftp.load(Ordering::Relaxed)
+        }
+    }
+
+    /// The sftp transport over `data_dir`, with a fresh account home.
+    struct Node {
+        t: SftpTransport,
+        home: tempfile::TempDir,
+        count: Arc<Count>,
+    }
+
+    fn node(data_dir: &Path) -> Node {
+        let count = Arc::new(Count::default());
+        let shell =
+            RemoteShell::local_sftp_server(&sftp_server(), count.clone(), Duration::from_secs(60))
+                .local_exec();
+        let home = tempfile::tempdir().expect("home");
+        let data = posix_root(&data_dir.display().to_string()).expect("posix root");
+        let home_root = posix_root(&home.path().display().to_string()).expect("home root");
+        let t = SftpTransport::new(shell, data, "nodes.master").with_home(&home_root);
+        Node { t, home, count }
+    }
+
+    /// Whether this process ignores mode bits (root), so denial cases cannot run.
+    fn ignores_modes(dir: &Path) -> bool {
+        let probe = dir.join(".mode-probe");
+        std::fs::create_dir_all(&probe).expect("probe dir");
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let ignored = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::remove_dir(&probe).expect("rm probe");
+        ignored
+    }
+
+    fn detail(err: CoreError) -> String {
+        match err {
+            CoreError::TransportFailed { detail, .. } => detail,
+            other => panic!("expected transport_failed, got {other:?}"),
+        }
+    }
+
+    fn save_dir(n: &Node) -> PathBuf {
+        n.home
+            .path()
+            .join("ign-deploy")
+            .join(GATEWAY)
+            .join("projects")
+            .join(PROJECT)
+            .join("git-save")
+            .join(RUN)
+    }
+
+    #[tokio::test]
+    async fn sftp_git_state_posix_managed() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        // markers the host may report, and a loose ref in a nested directory
+        std::fs::write(fx.git_dir().join("index.lock"), "").expect("lock");
+        std::fs::write(fx.git_dir().join("MERGE_HEAD"), "x\n").expect("merge");
+        fx.git_in_project(&["branch", "feature/x"]);
+        fx.git_in_project(&["branch", "feature-y"]);
+
+        let local: GitFiles = fx.node().read_git_state(PROJECT).await.expect("local");
+        let posix: GitFiles = n.t.read_git_state(PROJECT).await.expect("posix");
+        assert_eq!(posix, local, "the two implementations read the same state");
+        assert_eq!(posix.kind, GitEntry::Directory);
+        assert!(posix.index_present);
+        assert!(
+            posix.markers.contains(&"index.lock".to_string()),
+            "{posix:?}"
+        );
+        assert!(
+            posix.markers.contains(&"MERGE_HEAD".to_string()),
+            "{posix:?}"
+        );
+        assert!(
+            posix
+                .loose_refs
+                .iter()
+                .any(|(name, _)| name == "refs/heads/feature/x"),
+            "{posix:?}"
+        );
+        // a probe and a state call: two exec calls, no sftp session
+        assert_eq!(n.count.execs(), 2);
+        assert_eq!(n.count.sftp(), 0);
+
+        // not a directory, and no project: answered by kind, never read
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let absent = n.t.read_git_state(PROJECT).await.expect("absent");
+        assert_eq!(absent, GitFiles::without_contents(GitEntry::Absent));
+        std::fs::write(fx.git_dir(), "gitdir: elsewhere\n").expect("git file");
+        let file = n.t.read_git_state(PROJECT).await.expect("file");
+        assert_eq!(file, GitFiles::without_contents(GitEntry::File));
+    }
+
+    #[tokio::test]
+    async fn sftp_git_state_posix_failure_not_absent() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        if ignores_modes(&fx.data_dir) {
+            println!("running with privileges that ignore mode bits; denial cases skipped");
+            return;
+        }
+        // a config the account cannot read is a failure, never an absent file
+        let config = fx.git_dir().join("config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let why = detail(
+            n.t.read_git_state(PROJECT)
+                .await
+                .expect_err("denied config"),
+        );
+        assert!(why.contains("config"), "{why}");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        // a refs directory it cannot list is a failure too
+        let heads = fx.git_dir().join("refs/heads");
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let err = n.t.read_git_state(PROJECT).await.expect_err("denied refs");
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+
+        // a symlinked HEAD is refused
+        let head = fx.git_dir().join("HEAD");
+        std::fs::rename(&head, fx.git_dir().join("HEAD.real")).expect("rename");
+        std::os::unix::fs::symlink("HEAD.real", &head).expect("symlink");
+        let why = detail(n.t.read_git_state(PROJECT).await.expect_err("symlink"));
+        assert!(why.contains("symlink"), "{why}");
+        std::fs::remove_file(&head).expect("rm link");
+        std::fs::rename(fx.git_dir().join("HEAD.real"), &head).expect("rename back");
+        n.t.read_git_state(PROJECT).await.expect("readable again");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_save_restore_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let local_manifest = fx
+            .node()
+            .git_manifest(PROJECT)
+            .await
+            .expect("local manifest");
+        let before = n.t.git_manifest(PROJECT).await.expect("manifest");
+        assert_eq!(before, local_manifest, "both implementations digest alike");
+
+        let saved = n.t.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        assert_eq!(saved, before, "the save equals the gateway .git");
+        assert_eq!(
+            n.t.save_manifest(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("save manifest"),
+            before
+        );
+        let run_mode = std::fs::metadata(save_dir(&n))
+            .expect("run dir")
+            .permissions()
+            .mode();
+        assert_eq!(run_mode & 0o077, 0, "the save is private: {run_mode:o}");
+        // a save is never overwritten
+        let why = detail(
+            n.t.save_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("again"),
+        );
+        assert!(why.contains("never overwritten"), "{why}");
+
+        // restore refuses while `.git` exists
+        let why = detail(
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("present"),
+        );
+        assert!(why.contains("never replaced"), "{why}");
+        assert_eq!(n.t.git_manifest(PROJECT).await.expect("untouched"), before);
+
+        // the import deletes `.git`; the restore puts it back byte for byte
+        let config_mode = std::fs::metadata(fx.git_dir().join("config"))
+            .expect("config")
+            .permissions()
+            .mode();
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let back =
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("restore");
+        assert_eq!(back, before);
+        assert_eq!(n.t.git_manifest(PROJECT).await.expect("live"), before);
+        let restored_mode = std::fs::metadata(fx.git_dir().join("config"))
+            .expect("config")
+            .permissions()
+            .mode();
+        assert_eq!(
+            restored_mode, config_mode,
+            "the modes survive the round trip"
+        );
+        assert!(
+            !fx.project_dir()
+                .join(".ign-restore-20261114T101500Z-ab12")
+                .exists(),
+            "no staging directory is left"
+        );
+
+        // removing the save takes the repo tree and its run directory
+        n.t.remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("remove");
+        assert!(!save_dir(&n).exists());
+        n.t.remove_git_save(GATEWAY, PROJECT, RUN)
+            .await
+            .expect("absent is fine");
+    }
+
+    /// 27-30 (CR-B1): the removal walks the save path by position, so a
+    /// gateway or a project named `repo` never turns it into the removal of
+    /// the whole ledger (the release record, the journals, the other runs).
+    #[tokio::test]
+    async fn sftp_git_save_rm_named_repo_components() {
+        const OTHER: &str = "20261114T101600Z-cd34";
+        for (gateway, project) in [("repo", "p1"), ("gw1", "repo"), ("repo", "repo")] {
+            let fx = GitFixture::new();
+            let n = node(&fx.data_dir);
+            let proj = n
+                .home
+                .path()
+                .join("ign-deploy")
+                .join(gateway)
+                .join("projects")
+                .join(project);
+            let save = |run: &str| proj.join("git-save").join(run).join("repo");
+            for run in [RUN, OTHER] {
+                std::fs::create_dir_all(save(run).join("objects")).expect("save");
+                std::fs::write(save(run).join("HEAD"), format!("ref: {run}\n")).expect("head");
+                std::fs::write(save(run).join("objects/o1"), run).expect("object");
+            }
+            std::fs::create_dir_all(proj.join("release")).expect("release");
+            std::fs::write(proj.join("release/release.json"), "{\"keep\":1}").expect("record");
+            std::fs::create_dir_all(proj.join("journals")).expect("journals");
+            std::fs::write(proj.join("journals/j1.json"), "journal").expect("journal");
+            let sibling = n.home.path().join("ign-deploy").join(gateway).join("note");
+            std::fs::write(&sibling, "gateway-level file").expect("sibling");
+
+            n.t.remove_git_save(gateway, project, RUN)
+                .await
+                .unwrap_or_else(|e| panic!("{gateway}/{project}: {e:?}"));
+
+            let label = format!("{gateway}/{project}");
+            assert!(
+                !proj.join("git-save").join(RUN).exists(),
+                "{label}: removed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("release/release.json")).expect("record"),
+                "{\"keep\":1}",
+                "{label}: the release record survives"
+            );
+            assert_eq!(
+                std::fs::read_to_string(proj.join("journals/j1.json")).expect("journal"),
+                "journal",
+                "{label}: the journals survive"
+            );
+            assert_eq!(
+                std::fs::read_to_string(save(OTHER).join("objects/o1")).expect("other save"),
+                OTHER,
+                "{label}: another run's save survives"
+            );
+            assert_eq!(
+                std::fs::read_to_string(save(OTHER).join("HEAD")).expect("other head"),
+                format!("ref: {OTHER}\n")
+            );
+            assert!(
+                sibling.is_file(),
+                "{label}: the gateway-level file survives"
+            );
+        }
+    }
+
+    /// 27-30 (WR-B7): a `.git` that appears between the restore's last check
+    /// and its move is never entered. The stage is taken back out, the restore
+    /// refuses, and the gateway's new `.git` is left as it is.
+    #[tokio::test]
+    async fn sftp_git_restore_refuses_git_that_appears_before_the_move() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let before = n.t.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+
+        // a designer's open creates `.git` right before the restore's `mv`
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "mv",
+            "case $3 in */.git) case $2 in */.ign-restore-*) mkdir -- \"$3\";; esac;; esac\n\
+             exec \"$(real mv)\" \"$@\"",
+        );
+        n.count.use_shims(&shims);
+
+        let why = detail(
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("a .git appeared"),
+        );
+        assert!(why.contains(".git appeared"), "{why}");
+        assert!(fx.git_dir().is_dir(), "the new .git is still there");
+        assert_eq!(
+            std::fs::read_dir(fx.git_dir()).expect("new .git").count(),
+            0,
+            "nothing was left inside the new .git"
+        );
+        let beside: Vec<_> = std::fs::read_dir(fx.project_dir())
+            .expect("project")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".ign-restore-"))
+            .collect();
+        assert!(beside.is_empty(), "no stage is left beside it: {beside:?}");
+        let saved = save_dir(&n).join("repo");
+        assert!(saved.is_dir(), "the save is intact");
+        assert_eq!(
+            n.t.save_manifest(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("save manifest"),
+            before
+        );
+    }
+
+    /// The shims that make the project directory belong to a third account
+    /// (uid 4242), accept the ACL step and report what `getfacl` is told to.
+    fn acl_shims(file: &str, dir: &str) -> common::posix_exec::Shims {
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ls",
+            "case $1 in -ldn) printf 'drwxr-xr-x 2 4242 4242 64 Jan  1 00:00 %s\\n' \"$3\";; \
+             *) exec \"$(real ls)\" \"$@\";; esac",
+        );
+        shims.add("setfacl", "exit 0");
+        shims.add(
+            "getfacl",
+            "for a; do p=$a; done\n\
+             if [ -d \"$p\" ]; then cat \"$(dirname \"$0\")/getfacl.dir\"; \
+             else cat \"$(dirname \"$0\")/getfacl.file\"; fi",
+        );
+        shims.data("getfacl.file", file);
+        shims.data("getfacl.dir", dir);
+        shims
+    }
+
+    const RW: &str = "user:4242:rwx\t#effective:rw-\n";
+    const RW_NO_SUFFIX: &str = "user:4242:rw-\n";
+    const RX_TAB: &str = "user:4242:rw-\t#effective:r-x\n";
+    const RX_SPACE: &str = "user:4242:rwx #effective:r-x\n";
+
+    /// 27-30 (WR-B4): the probe asks whether the gateway account can write,
+    /// so `#effective:r-x` refuses too, on a file and on a directory.
+    #[tokio::test]
+    async fn sftp_git_probe_refuses_effective_no_write() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        for (file, dir, label) in [
+            (RX_TAB, RW, "file r-x with a tab"),
+            (RX_SPACE, RW, "file r-x with a space"),
+            (RW, RX_TAB, "directory r-x"),
+            (RW, RX_SPACE, "directory r-x with a space"),
+        ] {
+            let shims = acl_shims(file, dir);
+            n.count.use_shims(&shims);
+            let why = detail(
+                n.t.probe_write(PROJECT, RUN)
+                    .await
+                    .expect_err(&format!("{label} must refuse")),
+            );
+            assert!(why.contains("no effective write access"), "{label}: {why}");
+        }
+        // effective rw-, or no effective suffix at all, passes and cleans up
+        for (file, dir) in [(RW, RW), (RW_NO_SUFFIX, RW_NO_SUFFIX)] {
+            let shims = acl_shims(file, dir);
+            n.count.use_shims(&shims);
+            n.t.probe_write(PROJECT, RUN).await.expect("probe passes");
+        }
+        let probe = format!(".ign-probe-{RUN}");
+        assert!(!fx.project_dir().join(&probe).exists());
+        assert!(!fx.git_dir().join(&probe).exists());
+        assert!(!fx.git_dir().join(format!("{probe}.acl")).exists());
+    }
+
+    /// 27-30 (WR-B4): the same on the restore. Refused, with no `.git`
+    /// created and no stage left; with a writable effective right it lands.
+    #[tokio::test]
+    async fn sftp_git_restore_refuses_effective_no_write() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let before = n.t.save_git(GATEWAY, PROJECT, RUN).await.expect("save");
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        for (file, dir, label) in [
+            (RX_TAB, RW, "file r-x with a tab"),
+            (RX_SPACE, RW, "file r-x with a space"),
+            (RW, RX_TAB, "directory r-x"),
+        ] {
+            let shims = acl_shims(file, dir);
+            n.count.use_shims(&shims);
+            let why = detail(
+                n.t.restore_git(GATEWAY, PROJECT, RUN)
+                    .await
+                    .expect_err(&format!("{label} must refuse")),
+            );
+            assert!(why.contains("no effective write access"), "{label}: {why}");
+            assert!(!fx.git_dir().exists(), "{label}: no .git was created");
+            let beside: Vec<_> = std::fs::read_dir(fx.project_dir())
+                .expect("project")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with(".ign-restore-"))
+                .collect();
+            assert!(beside.is_empty(), "{label}: no stage is left: {beside:?}");
+        }
+        let shims = acl_shims(RW, RW);
+        n.count.use_shims(&shims);
+        let back =
+            n.t.restore_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect("writable restores");
+        assert_eq!(back, before);
+    }
+
+    #[tokio::test]
+    async fn sftp_git_save_refuses_a_symlink_and_leaves_no_save() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        std::os::unix::fs::symlink("/etc", fx.git_dir().join("hooks-link")).expect("symlink");
+        let why = detail(
+            n.t.save_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("symlink"),
+        );
+        assert!(why.contains("symlink"), "{why}");
+        assert!(!save_dir(&n).join("repo").exists(), "no half save");
+        // the manifest refuses it as well
+        let err = n.t.git_manifest(PROJECT).await.expect_err("symlink");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // and a symlinked project directory is never walked through
+        std::fs::remove_file(fx.git_dir().join("hooks-link")).expect("rm link");
+        let real = fx.data_dir.join("projects").join("Real");
+        std::fs::rename(fx.project_dir(), &real).expect("rename");
+        std::os::unix::fs::symlink(&real, fx.project_dir()).expect("project link");
+        let err =
+            n.t.save_git(GATEWAY, PROJECT, RUN)
+                .await
+                .expect_err("linked project");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_write_lock_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let pack = "ab".repeat(20);
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::BranchRef("feature/new".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+            GitWrite {
+                name: GitWriteName::PackFile(pack.clone()),
+                bytes: vec![7u8; 5000],
+            },
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/feature/new\n".to_vec(),
+            },
+        ];
+        n.t.write_git_files(PROJECT, &writes).await.expect("write");
+        for write in &writes {
+            let path = fx.git_dir().join(write.name.rel());
+            assert_eq!(std::fs::read(&path).expect("read back"), write.bytes);
+            let digest =
+                n.t.git_file_digest(PROJECT, &write.name)
+                    .await
+                    .expect("digest");
+            assert_eq!(digest, Some(sha256_hex(&write.bytes)), "{:?}", write.name);
+        }
+        let leftovers: Vec<String> = walk(&fx.git_dir())
+            .into_iter()
+            .filter(|p| p.ends_with(".lock") || p.ends_with(".ign-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(stages(&n).is_empty(), "no stage is left: {:?}", stages(&n));
+        // the ref file is a regular readable file, not private to the writer
+        let mode = std::fs::metadata(fx.git_dir().join("refs/heads/feature/new"))
+            .expect("ref")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o044, 0o044, "{mode:o}");
+        // an absent file has no digest
+        assert_eq!(
+            n.t.git_file_digest(PROJECT, &GitWriteName::BranchRef("nope".to_string()))
+                .await
+                .expect("absent"),
+            None
+        );
+
+        // an existing lock refuses and nothing is written, no lock of this
+        // call is left behind
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+        std::fs::write(fx.git_dir().join("config.lock"), "held").expect("lock");
+        let again = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Config,
+                bytes: b"[core]\n".to_vec(),
+            },
+        ];
+        let why = detail(
+            n.t.write_git_files(PROJECT, &again)
+                .await
+                .expect_err("held"),
+        );
+        assert!(why.contains("config.lock"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before
+        );
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "no lock of the refused call"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.git_dir().join("config.lock")).expect("lock"),
+            "held",
+            "the other writer's lock is left alone"
+        );
+        assert!(
+            stages(&n).is_empty(),
+            "a refusal leaves no stage: {:?}",
+            stages(&n)
+        );
+        // a pack name that is not a hex digest never reaches the host
+        let calls = n.count.execs();
+        let bad = vec![GitWrite {
+            name: GitWriteName::PackFile("../x".to_string()),
+            bytes: vec![1],
+        }];
+        n.t.write_git_files(PROJECT, &bad)
+            .await
+            .expect_err("bad shape");
+        assert_eq!(n.count.execs(), calls, "refused before any remote call");
+    }
+
+    /// The `git-stage-*` directories in the account's ledger root.
+    fn stages(n: &Node) -> Vec<String> {
+        match std::fs::read_dir(n.home.path().join("ign-deploy")) {
+            Ok(entries) => entries
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("git-stage-"))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn two_writes(fx: &GitFixture) -> Vec<GitWrite> {
+        vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/feature/new\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("feature/new".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ]
+    }
+
+    /// 27-31 (WR-B3): sftp puts the advance's bytes only into a private stage
+    /// in the deploy account's ledger root, never into a path the gateway
+    /// account can change.
+    #[tokio::test]
+    async fn sftp_git_write_stage_is_private() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let writes = two_writes(&fx);
+        n.t.write_git_files(PROJECT, &writes).await.expect("write");
+        for write in &writes {
+            assert_eq!(
+                std::fs::read(fx.git_dir().join(write.name.rel())).expect("read back"),
+                write.bytes
+            );
+        }
+        let puts = n.count.puts();
+        assert_eq!(puts.len(), writes.len(), "one put per write: {puts:?}");
+        let stage_root = format!("{}/ign-deploy/git-stage-", n.home.path().display());
+        let data = fx.data_dir.display().to_string();
+        for (remote, parent_mode) in &puts {
+            assert!(
+                remote.starts_with(&stage_root),
+                "{remote} is not below a stage in the ledger root"
+            );
+            assert!(!remote.starts_with(&data), "{remote} is below the data dir");
+            assert_eq!(*parent_mode, Some(0o700), "the stage is owner-only");
+        }
+        let ledger_mode = std::fs::metadata(n.home.path().join("ign-deploy"))
+            .expect("ledger root")
+            .permissions()
+            .mode();
+        assert_eq!(ledger_mode & 0o077, 0, "{ledger_mode:o}");
+        assert!(stages(&n).is_empty(), "the stage is gone: {:?}", stages(&n));
+    }
+
+    /// 27-31 (WR-B3): a symlink at a lock path is never written through. The
+    /// link appears after ign has looked, while the bytes are on their way.
+    #[tokio::test]
+    async fn sftp_git_write_never_follows_a_planted_link() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+
+        let git = fx.git_dir();
+        let link_to = victim.clone();
+        n.count.on_batch(move |_| {
+            let lock = git.join("HEAD.lock");
+            let _ = std::fs::remove_file(&lock);
+            std::os::unix::fs::symlink(&link_to, &lock).expect("plant");
+        });
+        let why = detail(
+            n.t.write_git_files(PROJECT, &two_writes(&fx))
+                .await
+                .expect_err("a link at the lock path"),
+        );
+        assert!(why.contains("exit code 4"), "refused as a refusal: {why}");
+        assert!(why.contains("HEAD.lock"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "precious\n",
+            "nothing was written through the link"
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before,
+            "no target changed"
+        );
+        assert!(
+            !fx.git_dir().join("refs/heads/feature/new").exists(),
+            "no target changed"
+        );
+        assert!(
+            std::fs::symlink_metadata(fx.git_dir().join("HEAD.lock"))
+                .expect("planted link")
+                .file_type()
+                .is_symlink(),
+            "what ign did not create is left alone"
+        );
+        assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    /// 27-31 (WR-B3): the exclusive create itself does not follow a link that
+    /// is planted after the checks and before the create.
+    #[tokio::test]
+    async fn sftp_git_write_create_refuses_a_link_planted_in_the_window() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+
+        // while the first lock is filled, the gateway account plants a link at
+        // the second lock's path
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "cat",
+            &format!(
+                "case $2 in */git-stage-*/0) ln -s {} {}/refs/heads/feature/new.lock;; esac\n\
+                 exec \"$(real cat)\" \"$@\"",
+                victim.display(),
+                fx.git_dir().display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &two_writes(&fx))
+                .await
+                .expect_err("a link planted in the window"),
+        );
+        assert!(why.contains("exit code 4"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "precious\n",
+            "the create did not follow the link"
+        );
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "the lock ign made is taken away again"
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before
+        );
+        assert!(
+            std::fs::symlink_metadata(fx.git_dir().join("refs/heads/feature/new.lock"))
+                .expect("planted link")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    /// 27-31 (WR-B2): a connection that dies while the write script runs
+    /// leaves an error that names every lock and the stage, and a cleanup that
+    /// removes the locks that hold ign's own bytes.
+    #[tokio::test]
+    async fn sftp_git_write_transport_failure_names_locks() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let writes = two_writes(&fx);
+        // the connection drops after the first lock was made and filled
+        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("own lock");
+        n.count.kill_exec("HEAD.lock", 1);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a dead connection"),
+        );
+        assert!(
+            why.contains("may still be in .git"),
+            "the leftovers are announced: {why}"
+        );
+        for lock in ["HEAD.lock", "refs/heads/feature/new.lock"] {
+            assert!(why.contains(lock), "{lock} is named: {why}");
+        }
+        assert!(why.contains("git-stage-"), "the stage is named: {why}");
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "the lock that held ign's bytes was removed by the cleanup"
+        );
+        assert!(stages(&n).is_empty(), "the cleanup took the stage away");
+
+        // a cleanup that dies as well is told in the same error, and the stage
+        // it could not remove is still named
+        let n = node(&fx.data_dir);
+        n.count.kill_exec("HEAD.lock", 2);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a dead connection twice"),
+        );
+        assert!(
+            why.contains("cleanup"),
+            "the failed cleanup is folded in: {why}"
+        );
+        assert!(why.contains("HEAD.lock"), "{why}");
+        assert!(why.contains("git-stage-"), "{why}");
+        assert_eq!(stages(&n).len(), 1, "the stage really is still there");
+    }
+
+    /// 27-31 (WR-B2): a lock that was there before the write and holds other
+    /// bytes (a JGit `index.lock`) is never removed, by a refusal or by the
+    /// cleanup after a dead connection.
+    #[tokio::test]
+    async fn sftp_git_write_cleanup_spares_a_foreign_lock() {
+        let fx = GitFixture::new();
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/feature/new\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::Index,
+                bytes: vec![9u8; 64],
+            },
+        ];
+        let foreign = fx.git_dir().join("index.lock");
+
+        // refused: nothing written, the foreign lock stays
+        let n = node(&fx.data_dir);
+        std::fs::write(&foreign, "JGit holds this\n").expect("foreign lock");
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("held"),
+        );
+        assert!(why.contains("index.lock"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("foreign"),
+            "JGit holds this\n"
+        );
+        assert!(!fx.git_dir().join("HEAD.lock").exists());
+        assert!(stages(&n).is_empty());
+
+        // a dead connection: the cleanup runs, removes the lock that holds
+        // ign's bytes and spares the foreign one
+        let n = node(&fx.data_dir);
+        std::fs::write(fx.git_dir().join("HEAD.lock"), &writes[0].bytes).expect("own lock");
+        n.count.kill_exec("index.lock", 1);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a dead connection"),
+        );
+        assert!(why.contains("index.lock"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(&foreign).expect("foreign"),
+            "JGit holds this\n",
+            "a lock with other bytes is never removed"
+        );
+        assert!(
+            !fx.git_dir().join("HEAD.lock").exists(),
+            "the lock with ign's own bytes is"
+        );
+        assert!(stages(&n).is_empty());
+    }
+
+    /// 27-31 (security review 1): a lock path that holds a symlink at the
+    /// moment the lock is created is refused whatever it points at, the shell
+    /// does not matter: a dangling link, a link to a FIFO (a noclobber
+    /// redirect opens a non-regular file without `O_EXCL`) and a link to a
+    /// directory. Nothing is written through it.
+    #[tokio::test]
+    async fn sftp_git_write_create_refuses_a_planted_link_of_any_kind() {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        for kind in ["dangling", "fifo", "dir"] {
+            let fx = GitFixture::new();
+            let n = node(&fx.data_dir);
+            let outside = tempfile::tempdir().expect("outside");
+            let aim = outside.path().join("aim");
+            let mut reader = None;
+            match kind {
+                "dangling" => {}
+                "fifo" => {
+                    let made = std::process::Command::new("mkfifo")
+                        .arg(&aim)
+                        .status()
+                        .expect("mkfifo");
+                    assert!(made.success());
+                    // a reader, so an open for writing would not block
+                    reader = Some(
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+                            .open(&aim)
+                            .expect("fifo reader"),
+                    );
+                }
+                _ => std::fs::create_dir(&aim).expect("aim dir"),
+            }
+            let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+            let shims = common::posix_exec::Shims::new();
+            shims.add(
+                "cat",
+                &format!(
+                    "case $2 in */git-stage-*/0) ln -s {} {}/refs/heads/feature/new.lock;; esac\n\
+                     exec \"$(real cat)\" \"$@\"",
+                    aim.display(),
+                    fx.git_dir().display()
+                ),
+            );
+            n.count.use_shims(&shims);
+            let why = detail(
+                n.t.write_git_files(PROJECT, &two_writes(&fx))
+                    .await
+                    .expect_err(kind),
+            );
+            assert!(why.contains("exit code 4"), "{kind}: {why}");
+            if let Some(mut reader) = reader {
+                let mut got = Vec::new();
+                let _ = reader.read_to_end(&mut got);
+                assert!(got.is_empty(), "{kind}: bytes reached the FIFO: {got:?}");
+            }
+            if kind == "dir" {
+                assert_eq!(
+                    std::fs::read_dir(&aim).expect("aim").count(),
+                    0,
+                    "nothing was put inside the directory the link points at"
+                );
+            } else if kind == "dangling" {
+                assert!(!aim.exists(), "the link's target was never created");
+            }
+            assert_eq!(
+                std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+                head_before
+            );
+            assert!(
+                !fx.git_dir().join("HEAD.lock").exists(),
+                "{kind}: our lock is taken away"
+            );
+            assert!(
+                std::fs::symlink_metadata(fx.git_dir().join("refs/heads/feature/new.lock"))
+                    .expect("planted link")
+                    .file_type()
+                    .is_symlink(),
+                "{kind}: what ign did not create is left alone"
+            );
+            assert!(stages(&n).is_empty(), "{kind}: {:?}", stages(&n));
+        }
+    }
+
+    /// 27-31 (security review 2): a parent directory that is swapped for a
+    /// symlink after it was checked is never written through, neither by the
+    /// create nor by the final move.
+    #[tokio::test]
+    async fn sftp_git_write_parent_swapped_after_its_check_is_refused() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        std::fs::create_dir_all(git.join("refs/heads/sub")).expect("sub");
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("x");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head_before = std::fs::read(git.join("HEAD")).expect("head");
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "cat",
+            &format!(
+                "case $2 in */git-stage-*/0) cd {g}/refs/heads && mv sub sub.real && ln -s {o} sub;; esac\n\
+                 exec \"$(real cat)\" \"$@\"",
+                g = git.display(),
+                o = outside.path().display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let writes = vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/sub/x\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("sub/x".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ];
+        let why = detail(
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a swapped parent"),
+        );
+        assert!(
+            why.contains("exit code 4") || why.contains("exit code 3"),
+            "{why}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("victim"),
+            "precious\n",
+            "nothing was written through the swapped parent"
+        );
+        assert!(
+            std::fs::read_dir(outside.path()).expect("outside").count() == 1,
+            "no lock or temporary was made through it"
+        );
+        assert_eq!(std::fs::read(git.join("HEAD")).expect("head"), head_before);
+        assert!(!git.join("HEAD.lock").exists());
+        assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// 27-31 (WR-B1): an advanced file never gets a wider mode than the file it
+    /// replaces, and a lock is never wider than its final mode.
+    #[tokio::test]
+    async fn sftp_git_write_keeps_target_modes() {
+        use ignition_core::deploy::git_advance::GitWriteName::{
+            BranchRef, Config, Head, RemoteRef,
+        };
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        let set = |rel: &str, mode: u32| {
+            std::fs::set_permissions(git.join(rel), std::fs::Permissions::from_mode(mode))
+                .expect("chmod")
+        };
+        set("HEAD", 0o600);
+        set("refs/heads/production", 0o600);
+        set("config", 0o600);
+
+        // every lock's mode, as it is when the script moves it
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "mv",
+            "printf '%s %s\\n' \"$3\" \"$(\"$(real ls)\" -l -- \"$3\" | cut -c1-10)\" \
+             >> \"$(dirname \"$0\")/mv.log\"\n\
+             exec \"$(real mv)\" \"$@\"",
+        );
+        n.count.use_shims(&shims);
+        let writes = vec![
+            GitWrite {
+                name: Head,
+                bytes: b"ref: refs/heads/production\n".to_vec(),
+            },
+            GitWrite {
+                name: BranchRef("production".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+            GitWrite {
+                name: Config,
+                bytes: b"[core]\n\trepositoryformatversion = 0\n".to_vec(),
+            },
+            GitWrite {
+                name: RemoteRef {
+                    remote: "origin".to_string(),
+                    branch: "feature".to_string(),
+                },
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ];
+        n.t.write_git_files(PROJECT, &writes).await.expect("write");
+        for rel in ["HEAD", "refs/heads/production", "config"] {
+            assert_eq!(mode_of(&git.join(rel)), 0o600, "{rel} is not widened");
+        }
+        assert_eq!(
+            mode_of(&git.join("refs/remotes/origin/feature")),
+            0o644,
+            "a new ref is 0644"
+        );
+        for write in &writes {
+            assert_eq!(
+                std::fs::read(git.join(write.name.rel())).expect("read back"),
+                write.bytes
+            );
+        }
+        let log = std::fs::read_to_string(shims.path().join("mv.log")).expect("mv log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), writes.len(), "{log}");
+        for (line, want) in
+            lines
+                .iter()
+                .zip(["-rw-------", "-rw-------", "-rw-------", "-rw-r--r--"])
+        {
+            assert!(
+                line.ends_with(want),
+                "a lock is made with its final mode: {line}"
+            );
+        }
+
+        // a config that is absent is created owner-only
+        std::fs::remove_file(git.join("config")).expect("rm config");
+        n.t.write_git_files(PROJECT, &writes[2..3])
+            .await
+            .expect("new config");
+        assert_eq!(mode_of(&git.join("config")), 0o600, "a new config is 0600");
+    }
+
+    /// 27-31 (WR-B1): a mode the host cannot report refuses the write before
+    /// anything is put in place.
+    #[tokio::test]
+    async fn sftp_git_write_refuses_an_unreadable_mode() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let head = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+        let shims = common::posix_exec::Shims::new();
+        shims.add("stat", "echo nonsense");
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.write_git_files(PROJECT, &two_writes(&fx))
+                .await
+                .expect_err("no mode"),
+        );
+        assert!(why.contains("exit code 3"), "{why}");
+        assert!(why.contains("mode"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head
+        );
+        assert!(!fx.git_dir().join("HEAD.lock").exists());
+        assert!(stages(&n).is_empty());
+    }
+
+    /// The shims that make the project directory belong to `uid` and record
+    /// every `setfacl` call.
+    fn gateway_shims(uid: &str) -> common::posix_exec::Shims {
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ls",
+            &format!(
+                "case $1 in -ldn) printf 'drwxr-xr-x 2 {uid} {uid} 64 Jan  1 00:00 %s\\n' \"$3\";; \
+                 *) exec \"$(real ls)\" \"$@\";; esac"
+            ),
+        );
+        shims.add(
+            "setfacl",
+            "echo \"$*\" >> \"$(dirname \"$0\")/setfacl.log\"",
+        );
+        shims
+    }
+
+    /// Writes that make no directory: HEAD and the existing branch.
+    fn in_place(fx: &GitFixture) -> Vec<GitWrite> {
+        vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/production\n".to_vec(),
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("production".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            },
+        ]
+    }
+
+    fn discard(run: &str) -> Vec<GitWrite> {
+        vec![GitWrite {
+            name: GitWriteName::DiscardRef(run.to_string()),
+            bytes: b"0123456789012345678901234567890123456789\n".to_vec(),
+        }]
+    }
+
+    /// 27-31 (WR-B1, D-22): a directory the advance creates gets the D-G1 named
+    /// ACL entry for a gateway account that is neither root nor the deploy
+    /// account, access and default; with no `setfacl` the write refuses before
+    /// any lock exists.
+    #[tokio::test]
+    async fn sftp_git_write_new_dir_gets_gateway_acl() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let shims = gateway_shims("4242");
+        n.count.use_shims(&shims);
+        n.t.write_git_files(PROJECT, &discard("run1"))
+            .await
+            .expect("write");
+        assert!(fx.git_dir().join("refs/ign-discarded/run1").is_file());
+        let log = std::fs::read_to_string(shims.path().join("setfacl.log")).expect("setfacl log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines.contains(&"-P -m u:4242:rwX ./ign-discarded"),
+            "the access entry: {lines:?}"
+        );
+        assert!(
+            lines.contains(&"-P -d -m u:4242:rwX ./ign-discarded"),
+            "the default entry: {lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "only the directory the advance made: {lines:?}"
+        );
+
+        // a write that makes no directory sets no ACL (the file replaces one
+        // the gateway already owns the right to)
+        std::fs::remove_file(shims.path().join("setfacl.log")).expect("rm log");
+        n.t.write_git_files(PROJECT, &in_place(&fx))
+            .await
+            .expect("no new directory");
+        assert!(!shims.path().join("setfacl.log").exists());
+
+        // a directory deeper down: every level the advance makes gets it
+        n.t.write_git_files(
+            PROJECT,
+            &[GitWrite {
+                name: GitWriteName::BranchRef("deep/er/x".to_string()),
+                bytes: format!("{}\n", fx.c2).into_bytes(),
+            }],
+        )
+        .await
+        .expect("deep");
+        let log = std::fs::read_to_string(shims.path().join("setfacl.log")).expect("setfacl log");
+        for dir in ["./deep", "./er"] {
+            for form in ["-P -m", "-P -d -m"] {
+                assert!(
+                    log.lines().any(|l| l == format!("{form} u:4242:rwX {dir}")),
+                    "{form} {dir}: {log}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sftp_git_write_new_dir_refuses_without_setfacl() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        // a PATH with everything the scripts use except setfacl
+        let shims = gateway_shims("4242");
+        let tools = shims.path();
+        std::fs::remove_file(tools.join("setfacl")).expect("no setfacl");
+        for tool in [
+            "sh", "mkdir", "rmdir", "rm", "mv", "wc", "cat", "id", "stat", "cmp", "dirname", "cut",
+            "ln",
+        ] {
+            let found = std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .expect("sh");
+            let target = String::from_utf8_lossy(&found.stdout).trim().to_string();
+            if found.status.success() && target.starts_with('/') {
+                std::os::unix::fs::symlink(&target, tools.join(tool)).expect("link");
+            }
+        }
+        *n.count.only_path.lock().expect("only") = Some(tools.to_path_buf());
+        let why = detail(
+            n.t.write_git_files(PROJECT, &discard("run1"))
+                .await
+                .expect_err("no setfacl"),
+        );
+        assert!(why.contains("exit code 6"), "{why}");
+        assert!(why.contains("setfacl"), "{why}");
+        assert!(
+            !fx.git_dir().join("refs/ign-discarded").exists(),
+            "no directory was made"
+        );
+        assert!(stages(&n).is_empty());
+        // a write that makes no directory does not need it
+        n.t.write_git_files(PROJECT, &in_place(&fx))
+            .await
+            .expect("no new directory, no setfacl needed");
+    }
+
+    /// 27-31 (WR-B1): with a gateway account that is root, or the deploy
+    /// account itself, no ACL is set.
+    #[tokio::test]
+    async fn sftp_git_write_new_dir_sets_no_acl_for_root_or_the_deploy_account() {
+        let fx = GitFixture::new();
+        for uid in ["0", ""] {
+            let n = node(&fx.data_dir);
+            // "" stands for the real owner: no `ls` shim, only the recorder
+            let shims = if uid.is_empty() {
+                let shims = common::posix_exec::Shims::new();
+                shims.add(
+                    "setfacl",
+                    "echo \"$*\" >> \"$(dirname \"$0\")/setfacl.log\"",
+                );
+                shims
+            } else {
+                gateway_shims(uid)
+            };
+            n.count.use_shims(&shims);
+            n.t.write_git_files(PROJECT, &discard(&format!("run{}", uid.len())))
+                .await
+                .expect("write");
+            assert!(
+                !shims.path().join("setfacl.log").exists(),
+                "uid {uid:?}: no setfacl call"
+            );
+        }
+    }
+
+    /// Every file below `dir`, `/`-separated and relative.
+    fn walk(dir: &Path) -> Vec<String> {
+        fn go(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                if entry.file_type().expect("type").is_dir() {
+                    go(base, &path, out);
+                } else {
+                    out.push(
+                        path.strip_prefix(base)
+                            .expect("prefix")
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        let mut out = Vec::new();
+        go(dir, dir, &mut out);
+        out
+    }
+
+    #[tokio::test]
+    async fn sftp_git_probe_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        n.t.probe_write(PROJECT, RUN).await.expect("probe");
+        let probe = format!(".ign-probe-{RUN}");
+        assert!(!fx.project_dir().join(&probe).exists());
+        assert!(!fx.git_dir().join(&probe).exists());
+        if ignores_modes(&fx.data_dir) {
+            println!("running with privileges that ignore mode bits; denial cases skipped");
+            return;
+        }
+        // a read-only project directory refuses, naming it
+        std::fs::set_permissions(fx.project_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let why = detail(
+            n.t.probe_write(PROJECT, RUN)
+                .await
+                .expect_err("read-only project"),
+        );
+        std::fs::set_permissions(fx.project_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(why.contains("projects/CapApp"), "{why}");
+        assert!(!why.contains("projects/CapApp/.git"), "{why}");
+        // a read-only `.git` refuses, naming it
+        std::fs::set_permissions(fx.git_dir(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod");
+        let why = detail(
+            n.t.probe_write(PROJECT, RUN)
+                .await
+                .expect_err("read-only .git"),
+        );
+        std::fs::set_permissions(fx.git_dir(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        assert!(why.contains("projects/CapApp/.git"), "{why}");
+        // a probe file that is already there is refused and left alone
+        std::fs::write(fx.git_dir().join(&probe), "mine").expect("existing");
+        let why = detail(n.t.probe_write(PROJECT, RUN).await.expect_err("existing"));
+        assert!(why.contains("already exists"), "{why}");
+        assert_eq!(
+            std::fs::read_to_string(fx.git_dir().join(&probe)).expect("kept"),
+            "mine"
+        );
+    }
+
+    #[tokio::test]
+    async fn sftp_git_yaml_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        assert_eq!(n.t.read_git_yaml().await.expect("absent"), None);
+        let yaml = fx.data_dir.join("git.yaml");
+        std::fs::write(&yaml, "repos: {}\n").expect("yaml");
+        assert_eq!(
+            n.t.read_git_yaml().await.expect("present"),
+            Some(b"repos: {}\n".to_vec())
+        );
+        // a symlink refuses, naming git.yaml
+        std::fs::rename(&yaml, fx.data_dir.join("real.yaml")).expect("rename");
+        std::os::unix::fs::symlink("real.yaml", &yaml).expect("symlink");
+        let err = n.t.read_git_yaml().await.expect_err("symlink");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        assert!(err.to_string().contains("git.yaml"), "{err}");
+        std::fs::remove_file(&yaml).expect("rm link");
+        // over the YAML cap refuses
+        std::fs::write(&yaml, vec![b'a'; 1_048_577]).expect("big");
+        let err = n.t.read_git_yaml().await.expect_err("oversize");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+        // a directory is not a yaml file
+        std::fs::remove_file(&yaml).expect("rm");
+        std::fs::create_dir(&yaml).expect("dir");
+        let err = n.t.read_git_yaml().await.expect_err("directory");
+        assert_eq!(err.code(), "deploy_run_invalid", "{err}");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_size_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let manifest = fx.node().git_manifest(PROJECT).await.expect("manifest");
+        let size = n.t.git_size(PROJECT).await.expect("size");
+        assert_eq!(size.files, manifest.files);
+        assert_eq!(size.bytes, manifest.bytes);
+        // one exec call, no sftp session, and nothing was hashed or read
+        assert_eq!(n.count.execs(), 1);
+        assert_eq!(n.count.sftp(), 0);
+        let command = n.count.execs.lock().expect("execs")[0].clone();
+        for reader in [
+            "sha256", "shasum", "cat ", "base64", "head ", "tail ", "wc ",
+        ] {
+            assert!(!command.contains(reader), "{reader} in the size script");
+        }
+        if !ignores_modes(&fx.data_dir) {
+            // a file nobody may read still counts: its size comes from the listing
+            let config = fx.git_dir().join("config");
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            let after = n.t.git_size(PROJECT).await;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod");
+            assert_eq!(after.expect("size without reading"), size);
+        }
+        // a symlink inside refuses
+        std::os::unix::fs::symlink("/etc", fx.git_dir().join("l")).expect("symlink");
+        let err = n.t.git_size(PROJECT).await.expect_err("symlink");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // a missing `.git` is a failure, not an empty size
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let err = n.t.git_size(PROJECT).await.expect_err("absent .git");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn sftp_git_free_bytes_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let free = n.t.free_bytes(GATEWAY, PROJECT).await.expect("free");
+        assert!(free > 0);
+        let local = fx
+            .node()
+            .free_bytes(GATEWAY, PROJECT)
+            .await
+            .expect("local free");
+        assert!(local > 0);
+    }
+
+    #[tokio::test]
+    async fn sftp_git_names_checked_first() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let hostile = [
+            "", ".", "..", "../x", "a/b", ".x", "a\nb", "a\u{7}b", "a\\b",
+        ];
+        for name in hostile {
+            let write = vec![GitWrite {
+                name: GitWriteName::Head,
+                bytes: vec![1],
+            }];
+            let results = [
+                n.t.read_git_state(name).await.map(|_| ()),
+                n.t.git_manifest(name).await.map(|_| ()),
+                n.t.git_size(name).await.map(|_| ()),
+                n.t.save_git(GATEWAY, name, RUN).await.map(|_| ()),
+                n.t.restore_git(GATEWAY, name, RUN).await.map(|_| ()),
+                n.t.remove_git_save(GATEWAY, name, RUN).await,
+                n.t.probe_write(name, RUN).await,
+                n.t.write_git_files(name, &write).await,
+                n.t.free_bytes(GATEWAY, name).await.map(|_| ()),
+                n.t.save_manifest(GATEWAY, name, RUN).await.map(|_| ()),
+                n.t.save_git(name, PROJECT, RUN).await.map(|_| ()),
+                n.t.save_git(GATEWAY, PROJECT, name).await.map(|_| ()),
+            ];
+            for (index, result) in results.iter().enumerate() {
+                assert!(result.is_err(), "{name:?} call {index} was accepted");
+            }
+        }
+        assert_eq!(n.count.execs(), 0, "no remote command ran");
+        assert_eq!(n.count.sftp(), 0, "no sftp session opened");
+        // the host trait reaches the same reader
+        let host: &dyn ProjectHost = &n.t;
+        assert!(host.git().is_some());
+    }
+
+    /// Every file the list names, as the fetch takes them.
+    fn all_files(
+        list: &ignition_core::deploy::git_objects::GitObjectList,
+    ) -> Vec<ignition_core::deploy::git_objects::GitObjectFile> {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let mut files = list.loose.clone();
+        for pack in &list.packs {
+            files.push(GitObjectFile {
+                rel: pack.idx_rel(),
+                size: pack.idx_size,
+            });
+            files.push(GitObjectFile {
+                rel: pack.pack_rel(),
+                size: pack.pack_size,
+            });
+        }
+        files
+    }
+
+    fn files_below(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            for entry in std::fs::read_dir(&current).expect("ls") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(path.strip_prefix(dir).expect("below").display().to_string());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// 27-11: the POSIX arm of the gateway-object read, over the local
+    /// sftp-server. The listing equals the local transport's for the same
+    /// repo (loose objects, packs and both at once), is one exec and no sftp
+    /// session, the fetch is a byte-identical round trip in a fixed number of
+    /// sessions whatever the object count, a bad name refuses before any
+    /// `get`, a size that differs from the listing refuses, and a target
+    /// already in the destination is never overwritten.
+    #[tokio::test]
+    async fn sftp_git_objects_posix() {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let fx = GitFixture::new();
+        // loose only first
+        let loose_only = fx.node().list_git_objects(PROJECT).await.expect("ref");
+        assert!(!loose_only.loose.is_empty() && loose_only.packs.is_empty());
+        let n = node(&fx.data_dir);
+        assert_eq!(
+            n.t.list_git_objects(PROJECT).await.expect("list"),
+            loose_only
+        );
+        assert_eq!((n.count.execs(), n.count.sftp()), (1, 0), "one script");
+
+        // packs and loose objects together
+        fx.gateway_gc();
+        fx.designer_commit(false);
+        let reference = fx.node().list_git_objects(PROJECT).await.expect("ref");
+        assert!(!reference.loose.is_empty() && !reference.packs.is_empty());
+        let n = node(&fx.data_dir);
+        let list = n.t.list_git_objects(PROJECT).await.expect("list");
+        assert_eq!(list, reference);
+        assert_eq!((n.count.execs(), n.count.sftp()), (1, 0));
+
+        // a byte-identical round trip of every listed file
+        let files = all_files(&list);
+        let dest = tempfile::tempdir().expect("dest");
+        let before = n.count.sftp();
+        n.t.fetch_git_objects(PROJECT, &files, dest.path())
+            .await
+            .expect("fetch");
+        let small_sessions = n.count.sftp() - before;
+        assert!(small_sessions >= 1, "the download ran");
+        let mut want: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
+        want.sort();
+        assert_eq!(files_below(dest.path()), want, "exactly the listed files");
+        for file in &files {
+            assert_eq!(
+                std::fs::read(dest.path().join(&file.rel)).expect("copy"),
+                std::fs::read(fx.git_dir().join(&file.rel)).expect("source"),
+                "{}",
+                file.rel
+            );
+        }
+
+        // the number of sessions does not depend on the object count
+        for i in 0..120u32 {
+            let fan = format!("{:02x}", i % 7);
+            let dir = fx.git_dir().join("objects").join(&fan);
+            std::fs::create_dir_all(&dir).expect("fan");
+            std::fs::write(dir.join(format!("{i:038x}")), vec![b'o'; 50 + i as usize])
+                .expect("object");
+        }
+        let n = node(&fx.data_dir);
+        let big = n.t.list_git_objects(PROJECT).await.expect("list");
+        assert!(big.loose.len() >= files.len() + 100, "{}", big.loose.len());
+        let more = all_files(&big);
+        let dest_big = tempfile::tempdir().expect("dest");
+        n.t.fetch_git_objects(PROJECT, &more, dest_big.path())
+            .await
+            .expect("fetch many");
+        assert_eq!(
+            n.count.sftp(),
+            small_sessions,
+            "{} files cost as many sessions as {}",
+            more.len(),
+            files.len()
+        );
+        assert_eq!(n.count.execs(), 1, "still one listing script");
+        assert_eq!(files_below(dest_big.path()).len(), more.len());
+
+        // a name outside the fixed shapes refuses before any `get`
+        let n = node(&fx.data_dir);
+        let empty = tempfile::tempdir().expect("dest");
+        for rel in [
+            "config",
+            "objects/info/alternates",
+            "hooks/pre-commit",
+            "objects/../config",
+            "objects/pack/pack-xyz.pack",
+            "/etc/passwd",
+        ] {
+            let bad = GitObjectFile {
+                rel: rel.to_string(),
+                size: 1,
+            };
+            let got =
+                n.t.fetch_git_objects(PROJECT, &[files[0].clone(), bad], empty.path())
+                    .await;
+            assert!(got.is_err(), "{rel}");
+        }
+        assert_eq!((n.count.execs(), n.count.sftp()), (0, 0), "no process ran");
+        assert!(files_below(empty.path()).is_empty());
+
+        // a size that is not the listed size refuses, and nothing is installed
+        let wrong = GitObjectFile {
+            rel: files[0].rel.clone(),
+            size: files[0].size + 1,
+        };
+        let err =
+            n.t.fetch_git_objects(PROJECT, &[wrong], empty.path())
+                .await
+                .expect_err("size");
+        assert!(detail(err).contains("listed as"), "names the mismatch");
+        assert!(files_below(empty.path()).is_empty(), "nothing installed");
+
+        // a target already in the destination is never overwritten
+        let taken = tempfile::tempdir().expect("dest");
+        let first = &files[0];
+        let target = taken.path().join(&first.rel);
+        std::fs::create_dir_all(target.parent().expect("parent")).expect("dirs");
+        std::fs::write(&target, "mine").expect("mine");
+        let err =
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(first), taken.path())
+                .await
+                .expect_err("exists");
+        assert!(detail(err).contains("never overwritten"));
+        assert_eq!(std::fs::read(&target).expect("kept"), b"mine");
+
+        // a destination that is a symlink, or a directory on the way that is
+        // one, is not followed
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let linked = taken.path().join("link");
+        std::os::unix::fs::symlink(elsewhere.path(), &linked).expect("link");
+        assert!(
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(first), &linked)
+                .await
+                .is_err()
+        );
+        let trap = tempfile::tempdir().expect("trap");
+        std::os::unix::fs::symlink(elsewhere.path(), trap.path().join("objects")).expect("link");
+        assert!(
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(first), trap.path())
+                .await
+                .is_err()
+        );
+        assert!(
+            files_below(elsewhere.path()).is_empty(),
+            "nothing written through"
+        );
+
+        // a source that went away between the listing and the fetch
+        let gone = &files[1];
+        std::fs::remove_file(fx.git_dir().join(&gone.rel)).expect("rm");
+        let fresh = tempfile::tempdir().expect("dest");
+        assert!(
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(gone), fresh.path())
+                .await
+                .is_err()
+        );
+        assert!(files_below(fresh.path()).is_empty());
+    }
+
+    /// 27-11: the listing refuses a symlink and a repo whose `objects` is
+    /// missing or a link, never an empty list (the transport arm of the
+    /// refusals the script test pins).
+    #[tokio::test]
+    async fn sftp_git_objects_posix_refusals() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        std::os::unix::fs::symlink("/", fx.git_dir().join("objects/ab_link")).expect("link");
+        let err = n.t.list_git_objects(PROJECT).await.expect_err("symlink");
+        assert!(detail(err).contains("symlink"));
+        std::fs::remove_file(fx.git_dir().join("objects/ab_link")).expect("rm");
+        assert!(n.t.list_git_objects(PROJECT).await.is_ok());
+        let err = n.t.list_git_objects("Nope").await.expect_err("missing");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        std::fs::write(fx.git_dir().join("objects/0a_bad:name"), "x").expect("colon");
+        // an extra file of no fixed shape is ignored, a colon in a name refuses
+        let err = n.t.list_git_objects(PROJECT).await.expect_err("colon");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    /// 27-11: what is sent is fixed text of one line: no control character
+    /// reaches the host, and the project name is data after the script.
+    #[tokio::test]
+    async fn sftp_git_objects_sh_one_line() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        n.t.list_git_objects(PROJECT).await.expect("list");
+        let sent = n.count.execs.lock().expect("execs").clone();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            !sent[0].chars().any(char::is_control),
+            "no control character: {:?}",
+            sent[0]
+        );
+        assert!(sent[0].contains("IGN-RESULT"), "the answer sentinel");
+        assert!(!sent[0].contains("git "), "no git runs on the host");
+        assert!(!sent[0].contains("eval"), "nothing is evaluated");
+    }
+
+    #[test]
+    fn sftp_git_scripts_are_not_reachable_from_the_read_only_host() {
+        // `ProjectHost::git` hands out the read half only; the writer trait is
+        // a different trait object that this accessor cannot produce.
+        let source = include_str!("../src/deploy/transport/projects.rs");
+        let trait_start = source.find("pub trait ProjectHost").expect("trait");
+        let trait_end = source[trait_start..].find("\n}\n").expect("end") + trait_start;
+        assert!(
+            !source[trait_start..trait_end].contains("GitStateWriter"),
+            "ProjectHost must not name the writer"
+        );
+    }
+}
+
+/// The Windows git scripts of 27-09 (`winps::GIT_*`): their size against the
+/// command budget, their parameter discipline, and their behaviour under the
+/// local `pwsh` against the same fixture the POSIX and local implementations
+/// are held to. Unix only: the `pwsh` driver and the mode checks are Unix.
+#[cfg(unix)]
+mod winps_git {
+    use super::*;
+    use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
+    use common::pwsh_exec;
+    use ignition_core::deploy::git_state::{GIT_MARKERS, GitFiles};
+    use ignition_core::deploy::transport::projects::{GitHostRead, GitManifest};
+    use ignition_core::deploy::transport::winps::{self, COMMAND_BUDGET, WinScript};
+    use ignition_core::deploy::tree::sha256_hex;
+    use serde_json::Value;
+
+    const RUN: &str = "20261114T101500Z-ab12";
+
+    fn s(path: &Path) -> String {
+        path.display().to_string()
+    }
+
+    /// Every constructor, with maximal realistic parameters: the Windows
+    /// install's data directory, a 100-character project, 48-character gateway
+    /// and run names, a long `.git` path.
+    fn maximal() -> Vec<WinScript> {
+        let prefix = winps::LONG_PATH_PREFIX;
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let home = "C:\\Users\\svc-ignition-deploy";
+        let project = "P".repeat(100);
+        let (gateway, run) = ("G".repeat(48), "R".repeat(48));
+        let git = format!("{data}\\projects\\{project}\\.git");
+        let save_rel = format!("ign-deploy/{gateway}/projects/{project}/git-save/{run}");
+        // twelve files named like SHA-1 packs: more than any advance writes
+        // (one pack and its index, two refs, HEAD, index)
+        let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
+        let writes: Vec<String> = (0..12).map(|_| pack.clone()).collect();
+        let sized: Vec<(String, u64)> = writes.iter().map(|w| (w.clone(), 123_456_789)).collect();
+        // one chunk of a write plan (the transport splits a longer plan) and the
+        // longest stage name a run id can make
+        let chunk: Vec<(String, u64)> =
+            sized[..ignition_core::deploy::transport::sftp::GIT_WIN_CHUNK].to_vec();
+        let stage = format!("git-stage-{}", "R".repeat(64));
+        vec![
+            WinScript::git_state(&git, GIT_MARKERS),
+            WinScript::git_save(prefix, data, &project, home, &gateway, &run),
+            WinScript::git_restore(prefix, data, &project, home, &gateway, &run),
+            WinScript::git_manifest(prefix, &git),
+            WinScript::git_size(prefix, &git),
+            WinScript::git_objects(
+                prefix,
+                &git,
+                ignition_core::deploy::git_objects::GIT_OBJECTS_LIST_MAX_ENTRIES,
+                51_025,
+            ),
+            WinScript::git_digest(
+                &git,
+                &format!("refs/remotes/{}/{}", "o".repeat(40), "b".repeat(80)),
+            ),
+            WinScript::git_stage(home, &stage),
+            WinScript::git_lock(data, &project, home, &stage, 8, &chunk),
+            WinScript::git_unlock(data, &project, home, &stage, 8, &chunk, true),
+            WinScript::git_replace(data, &project, home, &stage, &chunk, 3, true),
+            WinScript::git_probe(data, &project, &format!(".ign-probe-{}", "R".repeat(128))),
+            WinScript::git_save_rm(prefix, home, &format!("{save_rel}/repo"), &run),
+            WinScript::git_free(home, &save_rel),
+        ]
+    }
+
+    #[test]
+    fn winps_git_scripts_fit_budget() {
+        let scripts = maximal();
+        assert_eq!(scripts.len(), 14);
+        for script in &scripts {
+            let command = winps::encoded_command(script, COMMAND_BUDGET)
+                .unwrap_or_else(|why| panic!("{}: {why}", script.name));
+            let used = command.as_str().chars().count();
+            println!(
+                "winps_git_scripts_fit_budget {}: {used} of {COMMAND_BUDGET}",
+                script.name
+            );
+            assert!(used <= COMMAND_BUDGET, "{}", script.name);
+        }
+        // a chunk of the write plan with the longest names a write can carry
+        // (SHA-256 pack names, 10-digit sizes, a 100-character project, the
+        // longest stage name) fits too, for each of the three scripts that take
+        // a chunk; the transport splits a longer plan into chunks of this size
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let home = "C:\\Users\\svc-ignition-deploy";
+        let project = "P".repeat(100);
+        let stage = format!("git-stage-{}", "R".repeat(64));
+        let chunk_size = ignition_core::deploy::transport::sftp::GIT_WIN_CHUNK;
+        let plan: Vec<(String, u64)> = (0..12)
+            .map(|i| {
+                let ext = if i % 2 == 0 { "pack" } else { "idx" };
+                (
+                    format!("objects/pack/pack-{}{i:02}.{ext}", "b".repeat(62)),
+                    4_000_000_000 + i as u64,
+                )
+            })
+            .collect();
+        for (n, chunk) in plan.chunks(chunk_size).enumerate() {
+            let offset = n * chunk_size;
+            for script in [
+                WinScript::git_lock(data, &project, home, &stage, offset, chunk),
+                WinScript::git_unlock(data, &project, home, &stage, offset, chunk, true),
+                WinScript::git_replace(data, &project, home, &stage, chunk, 3, true),
+            ] {
+                let used = winps::encoded_command(&script, COMMAND_BUDGET)
+                    .unwrap_or_else(|why| panic!("{}: {why}", script.name))
+                    .as_str()
+                    .chars()
+                    .count();
+                println!(
+                    "winps_git_scripts_fit_budget {} chunk of {}: {used} of {COMMAND_BUDGET}",
+                    script.name,
+                    chunk.len()
+                );
+            }
+        }
+        // a chunk that cannot fit is refused before anything is sent, never
+        // truncated
+        let many: Vec<(String, u64)> = (0..60)
+            .map(|i| (format!("objects/pack/pack-{}-{i}.pack", "a".repeat(40)), 1))
+            .collect();
+        let script = WinScript::git_lock(data, &project, home, &stage, 0, &many);
+        assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_err());
+    }
+
+    /// WR-B5 (27-33, confirmed on the Windows test VM under 5.1): a raw
+    /// `[IO.Directory]::Delete(path, $true)` stops on a ReadOnly file, so every
+    /// recursive delete of the git scripts goes through the one helper `Dr`,
+    /// which clears ReadOnly first without entering a reparse point.
+    #[test]
+    fn winps_git_recursive_deletes_clear_readonly_first() {
+        for (name, body) in [
+            ("GIT_SAVE", winps::GIT_SAVE),
+            ("GIT_RESTORE", winps::GIT_RESTORE),
+            ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
+        ] {
+            assert!(body.contains("function Dr("), "{name} has the helper");
+            assert_eq!(
+                body.matches(",$true)").count(),
+                1,
+                "{name}: the only recursive delete is the one inside Dr"
+            );
+            assert!(
+                body.contains("[IO.Directory]::Delete($d,$true)"),
+                "{name}: Dr deletes"
+            );
+        }
+        // security review of e0159fb: the ROOT of a delete is checked to be a real
+        // directory first (a path swapped for a junction since the last check is
+        // refused, never walked or deleted), and a ReadOnly file with more than one
+        // hard link is left alone (clearing the bit would change the other link)
+        for (name, body) in [
+            ("GIT_SAVE", winps::GIT_SAVE),
+            ("GIT_RESTORE", winps::GIT_RESTORE),
+            ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
+        ] {
+            assert!(
+                body.contains("function Dr($d){$null=K (Z $d);"),
+                "{name}: Dr checks its root"
+            );
+            assert!(
+                body.contains("(Z $f.FullName).LinkType"),
+                "{name}: a hard-linked file is not changed"
+            );
+        }
+        for name in ["GIT_SAVE", "GIT_RESTORE"] {
+            let body = if name == "GIT_SAVE" {
+                winps::GIT_SAVE
+            } else {
+                winps::GIT_RESTORE
+            };
+            assert!(
+                body.contains("could not be removed)"),
+                "{name}: a delete that still fails names the leftover"
+            );
+        }
+    }
+
+    #[test]
+    fn winps_git_params_only() {
+        let bodies = [
+            ("GIT_STATE", winps::GIT_STATE),
+            ("GIT_SAVE", winps::GIT_SAVE),
+            ("GIT_RESTORE", winps::GIT_RESTORE),
+            ("GIT_MANIFEST", winps::GIT_MANIFEST),
+            ("GIT_SIZE", winps::GIT_SIZE),
+            ("GIT_OBJECTS", winps::GIT_OBJECTS),
+            ("GIT_DIGEST", winps::GIT_DIGEST),
+            ("GIT_LOCK", winps::GIT_LOCK),
+            ("GIT_REPLACE", winps::GIT_REPLACE),
+            ("GIT_PROBE", winps::GIT_PROBE),
+            ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
+            ("GIT_FREE", winps::GIT_FREE),
+        ];
+        for (name, body) in bodies {
+            assert!(!body.contains('\n'), "{name}: one line");
+            // no host path or drive in the text: paths exist only as `$p.*`
+            for drive in ["C:\\", "c:\\", "\\\\?\\", "/Users", "/home", "/tmp"] {
+                assert!(!body.contains(drive), "{name} holds a path ({drive})");
+            }
+            // nothing that evaluates or re-parses text
+            for forbidden in [
+                "Invoke-Expression",
+                "iex ",
+                "Invoke-Command",
+                "Start-Process",
+                "-Command",
+                "cmd ",
+                "Add-Type",
+                "[scriptblock]::Create",
+            ] {
+                assert!(!body.contains(forbidden), "{name} holds {forbidden}");
+            }
+            // a double-quoted string never carries a parameter: a parameter
+            // value inside quotes would be parsed as script
+            let mut quoted = false;
+            let mut at = 0;
+            let bytes: Vec<char> = body.chars().collect();
+            let mut text = String::new();
+            while at < bytes.len() {
+                let c = bytes[at];
+                if c == '\'' && !quoted {
+                    // skip a single-quoted literal
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != '\'' {
+                        at += 1;
+                    }
+                } else if c == '"' {
+                    if quoted {
+                        assert!(
+                            !text.contains("$p."),
+                            "{name}: a parameter inside a double-quoted string: {text}"
+                        );
+                        text.clear();
+                    }
+                    quoted = !quoted;
+                } else if quoted {
+                    text.push(c);
+                }
+                at += 1;
+            }
+            assert!(!quoted, "{name}: balanced quotes");
+            // the parameters are decoded from the base64 blob, never spliced
+            assert!(
+                !body.contains("FromBase64String"),
+                "{name}: the blob is the command's"
+            );
+        }
+        // a hostile value is data: it is inside the encoding and not in the
+        // text of the command
+        let odd = "it's$(x)`;y\"z";
+        let script = WinScript::git_probe("C:\\gw\\data", odd, ".ign-probe-r1");
+        let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
+        assert!(!command.as_str().contains("it's"));
+        assert_eq!(script.params["j"], odd);
+    }
+
+    /// 27-11: the object listing fits the command budget with the longest
+    /// realistic parameters (a 100-character project below the Windows data
+    /// directory, the largest caps), with room to spare.
+    #[test]
+    fn winps_git_objects_fit_budget() {
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let git = format!("{data}\\projects\\{}\\.git", "P".repeat(100));
+        let script = WinScript::git_objects(winps::LONG_PATH_PREFIX, &git, usize::MAX, usize::MAX);
+        let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
+        let used = command.as_str().chars().count();
+        println!("winps_git_objects_fit_budget: {used} of {COMMAND_BUDGET}");
+        assert!(used < COMMAND_BUDGET - 1_000, "{used} leaves no margin");
+        // and a path that cannot fit is refused, never truncated
+        let long = format!("C:\\{}", "d\\".repeat(3_000));
+        let script = WinScript::git_objects("", &long, 1, 1);
+        assert!(winps::encoded_command(&script, COMMAND_BUDGET).is_err());
+    }
+
+    /// 27-11: every value reaches the object listing as data in `$p`; the
+    /// text holds no path, no evaluation and no `Add-Type`, and a hostile
+    /// project is inside the encoding, not in the command text.
+    #[test]
+    fn winps_git_objects_params_only() {
+        let body = winps::GIT_OBJECTS;
+        assert!(!body.contains('\n'), "one line");
+        for drive in ["C:\\", "c:\\", "\\\\?\\", "/Users", "/home", "/tmp"] {
+            assert!(!body.contains(drive), "holds a path ({drive})");
+        }
+        for forbidden in [
+            "Invoke-Expression",
+            "iex ",
+            "Invoke-Command",
+            "Start-Process",
+            "-Command",
+            "cmd ",
+            "Add-Type",
+            "[scriptblock]::Create",
+            "FromBase64String",
+        ] {
+            assert!(!body.contains(forbidden), "holds {forbidden}");
+        }
+        // the parameters it reads are exactly the ones the constructor sends
+        let mut read: Vec<String> = body
+            .match_indices("$p.")
+            .map(|(at, _)| {
+                body[at + 3..]
+                    .chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect()
+            })
+            .collect();
+        read.sort();
+        read.dedup();
+        assert_eq!(read, ["a", "l", "m", "x"]);
+        let odd = "it's$(x)`;y\"z";
+        let script = WinScript::git_objects("", &format!("C:\\gw\\{odd}\\.git"), 5, 6);
+        let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
+        assert!(!command.as_str().contains("it's"));
+        let keys: Vec<&String> = script.params.as_object().expect("object").keys().collect();
+        assert_eq!(keys, ["a", "l", "m", "x"]);
+        assert_eq!(script.params["l"], 5);
+        assert_eq!(script.params["m"], 6);
+    }
+
+    /// 27-11: the reads that existed before the object read keep their
+    /// parameters. `bundle` sends no compression level, so the script keeps
+    /// the `Optimal` of every resource read; the stored level is only ever
+    /// asked for by `bundle_level`, with exactly one more key, and the body
+    /// accepts nothing but that word.
+    #[test]
+    fn bundle_existing_reads_unchanged() {
+        let old = WinScript::bundle("\\\\?\\", "C:\\d\\config\\resources", "L", "Z", "abc", 7);
+        let keys: Vec<&String> = old.params.as_object().expect("object").keys().collect();
+        assert_eq!(keys, ["b", "f", "h", "l", "x", "z"], "no `c` parameter");
+        assert_eq!(
+            old.params,
+            serde_json::json!({
+                "x": "\\\\?\\", "b": "C:\\d\\config\\resources", "l": "L", "z": "Z",
+                "h": "abc", "f": 7,
+            })
+        );
+        let same = WinScript::bundle_level(
+            "\\\\?\\",
+            "C:\\d\\config\\resources",
+            "L",
+            "Z",
+            "abc",
+            7,
+            None,
+        );
+        assert_eq!(same.params, old.params);
+        let stored = WinScript::bundle_level(
+            "\\\\?\\",
+            "C:\\d\\git",
+            "L",
+            "Z",
+            "abc",
+            7,
+            Some("NoCompression"),
+        );
+        assert_eq!(stored.params["c"], "NoCompression");
+        assert_eq!(stored.params.as_object().expect("object").len(), 7);
+        assert_eq!(stored.body, old.body, "one script");
+        let body = winps::BUNDLE;
+        assert!(body.contains("CompressionLevel]::Optimal"), "the default");
+        assert!(
+            body.contains("$p.c -eq 'NoCompression'"),
+            "one word accepted"
+        );
+        // the object listing and the archive both fit with their parameters
+        for script in [&old, &stored] {
+            let command = winps::encoded_command(script, COMMAND_BUDGET).expect("fits");
+            assert!(command.as_str().chars().count() <= COMMAND_BUDGET);
+        }
+    }
+
+    /// The manifest answer as the host-independent value.
+    fn manifest_of(answer: &Value) -> GitManifest {
+        GitManifest {
+            files: answer["files"].as_u64().expect("files") as usize,
+            bytes: answer["bytes"].as_u64().expect("bytes"),
+            digest: answer["digest"].as_str().expect("digest").to_string(),
+        }
+    }
+
+    fn b64(text: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .expect("base64")
+    }
+
+    fn file_of(value: &Value) -> Option<Vec<u8>> {
+        if value.is_null() {
+            None
+        } else {
+            Some(b64(value["b"].as_str().expect("bytes")))
+        }
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_state() {
+        if !pwsh_exec::gate("pwsh_git_state") {
+            return;
+        }
+        let fx = GitFixture::new();
+        std::fs::write(fx.git_dir().join("index.lock"), "").expect("lock");
+        std::fs::write(fx.git_dir().join("MERGE_HEAD"), "x\n").expect("merge");
+        fx.git_in_project(&["branch", "feature/x"]);
+        fx.git_in_project(&["branch", "feature-y"]);
+        fx.git_in_project(&["pack-refs", "--all"]);
+        fx.git_in_project(&["branch", "late"]);
+        let local: GitFiles = fx.node().read_git_state(PROJECT).await.expect("local");
+        let markers: Vec<&str> = GIT_MARKERS.to_vec();
+        let answer = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
+            .expect("the state script");
+        assert_eq!(answer["ok"], 1);
+        assert_eq!(file_of(&answer["head"]), local.head);
+        assert_eq!(file_of(&answer["config"]), local.config);
+        assert_eq!(file_of(&answer["packed"]), local.packed_refs);
+        assert_eq!(file_of(&answer["log"]), local.head_log_tail);
+        assert_eq!(answer["index"], local.index_present);
+        let mut marks: Vec<String> = answer["markers"]
+            .as_array()
+            .expect("markers")
+            .iter()
+            .map(|m| m.as_str().expect("marker").to_string())
+            .collect();
+        let mut want = local.markers.clone();
+        marks.sort();
+        want.sort();
+        assert_eq!(marks, want);
+        let mut refs: Vec<(String, Vec<u8>)> = answer["refs"]
+            .as_array()
+            .expect("refs")
+            .iter()
+            .map(|r| {
+                (
+                    String::from_utf8(b64(r["p"].as_str().expect("name"))).expect("utf8"),
+                    file_of(r).expect("bytes"),
+                )
+            })
+            .collect();
+        let mut want = local.loose_refs.clone();
+        refs.sort();
+        want.sort();
+        assert_eq!(refs, want);
+        assert!(
+            refs.iter().any(|(name, _)| name == "refs/heads/late"),
+            "a loose ref after the pack: {refs:?}"
+        );
+        // a missing file is null, never an empty string
+        std::fs::remove_file(fx.git_dir().join("packed-refs")).expect("rm");
+        let again =
+            pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers)).expect("run");
+        assert!(again["packed"].is_null());
+        // a link in the way is a refusal, not an absent file
+        let head = fx.git_dir().join("HEAD");
+        std::fs::rename(&head, fx.git_dir().join("HEAD.real")).expect("rename");
+        std::os::unix::fs::symlink("HEAD.real", &head).expect("symlink");
+        let why = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
+            .expect_err("a linked HEAD");
+        assert!(why.contains("not a regular file"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_size() {
+        if !pwsh_exec::gate("pwsh_git_size") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let local = fx.node().git_size(PROJECT).await.expect("local size");
+        let manifest = fx.node().git_manifest(PROJECT).await.expect("manifest");
+        let answer = pwsh_exec::run(&WinScript::git_size("", &s(&fx.git_dir()))).expect("size");
+        assert_eq!(answer["ok"], 1);
+        assert_eq!(answer["files"].as_u64(), Some(local.files as u64));
+        assert_eq!(answer["bytes"].as_u64(), Some(local.bytes));
+        assert_eq!(local.files, manifest.files);
+        assert_eq!(local.bytes, manifest.bytes);
+        // a link anywhere inside refuses
+        std::os::unix::fs::symlink(fx.data_dir.clone(), fx.git_dir().join("refs/loop"))
+            .expect("link");
+        let why = pwsh_exec::run(&WinScript::git_size("", &s(&fx.git_dir()))).expect_err("link");
+        assert!(why.contains("link"), "{why}");
+    }
+
+    /// The manifest of a Windows script is the one the local walk computes,
+    /// for names that sort differently by walk and by whole path.
+    #[tokio::test]
+    async fn pwsh_git_manifest_equals_local() {
+        if !pwsh_exec::gate("pwsh_git_manifest_equals_local") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let heads = fx.git_dir().join("refs/heads");
+        std::fs::create_dir_all(heads.join("a")).expect("dir");
+        std::fs::write(heads.join("a/b"), "1\n").expect("a/b");
+        std::fs::write(heads.join("a-b"), "2\n").expect("a-b");
+        std::fs::write(heads.join("caf\u{e9}"), "3\n").expect("accent");
+        std::fs::write(heads.join("empty"), "").expect("empty");
+        std::fs::write(fx.git_dir().join("objects/zero"), "").expect("zero");
+        let local = fx.node().git_manifest(PROJECT).await.expect("local");
+        let answer =
+            pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).expect("manifest");
+        assert_eq!(manifest_of(&answer), local);
+        // an empty directory has the digest of nothing, like the other hosts
+        let empty = fx.data_dir.join("empty-tree");
+        std::fs::create_dir_all(&empty).expect("empty");
+        let answer = pwsh_exec::run(&WinScript::git_manifest("", &s(&empty))).expect("empty");
+        assert_eq!(answer["files"], 0);
+        assert_eq!(answer["digest"], sha256_hex(b""));
+        // a link or a name with a control character refuses
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("link")).expect("link");
+        assert!(pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).is_err());
+        std::fs::remove_file(fx.git_dir().join("link")).expect("rm");
+        std::fs::write(fx.git_dir().join("bad\u{7}name"), "x").expect("bell");
+        assert!(pwsh_exec::run(&WinScript::git_manifest("", &s(&fx.git_dir()))).is_err());
+    }
+
+    /// The listing of the object WinScript as the entries it reports.
+    fn objects_entries(answer: &Value) -> Vec<ignition_core::deploy::git_objects::GitObjectEntry> {
+        use ignition_core::deploy::git_objects::{GitObjectEntry, GitObjectEntryKind};
+        answer["t"]
+            .as_str()
+            .expect("t")
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (size, rel) = line.split_once(' ').expect("size name");
+                GitObjectEntry {
+                    rel: rel.to_string(),
+                    size: size.parse().expect("size"),
+                    kind: GitObjectEntryKind::File,
+                }
+            })
+            .collect()
+    }
+
+    /// 27-11: the object listing under the local `pwsh` reports what the
+    /// local transport lists (loose objects and packs together), stops at its
+    /// report cap with `more`, refuses at its walk cap, and refuses a link, a
+    /// name with a control character or a colon, and a missing or linked
+    /// `objects` directory.
+    #[tokio::test]
+    async fn pwsh_git_objects() {
+        use ignition_core::deploy::git_objects::GitObjectList;
+        if !pwsh_exec::gate("pwsh_git_objects") {
+            return;
+        }
+        let fx = GitFixture::new();
+        fx.gateway_gc();
+        fx.designer_commit(false);
+        let local = fx.node().list_git_objects(PROJECT).await.expect("local");
+        assert!(!local.loose.is_empty() && !local.packs.is_empty());
+        let list = |walk: usize, report: usize| {
+            pwsh_exec::run(&WinScript::git_objects("", &s(&fx.git_dir()), walk, report))
+        };
+        let answer = list(200_000, 51_025).expect("the listing");
+        assert_eq!(
+            (answer["ok"].clone(), answer["more"].clone()),
+            (1.into(), 0.into())
+        );
+        let entries = objects_entries(&answer);
+        assert_eq!(answer["n"].as_u64(), Some(entries.len() as u64));
+        let got = GitObjectList::from_entries(&entries).expect("from entries");
+        assert_eq!(got, local);
+
+        // a report cap stops with `more`; a walk cap refuses
+        let capped = list(200_000, 2).expect("capped");
+        assert_eq!(
+            (capped["more"].clone(), capped["n"].clone()),
+            (1.into(), 2.into())
+        );
+        let why = list(3, 51_025).expect_err("walk cap");
+        assert!(why.contains("more entries"), "{why}");
+
+        // names of no fixed shape are never reported, hostile ones refuse
+        let objects = fx.git_dir().join("objects");
+        std::fs::write(objects.join("pack").join("pack-x.keep"), "").expect("keep");
+        std::fs::write(objects.join("info").join("packs"), "x\n").expect("info");
+        std::fs::write(objects.join("0a_short"), "x").expect("short");
+        assert_eq!(
+            GitObjectList::from_entries(&objects_entries(&list(200_000, 51_025).expect("again")))
+                .expect("list"),
+            local
+        );
+        std::fs::write(objects.join("pack/a:b"), "x").expect("colon");
+        assert!(
+            list(200_000, 51_025)
+                .expect_err("colon")
+                .contains("plain name")
+        );
+        std::fs::remove_file(objects.join("pack/a:b")).expect("rm");
+        std::fs::write(objects.join("pack/bad\u{7}name"), "x").expect("bell");
+        assert!(list(200_000, 51_025).is_err());
+        std::fs::remove_file(objects.join("pack/bad\u{7}name")).expect("rm");
+        std::os::unix::fs::symlink("/", objects.join("pack/link")).expect("link");
+        assert!(list(200_000, 51_025).expect_err("link").contains("link"));
+        std::fs::remove_file(objects.join("pack/link")).expect("rm");
+        std::os::unix::fs::symlink("/", objects.join("lnk")).expect("dir link");
+        assert!(
+            list(200_000, 51_025)
+                .expect_err("dir link")
+                .contains("link")
+        );
+        std::fs::remove_file(objects.join("lnk")).expect("rm");
+        assert!(list(200_000, 51_025).is_ok());
+
+        // objects missing, or a link
+        let moved = fx.git_dir().join("objects-real");
+        std::fs::rename(&objects, &moved).expect("move");
+        assert!(list(200_000, 51_025).is_err(), "missing objects");
+        std::os::unix::fs::symlink(&moved, &objects).expect("link objects");
+        let why = list(200_000, 51_025).expect_err("linked objects");
+        assert!(why.contains("not a real directory"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_save_restore() {
+        if !pwsh_exec::gate("pwsh_git_save_restore") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        // a ReadOnly file, as git sets on its pack and object files (WR-B5):
+        // the copy keeps the attribute, and the removal at the end must cope
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                fx.git_dir().join("HEAD"),
+                std::fs::Permissions::from_mode(0o444),
+            )
+            .expect("read-only HEAD");
+        }
+        let local = fx.node().git_manifest(PROJECT).await.expect("local");
+        let save = || WinScript::git_save("", &data, PROJECT, &home_s, GATEWAY, RUN);
+        let restore = || WinScript::git_restore("", &data, PROJECT, &home_s, GATEWAY, RUN);
+
+        let saved = pwsh_exec::run(&save()).expect("save");
+        assert_eq!(manifest_of(&saved), local, "the save equals the source");
+        let repo = home
+            .path()
+            .join("ign-deploy")
+            .join(GATEWAY)
+            .join("projects")
+            .join(PROJECT)
+            .join("git-save")
+            .join(RUN)
+            .join("repo");
+        assert!(repo.join("HEAD").is_file());
+        // a save is never overwritten
+        let why = pwsh_exec::run(&save()).expect_err("second save");
+        assert!(why.contains("already exists"), "{why}");
+        // and the failed second save left the first alone
+        assert_eq!(
+            manifest_of(&pwsh_exec::run(&WinScript::git_manifest("", &s(&repo))).expect("m")),
+            local
+        );
+
+        // restore refuses while `.git` exists
+        let why = pwsh_exec::run(&restore()).expect_err("restore over .git");
+        assert!(why.contains("never replaced"), "{why}");
+        assert_eq!(
+            fx.node().git_manifest(PROJECT).await.expect("intact"),
+            local
+        );
+
+        // the import deletes `.git`; the restore brings it back, equal
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let back = pwsh_exec::run(&restore()).expect("restore");
+        assert_eq!(manifest_of(&back), local, "the restore equals the save");
+        assert_eq!(fx.node().git_manifest(PROJECT).await.expect("after"), local);
+        let stage = fx.project_dir().join(format!(".ign-restore-{RUN}"));
+        assert!(!stage.exists(), "no stage is left behind");
+
+        // a planted stage (a link) is refused and its target is left alone
+        std::fs::remove_dir_all(fx.git_dir()).expect("rm .git");
+        let target = fx.data_dir.join("elsewhere");
+        std::fs::create_dir_all(&target).expect("target");
+        std::os::unix::fs::symlink(&target, &stage).expect("plant");
+        let why = pwsh_exec::run(&restore()).expect_err("planted stage");
+        assert!(why.contains("already exists"), "{why}");
+        assert_eq!(
+            std::fs::read_dir(&target).expect("ls").count(),
+            0,
+            "nothing written through"
+        );
+        assert!(!fx.git_dir().exists(), "nothing was restored");
+        std::fs::remove_file(&stage).expect("unplant");
+
+        // a restore proves the copy: a save changed behind the script's back
+        // after the manifest cannot be seen from here, but a save that is not
+        // a real directory is refused
+        let moved = repo.with_file_name("repo-real");
+        std::fs::rename(&repo, &moved).expect("move");
+        std::os::unix::fs::symlink(&moved, &repo).expect("link repo");
+        assert!(
+            pwsh_exec::run(&restore()).is_err(),
+            "a linked repo is refused"
+        );
+        assert!(!fx.git_dir().exists());
+        // the save holds the ReadOnly file; its removal clears it and succeeds
+        std::fs::remove_file(&repo).expect("unlink repo");
+        std::fs::rename(&moved, &repo).expect("move back");
+        let rel = format!("ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}/repo");
+        let removed =
+            pwsh_exec::run(&WinScript::git_save_rm("", &home_s, &rel, RUN)).expect("remove");
+        assert_eq!(removed["removed"], 1);
+        assert!(!repo.exists(), "a save with a ReadOnly file is removed");
+    }
+
+    /// WR-B5: the removal of a save clears ReadOnly on the files first, never
+    /// enters or changes what a link points at, and a delete that still fails
+    /// names the leftover path with the real error.
+    #[tokio::test]
+    async fn pwsh_git_save_rm_clears_readonly_and_names_what_is_left() {
+        use std::os::unix::fs::PermissionsExt;
+        if !pwsh_exec::gate("pwsh_git_save_rm_clears_readonly_and_names_what_is_left") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect("save");
+        let rel = format!("ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}");
+        let repo = home.path().join(&rel).join("repo");
+        let rm = || WinScript::git_save_rm("", &home_s, &format!("{rel}/repo"), RUN);
+        // a ReadOnly file, and a link to a directory outside holding another
+        let readonly = repo.join("HEAD");
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o444)).expect("ro");
+        let outside = tempfile::tempdir().expect("outside");
+        let precious = outside.path().join("precious");
+        std::fs::write(&precious, "keep").expect("precious");
+        std::fs::set_permissions(&precious, std::fs::Permissions::from_mode(0o444)).expect("ro");
+        std::os::unix::fs::symlink(outside.path(), repo.join("link")).expect("link");
+        // a directory that cannot be emptied: the delete fails, and says where
+        let locked = repo.join("objects");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("lock");
+        let why = pwsh_exec::run(&rm()).expect_err("an undeletable tree");
+        assert!(
+            why.contains("could not be removed") && why.contains(&s(&repo)),
+            "the leftover is named: {why}"
+        );
+        assert!(repo.is_dir(), "nothing else was touched");
+        // a ReadOnly file that is also a hard link to a file outside the tree: its
+        // attribute is shared with the other link, so it is not changed
+        let shared = outside.path().join("shared");
+        std::fs::write(&shared, "keep").expect("shared");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o444)).expect("ro");
+        std::fs::hard_link(&shared, repo.join("shared")).expect("hard link");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+        let done = pwsh_exec::run(&rm()).expect("remove");
+        assert_eq!(
+            std::fs::metadata(&shared)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o222,
+            0,
+            "a hard-linked file was not changed"
+        );
+        assert_eq!(done["removed"], 1);
+        assert!(!repo.exists(), "the save is gone, ReadOnly file included");
+        assert_eq!(
+            std::fs::read(&precious).expect("the link target is intact"),
+            b"keep"
+        );
+        assert_eq!(
+            std::fs::metadata(&precious)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o222,
+            0,
+            "a file behind a link was not changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_refuses_links_and_foreign_paths() {
+        if !pwsh_exec::gate("pwsh_git_refuses_links_and_foreign_paths") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+        // a link inside `.git` refuses the save and leaves no `repo`
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("link")).expect("link");
+        let why = pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect_err("save with a link");
+        assert!(why.contains("link"), "{why}");
+        let run_dir = home.path().join(format!(
+            "ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}"
+        ));
+        assert!(!run_dir.join("repo").exists(), "no partial save");
+        std::fs::remove_file(fx.git_dir().join("link")).expect("rm link");
+
+        // a link on the way into the save path refuses
+        std::fs::create_dir_all(home.path().join("ign-deploy")).expect("dir");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        std::os::unix::fs::symlink(
+            elsewhere.path(),
+            home.path().join("ign-deploy").join(GATEWAY),
+        )
+        .expect("link");
+        let why = pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect_err("save through a link");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert_eq!(std::fs::read_dir(elsewhere.path()).expect("ls").count(), 0);
+        std::fs::remove_file(home.path().join("ign-deploy").join(GATEWAY)).expect("unlink");
+
+        // remove_git_save: a foreign path is refused before anything is touched
+        let saved = pwsh_exec::run(&WinScript::git_save(
+            "", &data, PROJECT, &home_s, GATEWAY, RUN,
+        ))
+        .expect("save");
+        assert_eq!(saved["ok"], 1);
+        let rel = format!("ign-deploy/{GATEWAY}/projects/{PROJECT}/git-save/{RUN}");
+        for foreign in [
+            format!("{rel}/other"),
+            format!("{rel}/repo/objects"),
+            "ign-deploy/x/projects/y/git-save/other-run/repo".to_string(),
+            format!("../{rel}/repo"),
+            "repo".to_string(),
+        ] {
+            let why = pwsh_exec::run(&WinScript::git_save_rm("", &home_s, &foreign, RUN))
+                .expect_err(&foreign);
+            assert!(why.contains("refusing"), "{foreign}: {why}");
+        }
+        assert!(
+            run_dir.join("repo").is_dir(),
+            "the refusals removed nothing"
+        );
+        let removed = pwsh_exec::run(&WinScript::git_save_rm(
+            "",
+            &home_s,
+            &format!("{rel}/repo"),
+            RUN,
+        ))
+        .expect("remove");
+        assert_eq!(removed["removed"], 1);
+        assert!(!run_dir.exists(), "the empty run directory goes too");
+        let again = pwsh_exec::run(&WinScript::git_save_rm(
+            "",
+            &home_s,
+            &format!("{rel}/repo"),
+            RUN,
+        ))
+        .expect("absent");
+        assert_eq!(again["removed"], 0, "an absent save is a success");
+
+        // the probe: one file in each directory, removed; an existing one is
+        // refused and left
+        let probe = ".ign-probe-r1";
+        let ok = pwsh_exec::run(&WinScript::git_probe(&data, PROJECT, probe)).expect("probe");
+        assert_eq!(ok["ok"], 1);
+        assert!(!fx.project_dir().join(probe).exists());
+        assert!(!fx.git_dir().join(probe).exists());
+        std::fs::write(fx.git_dir().join(probe), "mine").expect("planted");
+        let why = pwsh_exec::run(&WinScript::git_probe(&data, PROJECT, probe))
+            .expect_err("planted probe");
+        assert!(
+            why.contains(".git"),
+            "names the directory that refused: {why}"
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join(probe)).expect("kept"),
+            b"mine"
+        );
+
+        // free space of a save root that does not exist yet
+        let free =
+            pwsh_exec::run(&WinScript::git_free(&home_s, &format!("{rel}/free"))).expect("free");
+        assert!(free["free"].as_u64().expect("free") > 0);
+    }
+
+    /// A project's `.git` and the private stage a Windows write fills its locks
+    /// from (27-33): the stage lives in the account home, the bytes of plan
+    /// index `n` are the file `n` in it.
+    struct WriteRig {
+        fx: GitFixture,
+        home: tempfile::TempDir,
+        data: String,
+        home_s: String,
+        stage: String,
+    }
+
+    impl WriteRig {
+        fn new() -> WriteRig {
+            let fx = GitFixture::new();
+            let home = tempfile::tempdir().expect("home");
+            let (data, home_s) = (s(&fx.data_dir), s(home.path()));
+            WriteRig {
+                fx,
+                home,
+                data,
+                home_s,
+                stage: "git-stage-w33a".to_string(),
+            }
+        }
+
+        fn git(&self) -> PathBuf {
+            self.fx.git_dir()
+        }
+
+        fn stage_dir(&self) -> PathBuf {
+            self.home.path().join("ign-deploy").join(&self.stage)
+        }
+
+        fn make_stage(&self) -> Result<Value, String> {
+            pwsh_exec::run(&WinScript::git_stage(&self.home_s, &self.stage))
+        }
+
+        /// The bytes of plan index `index`, as sftp would have put them.
+        fn put(&self, index: usize, bytes: &[u8]) {
+            std::fs::write(self.stage_dir().join(index.to_string()), bytes).expect("put");
+        }
+
+        fn lock(&self, offset: usize, writes: &[(&str, u64)]) -> Result<Value, String> {
+            let writes: Vec<(String, u64)> =
+                writes.iter().map(|(p, n)| ((*p).to_string(), *n)).collect();
+            pwsh_exec::run(&WinScript::git_lock(
+                &self.data,
+                PROJECT,
+                &self.home_s,
+                &self.stage,
+                offset,
+                &writes,
+            ))
+        }
+
+        fn unlock(&self, writes: &[(&str, u64)], remove_stage: bool) -> Result<Value, String> {
+            let writes: Vec<(String, u64)> =
+                writes.iter().map(|(p, n)| ((*p).to_string(), *n)).collect();
+            pwsh_exec::run(&WinScript::git_unlock(
+                &self.data,
+                PROJECT,
+                &self.home_s,
+                &self.stage,
+                0,
+                &writes,
+                remove_stage,
+            ))
+        }
+
+        fn replace(&self, writes: &[(&str, u64)], remove_stage: bool) -> Result<Value, String> {
+            let writes: Vec<(String, u64)> =
+                writes.iter().map(|(p, n)| ((*p).to_string(), *n)).collect();
+            pwsh_exec::run(&WinScript::git_replace(
+                &self.data,
+                PROJECT,
+                &self.home_s,
+                &self.stage,
+                &writes,
+                2,
+                remove_stage,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn pwsh_git_write_lock_replace_digest() {
+        if !pwsh_exec::gate("pwsh_git_write_lock_replace_digest") {
+            return;
+        }
+        let rig = WriteRig::new();
+        let (fx, git) = (&rig.fx, s(&rig.fx.git_dir()));
+        let pack = format!("objects/pack/pack-{}.pack", "a".repeat(40));
+        let new_head = b"ref: refs/heads/feature/new\n".to_vec();
+        let new_ref = b"0123456789abcdef0123456789abcdef01234567\n".to_vec();
+        let new_pack = vec![b'P'; 4096];
+        let plan = [
+            ("refs/heads/feature/new", new_ref.len() as u64),
+            ("HEAD", new_head.len() as u64),
+            (pack.as_str(), new_pack.len() as u64),
+        ];
+        let head_before = std::fs::read(fx.git_dir().join("HEAD")).expect("head");
+
+        // the stage is made once and never reused
+        assert_eq!(rig.make_stage().expect("stage")["ok"], 1);
+        assert!(rig.stage_dir().is_dir());
+        let why = rig.make_stage().expect_err("a second stage of the name");
+        assert!(why.contains("already exists"), "{why}");
+        // a stage name that is not one component of git-stage-* is refused
+        let bad = pwsh_exec::run(&WinScript::git_stage(&rig.home_s, "../escape"));
+        assert!(bad.is_err());
+        assert!(!rig.home.path().join("escape").exists());
+
+        rig.put(0, &new_ref);
+        rig.put(1, &new_head);
+        rig.put(2, &new_pack);
+        // the locks are created and filled from the stage, byte for byte
+        assert_eq!(rig.lock(0, &plan).expect("lock")["ok"], 1);
+        for (lock, bytes) in [
+            ("refs/heads/feature/new.lock", &new_ref),
+            ("HEAD.lock", &new_head),
+            (&*format!("{pack}.ign-tmp"), &new_pack),
+        ] {
+            assert_eq!(&std::fs::read(fx.git_dir().join(lock)).expect(lock), bytes);
+        }
+        // a second writer is refused and the first one's locks stay
+        let why = rig.lock(0, &plan).expect_err("held");
+        assert!(why.contains("already exists"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD.lock")).expect("lock"),
+            new_head
+        );
+        // a lock call that fails halfway takes back what it made this call, and
+        // leaves the lock another writer holds
+        let rig2 = WriteRig::new();
+        rig2.make_stage().expect("stage");
+        rig2.put(0, b"other\n");
+        rig2.put(1, b"[core]\n");
+        std::fs::write(rig2.git().join("config.lock"), "held").expect("foreign lock");
+        let both = [("refs/heads/other", 6), ("config", 7)];
+        assert!(rig2.lock(0, &both).is_err());
+        assert!(!rig2.git().join("refs/heads/other.lock").exists());
+        assert_eq!(
+            std::fs::read_to_string(rig2.git().join("config.lock")).expect("kept"),
+            "held",
+            "a foreign lock is left"
+        );
+        // bytes in the stage that are not the size that was sent are refused before
+        // any lock exists
+        let rig3 = WriteRig::new();
+        rig3.make_stage().expect("stage");
+        rig3.put(0, b"abc");
+        let why = rig3.lock(0, &[("refs/heads/x", 4)]).expect_err("size");
+        assert!(why.contains("size"), "{why}");
+        assert!(!rig3.git().join("refs/heads/x.lock").exists());
+
+        // a size that is not the size sent is refused by the replace
+        let wrong = [("HEAD", new_head.len() as u64 + 1)];
+        let why = rig.replace(&wrong, false).expect_err("size");
+        assert!(why.contains("size"), "{why}");
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            head_before
+        );
+        // the replace puts every lock over its file and removes the stage
+        let done = rig.replace(&plan, true).expect("replace");
+        assert_eq!(done["ok"], 1);
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("HEAD")).expect("head"),
+            new_head
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join("refs/heads/feature/new")).expect("ref"),
+            new_ref
+        );
+        assert_eq!(
+            std::fs::read(fx.git_dir().join(&pack)).expect("pack"),
+            new_pack
+        );
+        for gone in ["HEAD.lock", "refs/heads/feature/new.lock"] {
+            assert!(!fx.git_dir().join(gone).exists(), "{gone}");
+        }
+        assert!(!rig.stage_dir().exists(), "no stage remains");
+        // the read-back digest is the sha256 of what was written
+        let digest = pwsh_exec::run(&WinScript::git_digest(&git, "HEAD")).expect("digest");
+        assert_eq!(digest["digest"], sha256_hex(&new_head));
+        let absent =
+            pwsh_exec::run(&WinScript::git_digest(&git, "refs/heads/none")).expect("absent");
+        assert!(absent["digest"].is_null());
+        let nodir = pwsh_exec::run(&WinScript::git_digest(&git, "no/dir/file")).expect("nodir");
+        assert!(nodir["digest"].is_null());
+
+        // the cleanup removes the locks that hold ign's bytes and the stage
+        let rig4 = WriteRig::new();
+        rig4.make_stage().expect("stage");
+        rig4.put(0, b"again\n");
+        rig4.lock(0, &[("refs/heads/again", 6)]).expect("lock");
+        let cleaned = rig4
+            .unlock(&[("refs/heads/again", 6)], true)
+            .expect("unlock");
+        assert_eq!(
+            (cleaned["removed"].as_u64(), cleaned["kept"].as_u64()),
+            (Some(1), Some(0))
+        );
+        assert!(!rig4.git().join("refs/heads/again.lock").exists());
+        assert!(!rig4.stage_dir().exists());
+        // a link as a lock target is refused
+        let rig5 = WriteRig::new();
+        rig5.make_stage().expect("stage");
+        rig5.put(0, b"x");
+        std::os::unix::fs::symlink("HEAD", rig5.git().join("refs/heads/linked")).expect("link");
+        assert!(rig5.lock(0, &[("refs/heads/linked", 1)]).is_err());
+    }
+
+    /// 27-33 (WR-B3): a link planted where the lock goes, or in a level above
+    /// it, or in the stage, is refused: nothing is written through it and no
+    /// target in `.git` changes.
+    #[tokio::test]
+    async fn pwsh_git_write_refuses_a_planted_link_at_a_lock() {
+        if !pwsh_exec::gate("pwsh_git_write_refuses_a_planted_link_at_a_lock") {
+            return;
+        }
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, "precious\n").expect("victim");
+        let head = |rig: &WriteRig| std::fs::read(rig.git().join("HEAD")).expect("head");
+
+        // a link at the lock path: to a file, and dangling
+        for target in [victim.clone(), outside.path().join("not-there")] {
+            let rig = WriteRig::new();
+            rig.make_stage().expect("stage");
+            rig.put(0, b"ref: refs/heads/x\n");
+            let before = head(&rig);
+            std::os::unix::fs::symlink(&target, rig.git().join("HEAD.lock")).expect("plant");
+            let why = rig
+                .lock(0, &[("HEAD", 18)])
+                .expect_err("a link at the lock");
+            assert!(why.contains("already exists"), "{why}");
+            assert_eq!(std::fs::read(&victim).expect("victim"), b"precious\n");
+            assert!(
+                !outside.path().join("not-there").exists(),
+                "nothing was created behind the link"
+            );
+            assert_eq!(head(&rig), before, "no target changed");
+            assert!(
+                std::fs::symlink_metadata(rig.git().join("HEAD.lock"))
+                    .expect("still there")
+                    .file_type()
+                    .is_symlink(),
+                "the planted link is not ours and stays"
+            );
+        }
+        // a link in a level above the lock: refused, nothing created behind it
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"x");
+        std::os::unix::fs::symlink(outside.path(), rig.git().join("refs/heads/feature"))
+            .expect("plant");
+        let why = rig
+            .lock(0, &[("refs/heads/feature/new", 1)])
+            .expect_err("a link above");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert!(!outside.path().join("new.lock").exists());
+        // a link as the project's .git is refused outright
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"x");
+        let moved = rig.git().with_file_name("real-git");
+        std::fs::rename(rig.git(), &moved).expect("move");
+        std::os::unix::fs::symlink(&moved, rig.git()).expect("link .git");
+        let why = rig.lock(0, &[("HEAD", 1)]).expect_err("a linked .git");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert!(!moved.join("HEAD.lock").exists());
+        // a link in the stage in place of the staged bytes is refused
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        std::os::unix::fs::symlink(&victim, rig.stage_dir().join("0")).expect("plant");
+        let why = rig
+            .lock(0, &[("HEAD", 9)])
+            .expect_err("a link in the stage");
+        assert!(why.contains("staged bytes"), "{why}");
+        assert!(!rig.git().join("HEAD.lock").exists());
+        // the replace does not go through a link planted in a level above either
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"y");
+        rig.lock(0, &[("refs/heads/main", 1)]).expect("lock");
+        let heads = rig.git().join("refs/heads");
+        let moved = rig.git().join("refs/heads-real");
+        std::fs::rename(&heads, &moved).expect("move heads");
+        std::os::unix::fs::symlink(&moved, &heads).expect("link heads");
+        let why = rig
+            .replace(&[("refs/heads/main", 1)], true)
+            .expect_err("a link above");
+        assert!(why.contains("not a real directory"), "{why}");
+    }
+
+    /// 27-33 (WR-B2): the cleanup removes a lock only when its bytes equal the
+    /// staged bytes: a lock another writer holds (JGit's `index.lock`) stays.
+    #[tokio::test]
+    async fn pwsh_git_write_cleanup_spares_a_foreign_lock() {
+        if !pwsh_exec::gate("pwsh_git_write_cleanup_spares_a_foreign_lock") {
+            return;
+        }
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"ref: refs/heads/x\n");
+        rig.put(1, b"the staged index");
+        let plan = [("HEAD", 18), ("index", 16)];
+        // our lock holds the staged bytes; the other one is JGit's, with other
+        // bytes of the same length, and a third entry has no lock at all
+        std::fs::write(rig.git().join("HEAD.lock"), b"ref: refs/heads/x\n").expect("own");
+        std::fs::write(rig.git().join("index.lock"), b"jgit's own index!").expect("foreign");
+        let done = rig.unlock(&plan, true).expect("cleanup");
+        assert_eq!(
+            (done["removed"].as_u64(), done["kept"].as_u64()),
+            (Some(1), Some(1))
+        );
+        assert!(!rig.git().join("HEAD.lock").exists(), "our lock went");
+        assert_eq!(
+            std::fs::read(rig.git().join("index.lock")).expect("foreign"),
+            b"jgit's own index!",
+            "the foreign lock stays"
+        );
+        assert!(!rig.stage_dir().exists(), "the stage went");
+        // without a stage nothing can be proved ours: every lock stays, and
+        // that is not an error
+        let rig = WriteRig::new();
+        std::fs::write(rig.git().join("HEAD.lock"), b"ref: refs/heads/x\n").expect("lock");
+        let done = rig.unlock(&[("HEAD", 18)], true).expect("no stage");
+        assert_eq!(
+            (done["removed"].as_u64(), done["kept"].as_u64()),
+            (Some(0), Some(1))
+        );
+        assert!(rig.git().join("HEAD.lock").exists());
+        // a link as a lock is never removed (it is not a regular file)
+        let rig = WriteRig::new();
+        rig.make_stage().expect("stage");
+        rig.put(0, b"x");
+        std::os::unix::fs::symlink("HEAD", rig.git().join("config.lock")).expect("link");
+        let done = rig.unlock(&[("config", 1)], false).expect("cleanup");
+        assert_eq!(done["removed"], 0);
+        assert!(rig.git().join("config.lock").symlink_metadata().is_ok());
     }
 }
