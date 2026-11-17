@@ -2091,7 +2091,9 @@ impl SftpTransport {
     /// into `parts` (27-11): one session makes the staging dir and uploads
     /// every part's list, then every part runs its own BUNDLE, download and
     /// extraction at the same time (each its own ssh connection, its own list
-    /// and archive `read-<k>.tsv` / `read-<k>.zip`), and one session removes the
+    /// and archive `read-<k>.tsv` / `read-<k>.zip`; the other parts' BUNDLE
+    /// starts once part 0's, which checks the free space of the whole read,
+    /// has answered), and one session removes the
     /// staging dir. Each part is held to its own list, size and
     /// hostile-archive checks exactly as a single archive is; the parts are
     /// disjoint and together are the whole read. The connection count is
@@ -2121,13 +2123,30 @@ impl SftpTransport {
         }
         self.run_batch("read", ops).await?;
 
-        // a part's BUNDLE needs room for every archive not yet written: its
-        // own and those of the parts whose BUNDLE has not returned (CodeRabbit
-        // #56: an archive already written is already off the free space, so
-        // it is not charged again). The first check is the whole read's.
-        let written = Mutex::new(vec![false; parts.len()]);
-        let runs = (0..parts.len())
-            .map(|k| self.bundle_part(base, ctl, k, parts, &written, &shas[k], tmp));
+        // Free space is checked for the whole read once, before any archive
+        // exists: part 0's BUNDLE carries the need of every part together, and
+        // the other parts start their BUNDLE only after it answered, each
+        // checked against its own archive (CodeRabbit #56: a check made while
+        // other parts' archives are being written must not charge them
+        // again). A part 0 that failed leaves the others unstarted; its error
+        // is the read's.
+        let all: Vec<BundleFile> = parts.iter().flatten().cloned().collect();
+        let whole = bundle::archive_limit(&all).saturating_add(bundle::STAGING_FREE_MARGIN);
+        let (checked, gate) = tokio::sync::watch::channel(None::<bool>);
+        let runs = (0..parts.len()).map(|k| {
+            let opened = (k == 0).then_some(&checked);
+            self.bundle_part(
+                base,
+                ctl,
+                k,
+                &parts[k],
+                whole,
+                opened,
+                gate.clone(),
+                &shas[k],
+                tmp,
+            )
+        });
         // every part is awaited, a failed one too: a part dropped while its
         // extraction runs would keep writing below `tmp` after the read
         // returned; the failure of the lowest such part is then the read's
@@ -2148,31 +2167,38 @@ impl SftpTransport {
     /// One part of [`bundle_parts`](Self::bundle_parts): BUNDLE its list, check
     /// the reported size, download and remove the archive, check its size and
     /// extract it into `tmp`.
+    /// `whole` is the need of the whole read: the first part (the one holding
+    /// `opened`) checks it and then tells the others through `gate` whether
+    /// its BUNDLE answered; each other part waits for that, then checks only
+    /// its own archive.
     #[allow(clippy::too_many_arguments)]
     async fn bundle_part(
         &self,
         base: &ReadBase,
         ctl: &str,
         k: usize,
-        parts: &[Vec<BundleFile>],
-        written: &Mutex<Vec<bool>>,
+        part: &[BundleFile],
+        whole: u64,
+        opened: Option<&tokio::sync::watch::Sender<Option<bool>>>,
+        mut gate: tokio::sync::watch::Receiver<Option<bool>>,
         list_sha: &str,
         tmp: &Path,
     ) -> Result<(), CoreError> {
-        let part = &parts[k];
         let remote_list = format!("{ctl}/{}", part_file(k, "tsv"));
         let remote_zip = format!("{ctl}/{}", part_file(k, "zip"));
         let limit = bundle::archive_limit(part);
-        let unwritten: Vec<BundleFile> = {
-            let written = written.lock().expect("the written parts");
-            parts
-                .iter()
-                .zip(written.iter())
-                .filter(|(_, done)| !**done)
-                .flat_map(|(files, _)| files.iter().cloned())
-                .collect()
+        let need = if opened.is_some() {
+            whole
+        } else {
+            let passed = gate
+                .wait_for(Option::is_some)
+                .await
+                .is_ok_and(|answer| *answer == Some(true));
+            if !passed {
+                return Ok(());
+            }
+            limit.saturating_add(bundle::STAGING_FREE_MARGIN)
         };
-        let need = bundle::archive_limit(&unwritten).saturating_add(bundle::STAGING_FREE_MARGIN);
         let script = winps::WinScript::bundle_level(
             LONG_PATH_PREFIX,
             &windows_native_path(&base.remote_root(&self.data_dir)),
@@ -2183,8 +2209,12 @@ impl SftpTransport {
             base.bundle_level(),
         );
         let value = self.read_powershell(&script).await;
-        // written (or not written at all): either way off the reservation
-        written.lock().expect("the written parts")[k] = true;
+        if let Some(opened) = opened {
+            let ok = value
+                .as_ref()
+                .is_ok_and(|v| v.get("ok").and_then(serde_json::Value::as_i64) == Some(1));
+            let _ = opened.send(Some(ok));
+        }
         let value = value.map_err(|e| match e {
             CoreError::TransportFailed { detail, .. } => self.fail(format!(
                 "cannot bundle the listed files on the host: {detail}"
@@ -4454,6 +4484,10 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
         /// Each archive BUNDLE writes takes its size from `bundle_free`, and a
         /// removed archive gives nothing back (the parts' archives coexist).
         bundle_free_consumed: bool,
+        /// The first BUNDLE writes its archive and then holds its answer until
+        /// a second BUNDLE has run (at most 300 ms), as a slow first reply
+        /// over a real connection would while the other parts go on.
+        bundle_hold_first: bool,
         /// BUNDLE_CLEAN exits 1 and leaves everything.
         clean_fail: bool,
         /// The bytes of every list BUNDLE read, in call order.
@@ -5170,7 +5204,19 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
             _timeout: Duration,
         ) -> ProcessOutput {
             if program == "ssh" {
-                return self.exec(_args);
+                let bundle = exec_params(_args)
+                    .is_some_and(|p| p.get("l").is_some() && p.get("z").is_some());
+                let out = self.exec(_args);
+                if bundle && self.knobs().bundle_hold_first && self.knobs().bundle_params.len() == 1
+                {
+                    for _ in 0..60 {
+                        if self.knobs().bundle_params.len() > 1 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+                return out;
             }
             assert_eq!(program, "sftp");
             let batch = String::from_utf8(stdin.expect("batch on stdin")).expect("utf8");
@@ -10038,7 +10084,48 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         );
     }
 
-    /// CodeRabbit #56: a split read whose first part fails still waits for
+    /// CodeRabbit #56 round 2: the parts' BUNDLE calls overlap on a real host.
+    /// The first part's archive is written while its answer is still on the
+    /// way, and a second part checks free space in that window: it must not be
+    /// charged the first part's archive again. With room for every archive
+    /// once, the read succeeds.
+    #[tokio::test]
+    async fn windows_git_objects_fetch_overlapping_parts_charge_each_archive_once() {
+        use crate::deploy::git_objects::GitObjectFile;
+        use crate::deploy::transport::projects::GitHostRead;
+        let git = format!("{WDATA}/projects/CapApp/.git");
+        let fake = windows_fake();
+        let mut files = Vec::new();
+        let mut listed = Vec::new();
+        for i in 0..24u32 {
+            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
+            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
+            fake.file(&format!("{git}/{rel}"), &body);
+            listed.push(BundleFile {
+                collection: "objects".to_string(),
+                rel: rel.strip_prefix("objects/").expect("objects").to_string(),
+                size: body.len() as u64,
+            });
+            files.push(GitObjectFile {
+                rel,
+                size: body.len() as u64,
+            });
+        }
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        // exactly the whole read's need free: the archives together fit once
+        let whole = bundle::archive_limit(&listed) + bundle::STAGING_FREE_MARGIN;
+        fake.knobs().bundle_free = Some(whole);
+        fake.knobs().bundle_free_consumed = true;
+        fake.knobs().bundle_hold_first = true;
+        let t = windows_transport(&fake).with_part_target_bytes(total / 4);
+        let dest = tempfile::tempdir().expect("dest");
+        t.fetch_git_objects("CapApp", &files, dest.path())
+            .await
+            .expect("room for every archive once");
+        assert_eq!(fake.knobs().bundle_params.len(), 4);
+    }
+
+    /// CodeRabbit #56: a split read whose part fails still waits for
     /// every other part (an extraction under way is never left running after
     /// the read returns), then reports the failure and cleans the staging dir.
     #[tokio::test]
@@ -10058,12 +10145,14 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             });
         }
         let total: u64 = files.iter().map(|f| f.size).sum();
-        fake.knobs().bundle_fail_list = Some("read-0.tsv".to_string());
+        // a part after the first: the first part's BUNDLE is the read's free
+        // space check and the others start only after it answered
+        fake.knobs().bundle_fail_list = Some("read-1.tsv".to_string());
         let t = windows_transport(&fake).with_part_target_bytes(total / 4);
         let dest = tempfile::tempdir().expect("dest");
         t.fetch_git_objects("CapApp", &files, dest.path())
             .await
-            .expect_err("part 0 fails");
+            .expect_err("part 1 fails");
         assert_eq!(fake.knobs().bundle_params.len(), 4, "every part ran");
         assert_eq!(get_lines(&fake).len(), 3, "every other part was downloaded");
         assert!(staged_left(&fake).is_empty(), "{:?}", staged_left(&fake));
