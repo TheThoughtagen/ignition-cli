@@ -78,6 +78,13 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // no background maintenance or auto gc: git 2.5x repacks a many-pack
+        // repo after a commit, under a test that is reading its packs
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "gc.auto")
+        .env("GIT_CONFIG_VALUE_1", "0")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Test")
