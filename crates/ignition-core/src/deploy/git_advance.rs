@@ -745,7 +745,7 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .args(args)
             .current_dir(dir)
@@ -765,7 +765,7 @@ pub(crate) mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    fn put(root: &Path, rel: &str, body: &str) {
+    pub(crate) fn put(root: &Path, rel: &str, body: &str) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         std::fs::write(path, body).expect("write");
@@ -777,24 +777,24 @@ pub(crate) mod tests {
             || path.starts_with("com.inductiveautomation.")
     }
 
-    const CODE: &str = "ignition/script-python/cap/util/code.py";
+    pub(crate) const CODE: &str = "ignition/script-python/cap/util/code.py";
     const UTIL_RES: &str = "ignition/script-python/cap/util/resource.json";
     const NOTES: &str = "ignition/script-python/cap/util/NOTES.txt";
     const NEW_CODE: &str = "ignition/script-python/cap/util2/code.py";
     const LOCAL_ONLY: &str = "ignition/script-python/cap/util/local_only.py";
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _dir: tempfile::TempDir,
-        seed: PathBuf,
-        gw: PathBuf,
-        c1: String,
-        c2: String,
+        pub(crate) seed: PathBuf,
+        pub(crate) gw: PathBuf,
+        pub(crate) c1: String,
+        pub(crate) c2: String,
     }
 
     impl Fixture {
         /// A bare remote, a release checkout holding C1 and C2, and a plain
         /// clone at C1 standing in for the gateway repo.
-        fn new() -> Fixture {
+        pub(crate) fn new() -> Fixture {
             let dir = tempfile::tempdir().expect("tempdir");
             let root = dir.path();
             let remote = root.join("capapp.git");
@@ -863,12 +863,12 @@ pub(crate) mod tests {
             }
         }
 
-        fn git_dir(&self) -> PathBuf {
+        pub(crate) fn git_dir(&self) -> PathBuf {
             self.gw.join(".git")
         }
 
         /// The gateway's state, read through `HostGit` as a host read would.
-        async fn gateway_state(&self, host: &HostGit) -> (GitState, GitRefs) {
+        pub(crate) async fn gateway_state(&self, host: &HostGit) -> (GitState, GitRefs) {
             let files = read_git_files(&self.git_dir());
             files.check_caps().expect("caps");
             let config = host
@@ -885,7 +885,7 @@ pub(crate) mod tests {
         }
 
         /// The in-scope tree paths of C2 plus any `extra` members.
-        async fn members(&self, host: &HostGit, extra: &[&str]) -> BTreeSet<String> {
+        pub(crate) async fn members(&self, host: &HostGit, extra: &[&str]) -> BTreeSet<String> {
             let mut members: BTreeSet<String> = host
                 .tree_paths(&self.seed, &self.c2)
                 .await
@@ -900,7 +900,7 @@ pub(crate) mod tests {
         /// Replace the gateway work tree with what an import of C2 leaves:
         /// the in-scope files of C2, minus `drop`, plus `extra`, with
         /// `pretty` re-serialised the gateway way. Returns the export zip.
-        async fn import(
+        pub(crate) async fn import(
             &self,
             host: &HostGit,
             drop: &[&str],

@@ -20,6 +20,7 @@
 //! that is not the one the advance was prepared against stops the handover
 //! with reason `git_recreated` and is left as it is. A failure keeps the save.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
@@ -29,7 +30,7 @@ use super::git_advance::{
     AdvanceFailure, AdvancePrep, GitWriteName, config_digest, finish_advance,
 };
 use super::git_remote::HostGit;
-use super::git_state::{GitState, GitStateKind, classify, redact_text};
+use super::git_state::{GitRefs, GitState, GitStateKind, classify, redact_text};
 use super::ledger::{LedgerRoot, git_save_location};
 use super::transport::projects::{GitEntry, GitHostRead, GitManifest, GitStateWriter};
 use crate::error::CoreError;
@@ -144,12 +145,13 @@ pub async fn save(
     })
 }
 
-/// What `.git` is now, classified the way the prepare classified it.
+/// What `.git` is now, classified the way the prepare classified it, with the
+/// refs it was classified from.
 async fn classify_live(
     read: &dyn GitHostRead,
     git: &HostGit,
     project: &str,
-) -> Result<GitState, CoreError> {
+) -> Result<(GitState, Option<GitRefs>), CoreError> {
     let files = read.read_git_state(project).await?;
     files.check_caps()?;
     let config = match (&files.kind, &files.config) {
@@ -161,7 +163,33 @@ async fn classify_live(
     } else {
         None
     };
-    Ok(classify(&files, config.as_ref(), refs.as_ref()))
+    Ok((classify(&files, config.as_ref(), refs.as_ref()), refs))
+}
+
+/// The pack bases of `prep` that no ref of the live repo names, byte-sorted.
+/// The pack leaves out every object reachable from its bases, so a base the
+/// repo no longer names (a local branch the prepared repo had and this one
+/// lacks) may be a commit whose objects are not there: [`GitState`] compares
+/// HEAD, the upstream and the remote's refs, not every local branch.
+fn unnamed_bases(prep: &AdvancePrep, refs: Option<&GitRefs>) -> Vec<String> {
+    let named: BTreeSet<&str> = refs
+        .into_iter()
+        .flat_map(|r| {
+            r.head
+                .commit()
+                .into_iter()
+                .chain(r.heads.values().map(String::as_str))
+                .chain(r.remotes.values().map(String::as_str))
+        })
+        .collect();
+    let mut missing: Vec<String> = prep
+        .pack_bases
+        .iter()
+        .filter(|base| !named.contains(base.as_str()))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing
 }
 
 /// After the import: build the advance, put `.git` back if the import deleted
@@ -175,7 +203,9 @@ async fn classify_live(
 /// equal what was saved, is restored, and the restored repo must be the one the
 /// advance was prepared against (`state`); `.git` present: it must be that
 /// same repo, else `git_recreated` and it is left alone; anything else at
-/// `.git` is `git_recreated` too. (c) the writes, lock-and-rename, through
+/// `.git` is `git_recreated` too. Either way, some ref of the repo must still
+/// name every commit the pack was built against ([`AdvancePrep::pack_bases`]),
+/// or the pack may leave objects missing. (c) the writes, lock-and-rename, through
 /// `write`, in the plan's order: the index before every ref, config and HEAD
 /// write, so a write that fails part way leaves HEAD and the branch at the old
 /// commit over an index that holds the release (27-26, WR-A1). (d) each
@@ -272,9 +302,21 @@ pub async fn restore_and_advance(
             }
             restored = true;
             restored_now.store(true, std::sync::atomic::Ordering::Relaxed);
-            let now = classify_live(read, git, project)
+            let (now, refs) = classify_live(read, git, project)
                 .await
                 .map_err(|e| core("restore_failed", "the restored .git cannot be read", e))?;
+            let unnamed = unnamed_bases(prep, refs.as_ref());
+            if !unnamed.is_empty() {
+                return Err(fail(
+                    "restore_failed",
+                    Vec::new(),
+                    format!(
+                        "no ref of the restored .git names {}, which the pack was built \
+                         against (it changed between the prepare and the save)",
+                        unnamed.join(", ")
+                    ),
+                ));
+            }
             if &now != state {
                 return Err(fail(
                     "restore_failed",
@@ -301,7 +343,7 @@ pub async fn restore_and_advance(
             }
         }
         GitEntry::Directory => {
-            let now = classify_live(read, git, project)
+            let (now, refs) = classify_live(read, git, project)
                 .await
                 .map_err(|e| core("restore_failed", "the .git probe failed", e))?;
             // A managed repo is advanced and an adoptable one is adopted; the
@@ -314,6 +356,18 @@ pub async fn restore_and_advance(
                     "the .git the import left is not the repo the advance was prepared against; \
                      it is left as it is"
                         .to_string(),
+                ));
+            }
+            let unnamed = unnamed_bases(prep, refs.as_ref());
+            if !unnamed.is_empty() {
+                return Err(fail(
+                    "git_recreated",
+                    vec![".git".to_string()],
+                    format!(
+                        "no ref of the .git the import left names {}, which the pack was \
+                         built against, so it may lack those objects; it is left as it is",
+                        unnamed.join(", ")
+                    ),
                 ));
             }
             if !config_is_base(read, project, prep)
@@ -503,8 +557,8 @@ fn describe(name: &GitWriteName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy::git_advance::GitWrite;
-    use crate::deploy::git_advance::tests::read_git_files;
+    use crate::deploy::git_advance::tests::{CODE, Fixture, git, put, read_git_files};
+    use crate::deploy::git_advance::{GitWrite, prepare_advance};
     use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
     use crate::deploy::transport::projects::{GitSize, ImportDir};
     use std::path::PathBuf;
@@ -654,6 +708,65 @@ mod tests {
         assert_eq!(
             data.path,
             "ign-deploy/gw-a/projects/CapApp/git-save/r1/repo"
+        );
+    }
+
+    /// The surviving `.git` has the prepared HEAD, upstream and remote refs,
+    /// but no longer the local branch whose commit the pack was built
+    /// against, nor that commit's objects. The advance is refused and nothing
+    /// is written; before, it wrote a branch over a missing parent.
+    #[tokio::test]
+    async fn advance_refused_when_a_pack_base_is_gone() {
+        let mut f = Fixture::new();
+        let git_host = HostGit::new();
+        // The gateway holds C2 on a local branch, and the release C3 follows C2.
+        let seed = f.seed.to_str().expect("utf8").to_string();
+        git(&f.gw, &["fetch", "-q", &seed, "production:side"]);
+        put(&f.seed, CODE, "def f():\n    return 3\n");
+        git(&f.seed, &["commit", "-q", "-am", "three"]);
+        let c3 = git(&f.seed, &["rev-parse", "HEAD"]);
+        let c2 = std::mem::replace(&mut f.c2, c3.clone());
+
+        let (state, refs) = f.gateway_state(&git_host).await;
+        let members = f.members(&git_host, &[]).await;
+        let prep = prepare_advance(&git_host, &f.seed, &state, &refs, &c3, &members)
+            .await
+            .expect("prepare");
+        let mut want_bases = vec![f.c1.clone(), c2.clone()];
+        want_bases.sort();
+        assert_eq!(prep.pack_bases, want_bases);
+
+        // The branch and C2's objects go; HEAD, upstream and remote refs stay.
+        git(&f.gw, &["branch", "-q", "-D", "side"]);
+        git(&f.gw, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&f.gw, &["-c", "gc.auto=0", "gc", "-q", "--prune=now"]);
+        let (now, _) = f.gateway_state(&git_host).await;
+        assert_eq!(now, state, "the classification alone cannot tell");
+
+        let export = f.import(&git_host, &[], &[], None).await;
+        let host = DirHost {
+            git_dir: f.git_dir(),
+        };
+        let saved = save(&host, &host, LedgerRoot::DataDir, "gw", "CapApp", "r1")
+            .await
+            .expect("save");
+        let head_before = std::fs::read(f.git_dir().join("HEAD")).expect("HEAD");
+        let failure = restore_and_advance(
+            &host, &host, &git_host, &f.seed, &state, &saved, &prep, &export, None,
+        )
+        .await
+        .expect_err("a .git without a pack base is not advanced");
+        assert_eq!(failure.reason, "git_recreated");
+        assert!(failure.detail.contains(&c2), "{}", failure.detail);
+        assert!(!failure.restored);
+        assert_eq!(
+            git(&f.gw, &["rev-parse", "HEAD"]),
+            f.c1,
+            "the branch did not move"
+        );
+        assert_eq!(
+            std::fs::read(f.git_dir().join("HEAD")).expect("HEAD"),
+            head_before
         );
     }
 }
