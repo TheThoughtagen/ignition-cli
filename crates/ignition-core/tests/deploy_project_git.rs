@@ -313,6 +313,21 @@ impl GitStateWriter for FailsAfter {
     }
 }
 
+/// Copy the directory tree `from` to `to` with `std::fs` (no external `cp`:
+/// a Windows host may lack one). Symlinks are not expected in the fixture.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
 /// WR-A1 (27-26, D-06, D-10): the advance writes the index before every ref,
 /// config and HEAD. A write that fails right after pack, pack index and index
 /// leaves HEAD and the branch at the old commit with an index that holds the
@@ -367,13 +382,7 @@ async fn handover_write_fails_after_index_leaves_staged_changes() {
     // changes as staged work, not their reverse. Asked on a copy of the repo.
     let copy = tempfile::tempdir().expect("tempdir");
     let copied = copy.path().join("repo");
-    let status = std::process::Command::new("cp")
-        .arg("-R")
-        .arg(f.project_dir())
-        .arg(&copied)
-        .status()
-        .expect("cp runs");
-    assert!(status.success());
+    copy_tree(&f.project_dir(), &copied);
     let out = std::process::Command::new("git")
         .args(["write-tree"])
         .current_dir(&copied)
