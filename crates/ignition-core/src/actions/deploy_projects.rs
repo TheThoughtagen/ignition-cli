@@ -5042,14 +5042,30 @@ async fn execute(
                 // A Designer attached during the check (a wait, or a
                 // proceed) may have committed: each saved repo must still be
                 // the one the plan gated and the run saved (CodeRabbit #57).
-                saved_repos_unchanged(
-                    &writers,
-                    surfaces,
-                    git_saved.is_some(),
-                    backup_saved.is_some(),
-                    project,
-                )
-                .await
+                // It may also have saved project work: when a session was
+                // seen, the live project is read again (one export, only
+                // then) and must still be the one the plan was drawn
+                // against; the pre-image predates the wait (CodeRabbit #57
+                // R1).
+                let attached = found.proceeded || found.polls.iter().any(|open| *open > 0);
+                let live = if overwrite && attached {
+                    live_unchanged_since_plan(plan, gateway, project).await
+                } else {
+                    Ok(())
+                };
+                match live {
+                    Ok(()) => {
+                        saved_repos_unchanged(
+                            &writers,
+                            surfaces,
+                            git_saved.is_some(),
+                            backup_saved.is_some(),
+                            project,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                }
             }
             Err(err) => Err(err),
         };
@@ -6312,6 +6328,26 @@ async fn unwritten(
         events.emit_late(ProjectsEvent::JournalCleared);
     }
     err
+}
+
+/// The live project read again and compared with the plan's digest
+/// (`plan_stale` on a change, as K15 refuses before the pre-image).
+async fn live_unchanged_since_plan(
+    plan: &DeployProjectsResult,
+    gateway: &dyn ProjectGateway,
+    project: &str,
+) -> Result<(), CoreError> {
+    let zip = retry_transient(|| gateway.export_bytes(project)).await?;
+    let live = live_digest(project, &zip)?;
+    if plan.live_sha256.as_deref() != Some(live.sha256.as_str()) {
+        return Err(stale_live(
+            plan.live_sha256
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            live.sha256,
+        ));
+    }
+    Ok(())
 }
 
 /// The master's and the backup's `.git`, when the run saved them, read again

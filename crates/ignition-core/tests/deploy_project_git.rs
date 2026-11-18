@@ -3688,6 +3688,30 @@ mod published {
         assert!(rig.save_trees().is_empty(), "the save is removed");
     }
 
+    /// CodeRabbit #57 R1: under `--designers wait` a Designer that saves
+    /// project work while attached, after the saves, and then closes, leaves
+    /// HEAD, refs and config as they were, but the import would replace the
+    /// saved work, which the pre-image predates. The live project is read
+    /// again when a session was seen at the last check: a digest that differs
+    /// from the plan's is `plan_stale` before the import, and the save goes.
+    #[tokio::test]
+    async fn designer_save_during_the_wait_refuses_a_stale_plan() {
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let rig = Rig::with(|g| {
+            g.with_designers_script(vec![vec![], vec![session], vec![]])
+                .with_project_edited_on_designers_read(1, PROJECT)
+        });
+        let outcome = rig.apply_designers(wait_ms(5_000)).await;
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "no import: {outcome:?}"
+        );
+        let err = outcome.expect_err("a stale plan");
+        assert_eq!(err.code(), "plan_stale", "{err}");
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert!(rig.f.git_dir().is_dir(), "the .git was never touched");
+    }
+
     #[tokio::test]
     async fn designer_attached_at_restore() {
         // the session opens after the import's read-back (the third export):
