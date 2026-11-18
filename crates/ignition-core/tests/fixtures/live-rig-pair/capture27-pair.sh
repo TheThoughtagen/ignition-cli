@@ -470,18 +470,23 @@ master_import() {
   IGNITION_CLI_CONFIG=$CFG "$IGN" --profile pair27a --yes project import "$APP" --file "$1" --collision-policy overwrite > /dev/null
 }
 
-# poll_backup LABEL SECS CODE UTIL2: every 2 s, print each change of the backup's
-# .git presence, the backup's code.py value and util2 presence, and the master's
-# .git presence. Converged means code.py reads CODE and util2 reads UTIL2. Sets
+# backup_git: `present` or `absent`, the backup's .git now.
+backup_git() { if [ -d "$(pdir b)/.git" ]; then echo present; else echo absent; fi; }
+
+# poll_backup LABEL SECS CODE UTIL2 BEFORE: every 2 s, print each change of the
+# backup's .git presence, the backup's code.py value and util2 presence, and the
+# master's .git presence. Converged means code.py reads CODE and util2 reads
+# UTIL2. BEFORE is the backup's .git presence taken before the import (a
+# deletion during the import is a deletion too: POLL_GIT_GONE is then 0). Sets
 # POLL_GIT_GONE (seconds, or `none`) and POLL_CONVERGED.
 POLL_GIT_GONE=none
 POLL_CONVERGED=none
 poll_backup() {
-  local label=$1 secs=$2 want_code=$3 want_util2=$4 t0 now el bg ba cb ub ma last='' cur
+  local label=$1 secs=$2 want_code=$3 want_util2=$4 bg=$5 t0 now el ba cb ub ma last='' cur first=yes
+  case "$bg" in present | absent) ;; *) die "poll_backup: BEFORE is present or absent" ;; esac
   t0=$(date +%s)
   POLL_GIT_GONE=none
   POLL_CONVERGED=none
-  bg=$([ -d "$(pdir b)/.git" ] && echo present || echo absent)
   while :; do
     now=$(date +%s)
     el=$((now - t0))
@@ -494,7 +499,11 @@ poll_backup() {
       echo "   [$label] t=+${el}s $cur"
       last=$cur
     fi
-    if [ "$bg" = present ] && [ "$ba" = absent ] && [ "$POLL_GIT_GONE" = none ]; then POLL_GIT_GONE=$el; fi
+    if [ "$bg" = present ] && [ "$ba" = absent ] && [ "$POLL_GIT_GONE" = none ]; then
+      POLL_GIT_GONE=$el
+      [ "$first" = no ] || echo "   [$label] the backup's .git, present before the import, was already gone at the first sample"
+    fi
+    first=no
     if [ "$cb" = "$want_code" ] && [ "$ub" = "$want_util2" ] && [ "$POLL_CONVERGED" = none ]; then POLL_CONVERGED=$el; fi
     [ "$el" -lt "$secs" ] || break
     sleep 2
@@ -508,7 +517,7 @@ logs_b() { # SINCE
 }
 
 g5_steps() {
-  local zip=$TMPD/v110.zip zip100=$TMPD/v100.zip ts t_import n
+  local zip=$TMPD/v110.zip zip100=$TMPD/v100.zip ts t_import n before
   token_env
   rig_has_module || die "g5: the pair with the git module is not up: run up first"
   rm -f "$S27/fresh"
@@ -537,9 +546,10 @@ g5_steps() {
   echo "== (b) master-only overwrite import of the v1.1.0 artifact"
   ts=$(utc)
   t_import=$(date +%s)
+  before=$(backup_git)
   master_import "$zip"
   echo "   import answered after $(( $(date +%s) - t_import )) s; master .git present=$([ -d "$(pdir a)/.git" ] && echo yes || echo no)"
-  poll_backup b 120 'return 2' yes
+  poll_backup b 120 'return 2' yes "$before"
   echo "RESULT (b) backup .git disappeared after: $POLL_GIT_GONE s (none = still there at 120 s); backup content converged after: $POLL_CONVERGED s (none = not within 120 s)"
   echo "   backup .git at 120 s: present=$([ -d "$(pdir b)/.git" ] && echo yes || echo no)"
   echo "   backup module log lines since the import:"
@@ -556,9 +566,10 @@ g5_steps() {
   fi
   ts=$(utc)
   t_import=$(date +%s)
+  before=$(backup_git)
   master_import "$zip"
   echo "   import answered after $(( $(date +%s) - t_import )) s"
-  poll_backup c 120 'return 2' yes
+  poll_backup c 120 'return 2' yes "$before"
   echo "RESULT (c) restored backup .git disappeared after: $POLL_GIT_GONE s (none = survived 120 s)"
   echo "   backup .git at 120 s: present=$([ -d "$(pdir b)/.git" ] && echo yes || echo no)"
   shape "$(pdir b)" "backup after (c)"
@@ -571,9 +582,10 @@ g5_steps() {
   fi
   ts=$(utc)
   t_import=$(date +%s)
+  before=$(backup_git)
   master_import "$zip100"
   echo "   import answered after $(( $(date +%s) - t_import )) s"
-  poll_backup c2 120 'return 1' no
+  poll_backup c2 120 'return 1' no "$before"
   echo "RESULT (c2) backup .git disappeared after: $POLL_GIT_GONE s (none = survived 120 s); backup content converged after: $POLL_CONVERGED s"
   echo "   backup .git at 120 s: present=$([ -d "$(pdir b)/.git" ] && echo yes || echo no)"
   echo "   backup module log lines since the third import:"
