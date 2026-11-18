@@ -810,7 +810,10 @@ pub fn stage_gateway_project(emitted: &Path, to: &Path, url: &str) -> PathBuf {
         source.join(".git").is_dir(),
         "the emitted fixture holds no gateway project with a .git"
     );
-    let to = outside_repository(to).unwrap_or_else(|e| panic!("PRODSHAPE_STAGE_TO: {e}"));
+    // Checked, but used as given: the canonical form is a `\\?\` path on
+    // Windows, which git does not read.
+    outside_repository(to).unwrap_or_else(|e| panic!("PRODSHAPE_STAGE_TO: {e}"));
+    let to = to.to_path_buf();
     assert!(
         std::fs::symlink_metadata(&to).is_err(),
         "PRODSHAPE_STAGE_TO already exists: remove it or name a new path"

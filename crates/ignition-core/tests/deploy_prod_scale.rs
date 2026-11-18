@@ -2946,7 +2946,9 @@ fn prodshape_seed_places_the_configured_shape() {
             "--no-local",
             "-b",
             BRANCH,
-            emitted.join("capapp.git").to_str().expect("utf8"),
+            // The path as given: `emitted` is canonical, a `\\?\` path on
+            // Windows, which git reads as a host name.
+            out.path().join("capapp.git").to_str().expect("utf8"),
             clone.to_str().expect("utf8"),
         ],
     );
