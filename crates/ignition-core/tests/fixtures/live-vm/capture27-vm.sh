@@ -213,9 +213,12 @@ EOS
 
 R_lnx_g4() {
   cat <<'EOS'
-set -u
+set -u -o pipefail
 cd "$HOME/$SCRATCH_REL" || { echo "no scratch directory: run upload first" >&2; exit 2; }
 [ -d src.git ] || { echo "no src.git: run upload first" >&2; exit 2; }
+# a failed copy or manifest ends the measurement; the scratch trees go either way
+trap 'rm -rf g4-save g4-restore' EXIT
+fail() { echo "G4-FAIL lnx $*" >&2; exit 1; }
 now() { date +%s.%N; }
 elapsed() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", b - a }'; }
 median3() { printf '%s\n' "$@" | sort -n | sed -n 2p; }
@@ -224,23 +227,23 @@ manifest() {
   (
     cd "$1" || exit 1
     {
-      find objects -type f -printf 'O %p %s\n'
+      find objects -type f -printf 'O %p %s\n' || exit 1
       find . -type f ! -path './objects/*' -print0 | sort -z | xargs -0 -r sha256sum | sed 's/^/F /'
     } | LC_ALL=C sort | sha256sum | cut -d' ' -f1
   )
 }
 echo "== source: $(find src.git -type f | wc -l | tr -d ' ') files, $(du -sb src.git | cut -f1) bytes"
-m0=$(now); src_digest=$(manifest src.git 2>/dev/null); m1=$(now)
+m0=$(now); src_digest=$(manifest src.git 2>/dev/null) || fail "the manifest of src.git failed"; m1=$(now)
 echo "G4-MANIFEST-SOURCE seconds=$(elapsed "$m0" "$m1")"
 s1=""; s2=""; s3=""; r1=""; r2=""; r3=""
 for i in 1 2 3; do
   rm -rf g4-save g4-restore
-  mkdir g4-save g4-restore
-  t0=$(now); cp -a src.git g4-save/.git; t1=$(now)
+  mkdir g4-save g4-restore || fail "run $i: the scratch directories cannot be made"
+  t0=$(now); cp -a src.git g4-save/.git || fail "run $i: the save copy failed"; t1=$(now)
   save=$(elapsed "$t0" "$t1")
-  t2=$(now); cp -a g4-save/.git g4-restore/.git; t3=$(now)
+  t2=$(now); cp -a g4-save/.git g4-restore/.git || fail "run $i: the restore copy failed"; t3=$(now)
   restore=$(elapsed "$t2" "$t3")
-  t4=$(now); rest_digest=$(manifest g4-restore/.git 2>/dev/null); t5=$(now)
+  t4=$(now); rest_digest=$(manifest g4-restore/.git 2>/dev/null) || fail "run $i: the manifest of the restore failed"; t5=$(now)
   verify=$(elapsed "$t4" "$t5")
   rv=$(elapsed "$t2" "$t5")
   if [ "$rest_digest" = "$src_digest" ]; then eq=equal; else eq=differs; fi
