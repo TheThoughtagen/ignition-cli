@@ -5833,6 +5833,16 @@ host's permissions):
   getfacl -p "$P"
   ```
 
+  When the project already holds a `.git` (the module's clone, owned by the
+  gateway account), open it to the deploy account as well. The default
+  entries above reach only what is created later, not the repository that is
+  there, and without this the `git_write_access` probe inside `.git` fails:
+
+  ```text
+  setfacl -R -m u:<deploy-account>:rwX "$P/.git"
+  find "$P/.git" -type d -exec setfacl -d -m u:<deploy-account>:rwX {} +
+  ```
+
   `<gateway-account>` is the account the gateway service runs as. The default
   entries (`-d`) cover what `tar` or `git` create below the directory, but they
   are **not** what gives the gateway write access on the restored `.git`: a

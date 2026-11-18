@@ -3969,6 +3969,30 @@ fn readme_hand_restore_names_the_ledger_root_per_node() {
     assert!(!text.contains("below the node's data directory."), "{text}");
 }
 
+/// CodeRabbit #57: the Linux grant also opens the project's existing `.git`
+/// to the deploy account: the default ACL entries reach only what is created
+/// later, so without it the `git_write_access` probe inside `.git` fails.
+#[test]
+fn readme_linux_grant_covers_an_existing_git() {
+    let readme = repo_file("README.md");
+    let start = readme
+        .find("**Write access and the grant.**")
+        .expect("the grant paragraph");
+    let end = start
+        + readme[start..]
+            .find("- *Windows*")
+            .expect("the Windows grant");
+    let linux = &readme[start..end];
+    assert!(
+        linux.contains("setfacl -R -m u:<deploy-account>:rwX \"$P/.git\""),
+        "{linux}"
+    );
+    assert!(
+        linux.contains("-type d -exec setfacl -d -m u:<deploy-account>:rwX"),
+        "{linux}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 27-20 (D-23, checker W16): the composite actions and the git token.
 // ---------------------------------------------------------------------------
