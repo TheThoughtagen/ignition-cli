@@ -203,6 +203,9 @@ struct DesignersScript {
     /// On this Designer read (0-based) the project gains a member, as a
     /// Designer that saved while it was attached.
     edit_on_read: Option<(usize, String)>,
+    /// On this Designer read (0-based) the hook runs once (a Designer that
+    /// acts while it is attached, for example a commit in the gateway repo).
+    hook_on_read: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
 }
 
 /// Edits a project after the first import: the next `remaining` exports of it
@@ -1035,6 +1038,12 @@ impl FakeProjects {
         self
     }
 
+    /// On Designer read `read` (0-based) run `hook` once.
+    #[allow(dead_code)]
+    pub fn on_designers_read(&self, read: usize, hook: impl Fn() + Send + Sync + 'static) {
+        self.designers.lock().expect("designers").hook_on_read = Some((read, Box::new(hook)));
+    }
+
     /// Every Designer list read fails with `network_error`.
     pub fn with_designers_error(self) -> Self {
         self.designers.lock().expect("designers").fail = true;
@@ -1368,7 +1377,15 @@ impl ProjectGateway for FakeProjects {
                 )]);
             }
         }
-        let script = self.designers.lock().expect("designers");
+        let mut script = self.designers.lock().expect("designers");
+        if script
+            .hook_on_read
+            .as_ref()
+            .is_some_and(|(at, _)| *at == read)
+            && let Some((_, hook)) = script.hook_on_read.take()
+        {
+            hook();
+        }
         if let Some((at, name)) = script.edit_on_read.as_ref()
             && *at == read
             && let Some(stored) = self.projects.lock().expect("projects").get_mut(name)

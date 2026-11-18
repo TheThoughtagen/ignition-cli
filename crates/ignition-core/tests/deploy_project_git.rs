@@ -3650,6 +3650,44 @@ mod published {
         assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), head);
     }
 
+    /// CodeRabbit #57 round 2: under `--designers wait` a Designer that
+    /// commits in the gateway repo while attached, after the saves, and then
+    /// closes, would have that commit removed by the import (the save
+    /// predates it). The repository is read again after the wait: a change
+    /// since the plan refuses `plan_stale` before the import, the commit
+    /// stays and the save goes.
+    #[tokio::test]
+    async fn designer_commit_during_the_wait_refuses_a_stale_plan() {
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let rig = Rig::with(|g| g.with_designers_script(vec![vec![], vec![session], vec![]]));
+        let project = rig.f.project_dir();
+        rig.gateway.on_designers_read(1, move || {
+            common::git_fixture::git(
+                &project,
+                &[
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "designer while attached",
+                ],
+            );
+        });
+        let outcome = rig.apply_designers(wait_ms(5_000)).await;
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "no import: {outcome:?}"
+        );
+        let err = outcome.expect_err("a stale plan");
+        assert_eq!(err.code(), "plan_stale", "{err}");
+        assert_eq!(
+            rig.f.git_in_project(&["log", "-1", "--format=%s"]),
+            "designer while attached",
+            "the Designer's commit is still there"
+        );
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+    }
+
     #[tokio::test]
     async fn designer_attached_at_restore() {
         // the session opens after the import's read-back (the third export):

@@ -1428,6 +1428,21 @@ pub async fn git_before_import(
     project: &str,
     run_id: &str,
 ) -> Result<GitSaveReport, CoreError> {
+    git_unchanged_since_plan(prepared, read, git, project).await?;
+    save(read, write, prepared.root, gateway, project, run_id).await
+}
+
+/// The repo read again and compared with the prepare's: any change of HEAD,
+/// refs or config is `plan_stale` naming the project. Run right before the
+/// save, and again after a Designer wait that came after the save
+/// (CodeRabbit #57: a commit made while the Designer was attached would be
+/// removed by the import, and the save predates it).
+pub async fn git_unchanged_since_plan(
+    prepared: &PreparedGit,
+    read: &dyn GitHostRead,
+    git: &HostGit,
+    project: &str,
+) -> Result<(), CoreError> {
     let now = read_state(read, git, project).await?;
     // An adoption replaces the whole config: it is built from the bytes the
     // prepare read, so any other config is a change since the plan.
@@ -1448,7 +1463,7 @@ pub async fn git_before_import(
             ),
         });
     }
-    save(read, write, prepared.root, gateway, project, run_id).await
+    Ok(())
 }
 
 /// Slack the free-space need adds on top of the copies and the pack: room for

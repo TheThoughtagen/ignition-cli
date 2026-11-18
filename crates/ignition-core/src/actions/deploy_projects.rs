@@ -5032,14 +5032,29 @@ async fn execute(
     // saves go when the `.git` is the one saved); before any write it is the
     // run's error, and the saves go.
     if (tag_owning || git_saved.is_some() || backup_saved.is_some()) && !designers.skipped {
-        match designers_check(plan, gateway, &opts.designers, observer).await {
+        let checked = match designers_check(plan, gateway, &opts.designers, observer).await {
             Ok(found) => {
                 if found.proceeded {
                     events.emit_late(ProjectsEvent::DesignersProceed {
                         sessions: found.seen.clone(),
                     });
                 }
+                // A Designer attached during the check (a wait, or a
+                // proceed) may have committed: each saved repo must still be
+                // the one the plan gated and the run saved (CodeRabbit #57).
+                saved_repos_unchanged(
+                    &writers,
+                    surfaces,
+                    git_saved.is_some(),
+                    backup_saved.is_some(),
+                    project,
+                )
+                .await
             }
+            Err(err) => Err(err),
+        };
+        match checked {
+            Ok(()) => {}
             Err(err) if tags_wrote => {
                 let failure = TagFailure {
                     cause: RollbackCause::ProjectImportFailed,
@@ -6297,6 +6312,33 @@ async fn unwritten(
         events.emit_late(ProjectsEvent::JournalCleared);
     }
     err
+}
+
+/// The master's and the backup's `.git`, when the run saved them, read again
+/// and compared with the plan's (`plan_stale` on a change; the backup's
+/// error names the backup).
+async fn saved_repos_unchanged(
+    writers: &Writers<'_>,
+    surfaces: &ProjectsSurfaces<'_>,
+    master_saved: bool,
+    backup_saved: bool,
+    project: &str,
+) -> Result<(), CoreError> {
+    if master_saved
+        && let Some(git_run) = writers.git
+        && let Some(read) = surfaces.host.git()
+    {
+        git::git_unchanged_since_plan(git_run.prepared, read, &git_run.host_git, project).await?;
+    }
+    if backup_saved
+        && let Some(backup_run) = writers.backup_git
+        && let Some(read) = backup_run.host.git()
+    {
+        git::git_unchanged_since_plan(backup_run.prepared, read, &backup_run.host_git, project)
+            .await
+            .map_err(on_backup)?;
+    }
+    Ok(())
 }
 
 /// `err`, after the `.git` saves a run took and then stopped before any
