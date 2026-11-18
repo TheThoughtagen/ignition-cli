@@ -4880,7 +4880,10 @@ async fn execute(
                 };
                 return roll_back(
                     failure,
-                    Some(ProjectUndo { pre: pre_zip }),
+                    // no import was sent: the project is not this run's to
+                    // put back (an import of its pre-image would overwrite a
+                    // Designer's save and remove `.git`, CodeRabbit #57)
+                    None,
                     result,
                     loaded,
                     input,
@@ -4955,7 +4958,10 @@ async fn execute(
                 };
                 return roll_back(
                     failure,
-                    Some(ProjectUndo { pre: pre_zip }),
+                    // no import was sent: the project is not this run's to
+                    // put back (an import of its pre-image would overwrite a
+                    // Designer's save and remove `.git`, CodeRabbit #57)
+                    None,
                     result,
                     loaded,
                     input,
@@ -5030,7 +5036,10 @@ async fn execute(
                 };
                 return roll_back(
                     failure,
-                    Some(ProjectUndo { pre: pre_zip }),
+                    // no import was sent: the project is not this run's to
+                    // put back (an import of its pre-image would overwrite a
+                    // Designer's save and remove `.git`, CodeRabbit #57)
+                    None,
                     result,
                     loaded,
                     input,

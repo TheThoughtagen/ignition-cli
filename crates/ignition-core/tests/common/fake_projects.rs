@@ -200,6 +200,9 @@ struct Calls {
 struct DesignersScript {
     lists: Vec<Vec<DesignerSeen>>,
     fail: bool,
+    /// On this Designer read (0-based) the project gains a member, as a
+    /// Designer that saved while it was attached.
+    edit_on_read: Option<(usize, String)>,
 }
 
 /// Edits a project after the first import: the next `remaining` exports of it
@@ -1023,6 +1026,15 @@ impl FakeProjects {
         self.with_designers_after_verify(polls)
     }
 
+    /// On Designer read `read` (0-based) the project `name` is edited: it
+    /// gains the member `designer-edit.txt`, as a Designer saving while the
+    /// run waited.
+    #[allow(dead_code)]
+    pub fn with_project_edited_on_designers_read(self, read: usize, name: &str) -> Self {
+        self.designers.lock().expect("designers").edit_on_read = Some((read, name.to_string()));
+        self
+    }
+
     /// Every Designer list read fails with `network_error`.
     pub fn with_designers_error(self) -> Self {
         self.designers.lock().expect("designers").fail = true;
@@ -1357,6 +1369,15 @@ impl ProjectGateway for FakeProjects {
             }
         }
         let script = self.designers.lock().expect("designers");
+        if let Some((at, name)) = script.edit_on_read.as_ref()
+            && *at == read
+            && let Some(stored) = self.projects.lock().expect("projects").get_mut(name)
+        {
+            stored.members.insert(
+                "designer-edit.txt".to_string(),
+                b"saved by a Designer".to_vec(),
+            );
+        }
         if script.fail {
             return Err(CoreError::Network {
                 url: format!("{FAKE_BASE}/data/api/v1/designers"),
