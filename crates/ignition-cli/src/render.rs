@@ -1738,11 +1738,20 @@ fn deploy_projects_human_lines(
             }
             // Any other reason (or none named) keeps the 27-36 verdict, also
             // beside the finding when both kinds are present.
-            if repository || !manifest {
+            if (repository || !manifest) && git_failed_node_kept_save(result) {
                 lines.push(format!(
                     "verdict: {}: the project was deployed, read back equal and recorded; its \
                      git repository was not handed over and nothing was rolled back; restore \
                      the .git by hand from the copy named in the outcome line",
+                    escape_control(slug)
+                ));
+            } else if repository || !manifest {
+                // CodeRabbit #57: no copy was kept (the save itself failed),
+                // and the `.git` was never written.
+                lines.push(format!(
+                    "verdict: {}: the project was deployed, read back equal and recorded; its \
+                     git repository was not handed over and nothing was changed in .git (no \
+                     copy was taken); resolve the reason named in the outcome line",
                     escape_control(slug)
                 ));
             }
@@ -1863,6 +1872,20 @@ fn git_names(list: &[String], count: usize, short: bool) -> String {
         text.push_str(&format!(" (and {} more)", count - shown.len()));
     }
     text
+}
+
+/// Whether the node the `outcome:` line of a `git_restore_failed` run names
+/// (see [`git_restore_failed_line`]) kept a saved copy of its `.git`.
+fn git_failed_node_kept_save(
+    result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
+) -> bool {
+    result.git.as_deref().is_some_and(|g| {
+        g.nodes
+            .iter()
+            .find(|n| n.restore.as_ref().is_some_and(|r| r.reason.is_some()))
+            .or_else(|| g.nodes.first())
+            .is_some_and(|n| n.save.is_some() && n.restore.as_ref().is_some_and(|r| r.save_kept))
+    })
 }
 
 /// The `outcome:` line of a `git_restore_failed` run (D-09): the deploy is
@@ -5677,6 +5700,38 @@ mod tests {
         // Another reason keeps the 27-36 verdict.
         let other = deploy_projects_human_lines(&failed_pair_result("backup_unsynced")).join("\n");
         assert!(other.contains("restore the .git by hand"), "{other}");
+    }
+
+    /// CodeRabbit #57: a `.git` that could not be saved was never touched and
+    /// no copy exists, so the verdict never sends the operator to one.
+    #[test]
+    fn git_verdict_without_a_kept_save_names_no_copy() {
+        let mut result = failed_pair_result("restore_failed");
+        let git = result.git.as_mut().expect("git");
+        git.nodes.truncate(1);
+        let mut failed = restore_info();
+        failed.restored = false;
+        failed.advanced = false;
+        failed.verified = false;
+        failed.post_status = None;
+        failed.reason = Some("restore_failed".into());
+        failed.save_kept = false;
+        git.nodes[0].save = None;
+        git.nodes[0].restore = Some(failed);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        let verdict = text
+            .lines()
+            .find(|l| l.starts_with("verdict:"))
+            .expect("a verdict line");
+        assert!(
+            !verdict.contains("restore the .git") && !verdict.contains("copy named"),
+            "no copy to restore from: {verdict}"
+        );
+        assert!(verdict.contains("nothing was changed in .git"), "{verdict}");
+        assert!(
+            verdict.contains("reason named in the outcome line"),
+            "{verdict}"
+        );
     }
 
     #[test]
