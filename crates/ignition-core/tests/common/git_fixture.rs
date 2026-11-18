@@ -63,6 +63,21 @@ pub const UNPUSHED: &str = "ignition/script-python/cap/util/unpushed.py";
 /// envelope field, event line, run-directory file or error text.
 pub const GIT_YAML_SECRET: &str = "gy-dummy-credential-7f3a91c2";
 
+/// Copy the directory tree `from` to `to` with `std::fs` (no external `cp`:
+/// a Windows host may lack one). Symlinks are not expected in the fixture.
+pub fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
 /// Whether `path` is one an artifact carries (the project root allowlist).
 pub fn in_scope(path: &str) -> bool {
     path == "project.json"
@@ -399,13 +414,7 @@ impl GitFixture {
             .join("data-b");
         if !dir.exists() {
             std::fs::create_dir_all(dir.join("projects")).expect("mkdir");
-            let status = Command::new("cp")
-                .arg("-R")
-                .arg(self.project_dir())
-                .arg(dir.join("projects").join(PROJECT))
-                .status()
-                .expect("cp runs");
-            assert!(status.success(), "the backup clone is copied");
+            copy_tree(&self.project_dir(), &dir.join("projects").join(PROJECT));
         }
         dir
     }

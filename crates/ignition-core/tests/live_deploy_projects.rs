@@ -115,7 +115,7 @@ fn local_url_guard_refuses_non_loopback() {
         "https://gwnode01.example.local:8043",
         "http://localhost.evil.example:18290",
         "http://127.0.0.2:18290",
-        "http://52.154.75.231:8088",
+        "http://192.0.2.15:8088",
         "not a url",
     ] {
         assert!(local_url_guard(raw).is_err(), "must refuse {raw}");
@@ -642,6 +642,8 @@ impl Repo {
             release: release.to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             allow_manual_undo: false,
             artifact_sha256: None,
@@ -737,6 +739,7 @@ async fn deploy(
             tag_delete_poll: Duration::from_secs(
                 ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
             ),
+            git_writer: None,
         },
         &NoProjectsObserver,
     )

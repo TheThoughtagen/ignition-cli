@@ -35,8 +35,10 @@
 //!    refuses or settings it stores otherwise is created `STANDARD` and
 //!    reported `settings: not_rehearsed`, and the run's settings step then
 //!    leaves it alone), and `<ENV>`'s export imported at the root with
-//!    `Overwrite` (retried while the new provider still answers "provider not
-//!    found", for up to 30 s). A provider `<ENV>` lacks is deleted and left for the run
+//!    `Overwrite`, 20 s after the create ([`SEED_SETTLE`]; an 8.3.6 gateway can
+//!    fail, or silently drop parts of, an import sent into a provider created
+//!    moments earlier), and retried while the new provider still answers
+//!    "provider not found", for up to 120 s. A provider `<ENV>` lacks is deleted and left for the run
 //!    to create. The export read back must equal `<ENV>`'s, export against
 //!    export, and hash as the plan's `live_sha256`; a difference ends the
 //!    rehearsal red at `seed`, naming the nodes;
@@ -82,6 +84,18 @@ pub const REHEARSAL_RED_SLUG: &str = "deploy_rehearsal_red";
 /// The directory below `.ign/deploy/<gateway>/` that holds the rehearsal
 /// records of that gateway's environment.
 pub const REHEARSALS_DIR: &str = "rehearsals";
+
+/// How long the seed waits between a provider's create and the first import
+/// into it. On a local 8.3.6 rig, an import sent moments after a provider's
+/// create was answered 422 "provider not found" ([`import_when_ready`]
+/// retries that), or 200 with a gateway `NullPointerException` on one node
+/// (`qualitySubCode` 776, about 1 import in 5), or 200 with no failure while
+/// it silently dropped UDT instance overrides (OPC item paths, data types,
+/// custom properties, explicit history sample rates) and stored a nested
+/// type member as an atomic tag. The same import sent 20 s after the create
+/// was clean and kept every override. Rehearsal seed only: the deploy run
+/// path keeps its 1.8.1 behaviour.
+const SEED_SETTLE: Duration = Duration::from_secs(20);
 
 /// `.ign/deploy/<gateway>/rehearsals/<id>.json` below the repo.
 pub fn rehearsal_record_rel(gateway: &str, id: &str) -> String {
@@ -136,9 +150,17 @@ pub struct RehearseOptions {
 pub struct RehearsalPrepared {
     /// The confirmation prose: what is deleted and re-created where.
     pub prose: String,
+    /// How long the seed waits between a provider's create and the first
+    /// import into it. [`deploy_projects_rehearse_prepare`] sets
+    /// [`SEED_SETTLE`]; a test may shorten it; the CLI passes it through
+    /// unchanged.
+    pub seed_settle: Duration,
     plan: DeployProjectsResult,
     tag_records: BTreeMap<String, TagRecord>,
     removals: bool,
+    /// What the git gates found on the production gateway's repo, as warnings
+    /// (report mode: the apply would refuse, 27-20).
+    git_warnings: Vec<String>,
 }
 
 /// One owned provider of the seed.
@@ -258,6 +280,11 @@ pub struct DeployRehearsalResult {
     pub release: String,
     /// The rehearsal.
     pub rehearsal: RehearsalReport,
+    /// What the git gates found on the production gateway's repo, read-only
+    /// (27-20, GITDEP-10): `data.git` as `--check` reports it, with the word
+    /// the apply would refuse with in `nodes[0].reason`; null when
+    /// production holds no `.git`.
+    pub git: Option<Box<git::GitReport>>,
     /// Warnings in order.
     pub warnings: Vec<String>,
     /// False for a red rehearsal.
@@ -547,17 +574,24 @@ pub async fn deploy_projects_rehearse_prepare(
         &rehearsal.url,
     )?;
     check_reported_names(rehearsal, surfaces.gateway).await?;
-    let (plan, tag_records) = match deploy_projects_prepare(loaded, input, surfaces).await? {
-        ProjectsPrepared::Ready {
-            plan, tag_records, ..
-        } => (plan, tag_records),
-        ProjectsPrepared::Unchanged(_) => {
-            return Err(CoreError::InvalidInput {
-                reason: "--rehearse: the plan changes nothing, so there is nothing to rehearse"
-                    .to_string(),
-            });
-        }
-    };
+    // The production gateway may hold a module-managed `.git`: the git gates
+    // report here and never refuse (GITDEP-10). A transport failure still
+    // refuses, and the rehearsal never builds a git writer.
+    let (plan, tag_records, git_warnings) =
+        match deploy_projects_prepare_with(loaded, input, surfaces, git::GitMode::Report).await? {
+            ProjectsPrepared::Ready {
+                plan,
+                tag_records,
+                git_warnings,
+                ..
+            } => (plan, tag_records, git_warnings),
+            ProjectsPrepared::Unchanged(_) => {
+                return Err(CoreError::InvalidInput {
+                    reason: "--rehearse: the plan changes nothing, so there is nothing to rehearse"
+                        .to_string(),
+                });
+            }
+        };
     let rloaded = rehearsal_loaded(loaded, rehearsal);
     let removals = removal_gate(&plan, &rloaded, input, &rehearsal.surfaces)?;
     let prose = format!(
@@ -576,9 +610,11 @@ pub async fn deploy_projects_rehearse_prepare(
     );
     Ok(RehearsalPrepared {
         prose,
+        seed_settle: SEED_SETTLE,
         plan,
         tag_records,
         removals,
+        git_warnings,
     })
 }
 
@@ -613,6 +649,7 @@ async fn seed_provider(
     record: &TagProviderRecord,
     export: &[u8],
     wait: ProviderWait,
+    settle: Duration,
 ) -> Result<Seeded, CoreError> {
     drop_provider(rig, name).await?;
     let mut reason = None;
@@ -655,13 +692,21 @@ async fn seed_provider(
         "tags": tree.get("tags").cloned().unwrap_or_else(|| Value::Array(Vec::new()))
     }))
     .map_err(|e| CoreError::Internal(format!("the seed of provider {name}: {e}")))?;
+    // Every path here has just created the provider: settle first (SEED_SETTLE).
+    tokio::time::sleep(settle).await;
     let answer = import_when_ready(rig, name, "", CollisionPolicy::Overwrite, body, wait).await?;
     if !answer.is_clean() {
-        return Err(CoreError::Internal(format!(
-            "the rehearsal gateway did not take the seed of provider {name} cleanly ({} \
-             failure(s))",
-            answer.failure_count.unwrap_or(1)
-        )));
+        let failures = answer.failure_count.unwrap_or(1);
+        return Err(CoreError::Internal(match &answer.first_diagnostic {
+            Some(diagnostic) => format!(
+                "the rehearsal gateway did not take the seed of provider {name} cleanly \
+                 ({failures} failure(s)); the first: {diagnostic}"
+            ),
+            None => format!(
+                "the rehearsal gateway did not take the seed of provider {name} cleanly \
+                 ({failures} failure(s))"
+            ),
+        }));
     }
     let substitute = match &reason {
         None => None,
@@ -729,6 +774,7 @@ fn seed_mismatches(
 /// The seed of every owned provider, the substitutions it made in `rloaded`
 /// and `rplan`, and the mismatches of a seed that does not hold `<ENV>`'s
 /// tags.
+#[allow(clippy::too_many_arguments)]
 async fn seed_all(
     loaded: &LoadedProject,
     env_gateway: &dyn ProjectGateway,
@@ -737,6 +783,7 @@ async fn seed_all(
     rplan: &mut DeployProjectsResult,
     tag_records: &BTreeMap<String, TagRecord>,
     groups_planned: bool,
+    settle: Duration,
 ) -> Result<SeedReport, CoreError> {
     let Some(tags) = rplan.tags.as_mut() else {
         return Err(CoreError::Internal(
@@ -806,7 +853,7 @@ async fn seed_all(
             });
             continue;
         };
-        let mut seeded = seed_provider(rig, &name, &record, &bytes, PROVIDER_WAIT).await?;
+        let mut seeded = seed_provider(rig, &name, &record, &bytes, PROVIDER_WAIT, settle).await?;
         seeded.report.nodes = env_live.get(&name).map_or(0, BTreeMap::len);
         if let Some((enabled, description, config)) = seeded.substitute {
             let i = loaded
@@ -922,11 +969,13 @@ pub async fn deploy_projects_rehearse(
         plan,
         tag_records,
         removals,
+        seed_settle,
+        git_warnings,
         ..
     } = prepared;
     let mut rloaded = rehearsal_loaded(loaded, rehearsal);
     let mut rplan = plan.clone();
-    let mut warnings = Vec::new();
+    let mut warnings = git_warnings;
     let Some(env_tags) = plan.tags.as_ref() else {
         return Err(CoreError::Internal(
             "a rehearsal plan without tags".to_string(),
@@ -960,6 +1009,7 @@ pub async fn deploy_projects_rehearse(
         backup_policy: BackupPolicy::default(),
         tag_delete_ready: opts.tag_delete_ready,
         tag_delete_poll: opts.tag_delete_poll,
+        git_writer: None,
     };
     let rsurfaces = &rehearsal.surfaces;
     // The run's route gate, against the rehearsal gateway's route.
@@ -993,6 +1043,7 @@ pub async fn deploy_projects_rehearse(
         observer,
         warnings,
         (started, started_at),
+        seed_settle,
     )
     .await;
     match outcome {
@@ -1035,6 +1086,7 @@ async fn rehearse_in(
     observer: &dyn ProjectsObserver,
     mut warnings: Vec<String>,
     (started, started_at): (Instant, String),
+    seed_settle: Duration,
 ) -> Result<DeployRehearsalResult, CoreError> {
     let rsurfaces = &rehearsal.surfaces;
     run_dir.write_json(
@@ -1077,6 +1129,7 @@ async fn rehearse_in(
         &mut rplan,
         tag_records,
         !env_tags.groups.is_empty(),
+        seed_settle,
     )
     .await?;
     run_dir.write_json("plan.json", &rplan)?;
@@ -1171,6 +1224,9 @@ async fn rehearse_in(
                 run: None,
                 records: None,
                 release: None,
+                // A rehearsal never touches a gateway `.git`.
+                git: None,
+                backup_git: None,
             },
             route,
             &mut events,
@@ -1207,7 +1263,15 @@ async fn rehearse_in(
                     .await?
                     .ok_or_else(|| CoreError::Internal(format!("{name} is gone")))?;
                 let bytes = surfaces.gateway.tag_export(&name).await?;
-                seed_provider(rsurfaces.gateway, &name, &record, &bytes, PROVIDER_WAIT).await
+                seed_provider(
+                    rsurfaces.gateway,
+                    &name,
+                    &record,
+                    &bytes,
+                    PROVIDER_WAIT,
+                    seed_settle,
+                )
+                .await
             };
             match reseed.await {
                 Ok(_) => cleanup.push(name),
@@ -1290,6 +1354,7 @@ async fn rehearse_in(
             run_dir: rel.to_string(),
             elapsed_s: (started.elapsed().as_millis() as f64) / 1000.0,
         },
+        git: plan.git.clone(),
         warnings,
         ok,
         slug: (!ok).then(|| REHEARSAL_RED_SLUG.to_string()),
@@ -1658,6 +1723,10 @@ mod tests {
         attempts: usize,
         since_create: usize,
         log: Vec<String>,
+        /// When the last create ran.
+        created: Option<tokio::time::Instant>,
+        /// The time from that create to the first import after it.
+        settled: Option<Duration>,
     }
 
     /// A rehearsal gateway that keeps providers in memory and answers each
@@ -1684,6 +1753,15 @@ mod tests {
 
         fn log(&self) -> Vec<String> {
             self.state.lock().expect("state").log.clone()
+        }
+
+        /// The time from the last create to the first import after it.
+        fn settled(&self) -> Duration {
+            self.state
+                .lock()
+                .expect("state")
+                .settled
+                .expect("an import followed a create")
         }
     }
 
@@ -1739,6 +1817,9 @@ mod tests {
                 state.attempts += 1;
                 state.since_create += 1;
                 state.log.push(format!("import:{provider}"));
+                if state.settled.is_none() {
+                    state.settled = state.created.map(|at| at.elapsed());
+                }
                 self.not_ready.is_none_or(|n| state.since_create <= n)
             };
             if refuse {
@@ -1760,6 +1841,8 @@ mod tests {
             for sent in body {
                 state.log.push(format!("create:{}", sent.name));
                 state.since_create = 0;
+                state.created = Some(tokio::time::Instant::now());
+                state.settled = None;
                 let mut value = serde_json::json!({
                     "name": sent.name,
                     "enabled": sent.enabled,
@@ -1831,6 +1914,7 @@ mod tests {
             &env_record(standard_config()),
             EMPTY_EXPORT,
             quick(),
+            Duration::ZERO,
         )
         .await
         .expect("a green seed");
@@ -1849,7 +1933,7 @@ mod tests {
     async fn the_seed_waits_for_a_provider_created_standard() {
         let rig = SeedRig::new(Some(2), clean());
         let record = env_record(serde_json::json!({"profile": {"type": "DATASOURCE"}}));
-        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick())
+        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick(), Duration::ZERO)
             .await
             .expect("a green seed");
         assert_eq!(seeded.report.settings, "not_rehearsed");
@@ -1877,6 +1961,7 @@ mod tests {
             &env_record(standard_config()),
             EMPTY_EXPORT,
             wait,
+            Duration::ZERO,
         )
         .await
         .err()
@@ -1936,6 +2021,7 @@ mod tests {
                 &env_record(standard_config()),
                 EMPTY_EXPORT,
                 quick(),
+                Duration::ZERO,
             )
             .await
             .err()
@@ -1944,11 +2030,86 @@ mod tests {
             match expected {
                 Some(code) => assert_eq!(err.code(), code, "{what}"),
                 None => assert!(
-                    err.to_string().contains("did not take the seed"),
+                    err.to_string().ends_with("cleanly (1 failure(s))"),
                     "{what}: {err}"
                 ),
             }
         }
+    }
+
+    /// An unclean seed answer names the gateway's first diagnostic.
+    #[tokio::test]
+    async fn an_unclean_seed_names_the_first_diagnostic() {
+        let npe = "Cannot invoke \"TagPath.getPathLength()\" because \"cleanPath\" is null";
+        let rig = SeedRig::new(
+            Some(0),
+            Box::new(move || {
+                Ok(TagImportAnswer {
+                    failure_count: Some(1),
+                    bad_quality: vec!["Bad (776)".to_string()],
+                    first_diagnostic: Some(npe.to_string()),
+                    ..TagImportAnswer::default()
+                })
+            }),
+        );
+        let err = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            quick(),
+            Duration::ZERO,
+        )
+        .await
+        .err()
+        .expect("a failed seed");
+        assert_eq!(err.code(), "internal");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not take the seed of provider Edge cleanly (1 failure(s))"),
+            "{message}"
+        );
+        assert!(message.contains("\"cleanPath\" is null"), "{message}");
+    }
+
+    /// The with-settings create is followed by the settle before the import.
+    #[tokio::test]
+    async fn the_seed_settles_after_a_create_with_its_settings() {
+        let rig = SeedRig::new(Some(0), clean());
+        let settle = Duration::from_millis(150);
+        let seeded = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            quick(),
+            settle,
+        )
+        .await
+        .expect("a green seed");
+        assert_eq!(seeded.report.settings, "rehearsed");
+        assert_eq!(rig.attempts(), 1);
+        assert!(rig.settled() >= settle, "{:?}", rig.settled());
+    }
+
+    /// The STANDARD fallback create is followed by the settle as well.
+    #[tokio::test]
+    async fn the_seed_settles_after_the_standard_create() {
+        let rig = SeedRig::new(Some(0), clean());
+        let settle = Duration::from_millis(150);
+        let record = env_record(serde_json::json!({"profile": {"type": "DATASOURCE"}}));
+        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick(), settle)
+            .await
+            .expect("a green seed");
+        assert_eq!(seeded.report.settings, "not_rehearsed");
+        assert_eq!(rig.attempts(), 1);
+        assert!(rig.settled() >= settle, "{:?}", rig.settled());
+    }
+
+    /// A birth pin: a real rehearsal settles 20 s.
+    #[test]
+    fn seed_settle_is_pinned_at_20s() {
+        assert_eq!(SEED_SETTLE, Duration::from_secs(20));
     }
 
     #[test]

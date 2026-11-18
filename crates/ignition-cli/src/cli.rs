@@ -956,6 +956,8 @@ pub enum DeployCommand {
                 "tags_sha256",
                 "allow_downgrade",
                 "allow_first_change",
+                "discard_gateway_changes",
+                "allow_git_sync_hazards",
                 "allow_destructive",
                 "allow_manual_undo",
                 "rehearse",
@@ -1018,6 +1020,28 @@ pub enum DeployCommand {
         /// release must equal the live project
         #[arg(long, value_name = "REASON")]
         allow_first_change: Option<String>,
+        /// Let the deploy overwrite gateway repo work that is uncommitted,
+        /// unpushed or not merged into the release, with a reason of 1 to 500
+        /// characters. The run saves the live project first, keeps the
+        /// abandoned commits reachable under `refs/ign-discarded/<run-id>`
+        /// and keeps the saved repository; `--check` lists what it would
+        /// discard as `data.git.would_discard`. It passes only those three
+        /// refusals; every other refusal and a failed git preflight still
+        /// stop the run. Without it each of the three is refused
+        /// (`destructive_change_refused`, exit 2)
+        #[arg(long, value_name = "REASON")]
+        discard_gateway_changes: Option<String>,
+        /// Acknowledge, with a reason of 1 to 500 characters, that the
+        /// gateway's git module will run the start-sync imports `git.yaml`
+        /// sets for the project at its next start: a tag import while
+        /// `tags/` is present on the node, or a branch enforcement (stash,
+        /// switch, pull). `--check` lists the flags `git.yaml` sets as
+        /// `data.git.nodes[].hazards`. Without it a hazard that damaged the
+        /// gateway in testing is refused (`destructive_change_refused` gate
+        /// `git_sync_hazard`, exit 2); setting the flag false for the project
+        /// in `git.yaml` removes it
+        #[arg(long, value_name = "REASON")]
+        allow_git_sync_hazards: Option<String>,
         /// Let the deploy delete the tags the previous deploy of this
         /// project placed and the repo no longer holds; `--check` lists them
         /// (`data.tags.removed`). The gateway needs the tag-delete route
@@ -1053,7 +1077,12 @@ pub enum DeployCommand {
         /// and the wait repeats once. Only used for a project that lists
         /// tag_providers on a target with nodes.backup, whose session is
         /// only read. A backup that does not converge ends a green run
-        /// `applied_backup_unsynced` (exit 6) with the master left applied
+        /// `applied_backup_unsynced` (exit 6) with the master left applied.
+        /// It also bounds the wait for the backup's own copy of a project
+        /// whose gateway git repository the git module manages: the backup's
+        /// project export must equal the release before its repository is
+        /// restored and advanced; a backup that does not converge ends the
+        /// run `git_restore_failed` (reason `backup_unsynced`, exit 6)
         #[arg(
             long,
             value_name = "SECS",

@@ -344,6 +344,8 @@ async fn rehearsal_on_the_rig() {
         release: "v1.0.0".to_string(),
         allow_downgrade: false,
         allow_first_change: None,
+        discard_gateway_changes: None,
+        allow_git_sync_hazards: None,
         allow_destructive: false,
         allow_manual_undo: true,
         artifact_sha256: None,

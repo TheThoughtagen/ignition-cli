@@ -3786,6 +3786,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 tags_sha256,
                 allow_downgrade,
                 allow_first_change,
+                discard_gateway_changes,
+                allow_git_sync_hazards,
                 allow_destructive,
                 allow_manual_undo,
                 designers,
@@ -3835,6 +3837,8 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     release: release.unwrap_or_default(),
                     allow_downgrade,
                     allow_first_change,
+                    discard_gateway_changes,
+                    allow_git_sync_hazards,
                     allow_destructive,
                     allow_manual_undo,
                     artifact_sha256,
@@ -4106,12 +4110,24 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                 // host-journal refusal (26-12), which an unchanged plan does
                 // not skip.
                 // The backup of a pair (26-13): a tag-owning run that writes
-                // waits for it after a green run and after a rollback. Its own
-                // REST session is wrapped in the read-only handle, as
+                // waits for it after a green run and after a rollback, and so
+                // does a run whose backup holds a git-managed project (27-22).
+                // Its own REST session is wrapped in the read-only handle, as
                 // `deploy apply` does; no file transport is built for it, and
                 // `--check` never resolves it.
+                // Phase 27 (27-22): a pair whose backup holds a gateway `.git`
+                // needs the same handle for any apply, tag-owning or not: the
+                // wait for the backup's own copy of the project is a GET on its
+                // export.
+                let backup_holds_git = matches!(
+                    &prepared,
+                    Some(actions::deploy_projects::ProjectsPrepared::Ready {
+                        backup_git: Some(_),
+                        ..
+                    })
+                );
                 let backup_session = match &loaded.target.nodes.backup {
-                    Some(node) if owns_tags && !check => {
+                    Some(node) if (owns_tags || backup_holds_git) && !check => {
                         match named_profile_client(&mut config, &node.profile) {
                             Ok(session) => Some(session),
                             Err(err) => return (Some(profile), Err(err)),
@@ -4180,6 +4196,7 @@ async fn dispatch(cli: Cli, mode: RenderMode) -> (Option<String>, Result<ActionO
                     tag_delete_poll: std::time::Duration::from_secs(
                         ignition_core::deploy::tag_delete::TAG_DELETE_READY_POLL_S,
                     ),
+                    git_writer: None,
                 };
                 let result = match (prepared, &rollback_run) {
                     (Some(prepared), _) => {

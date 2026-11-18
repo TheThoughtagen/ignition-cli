@@ -89,7 +89,10 @@
 //! not clean may have applied part of it), `with_write_after_import` sets one
 //! key of one node right after a given import (a runtime write between the
 //! failure and the rollback, or another administrator's change),
-//! `with_project_import_denied` refuses every project import, and
+//! `with_project_import_lost` fails every project import with a transport error
+//! before anything is applied, `with_project_import_answer_lost` applies it and
+//! then fails the answer (27-34), `with_project_import_denied` refuses every
+//! project import, and
 //! `tag_provider_delete` removes a provider and its tree when the signature
 //! is the current one (the undo of a provider the run created). Three knobs
 //! stand in for other clients around a create: `with_provider_create_conflict`
@@ -109,6 +112,25 @@
 //! `with_created_default_value` stores a different `defaultValue`, and
 //! `with_created_value` stores a different `value` (a runtime write between
 //! the import and the verify).
+//!
+//! Disk mirror (27-12). `with_disk_mirror(data_dir, registered)` makes an
+//! import also write the project directory the git module watches,
+//! `<data_dir>/projects/<project>/`, the way the captures show a gateway
+//! does: R-3 (a project registered with the git module is replaced whole,
+//! its `.git` included, so every name below the directory is removed
+//! first), R-6 (a project that is not registered keeps its `.git` and
+//! the files outside the artifact's roots), and G2 (the bytes on disk equal
+//! the bytes of the next export, so the mirror writes what an export
+//! carries). `with_disk_mirror_gateway_form(paths)` keeps those
+//! `resource.json` members pretty-printed in the store, so the disk and
+//! every later export carry the gateway's own serialisation (R-1).
+//! `with_disk_mirror_readonly_after_import()` makes the project directory
+//! read-only once written, so a restore of `.git` fails;
+//! `with_disk_mirror_extra_on_disk(path)` writes one file to disk that no
+//! export ever shows. `with_disk_mirror_project_json(fate)` models the
+//! redundancy project sync on a backup (27-37): the import's `project.json`
+//! is deleted from disk or replaced by a directory, while the export still
+//! carries it.
 //!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
@@ -178,6 +200,12 @@ struct Calls {
 struct DesignersScript {
     lists: Vec<Vec<DesignerSeen>>,
     fail: bool,
+    /// On this Designer read (0-based) the project gains a member, as a
+    /// Designer that saved while it was attached.
+    edit_on_read: Option<(usize, String)>,
+    /// On this Designer read (0-based) the hook runs once (a Designer that
+    /// acts while it is attached, for example a commit in the gateway repo).
+    hook_on_read: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
 }
 
 /// Edits a project after the first import: the next `remaining` exports of it
@@ -194,6 +222,14 @@ pub struct FakeProjects {
     stamp: AtomicU64,
     empty_changes: AtomicBool,
     designers: Mutex<DesignersScript>,
+    /// How many Designer reads still report one attached session once the run
+    /// is past its verify (27-13, `with_designers_after_verify`).
+    designers_after_verify: Mutex<u64>,
+    /// How many project exports the gateway has served before
+    /// `designers_after_verify` applies (2 by default: the prepare's and the
+    /// run's own first; 3 for a tag-owning run, which reads the project back
+    /// once more before a rollback).
+    designers_after_exports: Mutex<usize>,
     /// What `gateway-info` answers as the gateway's name.
     gateway_name: Mutex<Option<String>>,
     /// What the redundancy status answers as the gateway's role.
@@ -231,6 +267,13 @@ pub struct FakeProjects {
     provider_signature_seq: AtomicU64,
     /// Every project import is refused (`import_denied`).
     deny_project_import: AtomicBool,
+    /// Every project import fails before it reaches the gateway's project
+    /// store, as a request whose answer never came back, and changes nothing
+    /// (27-34, WR-02).
+    lose_project_import: AtomicBool,
+    /// Every project import is applied and then answers a transport failure:
+    /// the request reached the gateway and the answer was lost (27-34, WR-02).
+    lose_project_import_answer: AtomicBool,
     /// How the next provider create goes when a test scripts it.
     provider_create_script: Mutex<Option<CreateScript>>,
     /// Providers another client re-signs right after the 1-based tag import.
@@ -245,6 +288,36 @@ pub struct FakeProjects {
     /// How many imports after a provider create answer 422 "provider not
     /// found", and how many are still due per provider.
     provider_starting: (AtomicU64, Mutex<BTreeMap<String, u64>>),
+    /// The project directory an import also writes (27-12).
+    mirror: Mutex<Option<DiskMirror>>,
+}
+
+/// The disk side of an import (27-12, module doc).
+struct DiskMirror {
+    data_dir: std::path::PathBuf,
+    registered: bool,
+    gateway_form: Vec<String>,
+    readonly_after: bool,
+    extra_on_disk: Vec<String>,
+    /// A Designer opened while `.git` was absent (D-07, R-9): the module's
+    /// `setupLocalRepo` leaves its partial repository right after the import.
+    recreates_git: bool,
+    /// What the redundancy project sync does to the backup's `project.json`
+    /// after the import wrote it (27-37, debug backup-project-json-absent).
+    project_json: Option<ProjectJsonFate>,
+}
+
+/// What happens to `<project>/project.json` on a mirrored node right after
+/// an import wrote it: the redundancy project sync's delete of the backup's
+/// manifest file (debug B8), or the full pull that leaves a directory at that
+/// path (debug B4). Never a repair: the fake only models the defect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ProjectJsonFate {
+    /// The file is deleted.
+    Absent,
+    /// The path becomes an empty directory.
+    Directory,
 }
 
 /// Take one of the `due` failures, if any is left. A compare-exchange loop
@@ -340,6 +413,8 @@ impl FakeProjects {
             stamp: AtomicU64::new(0),
             empty_changes: AtomicBool::new(false),
             designers: Mutex::new(DesignersScript::default()),
+            designers_after_verify: Mutex::new(0),
+            designers_after_exports: Mutex::new(2),
             gateway_name: Mutex::new(Some(FAKE_GATEWAY_NAME.to_string())),
             redundancy_role: Mutex::new(Some("Independent".to_string())),
             churn: Mutex::new(BTreeMap::new()),
@@ -357,11 +432,184 @@ impl FakeProjects {
             provider_writes_ignored: AtomicBool::new(false),
             provider_signature_seq: AtomicU64::new(0),
             deny_project_import: AtomicBool::new(false),
+            lose_project_import: AtomicBool::new(false),
+            lose_project_import_answer: AtomicBool::new(false),
             provider_create_script: Mutex::new(None),
             resign_after: Mutex::new(Vec::new()),
             reads_failing_after_create: (AtomicU64::new(0), AtomicU64::new(0)),
             exports_failing_after_import: (AtomicU64::new(0), AtomicU64::new(0)),
             provider_starting: (AtomicU64::new(0), Mutex::new(BTreeMap::new())),
+            mirror: Mutex::new(None),
+        }
+    }
+
+    /// An import also writes `<data_dir>/projects/<project>/` (module doc).
+    /// `registered`: the git module manages the project (R-3), so the
+    /// directory is emptied first, `.git` included; else (R-6) `.git` and
+    /// the files outside the artifact's roots stay.
+    #[allow(dead_code)]
+    pub fn with_disk_mirror(self, data_dir: &std::path::Path, registered: bool) -> Self {
+        *self.mirror.lock().expect("mirror") = Some(DiskMirror {
+            data_dir: data_dir.to_path_buf(),
+            registered,
+            gateway_form: Vec::new(),
+            readonly_after: false,
+            extra_on_disk: Vec::new(),
+            recreates_git: false,
+            project_json: None,
+        });
+        self
+    }
+
+    /// An import also removes `project.json` from the mirrored project
+    /// directory, or turns it into a directory: what redundancy project sync
+    /// does to the backup after the git module registered pseudo-resources on
+    /// the master (27-37). Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_project_json(self, fate: ProjectJsonFate) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .project_json = Some(fate);
+        self
+    }
+
+    /// These `resource.json` members are stored, written and exported
+    /// pretty-printed (R-1). Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_gateway_form(self, paths: &[&str]) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .gateway_form = paths.iter().map(|p| (*p).to_string()).collect();
+        self
+    }
+
+    /// The project directory is read-only once an import wrote it.
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_readonly_after_import(self) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .readonly_after = true;
+        self
+    }
+
+    /// An import also leaves this file on disk, which no export shows.
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_extra_on_disk(self, path: &str) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .extra_on_disk
+            .push(path.to_string());
+        self
+    }
+
+    /// A Designer opens while the import has removed `.git` (D-07, R-9, Pitfall
+    /// 1): right after the import the project directory holds a fresh partial
+    /// repository, the shape the module's `setupLocalRepo` leaves (an unborn
+    /// `master` HEAD, one remote `origin`, no branch, no index; see
+    /// `GitFixture::partial_setup_local_repo`). Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_recreates_git(self) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .recreates_git = true;
+        self
+    }
+
+    /// Write the stored project below the mirror's data directory.
+    fn mirror_write(&self, name: &str, stored: &StoredProject) {
+        let guard = self.mirror.lock().expect("mirror");
+        let Some(mirror) = guard.as_ref() else {
+            return;
+        };
+        let dir = mirror.data_dir.join("projects").join(name);
+        let artifact_root = |entry: &str| {
+            entry == "project.json"
+                || entry == "ignition"
+                || entry.starts_with("com.inductiveautomation.")
+        };
+        if mirror.registered {
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).expect("the mirror empties the directory");
+            }
+        } else if dir.exists() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let file = path
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .to_string();
+                if !artifact_root(&file) {
+                    continue;
+                }
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path).expect("rm dir");
+                } else {
+                    std::fs::remove_file(&path).expect("rm file");
+                }
+            }
+        }
+        std::fs::create_dir_all(&dir).expect("the mirror creates the directory");
+        for (path, bytes) in &stored.members {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+            std::fs::write(target, self.exported_bytes(stored, path, bytes)).expect("write");
+        }
+        for path in &mirror.extra_on_disk {
+            let target = dir.join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+            std::fs::write(target, b"extra\n").expect("write");
+        }
+        if mirror.recreates_git && !dir.join(".git").exists() {
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .expect("git runs");
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+            };
+            git(&["init", "-q", "-b", "master"]);
+            git(&[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/capapp.git",
+            ]);
+            git(&["config", "http.sslVerify", "false"]);
+        }
+        match mirror.project_json {
+            Some(ProjectJsonFate::Absent) => {
+                let _ = std::fs::remove_file(dir.join("project.json"));
+            }
+            Some(ProjectJsonFate::Directory) => {
+                let _ = std::fs::remove_file(dir.join("project.json"));
+                std::fs::create_dir_all(dir.join("project.json")).expect("a directory");
+            }
+            None => {}
+        }
+        #[cfg(unix)]
+        if mirror.readonly_after {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
         }
     }
 
@@ -696,6 +944,23 @@ impl FakeProjects {
         self
     }
 
+    /// Every project import fails with a transport error before anything is
+    /// applied, so the caller cannot tell whether the gateway imported
+    /// (27-34, WR-02).
+    pub fn with_project_import_lost(self) -> Self {
+        self.lose_project_import.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Every project import is applied and then answers a transport error:
+    /// the gateway changed and the caller never saw the answer (27-34,
+    /// WR-02).
+    pub fn with_project_import_answer_lost(self) -> Self {
+        self.lose_project_import_answer
+            .store(true, Ordering::SeqCst);
+        self
+    }
+
     /// The first `n` exports after the first tag import each hold an extra
     /// live-only root node whose `documentation` changes every read, so no
     /// two of them agree; the export after them is the tree as it stands.
@@ -734,6 +999,49 @@ impl FakeProjects {
     pub fn with_designers_script(self, lists: Vec<Vec<DesignerSeen>>) -> Self {
         self.designers.lock().expect("designers").lists = lists;
         self
+    }
+
+    /// One Designer session is attached for the next `polls` Designer reads
+    /// made after the run's verify (27-13, D-07): the reads after the gateway
+    /// has served two exports (the prepare's and the run's own first, the
+    /// pre-image of an import or the live read of a `record`), so the
+    /// pre-check of an import is not affected. The reads after those `polls`
+    /// find no session, as a Designer that closed.
+    #[allow(dead_code)]
+    pub fn with_designers_after_verify(self, polls: u64) -> Self {
+        *self
+            .designers_after_verify
+            .lock()
+            .expect("designers after verify") = polls;
+        self
+    }
+
+    /// [`Self::with_designers_after_verify`] for a run that has served `exports`
+    /// project exports (a tag-owning import reads the project back as its third
+    /// export, so `3` arms the session for the rollback that follows a failed
+    /// read-back, 27-21).
+    #[allow(dead_code)]
+    pub fn with_designers_after_exports(self, exports: usize, polls: u64) -> Self {
+        *self
+            .designers_after_exports
+            .lock()
+            .expect("designers after exports") = exports;
+        self.with_designers_after_verify(polls)
+    }
+
+    /// On Designer read `read` (0-based) the project `name` is edited: it
+    /// gains the member `designer-edit.txt`, as a Designer saving while the
+    /// run waited.
+    #[allow(dead_code)]
+    pub fn with_project_edited_on_designers_read(self, read: usize, name: &str) -> Self {
+        self.designers.lock().expect("designers").edit_on_read = Some((read, name.to_string()));
+        self
+    }
+
+    /// On Designer read `read` (0-based) run `hook` once.
+    #[allow(dead_code)]
+    pub fn on_designers_read(&self, read: usize, hook: impl Fn() + Send + Sync + 'static) {
+        self.designers.lock().expect("designers").hook_on_read = Some((read, Box::new(hook)));
     }
 
     /// Every Designer list read fails with `network_error`.
@@ -1045,12 +1353,48 @@ impl ProjectGateway for FakeProjects {
     }
 
     async fn designers(&self) -> Result<Vec<DesignerSeen>, CoreError> {
-        let read = {
+        let (read, exports) = {
             let mut calls = self.calls.lock().expect("calls");
             calls.designers += 1;
-            calls.designers - 1
+            (calls.designers - 1, calls.export.len())
         };
-        let script = self.designers.lock().expect("designers");
+        if exports
+            >= *self
+                .designers_after_exports
+                .lock()
+                .expect("designers after exports")
+        {
+            let mut left = self
+                .designers_after_verify
+                .lock()
+                .expect("designers after verify");
+            if *left > 0 {
+                *left -= 1;
+                return Ok(vec![(
+                    "dana".to_string(),
+                    String::new(),
+                    "ws-2".to_string(),
+                )]);
+            }
+        }
+        let mut script = self.designers.lock().expect("designers");
+        if script
+            .hook_on_read
+            .as_ref()
+            .is_some_and(|(at, _)| *at == read)
+            && let Some((_, hook)) = script.hook_on_read.take()
+        {
+            hook();
+        }
+        if let Some((at, name)) = script.edit_on_read.as_ref()
+            && *at == read
+            && let Some(stored) = self.projects.lock().expect("projects").get_mut(name)
+        {
+            stored.members.insert(
+                "designer-edit.txt".to_string(),
+                b"saved by a Designer".to_vec(),
+            );
+        }
         if script.fail {
             return Err(CoreError::Network {
                 url: format!("{FAKE_BASE}/data/api/v1/designers"),
@@ -1429,6 +1773,13 @@ impl ProjectGateway for FakeProjects {
                 endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/import/{name}")),
             });
         }
+        if self.lose_project_import.load(Ordering::SeqCst) {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/projects/import/{name}"),
+                source: None,
+                observation: None,
+            });
+        }
         self.imported.store(true, Ordering::SeqCst);
         let mut projects = self.projects.lock().expect("projects");
         if !overwrite && projects.contains_key(name) {
@@ -1438,7 +1789,18 @@ impl ProjectGateway for FakeProjects {
                 endpoint: Some(format!("{FAKE_BASE}/data/api/v1/projects/import/{name}")),
             });
         }
-        let members = adopt(&zip);
+        let mut members = adopt(&zip);
+        if let Some(mirror) = self.mirror.lock().expect("mirror").as_ref() {
+            for path in &mirror.gateway_form {
+                if let Some(bytes) = members.get_mut(path)
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+                {
+                    let mut pretty = serde_json::to_vec_pretty(&value).expect("pretty");
+                    pretty.push(b'\n');
+                    *bytes = pretty;
+                }
+            }
+        }
         let mut record = projects
             .get(name)
             .map(|p| p.record.clone())
@@ -1475,11 +1837,21 @@ impl ProjectGateway for FakeProjects {
                 .map(str::to_string);
         }
         projects.insert(name.to_string(), StoredProject { record, members });
+        if let Some(stored) = projects.get(name) {
+            self.mirror_write(name, stored);
+        }
         let changes = if self.empty_changes.load(Ordering::SeqCst) {
             serde_json::json!([])
         } else {
             serde_json::json!([{ "name": name }])
         };
+        if self.lose_project_import_answer.load(Ordering::SeqCst) {
+            return Err(CoreError::Network {
+                url: format!("{FAKE_BASE}/data/api/v1/projects/import/{name}"),
+                source: None,
+                observation: None,
+            });
+        }
         Ok(ImportOutcome {
             response: serde_json::json!({ "success": true, "changes": changes }),
         })
@@ -1614,6 +1986,7 @@ impl FakeProjects {
                 .map(|at| format!("[{provider}]{at}"))
                 .collect(),
             collisions_unnamed: 0,
+            first_diagnostic: None,
         })
     }
 

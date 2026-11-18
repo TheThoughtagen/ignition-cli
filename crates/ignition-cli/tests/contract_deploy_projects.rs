@@ -928,7 +928,8 @@ async fn projects_check_git_dir_refuses() {
     let err = error_of(&out);
     assert_eq!(err["error"]["code"], "project_git_managed");
     let message = err["error"]["message"].as_str().expect("message");
-    for needle in ["CapApp", "projects/CapApp/.git", "directory"] {
+    // 27-12: the refusal names the reason word (an empty `.git` has no HEAD).
+    for needle in ["CapApp", "projects/CapApp/.git", "no_head"] {
         assert!(message.contains(needle), "{needle}: {message}");
     }
     assert!(
@@ -939,7 +940,10 @@ async fn projects_check_git_dir_refuses() {
 
 #[tokio::test]
 async fn projects_check_git_file_and_symlink_refuse_with_their_kind() {
-    for (kind, make) in [("file", false), ("symlink", true)] {
+    for (kind, make, reason) in [
+        ("file", false, "not_directory"),
+        ("symlink", true, "symlink"),
+    ] {
         let fx = fixture();
         let project = fx.data.join("projects/CapApp");
         std::fs::create_dir_all(&project).expect("project dir");
@@ -960,7 +964,7 @@ async fn projects_check_git_file_and_symlink_refuse_with_their_kind() {
             err["error"]["message"]
                 .as_str()
                 .expect("message")
-                .contains(&format!("({kind})")),
+                .contains(&format!("({reason})")),
             "{err}"
         );
         assert!(methods(&server).await.is_empty(), "{kind}");
@@ -1049,8 +1053,9 @@ async fn projects_check_human_git_refusal_names_the_entry() {
     assert_eq!(out.status.code(), Some(6));
     let stderr = String::from_utf8(out.stderr).expect("utf-8");
     assert!(stderr.contains("projects/CapApp/.git"), "{stderr}");
-    assert!(stderr.contains("administrator"), "{stderr}");
+    assert!(stderr.contains("no_head"), "{stderr}");
     assert!(stderr.contains("hint:"), "{stderr}");
+    assert!(!stderr.contains("remove this project"), "{stderr}");
     assert!(methods(&server).await.is_empty());
 }
 
@@ -3690,4 +3695,910 @@ fn apply_action_classifies_provider_emptied_and_tag_plan_stale() {
     let stale = at("plan_stale: the live project");
     let line = text[stale..].lines().next().unwrap_or_default();
     assert!(line.contains("tags"), "{line}");
+}
+
+/// 27-21 (D-09, T-27-48): the apply action classifies `git_restore_failed` as
+/// a failure whose message says the project is deployed and recorded, names
+/// the restore reason and the saved copy from `data.git.nodes[]`, and says the
+/// job must not be rerun before the repository is restored. The values come
+/// out of ign's JSON, so they stay strings: the branch never reaches a shell
+/// or a `run:` block, and flattens them to one line.
+#[test]
+fn apply_action_classifies_git_restore_failed() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("action.yml lacks {needle:?}"))
+    };
+    let start = at(
+        "if (exit === 6 && data && data.ok === false && data.outcome === 'git_restore_failed') {",
+    );
+    let backup = at("data.outcome === 'applied_backup_unsynced'");
+    let rolled = at("err.code === 'rollback_failed'");
+    assert!(
+        backup < start && start < rolled,
+        "the branch sits between applied_backup_unsynced and rollback_failed"
+    );
+    let end = start
+        + text[start..]
+            .find("\n            }\n")
+            .expect("the branch ends");
+    let branch = &text[start..end];
+    for needle in [
+        "'git_restore_failed'",
+        "data.git.nodes",
+        "n.restore.reason",
+        "n.save.path",
+        "the project is deployed and its release is recorded",
+        "the gateway\\'s .git was not restored",
+        "the saved copy is at",
+        "do not re-run this workflow before the repository is restored from it",
+        "result(false,",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The untrusted values are only strings in the message (T-27-48).
+    assert!(!branch.contains("${{"), "{branch}");
+    assert!(!branch.contains("run:"), "{branch}");
+    assert!(branch.contains("oneLine("), "{branch}");
+    let one_line = text
+        .lines()
+        .find(|l| l.contains("const oneLine = "))
+        .expect("the flattening helper");
+    assert!(
+        one_line.contains("u0000-") && one_line.contains(".slice(0, 300)"),
+        "{one_line}"
+    );
+    // The outcome output lists it, in the action and in the reusable workflow.
+    for rel in [
+        ".github/actions/deploy-projects-apply/action.yml",
+        ".github/workflows/deploy-projects.yml",
+    ] {
+        let file = repo_file(rel);
+        let desc = file
+            .lines()
+            .find(|l| l.contains("Classified outcome of the apply"))
+            .unwrap_or_else(|| panic!("{rel}: no outcome description"));
+        assert!(desc.contains("git_restore_failed"), "{rel}: {desc}");
+    }
+}
+
+/// 27-37: when a node's reason is `backup_project_json_missing`, the headline
+/// carries the restart consequence and the put-back step, and does not send
+/// the operator to restore `.git` from the copy. Other reasons keep the
+/// restore-from-copy headline.
+#[test]
+fn apply_action_classifies_backup_project_json_missing() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let start = text
+        .find("if (exit === 6 && data && data.ok === false && data.outcome === 'git_restore_failed') {")
+        .expect("the git_restore_failed branch");
+    let end = start
+        + text[start..]
+            .find("\n            }\n")
+            .expect("the branch ends");
+    let branch = &text[start..end];
+    for needle in [
+        "backup_project_json_missing",
+        "next restart",
+        "put project.json back on the backup",
+        "ign does not repair",
+        "do not restart the backup or re-run this workflow until project.json is back",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The restore-from-copy headline stays for the other reasons.
+    for needle in [
+        "the gateway\\'s .git was not restored",
+        "do not re-run this workflow before the repository is restored from it",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The untrusted values are only strings in the message (T-27-48).
+    assert!(!branch.contains("${{"), "{branch}");
+    assert!(!branch.contains("run:"), "{branch}");
+    assert!(branch.contains("oneLine("), "{branch}");
+}
+
+/// 27-36 (WR-07, the 27-26 checkpoint, option-a): the apply action names a git
+/// gate refusal by its own cause. `git_unpushed`, `git_not_merged` and
+/// `git_dirty` end as kind `git_work_refused`; `git_sync_hazard` as
+/// `git_sync_hazard_refused`. Both are matched before the generic destructive
+/// branch, which keeps "a downgrade or a first change" for the rest.
+#[test]
+fn apply_action_classifies_git_gate_refusals() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("action.yml lacks {needle:?}"))
+    };
+    let generic = at("the deploy is a downgrade or a first change");
+    let work = at("/^(git_unpushed|git_not_merged|git_dirty)\\b/");
+    let hazard = at("/^git_sync_hazard\\b/");
+    assert!(
+        work < generic && hazard < generic,
+        "both git branches come before the generic destructive branch"
+    );
+    let end = |from: usize| {
+        from + text[from..]
+            .find("\n              }\n")
+            .expect("the branch ends")
+    };
+    let work_branch = &text[work..end(work)];
+    for needle in [
+        "'git_work_refused'",
+        "the gateway repository holds work the release lacks",
+        "push it and merge it",
+        "--discard-gateway-changes",
+        "nothing was written",
+        "errDetails()",
+    ] {
+        assert!(
+            work_branch.contains(needle),
+            "{needle:?} is missing from {work_branch}"
+        );
+    }
+    let hazard_branch = &text[hazard..end(hazard)];
+    for needle in [
+        "'git_sync_hazard_refused'",
+        "git.yaml",
+        "--allow-git-sync-hazards",
+        "nothing was written",
+        "errDetails()",
+    ] {
+        assert!(
+            hazard_branch.contains(needle),
+            "{needle:?} is missing from {hazard_branch}"
+        );
+    }
+    // Neither is a downgrade or a first change.
+    assert!(
+        !work_branch.contains("downgrade") && !hazard_branch.contains("downgrade"),
+        "{work_branch} {hazard_branch}"
+    );
+    // The values stay strings: no shell, no run: block.
+    for branch in [work_branch, hazard_branch] {
+        assert!(
+            !branch.contains("${{") && !branch.contains("run:"),
+            "{branch}"
+        );
+    }
+    // The outcome output lists both kinds.
+    for rel in [
+        ".github/actions/deploy-projects-apply/action.yml",
+        ".github/workflows/deploy-projects.yml",
+    ] {
+        let file = repo_file(rel);
+        let desc = file
+            .lines()
+            .find(|l| l.contains("Classified outcome of the apply"))
+            .unwrap_or_else(|| panic!("{rel}: no outcome description"));
+        assert!(
+            desc.contains("git_work_refused") && desc.contains("git_sync_hazard_refused"),
+            "{rel}: {desc}"
+        );
+    }
+    // The README names the kinds, and no longer calls every
+    // `destructive_change_refused` a downgrade or a first change.
+    let readme = repo_file("README.md");
+    for kind in ["git_work_refused", "git_sync_hazard_refused"] {
+        assert!(readme.contains(kind), "README lacks {kind}");
+    }
+    assert!(
+        readme.contains("`git_unpushed`, `git_not_merged` or `git_dirty`")
+            && readme.contains("`git_sync_hazard`"),
+        "the README paragraph names the git gates"
+    );
+}
+
+/// 27-36 (WR-06, D-07): on an unverified import of a git-managed project the
+/// action says that the printed restore command's import removes the gateway
+/// `.git` again, that it must be copied aside first and put back after, and
+/// it carries a failed K11 git restore's reason and save path from
+/// `data.git.nodes[]` through `oneLine`.
+#[test]
+fn apply_action_k11_names_git_repository() {
+    let text = repo_file(".github/actions/deploy-projects-apply/action.yml");
+    let start = text
+        .find("if (exit === 6 && data && (data.outcome === 'imported_unverified'")
+        .expect("the imported_unverified branch");
+    let end = start
+        + text[start..]
+            .find("\n            }\n")
+            .expect("the branch ends");
+    let branch = &text[start..end];
+    for needle in [
+        "data.git",
+        "removes the gateway\\'s .git again",
+        "copy it aside first and put it back after",
+        "n.restore.reason",
+        "n.save.path",
+        "oneLine(",
+        "restore command: ' + restore",
+    ] {
+        assert!(
+            branch.contains(needle),
+            "{needle:?} is missing from {branch}"
+        );
+    }
+    // The values stay strings: no shell, no run: block.
+    assert!(
+        !branch.contains("${{") && !branch.contains("run:"),
+        "{branch}"
+    );
+    // The README says the same, next to the K11 text.
+    let readme = repo_file("README.md");
+    assert!(
+        readme.contains("removes the gateway's `.git` again"),
+        "README lacks the K11 git note"
+    );
+}
+
+/// CodeRabbit #57: the hand restore of a saved `.git` names the right
+/// ledger root for each kind of node: a `local` node's save is below its data
+/// directory, an `ssh` node's below the deploy account's home
+/// (`LedgerRoot::for_node`), and `save.path` is relative to that root.
+#[test]
+fn readme_hand_restore_names_the_ledger_root_per_node() {
+    let readme = repo_file("README.md");
+    let start = readme
+        .find("- **Putting the saved copy back by hand.**")
+        .expect("the hand-restore paragraph");
+    let end = start + readme[start..].find("\n\n").expect("the paragraph ends");
+    let text = readme[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "the data directory of a `local` node",
+        "the deploy account's home of an `ssh` node",
+        "relative to the node's root",
+        "<root>/ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo",
+    ] {
+        assert!(text.contains(needle), "{needle:?} is missing: {text}");
+    }
+    assert!(!text.contains("below the node's data directory."), "{text}");
+}
+
+/// CodeRabbit #57: the Linux grant also opens the project's existing `.git`
+/// to the deploy account: the default ACL entries reach only what is created
+/// later, so without it the `git_write_access` probe inside `.git` fails.
+#[test]
+fn readme_linux_grant_covers_an_existing_git() {
+    let readme = repo_file("README.md");
+    let start = readme
+        .find("**Write access and the grant.**")
+        .expect("the grant paragraph");
+    let end = start
+        + readme[start..]
+            .find("- *Windows*")
+            .expect("the Windows grant");
+    let linux = &readme[start..end];
+    assert!(
+        linux.contains("setfacl -R -m u:<deploy-account>:rwX \"$P/.git\""),
+        "{linux}"
+    );
+    assert!(
+        linux.contains("-type d -exec setfacl -d -m u:<deploy-account>:rwX"),
+        "{linux}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 27-20 (D-23, checker W16): the composite actions and the git token.
+// ---------------------------------------------------------------------------
+
+/// The text of a file below the repo root, with LF line ends (a Windows
+/// checkout converts them to CRLF, and the needles here are LF).
+fn repo_file(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .replace("\r\n", "\n")
+}
+
+/// The two composite actions, as `(path, text)`.
+fn deploy_actions() -> [(&'static str, String); 2] {
+    [
+        (
+            ".github/actions/deploy-projects-check/action.yml",
+            repo_file(".github/actions/deploy-projects-check/action.yml"),
+        ),
+        (
+            ".github/actions/deploy-projects-apply/action.yml",
+            repo_file(".github/actions/deploy-projects-apply/action.yml"),
+        ),
+    ]
+}
+
+/// The steps of a composite action or workflow job as text, each from its
+/// `- name:` line (a six-space-or-less list item below `steps:`) to the next.
+fn steps_of(text: &str) -> Vec<String> {
+    let mut steps: Vec<String> = Vec::new();
+    let mut in_steps = false;
+    for line in text.lines() {
+        if line.trim_end() == "  steps:" || line.trim_end() == "    steps:" {
+            in_steps = true;
+            continue;
+        }
+        if !in_steps {
+            continue;
+        }
+        let item = line.starts_with("    - ") || line.starts_with("      - ");
+        if item {
+            steps.push(String::new());
+        }
+        if let Some(step) = steps.last_mut() {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    steps
+}
+
+/// The `run:` block of a step: the lines under `run: |` that are indented
+/// deeper than the key.
+fn run_block(step: &str) -> Option<String> {
+    let mut lines = step.lines();
+    let key = lines.find(|l| l.trim_start().starts_with("run: |"))?;
+    let indent = key.len() - key.trim_start().len();
+    let mut block = String::new();
+    for line in lines {
+        let here = line.len() - line.trim_start().len();
+        if !line.trim().is_empty() && here <= indent {
+            break;
+        }
+        block.push_str(line);
+        block.push('\n');
+    }
+    Some(block)
+}
+
+fn step_named<'a>(steps: &'a [String], name: &str) -> &'a str {
+    steps
+        .iter()
+        .find(|s| {
+            s.lines()
+                .next()
+                .is_some_and(|l| l.contains(&format!("name: {name}")))
+        })
+        .unwrap_or_else(|| panic!("no step named {name:?}"))
+}
+
+/// Both actions check the project out with its full history, keep the
+/// checkout credential-free and declare the optional `git-token` input.
+#[test]
+fn actions_fetch_full_history() {
+    for (path, text) in deploy_actions() {
+        let steps = steps_of(&text);
+        let checkout = step_named(&steps, "Checkout project");
+        assert!(checkout.contains("path: project"), "{path}: {checkout}");
+        assert!(checkout.contains("fetch-depth: 0"), "{path}: {checkout}");
+        assert!(
+            checkout.contains("persist-credentials: false"),
+            "{path}: {checkout}"
+        );
+        // The targets checkout stays sparse and shallow.
+        let targets = step_named(&steps, "Checkout targets");
+        assert!(!targets.contains("fetch-depth"), "{path}: {targets}");
+
+        let inputs = text.split("\noutputs:").next().expect("inputs come first");
+        let at = inputs
+            .find("\n  git-token:\n")
+            .unwrap_or_else(|| panic!("{path} declares no git-token input"));
+        let declared = &inputs[at..];
+        let block: String = declared
+            .lines()
+            .skip(2)
+            .take_while(|l| l.starts_with("    "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block.contains("required: false"), "{path}: {block}");
+        assert!(block.contains("default: ''"), "{path}: {block}");
+        assert!(block.contains("https"), "{path}: {block}");
+        assert!(block.contains("ssh"), "{path}: {block}");
+    }
+}
+
+/// The token never appears in `run:` text, in either action or in the
+/// reusable workflow: it is handed over as step environment only (a
+/// `${{ }}` expression in a script is script injection and a log leak).
+#[test]
+fn actions_token_not_in_run_text() {
+    let mut files: Vec<(&str, String)> = deploy_actions().into_iter().collect();
+    files.push((
+        ".github/workflows/deploy-projects.yml",
+        repo_file(".github/workflows/deploy-projects.yml"),
+    ));
+    for (path, text) in &files {
+        let mut runs = 0;
+        for step in steps_of(text) {
+            if let Some(run) = run_block(&step) {
+                runs += 1;
+                for needle in [
+                    "git-token",
+                    "IGNITION_GIT_TOKEN",
+                    "IGN_GIT_TOKEN",
+                    "extraheader",
+                ] {
+                    assert!(
+                        !run.contains(needle),
+                        "{path}: a run: block names {needle}:\n{run}"
+                    );
+                }
+            }
+        }
+        assert!(runs >= 3, "{path}: the run: blocks were not found ({runs})");
+    }
+}
+
+/// Checker W16: no action or workflow decides where the token is sent. ign
+/// derives the scope from the matched remote; the actions hand it over as one
+/// step environment variable and add no git configuration for it.
+#[test]
+fn actions_token_scope_not_hardcoded() {
+    let workflow = repo_file(".github/workflows/deploy-projects.yml");
+    for (path, text) in deploy_actions()
+        .iter()
+        .map(|(p, t)| (*p, t.as_str()))
+        .chain([(".github/workflows/deploy-projects.yml", workflow.as_str())])
+    {
+        assert!(
+            !text.to_ascii_lowercase().contains("extraheader"),
+            "{path} names an extraheader scope"
+        );
+        for line in text.lines().filter(|l| l.contains("GIT_CONFIG_VALUE_")) {
+            assert!(
+                !line.contains("token"),
+                "{path}: a GIT_CONFIG_VALUE_ entry reads a token: {line}"
+            );
+        }
+    }
+    for (path, text) in deploy_actions() {
+        // `inputs.git-token` is used exactly once: the ign step's
+        // environment, under the one name ign reads.
+        let uses: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("inputs.git-token"))
+            .collect();
+        assert_eq!(uses.len(), 1, "{path}: {uses:?}");
+        assert_eq!(
+            uses[0].trim(),
+            "IGNITION_GIT_TOKEN: ${{ inputs.git-token }}",
+            "{path}"
+        );
+        let steps = steps_of(&text);
+        let ign: Vec<&String> = steps
+            .iter()
+            .filter(|s| s.contains("IGNITION_GIT_TOKEN: ${{ inputs.git-token }}"))
+            .collect();
+        assert_eq!(ign.len(), 1, "{path}");
+        assert!(ign[0].contains("id: run"), "{path}: {}", ign[0]);
+        let env_at = ign[0].find("      env:").expect("the step has an env");
+        let run_at = ign[0].find("      run:").expect("the step runs");
+        let line_at = ign[0]
+            .find("IGNITION_GIT_TOKEN: ${{ inputs.git-token }}")
+            .expect("mapped");
+        assert!(
+            env_at < line_at && line_at < run_at,
+            "{path}: env of the ign step"
+        );
+        // The step that runs ign is the one that checks git is on PATH.
+        assert!(ign[0].contains("\"$IGN_BIN\" deploy projects"), "{path}");
+    }
+    // The reusable workflow passes one optional secret through, by name.
+    assert!(
+        workflow.contains("IGN_GIT_TOKEN:\n"),
+        "the secret is declared"
+    );
+    assert_eq!(
+        workflow
+            .lines()
+            .filter(|l| l.trim() == "git-token: ${{ secrets.IGN_GIT_TOKEN }}")
+            .count(),
+        2,
+        "both jobs pass it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 27-16 (D-05): `--discard-gateway-changes <REASON>`.
+// ---------------------------------------------------------------------------
+
+/// `--help` lists the flag with its `REASON` value, says what it keeps, and
+/// never suggests deleting a `.git`.
+#[tokio::test]
+async fn git_override_flag_parses() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        text.contains("--discard-gateway-changes <REASON>"),
+        "{text}"
+    );
+    for kept in ["refs/ign-discarded/<run-id>", "would_discard"] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+    let lowered = text.to_lowercase();
+    assert!(
+        !lowered.contains("delete the .git") && !lowered.contains("remove the .git"),
+        "the flag never suggests deleting a .git: {text}"
+    );
+
+    // With a reason it parses and the check proceeds to the gateway read.
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &["--discard-gateway-changes", "adopt the repo"],
+        ),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["action"], "record");
+    assert!(data["git"].is_null(), "no .git, no git block: {data}");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// The override undoes nothing: clap refuses it beside `--rollback-run`
+/// (usage, exit 2) before anything is contacted.
+#[tokio::test]
+async fn git_override_conflicts_with_rollback_run() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let out = run(
+        &server,
+        &rollback_args(
+            &fx,
+            "20261109T101500Z-ab12",
+            &["--discard-gateway-changes", "x"],
+        ),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--discard-gateway-changes") && stderr.contains("--rollback-run"),
+        "{stderr}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+/// An empty reason and one over 500 characters are `invalid_input` (exit 2)
+/// before any request; 500 characters pass. The reason is data: a shell
+/// metacharacter reason is accepted and runs nothing.
+#[tokio::test]
+async fn git_override_reason_bounds() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let long = "x".repeat(501);
+    for reason in [long.as_str(), ""] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--discard-gateway-changes", reason]),
+        );
+        assert_eq!(out.status.code(), Some(2), "{} chars", reason.len());
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{err}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("--discard-gateway-changes"), "{message}");
+    }
+    assert!(methods(&server).await.is_empty());
+
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let edge = "y".repeat(500);
+    for reason in [edge.as_str(), "x\"; touch pwned-27-16; $(id) `id`"] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--discard-gateway-changes", reason]),
+        );
+        assert_eq!(data_of(&out)["action"], "record");
+    }
+    assert!(!fx.repo.join("pwned-27-16").exists());
+    assert!(
+        !std::env::current_dir()
+            .expect("cwd")
+            .join("pwned-27-16")
+            .exists()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 27-18 (D-21): `--allow-git-sync-hazards <REASON>`.
+// ---------------------------------------------------------------------------
+
+/// `--help` lists the flag with its `REASON` value and the `data.git` key a
+/// check lists the hazards under.
+#[tokio::test]
+async fn git_hazard_flag_parses() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let help = run(
+        &server,
+        &["deploy".into(), "projects".into(), "--help".into()],
+    );
+    assert_eq!(help.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&help.stdout);
+    assert!(text.contains("--allow-git-sync-hazards <REASON>"), "{text}");
+    for kept in ["data.git.nodes[].hazards", "git_sync_hazard", "git.yaml"] {
+        assert!(text.contains(kept), "{kept}: {text}");
+    }
+
+    // With a reason it parses and the check proceeds to the gateway read.
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &["--allow-git-sync-hazards", "the module imports on purpose"],
+        ),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["action"], "record");
+    assert!(data["git"].is_null(), "no .git, no git block: {data}");
+    assert_only_gets(&methods(&server).await);
+}
+
+/// The acknowledgement undoes nothing: clap refuses it beside
+/// `--rollback-run` (usage, exit 2) before anything is contacted.
+#[tokio::test]
+async fn git_hazard_conflicts_with_rollback_run() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let out = run(
+        &server,
+        &rollback_args(
+            &fx,
+            "20261109T101500Z-ab12",
+            &["--allow-git-sync-hazards", "x"],
+        ),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--allow-git-sync-hazards") && stderr.contains("--rollback-run"),
+        "{stderr}"
+    );
+    assert!(methods(&server).await.is_empty());
+}
+
+/// The reason is 1 to 500 characters (`invalid_input`, exit 2, before any
+/// request) and data: a shell metacharacter reason is accepted and runs
+/// nothing.
+#[tokio::test]
+async fn git_hazard_reason_bounds() {
+    let fx = fixture();
+    let server = MockServer::start().await;
+    let long = "x".repeat(501);
+    for reason in [long.as_str(), ""] {
+        let out = run(
+            &server,
+            &args_with(&fx, "v1.0.0", &["--allow-git-sync-hazards", reason]),
+        );
+        assert_eq!(out.status.code(), Some(2), "{} chars", reason.len());
+        let err = error_of(&out);
+        assert_eq!(err["error"]["code"], "invalid_input", "{err}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains("--allow-git-sync-hazards"), "{message}");
+    }
+    assert!(methods(&server).await.is_empty());
+
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+    let reason = "x\"; touch pwned-27-18; $(id) `id`";
+    let out = run(
+        &server,
+        &args_with(&fx, "v1.0.0", &["--allow-git-sync-hazards", reason]),
+    );
+    assert_eq!(data_of(&out)["action"], "record");
+    assert!(!fx.repo.join("pwned-27-18").exists());
+    assert!(
+        !std::env::current_dir()
+            .expect("cwd")
+            .join("pwned-27-18")
+            .exists()
+    );
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=ign-test",
+            "-c",
+            "user.email=ign-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The fixture repo committed and tagged `v1.0.0`, pushed to a bare remote,
+/// with the gateway's project directory a clone of that remote: a managed
+/// `.git` whose HEAD is the release, so a live change makes it dirty.
+fn git_managed_fixture(fx: &Fixture) {
+    let remote = fx._scratch.path().join("remote.git");
+    git_in(
+        fx._scratch.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().expect("utf-8"),
+        ],
+    );
+    git_in(&fx.repo, &["init", "-q", "-b", "main"]);
+    put(&fx.repo, ".gitignore", b".ign/\n");
+    git_in(&fx.repo, &["add", "-A"]);
+    git_in(&fx.repo, &["commit", "-q", "-m", "release"]);
+    git_in(&fx.repo, &["tag", "v1.0.0"]);
+    git_in(
+        &fx.repo,
+        &["remote", "add", "origin", remote.to_str().expect("utf-8")],
+    );
+    git_in(&fx.repo, &["push", "-q", "-u", "origin", "main", "--tags"]);
+    let project = fx.data.join("projects/CapApp");
+    std::fs::remove_dir_all(&project).ok();
+    git_in(
+        fx._scratch.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().expect("utf-8"),
+            project.to_str().expect("utf-8"),
+        ],
+    );
+}
+
+/// A `git_dirty` refusal names `--discard-gateway-changes <reason>` and the
+/// dirty path; with the flag the same check passes and lists
+/// `data.git.would_discard`, writing nothing.
+#[tokio::test]
+async fn git_override_refusal_names_flag() {
+    let fx = fixture();
+    git_managed_fixture(&fx);
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V2, true)).await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused", "{err}");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in ["git_dirty", "--discard-gateway-changes <reason>"] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(
+        message.contains("ignition/script-python/cap/code.py"),
+        "{message}"
+    );
+    assert_only_gets(&methods(&server).await);
+
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &[
+                "--discard-gateway-changes",
+                "the designer edit is dropped",
+                "--allow-first-change",
+                "adopt the repo",
+            ],
+        ),
+    );
+    let data = data_of(&out);
+    let would = &data["git"]["would_discard"];
+    assert_eq!(would["dirty"], "listed", "{data}");
+    assert_eq!(would["paths_count"], 1, "{data}");
+    assert_eq!(would["paths"][0], "ignition/script-python/cap/code.py");
+    assert!(
+        data["git"]["discarded"].is_null(),
+        "a check discards nothing"
+    );
+    assert_only_gets(&methods(&server).await);
+}
+
+/// A `git_sync_hazard` refusal names `--allow-git-sync-hazards <reason>` and
+/// the hazard word; with the flag the same check passes, lists the word under
+/// `data.git.nodes[].hazards` and records the reason in
+/// `data.git.hazards_acknowledged`, sending GET requests only.
+#[tokio::test]
+async fn git_hazard_refusal_names_flag() {
+    let fx = fixture();
+    git_managed_fixture(&fx);
+    put(
+        &fx.data,
+        "git.yaml",
+        b"- ignition_projectName: CapApp\n  user_password: dummy-credential\n  \
+          commissioning_enforceBranch: true\n",
+    );
+    let server = MockServer::start().await;
+    mount_list(&server, &["CapApp"]).await;
+    mount_find_found(&server).await;
+    mount_export(&server, export_zip(CODE_V1, true)).await;
+
+    let out = run(&server, &check_args(&fx, "dev"));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = error_of(&out);
+    assert_eq!(err["error"]["code"], "destructive_change_refused", "{err}");
+    let message = err["error"]["message"].as_str().expect("message");
+    for needle in [
+        "git_sync_hazard",
+        "enforce_branch",
+        "--allow-git-sync-hazards <reason>",
+    ] {
+        assert!(message.contains(needle), "{needle}: {message}");
+    }
+    assert!(!message.contains("dummy-credential"), "{message}");
+    assert_only_gets(&methods(&server).await);
+
+    let out = run(
+        &server,
+        &args_with(
+            &fx,
+            "v1.0.0",
+            &[
+                "--allow-git-sync-hazards",
+                "branch enforcement is wanted",
+                "--allow-first-change",
+                "adopt the repo",
+            ],
+        ),
+    );
+    let data = data_of(&out);
+    assert_eq!(data["git"]["nodes"][0]["hazards"][0], "enforce_branch");
+    assert_eq!(
+        data["git"]["hazards_acknowledged"],
+        "branch enforcement is wanted"
+    );
+    assert!(!data.to_string().contains("dummy-credential"), "{data}");
+    assert_only_gets(&methods(&server).await);
 }

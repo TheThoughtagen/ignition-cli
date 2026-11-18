@@ -90,6 +90,8 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             // Most runs here create tags in the existing `PlantA` without a
             // tag-delete route: they accept the manual undo, so each keeps
@@ -367,6 +369,7 @@ async fn run_paired(
             tag_verify_poll: Duration::from_millis(5),
             tag_delete_ready: Duration::from_millis(300),
             tag_delete_poll: Duration::from_millis(5),
+            git_writer: None,
             backup: backup.map(|(node, _)| node),
             backup_policy: backup.map(|(_, policy)| policy).unwrap_or_default(),
         },
@@ -4132,6 +4135,7 @@ async fn run_logged(
             tag_verify_poll: Duration::from_millis(5),
             tag_delete_ready: Duration::from_millis(300),
             tag_delete_poll: Duration::from_millis(5),
+            git_writer: None,
             backup: None,
             backup_policy: BackupPolicy::default(),
         },
@@ -4452,6 +4456,7 @@ async fn rollback_run_with(
             tag_verify_poll: Duration::from_millis(5),
             tag_delete_ready: Duration::from_millis(300),
             tag_delete_poll: Duration::from_millis(5),
+            git_writer: None,
             backup: None,
             backup_policy: BackupPolicy::default(),
         },
@@ -6055,6 +6060,7 @@ fn fast_options(input: &ProjectsInput, loaded: &LoadedProject) -> ProjectsRunOpt
         tag_verify_poll: Duration::from_millis(5),
         tag_delete_ready: Duration::from_millis(300),
         tag_delete_poll: Duration::from_millis(5),
+        git_writer: None,
         backup: None,
         backup_policy: BackupPolicy::default(),
     }
@@ -7499,6 +7505,41 @@ async fn designers_checked_again_before_the_project_import() {
     assert_eq!(count["documentation"], "old", "the tag is back: {count}");
 }
 
+/// CodeRabbit #57: a Designer that attaches and saves while the tags are
+/// written stops the run at the check right before the import. The rollback
+/// takes the tags back and never imports the project: it was not imported by
+/// this run, so its pre-image would only overwrite the Designer's save (and,
+/// on a git-managed project, remove `.git` with no save to put back).
+#[tokio::test]
+async fn designers_refusal_before_the_import_never_imports_the_pre_image() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+    let gateway = importing(
+        &repo,
+        FakeProjects::new()
+            .with_designers_script(vec![vec![], vec![session]])
+            .with_project_edited_on_designers_read(1, PROJECT),
+    )
+    .await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+
+    let result = apply(&repo, &gateway).await.expect("a rolled-back verdict");
+    assert!(!result.ok, "{result:?}");
+    assert_eq!(
+        result.slug.as_deref(),
+        Some("deploy_rolled_back"),
+        "{result:?}"
+    );
+    assert!(
+        !gateway.call_log().iter().any(|c| c.starts_with("import:")),
+        "no project import, the pre-image included: {:?}",
+        gateway.call_log()
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the tag is back: {count}");
+}
+
 // -- ultrareview U6: transient errors on the reads after a write ------------
 
 /// U6: the reads after the run's tag import retry a transient error,
@@ -8073,6 +8114,8 @@ async fn created_provider_needs_no_allow_manual_undo() {
     let gateway = without_provider(&repo).await;
     let input = ProjectsInput {
         allow_first_change: Some("a new provider".to_string()),
+        discard_gateway_changes: None,
+        allow_git_sync_hazards: None,
         ..no_manual_undo(&repo)
     };
 

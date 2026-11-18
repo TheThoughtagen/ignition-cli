@@ -127,6 +127,8 @@ impl Checkout {
             release: "v1.0.0".to_string(),
             allow_downgrade: false,
             allow_first_change: None,
+            discard_gateway_changes: None,
+            allow_git_sync_hazards: None,
             allow_destructive: false,
             allow_manual_undo: false,
             artifact_sha256: None,
@@ -624,8 +626,16 @@ async fn git_present_refuses_before_gateway() {
                 project,
                 location,
                 kind: found,
+                reason,
             } => {
                 assert_eq!(project, PROJECT, "{kind}");
+                // 27-12: the refusal names why the repo cannot be handed over.
+                let want = match kind {
+                    "directory" => "no_head",
+                    "file" => "not_directory",
+                    _ => "symlink",
+                };
+                assert_eq!(reason, want, "{kind}: the reason is named");
                 assert_eq!(found, kind, "{kind}: the kind is named");
                 assert!(
                     location.contains("projects/CapApp/.git"),
@@ -711,6 +721,44 @@ fn first_change_input(checkout: &Checkout, reason: Option<&str>) -> ProjectsInpu
     let mut input = checkout.input();
     input.allow_first_change = reason.map(str::to_string);
     input
+}
+
+/// The reason bounds shared by the two git override flags (D-05, D-21): 1 to
+/// 500 characters, `invalid_input` naming the flag from `load_project`, which
+/// runs before any host or gateway is handed to the deploy.
+fn assert_override_reason_bounds(flag: &str, set: fn(&mut ProjectsInput, String)) {
+    let repo = checkout(&base_members());
+    let gateway = FakeProjects::new();
+    for (label, reason) in [("empty", String::new()), ("501", "x".repeat(501))] {
+        let mut input = repo.input();
+        set(&mut input, reason);
+        let err = load_project(&input).expect_err("an out-of-bounds reason is refused");
+        assert_eq!(err.code(), "invalid_input", "{label}: {err}");
+        assert!(err.to_string().contains(flag), "{label}: {err}");
+    }
+    // Characters, not bytes: 500 two-byte characters pass.
+    for reason in ["x".to_string(), "x".repeat(500), "\u{e9}".repeat(500)] {
+        let mut input = repo.input();
+        set(&mut input, reason);
+        load_project(&input).expect("a 1 to 500 character reason loads");
+    }
+    assert_untouched(&gateway);
+}
+
+/// D-05: `discard_gateway_changes` is a 1 to 500 character reason.
+#[test]
+fn discard_reason_bounds() {
+    assert_override_reason_bounds("--discard-gateway-changes", |input, reason| {
+        input.discard_gateway_changes = Some(reason);
+    });
+}
+
+/// D-21: `allow_git_sync_hazards` is a 1 to 500 character reason.
+#[test]
+fn hazard_reason_bounds() {
+    assert_override_reason_bounds("--allow-git-sync-hazards", |input, reason| {
+        input.allow_git_sync_hazards = Some(reason);
+    });
 }
 
 /// D-12, V3: no record and a live project that differs from the artifact is
@@ -1219,6 +1267,7 @@ async fn run_observed(
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
             tag_delete_ready: std::time::Duration::from_millis(50),
             tag_delete_poll: std::time::Duration::from_millis(5),
+            git_writer: None,
         },
         observer,
     )
@@ -1285,11 +1334,14 @@ async fn export_before_import_and_verify() {
         calls_after(&gateway, before),
         vec![
             "export:CapApp",
+            "export:CapApp",
             "import:CapApp:true",
             "export:CapApp",
             "list"
         ],
-        "pre-image, import, verify, then the listing that finds the children (25-15)"
+        "pre-image, the last look at the live project right before the import \
+         (CodeRabbit #57 S1), import, verify, then the listing that finds the \
+         children (25-15)"
     );
     assert_eq!(result.outcome, ProjectOutcome::Imported);
     assert!(result.ok && result.record_written, "{result:?}");
@@ -2096,6 +2148,12 @@ impl ProjectHost for RecordingHost {
             .push(format!("read_pre_image:{name}"));
         self.inner.read_pre_image(gateway, project, name).await
     }
+
+    /// 27-12: the git surface is the inner transport's, so a project the git
+    /// module manages is read through the recording host too.
+    fn git(&self) -> Option<&dyn ignition_core::deploy::transport::projects::GitHostRead> {
+        ProjectHost::git(&self.inner)
+    }
 }
 
 /// A [`TagRecordWriter`] that remembers which providers it wrote.
@@ -2293,6 +2351,7 @@ async fn sweep_only_reads() {
             backup_policy: ignition_core::deploy::pair::BackupPolicy::default(),
             tag_delete_ready: std::time::Duration::from_millis(50),
             tag_delete_poll: std::time::Duration::from_millis(5),
+            git_writer: None,
         },
         &NoProjectsObserver,
     )
@@ -2315,8 +2374,14 @@ async fn sweep_only_reads() {
     );
     assert_eq!(
         after_verify[..sweep_from],
-        ["export:CapApp", "import:CapApp:true", "export:CapApp"],
-        "everything before the sweep is the deploy of the parent"
+        [
+            "export:CapApp",
+            "export:CapApp",
+            "import:CapApp:true",
+            "export:CapApp"
+        ],
+        "everything before the sweep is the deploy of the parent (with the last \
+         look right before the import, CodeRabbit #57 S1)"
     );
     assert_eq!(gateway.import_calls(), vec![(PROJECT.to_string(), true)]);
     let host_calls = host.calls.lock().expect("calls").split_off(host_before);
@@ -3254,8 +3319,9 @@ async fn import_refusal_is_still_an_error() {
     assert!(matches!(err, CoreError::Auth { .. }), "{err:?}");
     assert_eq!(
         gateway.export_count(PROJECT),
-        exports_before + 2,
-        "the plan's read and the pre-image only; there is no read-back"
+        exports_before + 3,
+        "the plan's read, the pre-image and the last look right before the import \
+         (CodeRabbit #57 S1); there is no read-back"
     );
     assert_eq!(flaky.attempts(), 1);
     assert_eq!(

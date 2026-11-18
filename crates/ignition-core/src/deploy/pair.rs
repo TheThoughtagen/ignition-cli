@@ -153,6 +153,13 @@ impl<'a> BackupNode<'a> {
         self.gateway.tags_export_provider(provider).await
     }
 
+    /// The backup's export zip of one project (a GET, Phase 27, 27-22): the
+    /// wait for the backup's copy of a deployed project reads it until it
+    /// equals the artifact. Read only, like every method here.
+    pub async fn project_export(&self, project: &str) -> Result<Vec<u8>, CoreError> {
+        crate::actions::resources::export_zip_bytes(self.gateway, project).await
+    }
+
     /// The names a secret provider lists on the backup. Names only: the
     /// listing carries no value.
     pub async fn secret_names(&self, provider: &str) -> Result<SecretNameListing, CoreError> {
