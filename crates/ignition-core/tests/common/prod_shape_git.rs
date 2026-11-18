@@ -708,6 +708,8 @@ pub struct Measured {
     pub packs: usize,
     /// Files in `objects/<2 hex>/`.
     pub loose: usize,
+    /// Loose tag refs: files below `refs/tags/`.
+    pub tag_refs: usize,
 }
 
 /// Measure `git_dir` (no symlink is followed).
@@ -717,6 +719,7 @@ pub fn measure_git_dir(git_dir: &Path) -> Measured {
         files: 0,
         packs: 0,
         loose: 0,
+        tag_refs: 0,
     };
     walk(git_dir, git_dir, &mut measured);
     measured
@@ -734,6 +737,9 @@ fn walk(root: &Path, dir: &Path, into: &mut Measured) {
             into.files += 1;
             let rel = path.strip_prefix(root).expect("below root");
             let parts: Vec<&str> = rel.iter().filter_map(|p| p.to_str()).collect();
+            if parts.len() >= 3 && parts[0] == "refs" && parts[1] == "tags" {
+                into.tag_refs += 1;
+            }
             if parts.len() == 3 && parts[0] == "objects" {
                 if parts[1] == "pack" && parts[2].ends_with(".pack") {
                     into.packs += 1;
@@ -743,6 +749,85 @@ fn walk(root: &Path, dir: &Path, into: &mut Measured) {
             }
         }
     }
+}
+
+/// `got` is within 5% of `want` (the tolerance `git_prodshape_shape` holds
+/// the generator to).
+fn near(got: u64, want: u64) -> bool {
+    got.abs_diff(want) * 20 <= want
+}
+
+/// The counts of `measured` that are not within 5% of `shape`, by shape key:
+/// `git_bytes`, `git_files`, `packs`, `loose_objects`. Names only: a measured
+/// or configured value of a private shape is never in the result.
+pub fn shape_mismatches(measured: &Measured, shape: &GitShape) -> Vec<&'static str> {
+    let mut off = Vec::new();
+    if !near(measured.bytes, shape.git_bytes) {
+        off.push("git_bytes");
+    }
+    if !near(measured.files as u64, shape.git_files as u64) {
+        off.push("git_files");
+    }
+    if !near(measured.packs as u64, shape.packs as u64) {
+        off.push("packs");
+    }
+    if !near(measured.loose as u64, shape.loose_objects as u64) {
+        off.push("loose_objects");
+    }
+    off
+}
+
+/// [`shape_mismatches`] of a placed `.git` (the rig's live one), plus
+/// `tag_refs` when its loose tag refs are not within 5% of the emitted
+/// gateway `.git`'s (the shape has no tag-ref key; the generator's padding
+/// refs make up the file count). CodeRabbit #58 follow-up (X3).
+pub fn placed_mismatches(
+    placed: &Measured,
+    emitted: &Measured,
+    shape: &GitShape,
+) -> Vec<&'static str> {
+    let mut off = shape_mismatches(placed, shape);
+    if !near(placed.tag_refs as u64, emitted.tag_refs as u64) {
+        off.push("tag_refs");
+    }
+    off
+}
+
+/// The rig's `git.yaml` `repo_uri` (`capture27.sh` `yaml27`): the module's
+/// remote URL for `capapp.git` on the rig's git server.
+pub const RIG_REMOTE_URL: &str = "http://git-server/git/capapp.git";
+
+/// Copy the emitted gateway project `emitted/data/projects/CapApp` (its
+/// in-scope files and its `.git` as the generator left it: packs, loose
+/// objects, padding refs) to `to`, with the module remote's URL set to `url`
+/// (the emitted one names the generator's scratch path). The rig seed places
+/// this copy instead of letting the module clone the remote: a clone carries
+/// none of the padding (CodeRabbit #58 follow-up X3). Refused when `to`
+/// exists or is inside this repository.
+pub fn stage_gateway_project(emitted: &Path, to: &Path, url: &str) -> PathBuf {
+    let source = emitted.join("data").join("projects").join(PROJECT);
+    assert!(
+        source.join(".git").is_dir(),
+        "the emitted fixture holds no gateway project with a .git"
+    );
+    let to = outside_repository(to).unwrap_or_else(|e| panic!("PRODSHAPE_STAGE_TO: {e}"));
+    assert!(
+        std::fs::symlink_metadata(&to).is_err(),
+        "PRODSHAPE_STAGE_TO already exists: remove it or name a new path"
+    );
+    copy_tree(&source, &to);
+    let config = to.join(".git").join("config");
+    git(
+        &to,
+        &[
+            "config",
+            "--file",
+            to_str(&config),
+            &format!("remote.{REMOTE}.url"),
+            url,
+        ],
+    );
+    to
 }
 
 /// Copy a directory tree (regular files and directories; modes kept).

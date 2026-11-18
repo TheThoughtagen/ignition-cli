@@ -2811,6 +2811,8 @@ fn git_prodshape_shape() {
     // The in-scope files are on disk; the gateway's HEAD is not the release.
     assert!(f.project.join("project.json").is_file());
     assert_ne!(f.gateway_head, f.release_head);
+    // The shared check the rig gate applies to the live .git agrees.
+    assert_eq!(shape_git::shape_mismatches(&measured, &shape), [""; 0]);
 }
 
 #[test]
@@ -2830,6 +2832,26 @@ fn git_prodshape_emit() {
         f.gateway_head,
         f.release_head
     );
+}
+
+/// `capture27.sh seedprod27` (CodeRabbit #58 follow-up X3): stage the emitted
+/// gateway project from `PRODSHAPE_GIT_OUT` at `PRODSHAPE_STAGE_TO` with the
+/// module's remote URL, for the rig to put in place of a module clone. A quiet
+/// skip unless both are set. No shape value is printed.
+#[test]
+fn git_prodshape_stage() {
+    let (Some(out), Some(to)) = (
+        std::env::var_os("PRODSHAPE_GIT_OUT").filter(|v| !v.is_empty()),
+        std::env::var_os("PRODSHAPE_STAGE_TO").filter(|v| !v.is_empty()),
+    ) else {
+        return;
+    };
+    let staged = shape_git::stage_gateway_project(
+        std::path::Path::new(&out),
+        std::path::Path::new(&to),
+        shape_git::RIG_REMOTE_URL,
+    );
+    eprintln!("git_prodshape_stage: staged {}", staged.display());
 }
 
 /// CodeRabbit #58 (W2): a second emission into the same directory is refused
@@ -2876,6 +2898,104 @@ fn prodshape_emit_refuses_an_occupied_destination() {
         .filter(|n| n != "capapp.git" && n != "data")
         .collect();
     assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+}
+
+/// CodeRabbit #58 follow-up (X3): the generator pads the gateway's `.git`
+/// (unreferenced loose objects, loose tag refs, one pack per history run)
+/// after it made the remote, so a clone of the emitted remote, which is what
+/// the rig's git module made of it, does not carry the configured shape. The
+/// rig seed places the emitted gateway project instead, its remote pointed at
+/// the module's URL; that copy carries the shape and the shape check passes on
+/// it and refuses the clone.
+#[test]
+fn prodshape_seed_places_the_configured_shape() {
+    let _one = prodshape_serial();
+    let shape = GitShape {
+        git_bytes: 2 << 20,
+        git_files: 120,
+        packs: 3,
+        loose_objects: 20,
+        commits: 12,
+        tracked: 20,
+        in_scope: 6,
+        out_of_scope: 14,
+        advance_commits: 2,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let f = ProdShapeGit::generate(dir.path(), &shape);
+    let out = tempfile::tempdir().expect("tempdir");
+    let emitted = f.emit_to(out.path());
+    let emitted_git = shape_git::measure_git_dir(
+        &emitted
+            .join("data")
+            .join("projects")
+            .join(PROJECT)
+            .join(".git"),
+    );
+    assert_eq!(shape_git::shape_mismatches(&emitted_git, &shape), [""; 0]);
+
+    // What the module made of the remote: a transport clone (one pack, no
+    // loose objects, none of the padding refs).
+    let clones = tempfile::tempdir().expect("tempdir");
+    let clone = clones.path().join("clone");
+    run_git(
+        clones.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            "-b",
+            BRANCH,
+            emitted.join("capapp.git").to_str().expect("utf8"),
+            clone.to_str().expect("utf8"),
+        ],
+    );
+    let cloned = shape_git::measure_git_dir(&clone.join(".git"));
+    let refused = shape_git::placed_mismatches(&cloned, &emitted_git, &shape);
+    for what in ["loose_objects", "tag_refs", "git_files"] {
+        assert!(
+            refused.contains(&what),
+            "the clone's {what} passed the shape check: {refused:?}"
+        );
+    }
+
+    // What the seed places: the emitted gateway project, remote URL rewritten.
+    let stage = tempfile::tempdir().expect("tempdir");
+    let placed = stage.path().join(PROJECT);
+    shape_git::stage_gateway_project(&emitted, &placed, shape_git::RIG_REMOTE_URL);
+    let placed_git = shape_git::measure_git_dir(&placed.join(".git"));
+    assert_eq!(
+        shape_git::placed_mismatches(&placed_git, &emitted_git, &shape),
+        [""; 0]
+    );
+    assert_eq!(placed_git.tag_refs, emitted_git.tag_refs);
+    assert!(placed_git.tag_refs > 0, "the padding refs are missing");
+    assert_eq!(
+        run_git(
+            &placed,
+            &[
+                "config",
+                "--get",
+                &format!("remote.{}.url", common::git_fixture::REMOTE)
+            ]
+        ),
+        shape_git::RIG_REMOTE_URL
+    );
+    assert_eq!(
+        run_git(&placed, &["rev-parse", &format!("refs/heads/{BRANCH}")]),
+        f.gateway_head
+    );
+    assert!(placed.join("project.json").is_file());
+    assert!(placed.join(".git").join("index").is_file());
+    // A second stage into the same place is refused.
+    assert!(
+        std::panic::catch_unwind(|| shape_git::stage_gateway_project(
+            &emitted,
+            &placed,
+            shape_git::RIG_REMOTE_URL
+        ))
+        .is_err()
+    );
 }
 
 /// CodeRabbit #58 (W1): the generator's git acts on the fixture whatever
