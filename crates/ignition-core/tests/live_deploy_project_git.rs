@@ -770,8 +770,9 @@ async fn git_advance_status() {
 }
 
 /// G9: the advanced `.git` survives a restart, a project scan and a status
-/// read, and a second overwrite import deletes it again (the module
-/// re-registered it, R-7).
+/// read. What a second overwrite import does to it is recorded, not asserted
+/// (`second_import_git_deleted`): R-7 expected a deletion, the rig showed the
+/// `.git` kept (decision D-G9), and the handover covers both outcomes.
 #[tokio::test]
 #[ignore = "needs the git-module rig: IGNITION_LIVE_GIT=1"]
 async fn git_restore_survival() {
