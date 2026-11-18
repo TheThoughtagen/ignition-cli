@@ -3636,9 +3636,31 @@ mod published {
         );
     }
 
+    /// CodeRabbit #57: a Designer that attaches while the `.git` is being
+    /// saved stops the run at the check made after the saves, right before
+    /// the import: nothing is imported, the save goes (the `.git` was never
+    /// touched) and the repository is as it was.
+    #[tokio::test]
+    async fn designer_attached_during_the_save_stops_the_import() {
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let rig = Rig::with(|g| g.with_designers_script(vec![vec![], vec![session]]));
+        let head = rig.f.git_in_project(&["rev-parse", "HEAD"]);
+        let outcome = rig.apply().await;
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "no import: {outcome:?}"
+        );
+        let err = outcome.expect_err("the Designer check refuses");
+        assert!(err.to_string().contains("alice"), "{err}");
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert_eq!(rig.f.git_in_project(&["rev-parse", "HEAD"]), head);
+    }
+
     #[tokio::test]
     async fn designer_attached_at_restore() {
-        let rig = Rig::with(|g| g.with_designers_after_verify(100_000));
+        // the session opens after the import's read-back (the third export):
+        // one open before the import is refused by the check after the saves
+        let rig = Rig::with(|g| g.with_designers_after_exports(3, 100_000));
         let result = rig
             .apply_designers(wait_ms(60))
             .await
@@ -3688,7 +3710,7 @@ mod published {
     async fn designer_detaches_within_wait() {
         // The run's mode is `fail`: the gate still waits (30 s at most, 5 ms
         // between reads here) and the session closes after two reads.
-        let rig = Rig::with(|g| g.with_designers_after_verify(2));
+        let rig = Rig::with(|g| g.with_designers_after_exports(3, 2));
         let result = rig
             .apply_designers(fail_fast_poll())
             .await
@@ -4027,7 +4049,7 @@ mod published {
 
         // The unverified import: the outcome stays `imported_unverified`, the
         // repo is not put back while a session is attached.
-        let rig = Rig::with(|g| g.with_designers_after_verify(100_000));
+        let rig = Rig::with(|g| g.with_designers_after_exports(3, 100_000));
         rig.gateway.mutate_child_after_import(PROJECT, 1000);
         let result = rig
             .apply_designers(wait_ms(60))

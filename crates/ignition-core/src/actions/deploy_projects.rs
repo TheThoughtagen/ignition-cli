@@ -4857,65 +4857,6 @@ async fn execute(
         return Ok(result);
     }
 
-    // The Designer check ran before the tag step, which can take minutes:
-    // it is made again, under the same policy, right before the import it
-    // guards (ultrareview U7). A refusal after tag writes rolls back like a
-    // refused import; before any write it is the run's error.
-    if tag_owning && !designers.skipped {
-        match designers_check(plan, gateway, &opts.designers, observer).await {
-            Ok(found) => {
-                if found.proceeded {
-                    events.emit_late(ProjectsEvent::DesignersProceed {
-                        sessions: found.seen.clone(),
-                    });
-                }
-            }
-            Err(err) if tags_wrote => {
-                let failure = TagFailure {
-                    cause: RollbackCause::ProjectImportFailed,
-                    what: format!(
-                        "the Designer check right before the project import did not pass ({err})"
-                    ),
-                    writes: step.writes,
-                };
-                return roll_back(
-                    failure,
-                    // no import was sent: the project is not this run's to
-                    // put back (an import of its pre-image would overwrite a
-                    // Designer's save and remove `.git`, CodeRabbit #57)
-                    None,
-                    result,
-                    loaded,
-                    input,
-                    surfaces,
-                    opts,
-                    run_id,
-                    rel,
-                    UndoWriters {
-                        run: writers.run,
-                        records: None,
-                        release: None,
-                        git: None,
-                        backup_git: None,
-                    },
-                    route,
-                    &mut events,
-                )
-                .await;
-            }
-            Err(err) => {
-                return Err(unwritten(
-                    err,
-                    loaded,
-                    writers.run,
-                    step.writes.host.as_ref(),
-                    &mut events,
-                )
-                .await);
-            }
-        }
-    }
-
     // Phase 27: right before the import, the gateway repo is read again (any
     // change since the plan is `plan_stale`) and its `.git` is saved to a
     // host-local path no import reaches. The `.git` stays in place until the
@@ -5068,6 +5009,76 @@ async fn execute(
                     project,
                     git_undo(&writers, git_saved.as_ref()),
                     None,
+                    &mut events,
+                )
+                .await;
+                return Err(unwritten(
+                    err,
+                    loaded,
+                    writers.run,
+                    step.writes.host.as_ref(),
+                    &mut events,
+                )
+                .await);
+            }
+        }
+    }
+
+    // The Designer check ran before the tag step and the `.git` saves, which
+    // can take minutes: it is made again, under the same policy, right before
+    // the import it guards (ultrareview U7; CodeRabbit #57: after both saves,
+    // so a Designer that attached while they were taken is seen). A refusal
+    // after tag writes rolls the tags back and never imports the project (the
+    // saves go when the `.git` is the one saved); before any write it is the
+    // run's error, and the saves go.
+    if (tag_owning || git_saved.is_some() || backup_saved.is_some()) && !designers.skipped {
+        match designers_check(plan, gateway, &opts.designers, observer).await {
+            Ok(found) => {
+                if found.proceeded {
+                    events.emit_late(ProjectsEvent::DesignersProceed {
+                        sessions: found.seen.clone(),
+                    });
+                }
+            }
+            Err(err) if tags_wrote => {
+                let failure = TagFailure {
+                    cause: RollbackCause::ProjectImportFailed,
+                    what: format!(
+                        "the Designer check right before the project import did not pass ({err})"
+                    ),
+                    writes: step.writes,
+                };
+                return roll_back(
+                    failure,
+                    // no import was sent: the project is not this run's to
+                    // put back (CodeRabbit #57)
+                    None,
+                    result,
+                    loaded,
+                    input,
+                    surfaces,
+                    opts,
+                    run_id,
+                    rel,
+                    UndoWriters {
+                        run: writers.run,
+                        records: None,
+                        release: None,
+                        git: git_undo(&writers, git_saved.as_ref()),
+                        backup_git: backup_undo(&writers, backup_saved.as_ref()),
+                    },
+                    route,
+                    &mut events,
+                )
+                .await;
+            }
+            Err(err) => {
+                let err = discard_saves_before_import(
+                    err,
+                    &plan.gateway,
+                    project,
+                    git_undo(&writers, git_saved.as_ref()),
+                    backup_undo(&writers, backup_saved.as_ref()),
                     &mut events,
                 )
                 .await;
