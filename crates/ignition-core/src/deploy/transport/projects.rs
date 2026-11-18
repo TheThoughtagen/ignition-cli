@@ -692,6 +692,62 @@ pub fn tag_record_writer_for_node(
     }
 }
 
+/// The read-only git surface for `node`, built from its target block exactly
+/// as [`project_host_for_node`] builds the project host (Phase 27). No
+/// connection is opened until a method is called.
+pub fn git_host_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn GitHostRead>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
+}
+
+/// The node's data directory on the runner's own filesystem when its target
+/// block is a `local` one, else `None` (an `ssh` node, POSIX or Windows).
+/// Phase 27 (27-12, D-25): only a `local` node gets the post-advance status
+/// over the disk, because only there does ign read the project directory
+/// without a gateway host between.
+pub fn local_data_dir_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Option<std::path::PathBuf>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Some(data_dir)),
+        NodeAccess::Ssh { .. } => Ok(None),
+    }
+}
+
+/// The git state writer for `node`, from its target block, built exactly as
+/// [`git_host_for_node`] builds the reader. The source scan
+/// `git_state_writer_is_confined` lets only `deploy/transport/`,
+/// `deploy/git_handover.rs` and the project deploy action name it.
+pub fn git_state_writer_for_node(
+    base: &Path,
+    target_file: &str,
+    label: &str,
+    node: &NodeTarget,
+) -> Result<Box<dyn GitStateWriter>, CoreError> {
+    match node_access(base, target_file, label, node)? {
+        NodeAccess::Local(data_dir) => Ok(Box::new(local::LocalFsTransport::new(data_dir, label))),
+        NodeAccess::Ssh {
+            shell,
+            data_dir,
+            windows,
+        } => Ok(Box::new(sftp_transport(*shell, data_dir, label, windows))),
+    }
+}
+
 /// The release-record writer for `node`, from its target block.
 ///
 /// The `local` arm writes below the runner's own data directory. The `ssh` arm
@@ -785,6 +841,52 @@ mod tests {
         release_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
             .map(|_| ())
             .expect("an ssh node has a writer");
+    }
+
+    /// 27-08: the git reader and the git writer are built for a local and an
+    /// ssh node the way the release writer is, without a connection, and an
+    /// ssh node whose `known_hosts` is missing is refused before anything is
+    /// read or written.
+    #[test]
+    fn git_factories_build_local_and_ssh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_yaml = format!(
+            "schema_version: 1\ngateway: g\nmode: m\nnodes:\n  master:\n    profile: p\n    local:\n      data_dir: '{}'\n",
+            dir.path().display()
+        );
+        let local = crate::deploy::target::Target::parse("targets/dev.yaml", local_yaml.as_bytes())
+            .expect("local target")
+            .nodes
+            .master;
+        git_host_for_node(dir.path(), "targets/dev.yaml", "nodes.master", &local)
+            .map(|_| ())
+            .expect("a local node has a git reader");
+        git_state_writer_for_node(dir.path(), "targets/dev.yaml", "nodes.master", &local)
+            .map(|_| ())
+            .expect("a local node has a git writer");
+
+        let ssh = ssh_target("hosts/lnx.known_hosts").expect("target parses");
+        let err = git_host_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("no known_hosts under this base");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+        let err = git_state_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect_err("no known_hosts under this base");
+        assert_eq!(err.code(), "deploy_tree_invalid", "{err}");
+
+        std::fs::create_dir_all(dir.path().join("hosts")).expect("hosts dir");
+        std::fs::write(
+            dir.path().join("hosts/lnx.known_hosts"),
+            "lnx.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTheUnitTestOnly0000000\n",
+        )
+        .expect("known_hosts");
+        git_host_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect("an ssh node has a git reader");
+        git_state_writer_for_node(dir.path(), "targets/live.yaml", "nodes.master", &ssh)
+            .map(|_| ())
+            .expect("an ssh node has a git writer");
     }
 
     /// The probe file name is fixed by the run id.
