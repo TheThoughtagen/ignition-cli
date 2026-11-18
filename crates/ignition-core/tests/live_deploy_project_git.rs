@@ -536,7 +536,7 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
         "LIVE-STATE kind={:?} reason={:?} head_branch_tip_is_v1_0_0={} remote={} tracked={:?}",
         state.kind,
         state.reason,
-        refs.heads.values().any(|id| id == &c1),
+        head_at(&refs, &c1),
         state
             .remote
             .as_ref()
@@ -550,7 +550,7 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
         "the module's clone must classify as managed: {state:?}"
     );
     assert!(
-        refs.heads.values().any(|id| id == &c1),
+        head_at(&refs, &c1),
         "the module's clone must sit at v1.0.0 (run reset27 first)"
     );
 
@@ -737,11 +737,11 @@ async fn git_advance_status() {
     let (state, refs) = gateway_state(&rig, &host).await;
     assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
     assert!(
-        refs.heads.values().any(|id| id == &advanced.c2),
+        head_at(&refs, &advanced.c2),
         "the branch tip is the release commit"
     );
     assert!(
-        !refs.heads.values().any(|id| id == &advanced.c1),
+        !head_at(&refs, &advanced.c1),
         "the branch tip moved off v1.0.0"
     );
     rig.node()
@@ -782,7 +782,7 @@ async fn git_restore_survival() {
 
     let (state, refs) = gateway_state(&rig, &host).await;
     assert!(
-        state.kind == GitStateKind::Managed && refs.heads.values().any(|id| id == &c2),
+        state.kind == GitStateKind::Managed && head_at(&refs, &c2),
         "refusing to start: CapApp's HEAD is not v1.1.0 (run git_advance_status first)"
     );
     let (_work, config) = script_config(&api, &rig.url).await;
@@ -828,7 +828,7 @@ async fn git_restore_survival() {
     let (state_after, refs_after) = gateway_state(&rig, &host).await;
     assert_eq!(state_after.kind, GitStateKind::Managed, "{state_after:?}");
     assert!(
-        refs_after.heads.values().any(|id| id == &c2),
+        head_at(&refs_after, &c2),
         "HEAD is still v1.1.0 after the restart"
     );
     assert_eq!(
@@ -2293,7 +2293,7 @@ async fn git_deploy_managed_e2e() {
     assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
     let (_keep, _checkout, c1) = release_checkout(&rig, "v1.0.0");
     assert!(
-        refs.heads.values().any(|id| id == &c1),
+        head_at(&refs, &c1),
         "the module's clone must sit at v1.0.0 (run reset27 first)"
     );
 
@@ -2413,7 +2413,7 @@ async fn git_refusals_live() {
     assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
     let (_keep, _checkout, c1) = release_checkout(&rig, "v1.0.0");
     assert!(
-        refs.heads.values().any(|id| id == &c1),
+        head_at(&refs, &c1),
         "the module's clone must sit at v1.0.0 (run reset27 first)"
     );
     let (_work, config) = script_config(&api, &rig.url).await;
@@ -2984,7 +2984,7 @@ async fn git_prodscale_rig() {
     assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
     let (_keep, _checkout, release) = release_checkout(&rig, "v1.1.0");
     assert!(
-        !refs.heads.values().any(|id| id == &release),
+        !head_at(&refs, &release),
         "the module's clone must sit behind the release (run seedprod27 first)"
     );
     let (_work, config) = script_config(&api, &rig.url).await;
@@ -3509,6 +3509,43 @@ fn head_commit(refs: &GitRefs) -> String {
     }
 }
 
+/// Whether `HEAD` names `commit`. Another local branch at `commit` does not
+/// count: a gate about HEAD reads HEAD.
+fn head_at(refs: &GitRefs, commit: &str) -> bool {
+    refs.head.commit() == Some(commit)
+}
+
+/// CodeRabbit #58 (W12): HEAD on `production` at v1.0.0 is not "at v1.1.0"
+/// because another local branch holds v1.1.0.
+#[test]
+fn head_at_reads_head_not_any_branch() {
+    let (old, new) = ("1".repeat(40), "2".repeat(40));
+    let refs = GitRefs {
+        head: GitHead::Branch {
+            name: "production".to_string(),
+            commit: Some(old.clone()),
+        },
+        heads: BTreeMap::from([
+            ("refs/heads/production".to_string(), old.clone()),
+            ("refs/heads/other".to_string(), new.clone()),
+        ]),
+        remotes: BTreeMap::new(),
+    };
+    assert!(head_at(&refs, &old));
+    assert!(
+        !head_at(&refs, &new),
+        "another branch at the commit is not HEAD"
+    );
+    let unborn = GitRefs {
+        head: GitHead::Branch {
+            name: "production".to_string(),
+            commit: None,
+        },
+        ..refs
+    };
+    assert!(!head_at(&unborn, &old), "an unborn HEAD names no commit");
+}
+
 /// Every git event of a pair run with the node it names and the time it was
 /// heard (names, nodes and milliseconds only).
 struct PairTimeline {
@@ -3642,7 +3679,7 @@ async fn git_pair_e2e() {
         before.1 == after.1
     );
     eprintln!(
-        "LIVE-PAIR check: nodes=2 master_state={} backup_state={} master_head_is_v1_0_0={} backup_head_is_v1_0_0={} git_manifests_unchanged=true files_master={} files_backup={}",
+        "LIVE-PAIR check: nodes=2 master_state={} backup_state={} master_head_branch_tip_is_v1_0_0={} backup_head_is_v1_0_0={} git_manifests_unchanged=true files_master={} files_backup={}",
         nodes[0]["state"],
         nodes[1]["state"],
         nodes[0]["head"] == serde_json::Value::String(c1.clone()),
