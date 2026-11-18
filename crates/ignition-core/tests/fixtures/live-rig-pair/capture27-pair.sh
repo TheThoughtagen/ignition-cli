@@ -442,14 +442,19 @@ down() {
 # --------------------------------------------------------------------- g5
 
 # digest_b: the backup's REST project export (GET) as member count and a digest
-# of (member, content hash).
+# of (member, content hash). An answer other than HTTP 200, or a body that is
+# not a ZIP, is reported as unavailable, never as a digest of no members.
 digest_b() {
-  local z=$TMPD/b-export.zip list=$TMPD/b-export.list n
-  get b "/data/api/v1/projects/export/$APP" > "$z" || { echo "export unavailable"; return 0; }
+  local z=$TMPD/b-export.zip list=$TMPD/b-export.list names=$TMPD/b-export.names n code
+  /bin/rm -f "$z"
+  code=$(curl_tok IGN_PAIR_TOKEN_B -sS -m 120 -o "$z" -w '%{http_code}' "$BASE_B/data/api/v1/projects/export/$APP") \
+    || { echo "export unavailable (no answer)"; return 0; }
+  [ "$code" = 200 ] || { echo "export unavailable (HTTP $code)"; return 0; }
+  unzip -Z1 "$z" > "$names" 2> /dev/null || { echo "export unavailable (the body is not a ZIP)"; return 0; }
   : > "$list"
   while IFS= read -r n; do
     printf '%s %s\n' "$n" "$(unzip -p "$z" "$n" | shasum -a 256 | cut -c1-16)" >> "$list"
-  done < <(unzip -Z1 "$z" 2> /dev/null | grep -v '/$' | LC_ALL=C sort)
+  done < <(grep -v '/$' "$names" | LC_ALL=C sort)
   printf 'members=%s git_members=%s digest=%s' "$(wc -l < "$list" | tr -d ' ')" "$(grep -c '^\.git/' "$list" || true)" "$(shasum -a 256 < "$list" | cut -c1-12)"
 }
 
