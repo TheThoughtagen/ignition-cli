@@ -9706,13 +9706,16 @@ pub async fn deploy_projects_rollback_run(
                 )
                 .await?;
                 report.set_save(&saved);
-                events.emit(ProjectsEvent::GitSaved {
+                // held before the event, so a log that fails still leaves the
+                // save to the cleanup (CodeRabbit #57)
+                let event = ProjectsEvent::GitSaved {
                     node: "nodes.master".to_string(),
                     path: saved.path.clone(),
                     files: saved.manifest.files,
                     bytes: saved.manifest.bytes,
-                })?;
+                };
                 git_saved = Some(saved);
+                events.emit(event)?;
             }
             // 27-22: the backup's `.git` is saved the same way, on its own host.
             if let (Some(report), Some(writer), Some(host)) = (
@@ -9733,13 +9736,14 @@ pub async fn deploy_projects_rollback_run(
                 .await
                 .map_err(on_backup)?;
                 git::set_backup_save(report, &saved);
-                events.emit(ProjectsEvent::GitSaved {
+                let event = ProjectsEvent::GitSaved {
                     node: git::BACKUP.to_string(),
                     path: saved.path.clone(),
                     files: saved.manifest.files,
                     bytes: saved.manifest.bytes,
-                })?;
+                };
                 backup_saved = Some(saved);
+                events.emit(event)?;
             }
             result.git = git_report.take().map(Box::new);
             // The journal says rolling_back before the first gateway write; a
