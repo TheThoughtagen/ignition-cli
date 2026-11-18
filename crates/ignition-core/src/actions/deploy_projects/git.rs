@@ -1813,6 +1813,9 @@ pub async fn git_after_verify(
 struct SettleHold {
     /// The save was kept because the `.git` was advanced in place.
     held: bool,
+    /// The run discarded gateway commits, so the save stays after the settle
+    /// too (27-15, D-05); the settle still looks again (CodeRabbit #57).
+    keep_save: bool,
     /// The manifest of the advanced `.git`, read right after the read-back;
     /// `None` when it could not be read.
     advanced: Option<GitManifest>,
@@ -1844,16 +1847,7 @@ async fn after_verify(
     if hold.held
         && let Some(interval) = settle
     {
-        after = settle_backup_git(
-            prepared,
-            report,
-            saved,
-            inputs,
-            interval,
-            hold.advanced,
-            after,
-        )
-        .await;
+        after = settle_backup_git(prepared, report, saved, inputs, interval, hold, after).await;
     }
     after.events.splice(
         0..0,
@@ -2159,8 +2153,18 @@ async fn advance_after(
             inputs.project,
             discard_ref_name(&saved.run_id)
         ));
-        if is_backup {
-            project_json_gate(report, saved, inputs, &mut after).await;
+        match hold {
+            // the settle looks again (a late delete is restored from the
+            // save) and checks `project.json` then; the save stays
+            Some(slot) if !done.restored => {
+                slot.held = true;
+                slot.keep_save = true;
+            }
+            _ => {
+                if is_backup {
+                    project_json_gate(report, saved, inputs, &mut after).await;
+                }
+            }
         }
     } else {
         match hold {
@@ -2314,9 +2318,14 @@ async fn settle_backup_git(
     saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
     interval: Duration,
-    advanced: Option<GitManifest>,
+    hold: SettleHold,
     mut after: GitAfter,
 ) -> GitAfter {
+    let SettleHold {
+        advanced,
+        keep_save,
+        ..
+    } = hold;
     let project = inputs.project;
     tokio::time::sleep(interval).await;
     let files = match inputs.read.read_git_state(project).await {
@@ -2342,7 +2351,7 @@ async fn settle_backup_git(
                 // The second look also covers `project.json` (27-37): the
                 // sync's late delete takes it with the `.git`. A finding
                 // fails the node and the save stays.
-                if !project_json_gate(report, saved, inputs, &mut after).await {
+                if !project_json_gate(report, saved, inputs, &mut after).await && !keep_save {
                     remove_save(report, saved, inputs, &mut after).await;
                 }
             }

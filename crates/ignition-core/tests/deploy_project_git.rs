@@ -6431,6 +6431,54 @@ mod published {
         );
     }
 
+    /// CodeRabbit #57: a run that discards gateway commits keeps each node's
+    /// save (D-05), and the backup's `.git` still settles: the redundancy
+    /// sync's late delete after the advance is found one poll interval later
+    /// and the repository is restored from the save and advanced, and the save
+    /// stays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pair_backup_discarding_run_still_settles_and_keeps_save() {
+        let mut rig = pair();
+        rig.discard = Some(REASON.to_string());
+        rig.backup_interval = std::time::Duration::from_millis(100);
+        // the same unpushed gateway commit on both nodes
+        let d = rig.f.designer_commit(false);
+        let master_git = rig.f.git_dir().display().to_string();
+        rig.f.git_in_backup(&["fetch", "-q", &master_git, &d]);
+        rig.f.git_in_backup(&["reset", "-q", "--hard", &d]);
+        rig.sync_live();
+        let scratch = tempfile::tempdir().expect("scratch");
+        let program = late_backup_git(
+            scratch.path(),
+            &rig,
+            &format!("/bin/rm -rf '{}'", rig.f.backup_git_dir().display()),
+        );
+        let host = rig.host_with_program(&program);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig
+            .apply_pair_on(&host, &backup, WAIT)
+            .await
+            .expect("the apply completes");
+        assert!(
+            scratch.path().join("late-ran").exists(),
+            "the late delete ran"
+        );
+        assert!(
+            rig.f.backup_git_dir().exists(),
+            "the backup must not end without a .git: {:?}",
+            result.warnings
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert!(restore.restored && restore.advanced, "{restore:?}");
+        assert!(
+            restore.save_kept,
+            "a discarding run keeps the save: {restore:?}"
+        );
+        assert_eq!(rig.save_trees_in(&rig.f.backup_data_dir()).len(), 1);
+    }
+
     /// WR-08, the quiet case: the sync leaves the backup's `.git` alone. It
     /// is advanced in place, probed again after one poll interval, found equal
     /// to the advanced state, and only then is the save removed.
