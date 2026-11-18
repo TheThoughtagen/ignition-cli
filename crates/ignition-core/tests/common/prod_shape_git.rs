@@ -1127,12 +1127,36 @@ impl ProdShapeGit {
     /// VM gates (a release checkout is a clone of the remote at the tag).
     /// Refused when `dir` is inside this repository.
     pub fn emit_to(&self, dir: &Path) -> PathBuf {
-        let dir = outside_repository(dir).unwrap_or_else(|e| panic!("PRODSHAPE_GIT_OUT: {e}"));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        copy_tree(&self.remote, &dir.join("capapp.git"));
-        copy_tree(&self.data_dir, &dir.join("data"));
-        dir
+        emit_fixture(&self.remote, &self.data_dir, dir)
     }
+}
+
+/// Write `remote` as `dir/capapp.git` and `data_dir` as `dir/data`. Refused
+/// when `dir` already holds either: an emission is never merged into an
+/// earlier one. Both trees are copied into a staging directory inside `dir`
+/// and moved into place only after both copies finished.
+pub fn emit_fixture(remote: &Path, data_dir: &Path, dir: &Path) -> PathBuf {
+    let dir = outside_repository(dir).unwrap_or_else(|e| panic!("PRODSHAPE_GIT_OUT: {e}"));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let targets = [dir.join("capapp.git"), dir.join("data")];
+    for target in &targets {
+        assert!(
+            std::fs::symlink_metadata(target).is_err(),
+            "PRODSHAPE_GIT_OUT already holds {}: remove it or name an empty directory",
+            target.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+        );
+    }
+    let stage = tempfile::Builder::new()
+        .prefix(".emit-")
+        .tempdir_in(&dir)
+        .expect("a staging directory");
+    let staged = [stage.path().join("capapp.git"), stage.path().join("data")];
+    copy_tree(remote, &staged[0]);
+    copy_tree(data_dir, &staged[1]);
+    for (from, to) in staged.iter().zip(&targets) {
+        std::fs::rename(from, to).expect("the emitted tree is moved into place");
+    }
+    dir
 }
 
 fn to_str(path: &Path) -> &str {

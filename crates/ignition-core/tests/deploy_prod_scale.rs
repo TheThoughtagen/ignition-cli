@@ -2832,6 +2832,52 @@ fn git_prodshape_emit() {
     );
 }
 
+/// CodeRabbit #58 (W2): a second emission into the same directory is refused
+/// and leaves the first one as it was. Merged, the files of an earlier, larger
+/// emission (loose objects, packs) would stay beside the new fixture's.
+#[test]
+fn prodshape_emit_refuses_an_occupied_destination() {
+    use common::prod_shape_git::emit_fixture;
+    let src = tempfile::tempdir().expect("tempdir");
+    let make = |root: &std::path::Path, loose: &[&str]| {
+        let remote = root.join("remote");
+        let data = root.join("data");
+        for name in loose {
+            let file = remote.join("objects").join("aa").join(name);
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&file, name).expect("write");
+        }
+        let project = data.join("projects").join("CapApp");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        std::fs::write(project.join("project.json"), "{}").expect("write");
+        (remote, data)
+    };
+    let (remote1, data1) = make(&src.path().join("one"), &["first", "second"]);
+    let (remote2, data2) = make(&src.path().join("two"), &["third"]);
+    let out = tempfile::tempdir().expect("tempdir");
+    let written = emit_fixture(&remote1, &data1, out.path());
+    let loose = written.join("capapp.git").join("objects").join("aa");
+    assert!(loose.join("first").is_file() && loose.join("second").is_file());
+
+    let again = std::panic::catch_unwind(|| emit_fixture(&remote2, &data2, out.path()));
+    assert!(
+        again.is_err(),
+        "a second emission into an occupied directory was merged into the first"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&loose)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["first", "second"], "the first emission changed");
+    let leftovers: Vec<String> = std::fs::read_dir(&written)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "capapp.git" && n != "data")
+        .collect();
+    assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+}
+
 /// CodeRabbit #58 (W1): the generator's git acts on the fixture whatever
 /// repository-selection variables the test process inherited (a git hook sets
 /// `GIT_DIR`, and with it set `-C` does not pick the fixture's repository).
