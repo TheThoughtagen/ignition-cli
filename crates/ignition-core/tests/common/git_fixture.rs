@@ -88,7 +88,7 @@ pub fn in_scope(path: &str) -> bool {
 /// Repository-selection variables a test process may inherit (a git hook,
 /// an IDE, `git rebase --exec`). Any of them makes git ignore the working
 /// directory and act on the caller's repository instead of the fixture's.
-const GIT_LOCATION_VARS: [&str; 8] = [
+pub const GIT_LOCATION_VARS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
