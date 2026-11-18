@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::git_fixture::{BRANCH, GATEWAY, PROJECT, REMOTE, gateway_form, git, in_scope};
+use super::git_fixture::{
+    BRANCH, GATEWAY, GIT_LOCATION_VARS, PROJECT, REMOTE, gateway_form, git, in_scope,
+};
 use ignition_core::deploy::git_advance::{AdvancePrep, prepare_advance};
 use ignition_core::deploy::git_remote::HostGit;
 use ignition_core::deploy::git_state::{GitRefs, GitState, GitStateKind, classify};
@@ -599,11 +601,16 @@ impl History {
 
 // ---- host git plumbing ------------------------------------------------------
 
-fn git_command(dir: &Path) -> Command {
+/// Host git in `dir` on the fixture's repository only: the inherited
+/// repository-selection variables cleared (as [`git`] does), no user or
+/// system config, no background maintenance or auto gc.
+pub fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
+    command.arg("-C").arg(dir);
+    for var in GIT_LOCATION_VARS {
+        command.env_remove(var);
+    }
     command
-        .arg("-C")
-        .arg(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         // no background maintenance or auto gc: git 2.5x repacks a many-pack

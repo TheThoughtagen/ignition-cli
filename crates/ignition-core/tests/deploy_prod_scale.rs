@@ -2832,6 +2832,22 @@ fn git_prodshape_emit() {
     );
 }
 
+/// CodeRabbit #58 (W1): the generator's git acts on the fixture whatever
+/// repository-selection variables the test process inherited (a git hook sets
+/// `GIT_DIR`, and with it set `-C` does not pick the fixture's repository).
+#[test]
+fn prodshape_git_clears_inherited_repository_selection() {
+    let command = common::prod_shape_git::git_command(std::path::Path::new("."));
+    let envs: BTreeMap<_, _> = command.get_envs().collect();
+    for var in common::git_fixture::GIT_LOCATION_VARS {
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new(var)),
+            Some(&None),
+            "{var} is not cleared"
+        );
+    }
+}
+
 #[test]
 fn git_prodshape_refuses_a_path_inside_the_repository() {
     let root = repository_root();
