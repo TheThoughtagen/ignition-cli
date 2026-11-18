@@ -3701,6 +3701,16 @@ mod published {
             g.with_designers_script(vec![vec![], vec![session], vec![]])
                 .with_project_edited_on_designers_read(1, PROJECT)
         });
+        // CodeRabbit #57 S2: the read that reports Alice comes after the save
+        let saves = rig.f.data_dir.join("ign-deploy");
+        let saved_at_poll = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = saved_at_poll.clone();
+        rig.gateway.on_designers_read(1, move || {
+            let taken = std::fs::read_dir(saves.join("capgw/projects/CapApp/git-save"))
+                .map(|runs| runs.flatten().any(|run| run.path().join("repo").is_dir()))
+                .unwrap_or(false);
+            seen.store(taken, std::sync::atomic::Ordering::SeqCst);
+        });
         let outcome = rig.apply_designers(wait_ms(5_000)).await;
         assert!(
             rig.gateway.import_calls().is_empty(),
@@ -3708,6 +3718,25 @@ mod published {
         );
         let err = outcome.expect_err("a stale plan");
         assert_eq!(err.code(), "plan_stale", "{err}");
+        assert!(
+            saved_at_poll.load(std::sync::atomic::Ordering::SeqCst),
+            "the save was taken before the poll that reported the session"
+        );
+        // and the run logged the save, then its removal
+        let run = std::fs::read_dir(rig.repo.join(".ign/deploy/capgw"))
+            .expect("run dirs")
+            .flatten()
+            .next()
+            .expect("one run directory")
+            .path();
+        let events: Vec<String> = std::fs::read_to_string(run.join("events.ndjson"))
+            .expect("events")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|e| e["event"].as_str().map(str::to_string))
+            .filter(|e| e == "git_saved" || e == "git_save_removed")
+            .collect();
+        assert_eq!(events, ["git_saved", "git_save_removed"], "{events:?}");
         assert!(rig.save_trees().is_empty(), "the save is removed");
         assert!(rig.f.git_dir().is_dir(), "the .git was never touched");
     }
