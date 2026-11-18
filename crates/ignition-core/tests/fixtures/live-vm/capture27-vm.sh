@@ -266,6 +266,12 @@ proj_dir="$DATA/projects/$PROJ"
 gitdir="$proj_dir/.git"
 src="$HOME/$SCRATCH_REL/src.git"
 [ -d "$src" ] || { echo "no src.git: run upload first" >&2; exit 2; }
+# the probe copies src.git in as .git and removes it again: a .git that is
+# already there is not this run's, so it is never replaced or removed
+if [ -e "$gitdir" ] || [ -L "$gitdir" ]; then
+  echo "REFUSING: $PROJ already has a .git; g1-after only probes a project without one" >&2
+  exit 2
+fi
 err=$(mktemp)
 probe() { # DIR LABEL
   if { : > "$1/.ign-probe-27"; } 2> "$err"; then rm -f "$1/.ign-probe-27"; echo "probe-file $2: created and removed"; else echo "probe-file $2: denied: $(cat "$err")"; fi
@@ -776,12 +782,14 @@ $projDir = Join-Path $Data "projects\$Proj"
 $gitdir = Join-Path $projDir '.git'
 $src = Join-Path $Scratch 'src.git'
 if (-not (Test-Path -LiteralPath $src)) { Write-Output 'no src.git: run upload first'; exit 2 }
+# the probe copies src.git in as .git and removes it again: a .git that is
+# already there is not this run's, so it is never replaced or removed
+if (Test-Path -LiteralPath $gitdir) { Write-Output "REFUSING: $Proj already has a .git; g1-after only probes a project without one"; exit 2 }
 Write-Output "== identity"; Write-Output (& whoami.exe)
 Write-Output "== project directory after the grant"
 Show-Acl $projDir
 Test-Probe $projDir 'project-dir'
 Write-Output ("== copying src.git into the project as .git with {0}" -f $Tool)
-Remove-Tree $gitdir
 Copy-With $Tool $src $gitdir
 $n = (Get-ChildItem -LiteralPath $gitdir -Recurse -Force -File | Measure-Object).Count
 Write-Output ("copied: {0} files" -f $n)
