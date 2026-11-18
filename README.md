@@ -4914,8 +4914,12 @@ refusals as the check first (`.git`, parent, downgrade, first deploy), then:
    copied into any other file; keep the directory private.
 5. **The import** is preceded, for an `import`, by one more export of the live
    project, made last: if its digest is no longer the plan's (a Designer saved
-   since the pre-image, possibly between two Designer polls), the run refuses
-   `plan_stale` and imports nothing; after tag writes the tags are rolled back.
+   since the pre-image, possibly between two Designer polls), the run imports
+   nothing. Before any tag write that is the `plan_stale` refusal. After a tag
+   write the tags are rolled back instead: a verified rollback ends
+   `tags_rolled_back` (slug `deploy_rolled_back`, exit 6), and a rollback
+   that could not restore is `rollback_failed` (exit 6) and may leave tag
+   changes on the gateway.
    The import goes to the master node's gateway only (the project is never
    imported on `nodes.backup`: the redundancy sync carries it there; when the
    backup holds a git repository, see **Redundant pairs** under [Projects the
