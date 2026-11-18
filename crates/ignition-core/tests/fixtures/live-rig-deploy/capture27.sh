@@ -407,6 +407,7 @@ seed_prodshape27() {
   # and environments in deploy/project.yaml, so one commit on top of the
   # generator's release adds that one neutral file and the tag v1.1.0 moves to it
   # (the only change to the generated history: one commit, one file).
+  # live_deploy_project_git's git_prodscale_rig keys on this commit's subject.
   local blob tree commit idx=$TMPD/prodshape.index
   blob=$(printf 'schema_version: 1\nproject: %s\nenvironments: [rig]\n' "$APP" | seedgit -C "$bare" hash-object -w --stdin)
   GIT_INDEX_FILE=$idx seedgit -C "$bare" read-tree "$rel"

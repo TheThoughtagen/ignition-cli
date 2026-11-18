@@ -2969,6 +2969,10 @@ async fn git_restart_pull_e2e() {
     eprintln!("LIVE-RAN git_restart_pull_e2e");
 }
 
+/// The subject of the one commit `capture27.sh seedprod27` adds on top of the
+/// production-shape generator's release (it carries `deploy/project.yaml`).
+const PRODSHAPE_DESCRIPTOR_SUBJECT: &str = "release deploy descriptor";
+
 /// 27-24 Task 1 (D-18): the rig remote was seeded by the production-shape
 /// generator (`capture27.sh seedprod27`) and the module cloned it. The deploy
 /// runs on that project and the handover's save, restore plus verify, and
@@ -2982,10 +2986,18 @@ async fn git_prodscale_rig() {
     let host = HostGit::new();
     let (state, refs) = gateway_state(&rig, &host).await;
     assert_eq!(state.kind, GitStateKind::Managed, "{state:?}");
-    let (_keep, _checkout, release) = release_checkout(&rig, "v1.1.0");
+    let (_keep, release_tree, release) = release_checkout(&rig, "v1.1.0");
     assert!(
         !head_at(&refs, &release),
         "the module's clone must sit behind the release (run seedprod27 first)"
+    );
+    // CodeRabbit #58 (W14): the synthetic seed also leaves the clone behind the
+    // release, so the remote's identity is checked: only seedprod27 tags v1.1.0
+    // on its one descriptor commit above the generator's release.
+    assert_eq!(
+        git(&release_tree, &["log", "-1", "--format=%s", &release]),
+        PRODSHAPE_DESCRIPTOR_SUBJECT,
+        "the rig remote is not the production-shape seed (run seedprod27 first)"
     );
     let (_work, config) = script_config(&api, &rig.url).await;
 
