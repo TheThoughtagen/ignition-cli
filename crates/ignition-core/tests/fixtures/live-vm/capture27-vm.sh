@@ -970,7 +970,12 @@ vm_select() {
   [ -s "$PIN" ] || die "pinned known_hosts file is missing or empty"
   [ -r "$KEYFILE" ] || die "the key file for $VM is not readable"
   grep -q -F "$HOST " "$PIN" || die "the pinned known_hosts file has no entry for the $VM host"
-  case "$(stat -f '%Lp' "$PIN" 2>/dev/null || stat -c '%a' "$PIN")" in
+  # BSD stat first, GNU second, each output used only when that stat succeeded:
+  # GNU `stat -f` reads '%Lp' as a file name and still prints the file
+  # system details of $PIN before it fails.
+  local pin_mode
+  pin_mode=$(stat -f '%Lp' "$PIN" 2>/dev/null) || pin_mode=$(stat -c '%a' "$PIN")
+  case "$pin_mode" in
     600 | 400 | 644) ;;
     *) die "pinned known_hosts must be 0600 (or 0644)" ;;
   esac
