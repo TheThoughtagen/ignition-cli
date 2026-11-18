@@ -1297,9 +1297,14 @@ vm_vm_gate() {
   esac
   command -v cargo > /dev/null 2>&1 || die "cargo is required for vm-gate"
   echo "== vm-gate $t ($bin)"
+  # `export` is a builtin: the Windows key in gate_env is never a process
+  # argument (an `env NAME=VALUE ...` process would carry it in its argv).
+  # `--exact`: libtest matches a filter as a substring, so a partial name would
+  # run every gate holding it; exact, it runs the one named or none.
   (
     cd "$REPO_ROOT"
-    env "${gate_env[@]}" cargo test -p ignition-core --test "$bin" "$t" -- --ignored --nocapture --test-threads=1
+    export "${gate_env[@]}"
+    cargo test -p ignition-core --test "$bin" "$t" -- --ignored --exact --nocapture --test-threads=1
   ) 2>&1 | tee "$out"
   rc=${PIPESTATUS[0]}
   [ "$rc" -eq 0 ] || die "cargo test $t exited $rc"
