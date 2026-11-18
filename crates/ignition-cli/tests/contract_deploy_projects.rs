@@ -3943,6 +3943,32 @@ fn apply_action_k11_names_git_repository() {
     );
 }
 
+/// CodeRabbit #57: the hand restore of a saved `.git` names the right
+/// ledger root for each kind of node: a `local` node's save is below its data
+/// directory, an `ssh` node's below the deploy account's home
+/// (`LedgerRoot::for_node`), and `save.path` is relative to that root.
+#[test]
+fn readme_hand_restore_names_the_ledger_root_per_node() {
+    let readme = repo_file("README.md");
+    let start = readme
+        .find("- **Putting the saved copy back by hand.**")
+        .expect("the hand-restore paragraph");
+    let end = start + readme[start..].find("\n\n").expect("the paragraph ends");
+    let text = readme[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "the data directory of a `local` node",
+        "the deploy account's home of an `ssh` node",
+        "relative to the node's root",
+        "<root>/ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo",
+    ] {
+        assert!(text.contains(needle), "{needle:?} is missing: {text}");
+    }
+    assert!(!text.contains("below the node's data directory."), "{text}");
+}
+
 // ---------------------------------------------------------------------------
 // 27-20 (D-23, checker W16): the composite actions and the git token.
 // ---------------------------------------------------------------------------

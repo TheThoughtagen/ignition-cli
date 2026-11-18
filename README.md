@@ -6203,14 +6203,19 @@ consistent with the project it ends with, or says exactly where it is not.
 - **Putting the saved copy back by hand.** Do it with no Designer attached to
   the project. The copy is the whole `.git` directory, at
   `ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo` below the
-  node's data directory. On a POSIX host: if a `.git` is in the way, move it
-  aside first (`mv projects/<project>/.git projects/<project>/.git.recreated`),
-  then `cp -a ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo
-  projects/<project>/.git`. On a Windows host, in PowerShell: `Move-Item
-  projects\<project>\.git projects\<project>\.git.recreated` if one is in the
-  way, then `Copy-Item -Recurse
-  ign-deploy\<gateway>\projects\<project>\git-save\<run-id>\repo
-  projects\<project>\.git`. Once `.git` is back, the module's next start sync
+  node's [ledger root](#decision-b-where-the-ledger-the-journal-and-staging-live):
+  the data directory of a `local` node, the deploy account's home of an `ssh`
+  node. `data.git.nodes[].save.path` is that path, relative to the node's
+  root. Below, `<root>` is that root and `<data>` the node's data directory
+  (the same directory on a `local` node). On a POSIX host: if a `.git` is in
+  the way, move it aside first (`mv <data>/projects/<project>/.git
+  <data>/projects/<project>/.git.recreated`), then `cp -a
+  <root>/ign-deploy/<gateway>/projects/<project>/git-save/<run-id>/repo
+  <data>/projects/<project>/.git`. On a Windows host, in PowerShell: `Move-Item
+  <data>\projects\<project>\.git <data>\projects\<project>\.git.recreated` if
+  one is in the way, then `Copy-Item -Recurse
+  <root>\ign-deploy\<gateway>\projects\<project>\git-save\<run-id>\repo
+  <data>\projects\<project>\.git`. Once `.git` is back, the module's next start sync
   works again; the saved copy can be removed when you are done with it. In CI,
   `git_restore_failed` fails the job and the job must not be run again before
   this is done (see **Failures** under the composite actions).
