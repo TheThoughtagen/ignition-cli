@@ -1158,15 +1158,20 @@ vm_project_up() {
 step_project_up() { each_vm vm_project_up; }
 
 vm_upload() {
-  local out=${PRODSHAPE_GIT_OUT:-} stage=$CACHE/stage
+  # The two archives are built from PRODSHAPE_GIT_OUT by this invocation, once
+  # for all selected VMs, in its own temporary directory: an archive pair of an
+  # earlier run (another fixture, or one archive of an interrupted attempt) is
+  # never sent. `done` is written only after both archives are complete.
+  local out=${PRODSHAPE_GIT_OUT:-} stage=$TMPD/stage
   [ -n "$out" ] || die "PRODSHAPE_GIT_OUT is not set"
   [ -d "$out/capapp.git" ] && [ -d "$out/data/projects/CapApp/.git" ] || die "PRODSHAPE_GIT_OUT does not hold capapp.git and data/projects/CapApp/.git"
-  case "$out" in *[[:space:]]*) die "the fixture path holds a space" ;; esac
-  mkdir -p "$stage"
-  chmod 700 "$stage"
-  if [ ! -s "$stage/src.git.tar" ] || [ "${CAPTURE27_REARCHIVE:-0}" = 1 ]; then
+  case "$out$stage" in *[[:space:]]*) die "the fixture or temporary path holds a space" ;; esac
+  if [ ! -f "$stage/done" ]; then
+    /bin/rm -rf "$stage"
+    mkdir -m 700 "$stage"
     COPYFILE_DISABLE=1 tar --no-xattrs -cf "$stage/src.git.tar" -C "$out/data/projects/CapApp/.git" .
     COPYFILE_DISABLE=1 tar --no-xattrs -cf "$stage/remote.git.tar" -C "$out/capapp.git" .
+    : > "$stage/done"
   fi
   echo "local: src.git $(find "$out/data/projects/CapApp/.git" -type f | wc -l | tr -d ' ') files, remote.git $(find "$out/capapp.git" -type f | wc -l | tr -d ' ') files; archives $(wc -c < "$stage/src.git.tar" | tr -d ' ') and $(wc -c < "$stage/remote.git.tar" | tr -d ' ') bytes"
   local n t0
