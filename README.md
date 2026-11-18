@@ -4912,7 +4912,11 @@ refusals as the check first (`.git`, parent, downgrade, first deploy), then:
    `plan_stale` ("live project changed since the plan", exit 6) and imports
    nothing. The export holds the live project's files and is never printed or
    copied into any other file; keep the directory private.
-5. **The import** goes to the master node's gateway only (the project is never
+5. **The import** is preceded, for an `import`, by one more export of the live
+   project, made last: if its digest is no longer the plan's (a Designer saved
+   since the pre-image, possibly between two Designer polls), the run refuses
+   `plan_stale` and imports nothing; after tag writes the tags are rolled back.
+   The import goes to the master node's gateway only (the project is never
    imported on `nodes.backup`: the redundancy sync carries it there; when the
    backup holds a git repository, see **Redundant pairs** under [Projects the
    git module manages](#projects-the-git-module-manages)). An

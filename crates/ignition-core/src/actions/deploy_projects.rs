@@ -5031,8 +5031,9 @@ async fn execute(
     // after tag writes rolls the tags back and never imports the project (the
     // saves go when the `.git` is the one saved); before any write it is the
     // run's error, and the saves go.
+    let mut checked: Result<(), CoreError> = Ok(());
     if (tag_owning || git_saved.is_some() || backup_saved.is_some()) && !designers.skipped {
-        let checked = match designers_check(plan, gateway, &opts.designers, observer).await {
+        checked = match designers_check(plan, gateway, &opts.designers, observer).await {
             Ok(found) => {
                 if found.proceeded {
                     events.emit_late(ProjectsEvent::DesignersProceed {
@@ -5042,40 +5043,36 @@ async fn execute(
                 // A Designer attached during the check (a wait, or a
                 // proceed) may have committed: each saved repo must still be
                 // the one the plan gated and the run saved (CodeRabbit #57).
-                // It may also have saved project work: when a session was
-                // seen, the live project is read again (one export, only
-                // then) and must still be the one the plan was drawn
-                // against; the pre-image predates the wait (CodeRabbit #57
-                // R1).
-                let attached = found.proceeded || found.polls.iter().any(|open| *open > 0);
-                let live = if overwrite && attached {
-                    live_unchanged_since_plan(plan, gateway, project).await
-                } else {
-                    Ok(())
-                };
-                match live {
-                    Ok(()) => {
-                        saved_repos_unchanged(
-                            &writers,
-                            surfaces,
-                            git_saved.is_some(),
-                            backup_saved.is_some(),
-                            project,
-                        )
-                        .await
-                    }
-                    Err(err) => Err(err),
-                }
+                saved_repos_unchanged(
+                    &writers,
+                    surfaces,
+                    git_saved.is_some(),
+                    backup_saved.is_some(),
+                    project,
+                )
+                .await
             }
             Err(err) => Err(err),
         };
+    }
+    // CodeRabbit #57 (R1, S1): a Designer may have saved project work since
+    // the plan, even one the polls never saw (it opened, saved and closed
+    // between two reads) and even while the repos were read; a project save
+    // leaves `.git` as it was. Every overwrite reads the live project once
+    // more, last, right before the import: it must still be the one the plan
+    // was drawn against, since the pre-image predates it. This narrows the
+    // window to the time between this export and the import request.
+    if checked.is_ok() && overwrite {
+        checked = live_unchanged_since_plan(plan, gateway, project).await;
+    }
+    {
         match checked {
             Ok(()) => {}
             Err(err) if tags_wrote => {
                 let failure = TagFailure {
                     cause: RollbackCause::ProjectImportFailed,
                     what: format!(
-                        "the Designer check right before the project import did not pass ({err})"
+                        "the checks right before the project import did not pass ({err})"
                     ),
                     writes: step.writes,
                 };

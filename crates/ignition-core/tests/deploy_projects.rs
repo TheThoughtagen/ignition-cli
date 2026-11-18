@@ -1334,11 +1334,14 @@ async fn export_before_import_and_verify() {
         calls_after(&gateway, before),
         vec![
             "export:CapApp",
+            "export:CapApp",
             "import:CapApp:true",
             "export:CapApp",
             "list"
         ],
-        "pre-image, import, verify, then the listing that finds the children (25-15)"
+        "pre-image, the last look at the live project right before the import \
+         (CodeRabbit #57 S1), import, verify, then the listing that finds the \
+         children (25-15)"
     );
     assert_eq!(result.outcome, ProjectOutcome::Imported);
     assert!(result.ok && result.record_written, "{result:?}");
@@ -2371,8 +2374,14 @@ async fn sweep_only_reads() {
     );
     assert_eq!(
         after_verify[..sweep_from],
-        ["export:CapApp", "import:CapApp:true", "export:CapApp"],
-        "everything before the sweep is the deploy of the parent"
+        [
+            "export:CapApp",
+            "export:CapApp",
+            "import:CapApp:true",
+            "export:CapApp"
+        ],
+        "everything before the sweep is the deploy of the parent (with the last \
+         look right before the import, CodeRabbit #57 S1)"
     );
     assert_eq!(gateway.import_calls(), vec![(PROJECT.to_string(), true)]);
     let host_calls = host.calls.lock().expect("calls").split_off(host_before);
@@ -3310,8 +3319,9 @@ async fn import_refusal_is_still_an_error() {
     assert!(matches!(err, CoreError::Auth { .. }), "{err:?}");
     assert_eq!(
         gateway.export_count(PROJECT),
-        exports_before + 2,
-        "the plan's read and the pre-image only; there is no read-back"
+        exports_before + 3,
+        "the plan's read, the pre-image and the last look right before the import \
+         (CodeRabbit #57 S1); there is no read-back"
     );
     assert_eq!(flaky.attempts(), 1);
     assert_eq!(

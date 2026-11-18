@@ -3712,6 +3712,28 @@ mod published {
         assert!(rig.f.git_dir().is_dir(), "the .git was never touched");
     }
 
+    /// CodeRabbit #57 S1: a Designer that opens, saves project work and
+    /// closes between two Designer polls is never seen as a session, and a
+    /// project save leaves `.git` as it was. The live project is read again
+    /// on every overwrite, after the repo checks and right before the import:
+    /// a digest that differs from the plan's is `plan_stale`, and the save goes.
+    #[tokio::test]
+    async fn designer_save_between_polls_refuses_a_stale_plan() {
+        let rig = Rig::with(|g| {
+            g.with_designers_script(vec![vec![]])
+                .with_project_edited_on_designers_read(1, PROJECT)
+        });
+        let outcome = rig.apply().await;
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "no import: {outcome:?}"
+        );
+        let err = outcome.expect_err("a stale plan");
+        assert_eq!(err.code(), "plan_stale", "{err}");
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert!(rig.f.git_dir().is_dir(), "the .git was never touched");
+    }
+
     #[tokio::test]
     async fn designer_attached_at_restore() {
         // the session opens after the import's read-back (the third export):
