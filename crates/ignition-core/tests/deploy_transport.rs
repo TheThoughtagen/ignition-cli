@@ -7062,6 +7062,425 @@ mod winps_git_native {
             assert_eq!(part.params["h"], "C:\\Users\\svc", "{}", part.name);
         }
     }
+
+    /// 27-49, Task 2: the Win32 anchoring of the reviewed block and of the state
+    /// read built on it, under the real Windows PowerShell 5.1 with the real
+    /// `Add-Type` (csc, C# 5), which no unix machine can run. The unix harness
+    /// (`pwsh_exec`, with its `IgnGit.N` stand-in) tests the scripts' logic;
+    /// this module is the proof that the block compiles, that a junction is
+    /// refused on the handle that was opened, and that a held level cannot be
+    /// renamed. It compiles on every Windows target and under
+    /// `cargo xwin clippy`; the windows-latest CI job runs it. The helpers are
+    /// the ones 27-50 to 27-52 reuse: run a `WinScript` locally under 5.1, make
+    /// a junction, make a file symlink where the runner allows it, and make a
+    /// `.git` fixture with the pinned source staged in an account home.
+    #[cfg(windows)]
+    mod ps51 {
+        use super::winps;
+        use ignition_core::deploy::git_state::GIT_MARKERS;
+        use ignition_core::deploy::transport::process::ProcessOutput;
+        use ignition_core::deploy::transport::winps::{
+            COMMAND_BUDGET, WinScript, interpret_output,
+        };
+        use serde_json::Value;
+        use std::path::{Path, PathBuf};
+        use std::process::{Command, Stdio};
+
+        /// Windows PowerShell 5.1 of this machine, by full path: never the
+        /// `pwsh` of PowerShell 7, which a host does not run.
+        fn windows_powershell() -> PathBuf {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+            Path::new(&root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        }
+
+        /// `path` with every `/` a `\`: `mklink` reads a `/` as a switch, and
+        /// the scripts are given native paths (quick 261104-ava, W1).
+        fn native(path: &Path) -> String {
+            path.display().to_string().replace('/', "\\")
+        }
+
+        /// The process that runs `script` as a host receives it: the exact
+        /// `-EncodedCommand` that `encoded_command` builds, within the real
+        /// budget, under Windows PowerShell 5.1.
+        fn command_of(script: &WinScript) -> Result<Command, String> {
+            let command = winps::encoded_command(script, COMMAND_BUDGET)?;
+            let encoded = command
+                .as_str()
+                .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
+                .ok_or_else(|| "not an encoded command".to_string())?
+                .to_string();
+            let mut process = Command::new(windows_powershell());
+            process
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    encoded.as_str(),
+                ])
+                .stdin(Stdio::null());
+            Ok(process)
+        }
+
+        /// The `IGN-RESULT` JSON of a finished process, or the host's failure
+        /// text.
+        fn interpret(out: std::process::Output) -> Result<Value, String> {
+            interpret_output(
+                &ProcessOutput {
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    code: out.status.code().unwrap_or(-1),
+                    timed_out: false,
+                },
+                600,
+                None,
+            )
+        }
+
+        /// Run `script` under Windows PowerShell 5.1 on this machine: its
+        /// `IGN-RESULT` JSON, or the host's failure text.
+        pub fn run_local(script: &WinScript) -> Result<Value, String> {
+            let out = command_of(script)?
+                .output()
+                .map_err(|e| format!("powershell.exe did not start: {e}"))?;
+            interpret(out)
+        }
+
+        /// Make `link` a junction to `target` with `cmd /C mklink /J`, both
+        /// paths native and each its own argument.
+        pub fn make_junction(link: &Path, target: &Path) {
+            let made = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(native(link))
+                .arg(native(target))
+                .output()
+                .expect("mklink");
+            assert!(made.status.success(), "mklink /J: {made:?}");
+        }
+
+        /// Make `link` a file symlink to `target`, where the runner allows it
+        /// (creating one needs a privilege). When it is refused this prints
+        /// `SYMLINK-UNAVAILABLE <what>` and answers false: the caller then
+        /// asserts a junction case instead, never a silent pass.
+        pub fn make_file_symlink(link: &Path, target: &Path, what: &str) -> bool {
+            match std::os::windows::fs::symlink_file(target, link) {
+                Ok(()) => true,
+                Err(err) => {
+                    println!("SYMLINK-UNAVAILABLE {what}: {err}");
+                    false
+                }
+            }
+        }
+
+        /// A `.git` made by host git (Git for Windows is on the runner), an
+        /// account home with the pinned source staged in it as the transport's
+        /// upload leaves it, and a directory outside both that holds what a
+        /// followed link would expose.
+        pub struct Fixture {
+            _dir: tempfile::TempDir,
+            pub home: PathBuf,
+            pub git: PathBuf,
+            pub outside: PathBuf,
+        }
+
+        pub fn fixture() -> Fixture {
+            let dir = tempfile::tempdir().expect("fixture dir");
+            let root = dir.path().to_path_buf();
+            let project = root.join("project");
+            std::fs::create_dir_all(&project).expect("project");
+            let git = |args: &[&str]| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(&project)
+                    .output()
+                    .expect("git");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            git(&["init", "-q"]);
+            git(&[
+                "-c",
+                "user.name=ign",
+                "-c",
+                "user.email=ign@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ]);
+            git(&["branch", "feature/x"]);
+            let home = root.join("home");
+            let staged = home
+                .join(winps::GIT_NATIVE_STAGED_DIR)
+                .join(winps::GIT_NATIVE_STAGED_FILE);
+            std::fs::create_dir_all(staged.parent().expect("dir")).expect("staged dir");
+            std::fs::write(&staged, winps::GIT_NATIVE_CS).expect("staged source");
+            let outside = root.join("outside");
+            std::fs::create_dir_all(outside.join("heads")).expect("outside");
+            std::fs::write(outside.join("heads").join("stolen"), "1\n").expect("ref");
+            std::fs::write(outside.join("HEAD"), "0 1 x\n").expect("log");
+            Fixture {
+                _dir: dir,
+                home,
+                git: project.join(".git"),
+                outside,
+            }
+        }
+
+        /// The three scripts of a state read of the fixture's `.git`.
+        pub fn state_parts(fx: &Fixture) -> Vec<WinScript> {
+            WinScript::git_state(&native(&fx.git), GIT_MARKERS, &native(&fx.home))
+        }
+
+        /// A script body that is only for a test: leaked so it is `'static`
+        /// like every `WinScript` body.
+        fn test_body(text: String) -> &'static str {
+            Box::leak(text.into_boxed_str())
+        }
+
+        fn decode(value: &Value) -> Vec<u8> {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                value.as_str().expect("base64 text"),
+            )
+            .expect("base64")
+        }
+
+        /// The loader alone, under the real Windows PowerShell 5.1 and its
+        /// `Add-Type` (the .NET Framework's csc, C# 5): it reads the staged
+        /// source, compares its hash with the pin and compiles it. That the
+        /// type then exists with the seven methods proves csc accepts the block
+        /// (no unix machine can); a staged file that is not the pinned text is
+        /// refused with the fixed prefix.
+        #[test]
+        fn win_git_native_block_compiles_under_5_1() {
+            let version = run_local(&WinScript {
+                name: "version",
+                body: "E @{ok=1;v=$PSVersionTable.PSVersion.ToString()}",
+                params: Value::Null,
+            })
+            .expect("the version");
+            let version = version["v"].as_str().expect("version text").to_string();
+            println!("win_git_native_block_compiles_under_5_1: powershell.exe {version}");
+            assert!(
+                version.starts_with("5.1"),
+                "this module is for Windows PowerShell 5.1, not {version}"
+            );
+            let fx = fixture();
+            let body = test_body(format!(
+                "{}E @{{ok=1;loaded=[bool]('IgnGit.N' -as [type]);methods=@([IgnGit.N].GetMethods()|?{{$_.DeclaringType.Name -eq 'N' -and $_.IsPublic -and $_.IsStatic}}|%{{$_.Name}}|sort)}}",
+                winps::GIT_NATIVE_LOAD
+            ));
+            let run = |home: &Path| {
+                run_local(&WinScript {
+                    name: "loader",
+                    body,
+                    params: serde_json::json!({ "h": native(home) }),
+                })
+            };
+            let answer = run(&fx.home).expect("csc accepts the pinned block");
+            assert_eq!(answer["loaded"], true);
+            let methods: Vec<&str> = answer["methods"]
+                .as_array()
+                .expect("methods")
+                .iter()
+                .map(|m| m.as_str().expect("name"))
+                .collect();
+            assert_eq!(
+                methods,
+                [
+                    "CreateNew",
+                    "DeleteOnClose",
+                    "FileId",
+                    "Move",
+                    "OpenDir",
+                    "OpenFile",
+                    "OpenForDelete"
+                ]
+            );
+            // one byte more: refused, and the cause is the pin check
+            let staged = fx
+                .home
+                .join(winps::GIT_NATIVE_STAGED_DIR)
+                .join(winps::GIT_NATIVE_STAGED_FILE);
+            std::fs::write(&staged, format!("{} ", winps::GIT_NATIVE_CS)).expect("overwrite");
+            let why = run(&fx.home).expect_err("a changed staged source");
+            assert!(
+                why.contains("the .git reader cannot declare its native calls"),
+                "{why}"
+            );
+            assert!(
+                why.contains("the staged source is not the pinned text"),
+                "{why}"
+            );
+        }
+
+        /// The positive control of the other tests of this module: on an honest
+        /// `.git` the three scripts of the state read answer what the files
+        /// hold, under 5.1 and the real block.
+        #[test]
+        fn win_git_state_reads_an_honest_tree_under_5_1() {
+            let fx = fixture();
+            let mut answers = Vec::new();
+            for part in state_parts(&fx) {
+                answers.push(run_local(&part).unwrap_or_else(|why| panic!("{}: {why}", part.name)));
+            }
+            let merged = winps::merge_git_state(&answers).expect("merge");
+            let head = std::fs::read(fx.git.join("HEAD")).expect("HEAD");
+            assert_eq!(merged["head"]["n"].as_u64(), Some(head.len() as u64));
+            assert_eq!(decode(&merged["head"]["b"]), head);
+            let config = std::fs::read(fx.git.join("config")).expect("config");
+            assert_eq!(decode(&merged["config"]["b"]), config);
+            assert!(merged["packed"].is_null(), "no packed-refs yet");
+            assert!(merged["log"].is_object(), "logs/HEAD is read");
+            assert_eq!(merged["index"], fx.git.join("index").exists());
+            let loose = std::fs::read(fx.git.join("refs").join("heads").join("feature").join("x"))
+                .expect("the loose ref");
+            let refs = merged["refs"].as_array().expect("refs");
+            let found = refs
+                .iter()
+                .find(|r| decode(&r["p"]) == b"refs/heads/feature/x")
+                .unwrap_or_else(|| panic!("feature/x is listed: {refs:?}"));
+            assert_eq!(decode(&found["b"]), loose);
+        }
+
+        /// A junction swapped in for a level of the `.git` is refused on the
+        /// handle that was opened (the reparse point is read from it), naming
+        /// the level, and nothing behind the junction is in any answer. The
+        /// refusal is from the real block's `FILE_FLAG_OPEN_REPARSE_POINT` and
+        /// attribute-tag check, which the unix stand-in only imitates.
+        #[test]
+        fn win_git_state_refuses_a_junction_level() {
+            for level in ["logs", "refs"] {
+                let fx = fixture();
+                std::fs::rename(fx.git.join(level), fx.git.join(format!("{level}.real")))
+                    .expect("aside");
+                make_junction(&fx.git.join(level), &fx.outside);
+                let parts = state_parts(&fx);
+                // `logs` is read by the first script, `refs` by the third
+                let touching = if level == "logs" {
+                    &parts[0]
+                } else {
+                    &parts[2]
+                };
+                let why = run_local(touching).expect_err(level);
+                assert!(why.contains(level), "names the level: {why}");
+                assert!(why.contains("reparse point"), "{level}: {why}");
+                assert!(
+                    !why.contains("stolen"),
+                    "nothing behind the junction: {why}"
+                );
+                // the whole read is refused, and no script answered with the
+                // directory the junction points to
+                let mut refused = false;
+                for part in &parts {
+                    match run_local(part) {
+                        Ok(answer) => assert!(
+                            !answer.to_string().contains("stolen"),
+                            "{}: {answer}",
+                            part.name
+                        ),
+                        Err(_) => refused = true,
+                    }
+                }
+                assert!(refused, "the read of {level} behind a junction is refused");
+            }
+        }
+
+        /// A file symlink as `HEAD` is refused the same way. Creating a symlink
+        /// needs a privilege the runner may not give: then this prints
+        /// `SYMLINK-UNAVAILABLE` and asserts the junction case instead.
+        #[test]
+        fn win_git_state_refuses_a_linked_file() {
+            let fx = fixture();
+            let head = fx.git.join("HEAD");
+            let real = fx.git.join("HEAD.real");
+            std::fs::rename(&head, &real).expect("aside");
+            if make_file_symlink(&head, &real, "HEAD") {
+                let why = run_local(&state_parts(&fx)[0]).expect_err("a linked HEAD");
+                assert!(why.contains("HEAD"), "names the file: {why}");
+                assert!(why.contains("reparse point"), "{why}");
+            } else {
+                std::fs::rename(&real, &head).expect("restore HEAD");
+                std::fs::rename(fx.git.join("refs"), fx.git.join("refs.real")).expect("aside");
+                make_junction(&fx.git.join("refs"), &fx.outside);
+                let why = run_local(&state_parts(&fx)[2]).expect_err("a junction at refs");
+                assert!(why.contains("reparse point"), "{why}");
+            }
+        }
+
+        /// While a script holds its levels (a test-only variant that opens `.git`,
+        /// `refs` and `refs/heads` with the block and waits), a rename of `.git`
+        /// or of a held level from the test fails; after the script ends the
+        /// same renames succeed. That the refusal is the held handle and nothing
+        /// else is what the second half shows. The script and the test agree
+        /// through two marker files: `f` is written when every level is held,
+        /// and the script ends when `r` appears.
+        #[test]
+        fn win_git_state_holds_its_levels() {
+            let fx = fixture();
+            let marker = fx.git.parent().expect("project").join("held.marker");
+            let release = fx.git.parent().expect("project").join("release.marker");
+            let body = test_body(format!(
+                "{}$o=[Collections.ArrayList]@();try{{foreach($x in '','refs','refs/heads'){{$q=$p.a;if($x){{$q+='/'+$x}};[void]$o.Add([IgnGit.N]::OpenDir($q))}};Set-Content -LiteralPath $p.f -Value held;$t=[Diagnostics.Stopwatch]::StartNew();while(!(Test-Path -LiteralPath $p.r) -and $t.Elapsed.TotalSeconds -lt 120){{Start-Sleep -Milliseconds 100}};E @{{ok=1}}}}finally{{$o|%{{$_.Dispose()}}}}",
+                winps::GIT_NATIVE_LOAD
+            ));
+            let script = WinScript {
+                name: "hold",
+                body,
+                params: serde_json::json!({
+                    "a": native(&fx.git),
+                    "h": native(&fx.home),
+                    "f": native(&marker),
+                    "r": native(&release),
+                }),
+            };
+            let child = command_of(&script)
+                .expect("command")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("powershell.exe did not start");
+            // every level is held once the marker exists (the first compile of
+            // the block takes seconds)
+            let mut waited = 0;
+            while !marker.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                waited += 1;
+                assert!(waited < 480, "the script never held its levels");
+            }
+            let aside = fx.git.with_file_name(".git-renamed");
+            let refused = std::fs::rename(&fx.git, &aside).expect_err("a held .git is renamed");
+            println!("win_git_state_holds_its_levels: rename of .git: {refused}");
+            // a sharing violation (32), or access denied (5), which a rename of a
+            // directory with an open handle is also reported as
+            assert!(
+                matches!(refused.raw_os_error(), Some(32) | Some(5)),
+                "{refused:?}"
+            );
+            let level = fx.git.join("refs").join("heads");
+            let refused = std::fs::rename(&level, fx.git.join("refs").join("heads.aside"))
+                .expect_err("a held level is renamed");
+            assert!(
+                matches!(refused.raw_os_error(), Some(32) | Some(5)),
+                "{refused:?}"
+            );
+            assert!(fx.git.is_dir() && level.is_dir(), "nothing moved");
+            // the script ends, its handles are released, and the same renames work
+            std::fs::write(&release, "go").expect("release");
+            let out = child.wait_with_output().expect("the script ends");
+            interpret(out).expect("the holding script succeeds");
+            std::fs::rename(&fx.git, &aside).expect("a released .git is renamed");
+            assert!(aside.is_dir());
+        }
+    }
 }
 
 /// The Windows git scripts of 27-09 (`winps::GIT_*`): their size against the
