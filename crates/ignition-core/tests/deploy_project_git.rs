@@ -6836,6 +6836,154 @@ mod published {
         assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c1);
     }
 
+    // ---- 27-55 (P6): each backup export is bounded by the remaining wait ----
+
+    /// A backup whose project export answers `zip` after `delay` of real time.
+    /// It is the only fake that stalls: the pair rig's fake backup answers
+    /// without yielding, so the bound can never cut it.
+    struct SlowBackup {
+        zip: Vec<u8>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl BackupTags for SlowBackup {
+        async fn tag_export(&self, _provider: &str) -> Result<Vec<u8>, CoreError> {
+            Err(CoreError::Internal("no tags here".to_string()))
+        }
+        async fn status(
+            &self,
+        ) -> Result<ignition_core::client::redundancy::RedundancyStatusWire, CoreError> {
+            Err(CoreError::Internal("no status here".to_string()))
+        }
+        async fn sync_exhausted(&self, _since_ms: i64) -> Result<bool, CoreError> {
+            Ok(false)
+        }
+        async fn project_export(&self, _project: &str) -> Result<Vec<u8>, CoreError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.zip.clone())
+        }
+    }
+
+    /// The export zip and canonical digest of a small project.
+    async fn small_project() -> (Vec<u8>, String) {
+        use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
+        let gateway = FakeProjects::new().with_project(
+            PROJECT,
+            None,
+            false,
+            &[("project.json", br#"{"title":"Cap App"}"#.to_vec())],
+        );
+        let zip = Gw::export_bytes(&gateway, PROJECT).await.expect("export");
+        let digest = canonical_digest(&zip).expect("a project export").sha256;
+        (zip, digest)
+    }
+
+    fn policy(budget_ms: u64, interval_ms: u64) -> ignition_core::deploy::pair::BackupPolicy {
+        ignition_core::deploy::pair::BackupPolicy {
+            budget: std::time::Duration::from_millis(budget_ms),
+            interval: std::time::Duration::from_millis(interval_ms),
+        }
+    }
+
+    /// P6: a backup export that stalls for 10 s ends the wait at the budget
+    /// plus one interval, not at the client's request timeout.
+    #[tokio::test]
+    async fn backup_export_stall_is_bounded() {
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let (zip, want) = small_project().await;
+        let backup = SlowBackup {
+            zip,
+            delay: std::time::Duration::from_secs(10),
+        };
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(300, 50),
+        };
+        let started = std::time::Instant::now();
+        let outcome = wait_for_backup_project(&wait, PROJECT, &want).await;
+        let took = started.elapsed();
+        let detail = outcome.expect_err("a stalled export is unsynced");
+        eprintln!("backup_export_stall_is_bounded: returned after {took:?}");
+        assert!(
+            took < std::time::Duration::from_millis(300 + 50 + 200),
+            "bounded by budget + interval + slack, took {took:?}"
+        );
+        assert!(detail.contains("did not answer"), "{detail}");
+    }
+
+    /// P6: an answer that arrives after the budget ran out but inside the
+    /// grace window (one interval) is taken: a match proves the backup holds
+    /// the release.
+    #[tokio::test]
+    async fn backup_export_matching_answer_in_the_grace_window_is_accepted() {
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let (zip, want) = small_project().await;
+        // 30 ms after the 300 ms budget, inside the 50 ms interval
+        let backup = SlowBackup {
+            zip: zip.clone(),
+            delay: std::time::Duration::from_millis(330),
+        };
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(300, 50),
+        };
+        let got = wait_for_backup_project(&wait, PROJECT, &want)
+            .await
+            .expect("a matching answer inside the grace window is accepted");
+        assert_eq!(got, zip);
+    }
+
+    /// P6: an answer after budget plus interval is `backup_unsynced`, and the
+    /// reason says the export did not answer in time.
+    #[tokio::test]
+    async fn backup_export_matching_answer_after_the_grace_window_is_unsynced() {
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let (zip, want) = small_project().await;
+        let backup = SlowBackup {
+            zip,
+            delay: std::time::Duration::from_millis(600),
+        };
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(300, 50),
+        };
+        let detail = wait_for_backup_project(&wait, PROJECT, &want)
+            .await
+            .expect_err("too late");
+        assert!(
+            detail.contains("did not answer") && detail.contains("wait"),
+            "{detail}"
+        );
+    }
+
+    /// P6 (27-55, option-b): the pair rig's fake backup answers its export in
+    /// one poll, without yielding, and tokio's `timeout` polls the request
+    /// before its clock, so the bound never cuts it, however loaded the box
+    /// is. That is what keeps every pair test on the unchanged 400 ms `WAIT`:
+    /// a zero budget and a zero interval still take the answer.
+    #[tokio::test]
+    async fn backup_export_of_the_pair_fake_is_never_cut_by_the_bound() {
+        use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let rig = Rig::tagged_pair(true);
+        let want = canonical_digest(
+            &Gw::export_bytes(&rig.gateway, PROJECT)
+                .await
+                .expect("export"),
+        )
+        .expect("a project export")
+        .sha256;
+        let backup = rig.backup_node(0);
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(0, 0),
+        };
+        wait_for_backup_project(&wait, PROJECT, &want)
+            .await
+            .expect("the fake's answer is taken with nothing left of the wait");
+    }
+
     // ---- 27-35: the backup's `.git` settles before its save goes (WR-08) ----
 
     /// A host git that runs git and then, once, after the post-advance status

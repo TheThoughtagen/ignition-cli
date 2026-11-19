@@ -3226,6 +3226,13 @@ pub struct BackupWait<'a> {
 /// converged export bytes come back for the read-back of the handover; a wait
 /// that did not converge returns the reason text (a code or a count, never
 /// content).
+///
+/// Each export is bounded by what is left of the budget plus one poll
+/// interval (27-55, P6), so one stalled request cannot outlast
+/// `--backup-timeout` by the client's request timeout. An answer that arrives
+/// inside that window is taken even after the budget ran out: a match proves
+/// the backup holds the release. A request that does not answer inside it ends
+/// the wait, since the budget is spent.
 pub async fn wait_for_backup_project(
     wait: &BackupWait<'_>,
     project: &str,
@@ -3234,8 +3241,11 @@ pub async fn wait_for_backup_project(
     let start = std::time::Instant::now();
     let mut last: String;
     loop {
-        match wait.backup.project_export(project).await {
-            Ok(zip) => match crate::deploy::project_artifact::canonical_digest(&zip) {
+        let remaining = wait.policy.budget.saturating_sub(start.elapsed());
+        let bound = remaining.saturating_add(wait.policy.interval);
+        match tokio::time::timeout(bound, wait.backup.project_export(project)).await {
+            Err(_) => return Err("the backup's export did not answer within the wait".to_string()),
+            Ok(Ok(zip)) => match crate::deploy::project_artifact::canonical_digest(&zip) {
                 Ok(digest) if !digest.members.is_empty() && digest.sha256 == want => {
                     return Ok(zip);
                 }
@@ -3244,7 +3254,7 @@ pub async fn wait_for_backup_project(
                     last = format!("the backup's export is unusable ({})", err.code());
                 }
             },
-            Err(err) => {
+            Ok(Err(err)) => {
                 last = format!("the backup's export could not be read ({})", err.code());
             }
         }
