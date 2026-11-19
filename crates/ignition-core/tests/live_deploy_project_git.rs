@@ -60,7 +60,7 @@ use ignition_core::deploy::git_advance::{AdvancePrep, GitWrite, prepare_advance}
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
 use ignition_core::deploy::git_state::{GitHead, GitRefs, GitState, GitStateKind, classify};
-use ignition_core::deploy::ledger::LedgerRoot;
+use ignition_core::deploy::ledger::{LedgerRoot, git_save_rel};
 use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact, canonical_digest};
 use ignition_core::deploy::tag_converge::BackupTags;
@@ -2660,35 +2660,171 @@ fn drift_difference(jg: &Jgit, predicted: &[String]) -> (Vec<String>, Vec<String
     )
 }
 
-/// Print a row's time beside its budget and fail over it.
-fn within(row: &str, measured: Duration, budget: Duration) {
+/// 27-42 (T-27-188): the files whose bytes on the rig's project directory
+/// differ from the release's, which is what JGit lists once its index holds
+/// the release. The export is not read: it renders the gateway's form for
+/// files the import left alone (the premise the 2026-11-18 run falsified).
+///
+/// Paths are relative to the project, `/`-separated, the form of an artifact
+/// member (the caller maps them with [`module_path`] for JGit's list and
+/// counts the files for the run's `expected_drift_count`). Only regular files
+/// are compared; no link is followed; the project's own `.git` is skipped.
+/// A release member that is not a regular file on the disk is a deletion and
+/// is drift, so a deletion still fails the gate.
+fn disk_drift(project_dir: &Path, release: &BTreeMap<String, Vec<u8>>) -> BTreeSet<String> {
+    fn walk(root: &Path, rel: &str, out: &mut BTreeMap<String, PathBuf>) {
+        let here = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(rel)
+        };
+        for entry in std::fs::read_dir(&here).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            if rel.is_empty() && name == ".git" {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let kind = entry.file_type().expect("file type");
+            if kind.is_dir() {
+                walk(root, &child, out);
+            } else if kind.is_file() {
+                out.insert(child, entry.path());
+            }
+        }
+    }
+    let mut on_disk = BTreeMap::new();
+    walk(project_dir, "", &mut on_disk);
+    release
+        .iter()
+        .filter(|(path, bytes)| match on_disk.get(*path) {
+            Some(file) => std::fs::read(file).expect("a project file reads") != **bytes,
+            None => true,
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// 27-42 (Y3 follow-up): the counts of the saved `.git` that differ from the
+/// ones measured right before the timed apply, by name. Never a value.
+fn saved_count_changes(
+    saved: &prod_shape_git::Measured,
+    before_apply: &prod_shape_git::Measured,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    for (name, now, first) in [
+        ("saved_packs_changed", saved.packs, before_apply.packs),
+        (
+            "saved_loose_objects_changed",
+            saved.loose,
+            before_apply.loose,
+        ),
+        (
+            "saved_tag_refs_changed",
+            saved.tag_refs,
+            before_apply.tag_refs,
+        ),
+    ] {
+        if now != first {
+            changed.push(name);
+        }
+    }
+    changed
+}
+
+/// The whole saved-shape compare: the saved `.git` has the configured shape
+/// (the names `placed_mismatches` gives, prefixed `saved_`), and its packs,
+/// loose objects and tag refs equal the ones measured before the timed apply.
+/// `None` for the save is itself a difference.
+fn saved_shape_differences(
+    saved: Option<&prod_shape_git::Measured>,
+    before_apply: &prod_shape_git::Measured,
+    emitted: &prod_shape_git::Measured,
+    shape: &prod_shape_git::GitShape,
+) -> Vec<String> {
+    let Some(saved) = saved else {
+        return vec!["saved_shape_not_measured".to_string()];
+    };
+    let mut off: Vec<String> = prod_shape_git::placed_mismatches(saved, emitted, shape)
+        .into_iter()
+        .map(|name| format!("saved_{name}"))
+        .collect();
+    off.extend(
+        saved_count_changes(saved, before_apply)
+            .into_iter()
+            .map(str::to_string),
+    );
+    off
+}
+
+/// Record `finding` and print it at once, so a run that dies later still
+/// shows what it had found.
+fn find(findings: &mut Vec<String>, finding: String) {
+    eprintln!("LIVE-SCALE finding: {finding}");
+    findings.push(finding);
+}
+
+/// Print a row's time beside its budget; the finding when it is over the
+/// budget, or when the run left no span for the row (a missing span is a
+/// finding too, and the other rows are still printed).
+fn within(row: &str, measured: Option<Duration>, budget: Duration) -> Option<String> {
+    let Some(measured) = measured else {
+        let finding = format!("{row}: the run left no timed span for this row");
+        eprintln!(
+            "LIVE-SCALE {row}: no span, budget {} ms",
+            budget.as_millis()
+        );
+        return Some(finding);
+    };
     eprintln!(
         "LIVE-SCALE {row}: measured {} ms budget {} ms",
         measured.as_millis(),
         budget.as_millis()
     );
-    assert!(
-        measured <= budget,
-        "{row}: measured {} ms is over the budget of {} ms",
-        measured.as_millis(),
-        budget.as_millis()
-    );
+    (measured > budget).then(|| {
+        format!(
+            "{row}: measured {} ms is over the budget of {} ms",
+            measured.as_millis(),
+            budget.as_millis()
+        )
+    })
 }
 
 /// The run's own git writer calls, timed: the same local transport the run
 /// would build from the master, wrapped so each save, restore and advance
 /// upload leaves its duration (the run's events carry no durations).
+///
+/// 27-42 (Y3 follow-up): right after the save span is recorded, outside it,
+/// the writer measures the save's `repo` directory below `data` and keeps the
+/// result for the gate's saved-shape compare. The measurement lengthens the
+/// time between the save and the import, never a timed span.
 struct TimedWriter {
     inner: LocalFsTransport,
+    /// The rig's data directory (the root of the ledger's save path).
+    data: PathBuf,
     spans: std::sync::Mutex<Vec<(&'static str, Duration)>>,
+    saved: std::sync::Mutex<Option<prod_shape_git::Measured>>,
 }
 
 impl TimedWriter {
-    fn new(inner: LocalFsTransport) -> TimedWriter {
+    fn new(inner: LocalFsTransport, data: PathBuf) -> TimedWriter {
         TimedWriter {
             inner,
+            data,
             spans: std::sync::Mutex::new(Vec::new()),
+            saved: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The save's `repo` directory as measured after the save span, if the
+    /// run saved one.
+    fn saved_shape(&self) -> Option<prod_shape_git::Measured> {
+        self.saved.lock().expect("saved").clone()
     }
 
     fn span(&self, name: &'static str) -> Option<Duration> {
@@ -2717,6 +2853,16 @@ impl GitStateWriter for TimedWriter {
         let started = Instant::now();
         let out = self.inner.save_git(gateway, project, run_id).await;
         self.record("save", started);
+        // Outside the span above.
+        if out.is_ok() {
+            let mut repo = self.data.clone();
+            for part in git_save_rel(gateway, project, run_id).split('/') {
+                repo.push(part);
+            }
+            if repo.is_dir() {
+                *self.saved.lock().expect("saved") = Some(prod_shape_git::measure_git_dir(&repo));
+            }
+        }
         out
     }
 
@@ -3077,7 +3223,7 @@ async fn git_prodscale_rig() {
         changed_since.is_empty(),
         "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
     );
-    let timed = TimedWriter::new(rig.node());
+    let timed = TimedWriter::new(rig.node(), rig.data.clone());
     let timeline = Timeline::new();
     let extras = Extras {
         observer: Some(&timeline),
@@ -3103,49 +3249,96 @@ async fn git_prodscale_rig() {
     for (at, name) in timeline.seen.lock().expect("timeline").iter() {
         eprintln!("LIVE-SCALE event {name} at {at} ms");
     }
-    assert_eq!(
-        applied.outcome.as_str(),
-        "imported",
-        "scale outcome (slug {}): {}",
-        applied_json["slug"],
-        applied_json["git"]
-    );
-    assert!(
-        restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true,
-        "the handover did not complete: {restore}"
-    );
-    assert_eq!(restore["post_status"], "matched", "{restore}");
 
-    // The budgets (D-18): none is scaled and none is skipped.
-    within(
-        "save",
-        timed.span("save").expect("the run saved the repository"),
-        HOST_LINUX_SAVE,
+    // 27-42: every finding is recorded and printed as it is found, and the
+    // gate fails once at its end naming all of them (the 27-25 rule), so a red
+    // run still yields its timings. Nothing below is dropped or loosened.
+    let mut findings: Vec<String> = Vec::new();
+    if applied.outcome.as_str() != "imported" {
+        find(
+            &mut findings,
+            format!(
+                "scale outcome (slug {}): {} is not imported: {}",
+                applied_json["slug"],
+                applied.outcome.as_str(),
+                applied_json["git"]
+            ),
+        );
+    }
+    if !(restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true)
+    {
+        find(
+            &mut findings,
+            format!("the handover did not complete: {restore}"),
+        );
+    }
+    if restore["post_status"] != "matched" {
+        find(
+            &mut findings,
+            format!("post_status is not matched: {restore}"),
+        );
+    }
+
+    // The budgets (D-18): none is scaled and none is skipped, and each row is
+    // printed whatever the outcome.
+    for (row, span, budget) in [
+        ("save", timed.span("save"), HOST_LINUX_SAVE),
+        (
+            "restore_verify",
+            timed.span("restore"),
+            HOST_LINUX_RESTORE_VERIFY,
+        ),
+        ("upload", timed.span("upload"), HOST_LINUX_UPLOAD),
+    ] {
+        if let Some(finding) = within(row, span, budget) {
+            find(&mut findings, finding);
+        }
+    }
+
+    // Y3 follow-up (27-42): the save's `.git`, measured right after the timed
+    // save and outside its span, has the configured shape and the counts
+    // measured right before the timed apply. Names only, never a value.
+    let saved_off = saved_shape_differences(
+        timed.saved_shape().as_ref(),
+        &before_apply,
+        &emitted_git,
+        &shape,
     );
-    within(
-        "restore_verify",
-        timed
-            .span("restore")
-            .expect("the import removed .git and the run restored it"),
-        HOST_LINUX_RESTORE_VERIFY,
+    eprintln!(
+        "LIVE-SCALE saved shape equals the checked shape={} differing={saved_off:?}",
+        saved_off.is_empty()
     );
-    within(
-        "upload",
-        timed.span("upload").expect("the run wrote the advance"),
-        HOST_LINUX_UPLOAD,
-    );
+    if !saved_off.is_empty() {
+        find(
+            &mut findings,
+            format!("the saved .git differs from the checked shape (differing: {saved_off:?})"),
+        );
+    }
 
     // JGit says what the run predicted (D-25): a difference blocks the cut-over.
     // `data.git.expected_drift` is byte-sorted and capped; `expected_drift_count`
     // is the full number (the published contract). So: every listed path is in
     // JGit's list, the run's count equals an independent recomputation (the
-    // read-back export against the release's bytes), and JGit's list equals
-    // that recomputed full set.
-    assert_eq!(applied_json["git"]["expected_drift_complete"], true);
+    // rig's project directory on disk against the release's bytes, 27-42: what
+    // JGit reads, not the read-back export), and JGit's list equals that
+    // recomputed full set.
+    if applied_json["git"]["expected_drift_complete"] != true {
+        find(
+            &mut findings,
+            format!(
+                "expected_drift_complete is not true: {}",
+                applied_json["git"]["expected_drift_complete"]
+            ),
+        );
+    }
     let predicted = strs(&applied_json["git"]["expected_drift"]);
-    let counted = applied_json["git"]["expected_drift_count"]
-        .as_u64()
-        .expect("the run reports the full drift count");
+    let counted = applied_json["git"]["expected_drift_count"].as_u64();
+    if counted.is_none() {
+        find(
+            &mut findings,
+            "the run does not report the full drift count".to_string(),
+        );
+    }
     tokio::time::sleep(Duration::from_secs(10)).await;
     let jg = jgit(&api, &config).await;
     // The listed part is capped, so JGit's list is the longer one: only the
@@ -3153,17 +3346,7 @@ async fn git_prodscale_rig() {
     let (_, missing) = drift_difference(&jg, &predicted);
     let (_keep2, checkout, _c) = release_checkout(&rig, "v1.1.0");
     let release_files = zip_members(&build_artifact(&checkout).expect("artifact builds").zip);
-    let live_files = zip_members(
-        &GatewayProjects(&api)
-            .export_bytes(APP)
-            .await
-            .expect("the project's export"),
-    );
-    let changed: BTreeSet<String> = release_files
-        .iter()
-        .filter(|(path, bytes)| live_files.get(*path).is_some_and(|live| live != *bytes))
-        .map(|(path, _)| path.clone())
-        .collect();
+    let changed = disk_drift(&rig.project_dir(), &release_files);
     let full: BTreeSet<String> = changed.iter().map(|file| module_path(file)).collect();
     let extra: Vec<&String> = jg.paths.difference(&full).collect();
     let absent: Vec<&String> = full.difference(&jg.paths).collect();
@@ -3172,28 +3355,48 @@ async fn git_prodscale_rig() {
         missing.len(),
         extra.len(),
         absent.len(),
-        counted == changed.len() as u64,
+        counted == Some(changed.len() as u64),
         jg.unpushed,
         jg.branch
     );
-    assert!(
-        missing.is_empty(),
-        "CUT-OVER BLOCKER (D-25): {} listed path(s) are not in JGit's status",
-        missing.len()
-    );
-    assert!(
-        extra.is_empty() && absent.is_empty(),
-        "CUT-OVER BLOCKER (D-25): JGit differs from the full prediction: extra={} missing={}",
-        extra.len(),
-        absent.len()
-    );
-    assert_eq!(
-        counted,
-        changed.len() as u64,
-        "the run's drift count differs from the recomputed one"
-    );
-    assert_eq!(jg.unpushed, 0);
-    eprintln!("LIVE-CHECK prodscale_jgit_equals_expected_drift");
+    let jgit_findings = findings.len();
+    if !missing.is_empty() {
+        find(
+            &mut findings,
+            format!(
+                "CUT-OVER BLOCKER (D-25): {} listed path(s) are not in JGit's status",
+                missing.len()
+            ),
+        );
+    }
+    if !(extra.is_empty() && absent.is_empty()) {
+        find(
+            &mut findings,
+            format!(
+                "CUT-OVER BLOCKER (D-25): JGit differs from the full prediction: extra={} missing={}",
+                extra.len(),
+                absent.len()
+            ),
+        );
+    }
+    if counted != Some(changed.len() as u64) {
+        find(
+            &mut findings,
+            format!(
+                "the run's drift count ({counted:?}) differs from the recomputed one ({})",
+                changed.len()
+            ),
+        );
+    }
+    if jg.unpushed != 0 {
+        find(
+            &mut findings,
+            format!("unpushed commits after the deploy: {}", jg.unpushed),
+        );
+    }
+    if findings.len() == jgit_findings {
+        eprintln!("LIVE-CHECK prodscale_jgit_equals_expected_drift");
+    }
     write_evidence(
         &rig,
         "git_prodscale_rig",
@@ -3204,7 +3407,13 @@ async fn git_prodscale_rig() {
             "restore_verify_ms": timed.span("restore").map(|d| d.as_millis()),
             "upload_ms": timed.span("upload").map(|d| d.as_millis()),
             "post_status": restore["post_status"],
+            "saved_shape_differing": saved_off,
+            "findings": findings,
         }),
+    );
+    assert!(
+        findings.is_empty(),
+        "findings of the production-scale run: {findings:#?}"
     );
     eprintln!("LIVE-RAN git_prodscale_rig");
 }
@@ -3611,6 +3820,88 @@ fn head_at_reads_head_not_any_branch() {
         ..refs
     };
     assert!(!head_at(&unborn, &old), "an unborn HEAD names no commit");
+}
+
+/// 27-42 (T-27-188): the gate's independent drift set is what JGit measures,
+/// the rig's project directory against the release's bytes. A file holding
+/// the gateway's form is drift, a file holding the release's bytes is not,
+/// and `.git` is never read.
+#[test]
+fn disk_drift_counts_only_files_that_differ_from_the_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project = dir.path();
+    let kept = "com.inductiveautomation.perspective/views/V/resource.json";
+    let rewritten = "ignition/script-python/cap/util/resource.json";
+    let release = BTreeMap::from([
+        (kept.to_string(), b"{\"a\":1}".to_vec()),
+        (rewritten.to_string(), b"{\"a\":1}".to_vec()),
+    ]);
+    let put = |rel: &str, bytes: &[u8]| {
+        let path = project.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("write");
+    };
+    put(kept, b"{\"a\":1}");
+    put(rewritten, b"{ \"a\": 1 }\n");
+    // Whatever `.git` holds, even a copy of a release path, is not read.
+    put(".git/HEAD", b"ref: refs/heads/production\n");
+    put(&format!(".git/{kept}"), b"not the release");
+    assert_eq!(
+        disk_drift(project, &release),
+        BTreeSet::from([rewritten.to_string()]),
+        "only the file holding other bytes than the release is drift"
+    );
+    assert_eq!(module_path(rewritten), "ignition/script-python/cap/util");
+}
+
+/// A release member that is not on the disk is a deletion, and a deletion
+/// still fails the gate.
+#[test]
+fn disk_drift_reports_a_release_member_missing_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gone = "project.json";
+    let release = BTreeMap::from([(gone.to_string(), b"{}".to_vec())]);
+    std::fs::create_dir_all(dir.path().join(".git")).expect("git dir");
+    assert_eq!(
+        disk_drift(dir.path(), &release),
+        BTreeSet::from([gone.to_string()])
+    );
+}
+
+/// 27-42 (Y3 follow-up): the saved shape compare names the counts that
+/// changed, never a measured value.
+#[test]
+fn saved_shape_mismatch_names_only_counts() {
+    let checked = prod_shape_git::Measured {
+        bytes: 1_000_000,
+        files: 90,
+        packs: 3,
+        loose: 40,
+        tag_refs: 7,
+    };
+    assert!(saved_count_changes(&checked, &checked).is_empty());
+    let saved = prod_shape_git::Measured {
+        packs: 4,
+        ..checked.clone()
+    };
+    assert_eq!(
+        saved_count_changes(&saved, &checked),
+        vec!["saved_packs_changed"]
+    );
+    let everything = prod_shape_git::Measured {
+        packs: 1,
+        loose: 2,
+        tag_refs: 3,
+        ..checked.clone()
+    };
+    assert_eq!(
+        saved_count_changes(&everything, &checked),
+        vec![
+            "saved_packs_changed",
+            "saved_loose_objects_changed",
+            "saved_tag_refs_changed"
+        ]
+    );
 }
 
 /// Every git event of a pair run with the node it names and the time it was
