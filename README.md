@@ -5624,6 +5624,25 @@ the run writes `journal.json`, state `applying`. The host keeps the latest
 run's pre-image only: the next run writes over it. A host that cannot take
 the copy stops the run with nothing written to the gateway.
 
+**The schema of the host copy.** `pre-image/run.json` and `journal.json` are
+written at `schema_version` 2. Version 2 adds one field to each file:
+
+| File | Field | Meaning |
+|------|-------|---------|
+| `pre-image/run.json` | `import_sent` | required; `false` when the pre-image is written, `true` once the run rewrote `run.json` right before it sent the project import. A write that fails there stops the run with nothing imported |
+| `journal.json` | `git_pending` | optional, present only when it names at least one save: the `.git` saves a rollback could not put back, each `{node, run_id, path, manifest: {files, bytes, digest}}` (`node` is `nodes.master` or `nodes.backup`, at most one entry per node, `digest` 64 lowercase hex) |
+
+`--rollback-run` imports the pre-image back only when `import_sent` is `true`,
+so a run that was refused before its import and whose tag rollback failed is
+retried by restoring the tags alone: the retry never imports the project and
+never removes a gateway `.git`. Version 1 files that earlier releases wrote
+are still read, with no `import_sent` and no `git_pending`, and a retry of such
+a run behaves as it did before. A file with another `schema_version` is
+`deploy_run_invalid`, naming the versions this build reads (1 and 2); an
+older ign that meets a version 2 file refuses it with its own
+`schema_version is not 1` message. Both files stay strict: an unknown or
+missing field (other than the optional `git_pending`) is refused.
+
 The journal says `rolling_back` while a rollback runs. It is removed after a
 green run (after the records), after a verified rollback, and after a run
 that stopped before its first gateway write (its error stands). It stays after

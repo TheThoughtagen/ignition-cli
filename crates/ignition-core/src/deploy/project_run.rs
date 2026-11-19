@@ -66,8 +66,12 @@ pub fn pre_image_run_max_bytes(providers: usize) -> usize {
         .saturating_add(1024 * 1024)
 }
 
-/// The only schema version this build reads and writes.
-const SCHEMA_VERSION: u32 = 1;
+/// The schema version this build writes (27-53: 2 adds `import_sent` to the
+/// pre-image and `git_pending` to the journal).
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The schema versions this build reads.
+pub const READ_VERSIONS: [u32; 2] = [1, 2];
 
 /// One file of the pre-image set. The names are fixed; a provider name inside
 /// one must also pass the host's tag-record name check.
@@ -171,13 +175,43 @@ impl JournalState {
     }
 }
 
+/// What a saved gateway `.git` holds (27-53): files, bytes and the digest of
+/// the same comparable value the save's manifest is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingManifest {
+    /// Regular files in the saved tree.
+    pub files: u64,
+    /// Their total size in bytes.
+    pub bytes: u64,
+    /// Lowercase hex sha256 of the manifest lines.
+    pub digest: String,
+}
+
+/// A `.git` save a rollback could not put back (27-53, P3): the journal names
+/// it so a `--rollback-run` retry puts it back instead of treating the project
+/// as having no git work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingSave {
+    /// The node whose repository the save holds: `nodes.master` or
+    /// `nodes.backup`.
+    pub node: String,
+    /// The run that took the save (the save's directory name).
+    pub run_id: String,
+    /// Where the save lives, relative to the ledger root.
+    pub path: String,
+    /// What the save held when it was taken.
+    pub manifest: PendingManifest,
+}
+
 /// The host journal of a tag-owning run (26-12): written after the complete
 /// pre-image and before the first gateway write, cleared after a green run or
 /// a verified rollback, left after `rollback_failed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectJournal {
-    /// Always 1.
+    /// 2 as written now; 1 when read from an earlier release's journal.
     pub schema_version: u32,
     /// The target's gateway.
     pub gateway: String,
@@ -191,9 +225,14 @@ pub struct ProjectJournal {
     pub started_at: String,
     /// The owned providers, byte-sorted and unique.
     pub providers: Vec<String>,
+    /// The `.git` saves a rollback left (27-53, version 2): present only
+    /// when non-empty, absent in a version 1 journal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_pending: Vec<PendingSave>,
 }
 
-const JOURNAL_FIELDS: [&str; 7] = [
+/// Every field of a version 1 journal.
+const JOURNAL_FIELDS_V1: [&str; 7] = [
     "schema_version",
     "gateway",
     "project",
@@ -202,6 +241,27 @@ const JOURNAL_FIELDS: [&str; 7] = [
     "started_at",
     "providers",
 ];
+
+/// Every field a version 2 journal may hold: version 1's and `git_pending`.
+const JOURNAL_FIELDS_V2: [&str; 8] = [
+    "schema_version",
+    "gateway",
+    "project",
+    "run_id",
+    "state",
+    "started_at",
+    "providers",
+    "git_pending",
+];
+
+/// The one field of a version 2 journal that may be absent.
+const JOURNAL_OPTIONAL_V2: [&str; 1] = ["git_pending"];
+
+/// The most pending saves a journal names: the master's and the backup's.
+const PENDING_MAX: usize = 2;
+
+/// The longest save path a pending entry names.
+const PENDING_PATH_MAX: usize = 1024;
 
 /// What a provider the run created is proven by (26-11): the create's answer,
 /// what was sent, and the signature read right after the run's own create.
@@ -262,7 +322,7 @@ pub struct PreImageProvider {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreImageRun {
-    /// Always 1.
+    /// 2 as written now; 1 when read from an earlier release's set.
     pub schema_version: u32,
     /// The target's gateway.
     pub gateway: String,
@@ -283,9 +343,16 @@ pub struct PreImageRun {
     pub providers: Vec<PreImageProvider>,
     /// Every other file of the set, by name, with its sha256.
     pub files: BTreeMap<String, String>,
+    /// Whether the run had sent its project import (27-53, Q2): `false`
+    /// when the pre-image is written, `true` once the host copy was
+    /// rewritten right before the import. `None` only in a version 1 set,
+    /// which a retry treats as sent (today's behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_sent: Option<bool>,
 }
 
-const RUN_FIELDS: [&str; 10] = [
+/// Every field of a version 1 `run.json`.
+const RUN_FIELDS_V1: [&str; 10] = [
     "schema_version",
     "gateway",
     "project",
@@ -296,6 +363,55 @@ const RUN_FIELDS: [&str; 10] = [
     "groups",
     "providers",
     "files",
+];
+
+/// Every field of a version 2 `run.json`: version 1's and `import_sent`.
+const RUN_FIELDS_V2: [&str; 11] = [
+    "schema_version",
+    "gateway",
+    "project",
+    "run_id",
+    "release",
+    "written_at",
+    "project_action",
+    "groups",
+    "providers",
+    "files",
+    "import_sent",
+];
+
+/// One schema version's field list: every field it may hold, and the ones of
+/// those that may be absent.
+struct Layout {
+    version: u32,
+    fields: &'static [&'static str],
+    optional: &'static [&'static str],
+}
+
+const JOURNAL_LAYOUTS: [Layout; 2] = [
+    Layout {
+        version: 1,
+        fields: &JOURNAL_FIELDS_V1,
+        optional: &[],
+    },
+    Layout {
+        version: 2,
+        fields: &JOURNAL_FIELDS_V2,
+        optional: &JOURNAL_OPTIONAL_V2,
+    },
+];
+
+const RUN_LAYOUTS: [Layout; 2] = [
+    Layout {
+        version: 1,
+        fields: &RUN_FIELDS_V1,
+        optional: &[],
+    },
+    Layout {
+        version: 2,
+        fields: &RUN_FIELDS_V2,
+        optional: &[],
+    },
 ];
 
 /// At most 64 printable characters of `text`, for a problem message.
@@ -315,13 +431,15 @@ fn stamp_ok(text: &str) -> bool {
 }
 
 /// The strict front half both parses share: size, UTF-8, no repeated key, a
-/// top-level object holding exactly `fields`.
+/// top-level object whose `schema_version` is one this build reads and that
+/// holds exactly that version's fields (27-53: the version is read first, so
+/// each version has its own field list). Returns the object.
 fn strict_object(
     bytes: &[u8],
     cap: usize,
-    fields: &[&str],
+    layouts: &[Layout],
     bad: &dyn Fn(String) -> CoreError,
-) -> Result<(), CoreError> {
+) -> Result<Node, CoreError> {
     if bytes.is_empty() {
         return Err(bad("the file is empty".to_string()));
     }
@@ -346,17 +464,39 @@ fn strict_object(
     let Node::Obj(members) = &root else {
         return Err(bad("the top level is not a JSON object".to_string()));
     };
+    let Some(version) = root.get("schema_version") else {
+        return Err(bad("missing field `schema_version`".to_string()));
+    };
+    let Some(layout) = (match version {
+        Node::Lit(lexeme) => lexeme
+            .parse::<u32>()
+            .ok()
+            .and_then(|v| layouts.iter().find(|l| l.version == v)),
+        _ => None,
+    }) else {
+        return Err(bad(read_versions_message()));
+    };
     for (key, _) in members {
-        if !fields.contains(&key.as_str()) {
+        if !layout.fields.contains(&key.as_str()) {
             return Err(bad(format!("unknown field `{}`", shown(key))));
         }
     }
-    for field in fields {
-        if root.get(field).is_none() {
+    for field in layout.fields {
+        if root.get(field).is_none() && !layout.optional.contains(field) {
             return Err(bad(format!("missing field `{field}`")));
         }
     }
-    Ok(())
+    Ok(root)
+}
+
+/// The refusal of a `schema_version` this build does not read, naming the
+/// ones it does.
+fn read_versions_message() -> String {
+    let versions: Vec<String> = READ_VERSIONS.iter().map(u32::to_string).collect();
+    format!(
+        "schema_version is not one this build reads ({})",
+        versions.join(" and ")
+    )
 }
 
 /// The checks of the names both files carry.
@@ -366,10 +506,8 @@ fn common_checks(
     (want_gateway, want_project): (&str, &str),
     bad: &dyn Fn(String) -> CoreError,
 ) -> Result<(), CoreError> {
-    if schema_version != SCHEMA_VERSION {
-        return Err(bad(format!(
-            "schema_version is not {SCHEMA_VERSION}, the only version this build reads"
-        )));
+    if !READ_VERSIONS.contains(&schema_version) {
+        return Err(bad(read_versions_message()));
     }
     if gateway != want_gateway {
         return Err(bad(format!(
@@ -412,6 +550,52 @@ fn provider_names_ok(
     Ok(())
 }
 
+/// The bounds of the journal's pending saves (27-53): at most one per node,
+/// each a bounded path, a run id and a lowercase hex digest. Messages name the
+/// entry by position and never echo a value.
+fn pending_ok(pending: &[PendingSave], bad: &dyn Fn(String) -> CoreError) -> Result<(), CoreError> {
+    for (i, entry) in pending.iter().enumerate() {
+        if i >= PENDING_MAX {
+            return Err(bad(format!(
+                "git_pending[{i}] is one more than the {PENDING_MAX} saves a journal names"
+            )));
+        }
+        if !matches!(entry.node.as_str(), "nodes.master" | "nodes.backup") {
+            return Err(bad(format!(
+                "git_pending[{i}].node is not nodes.master or nodes.backup"
+            )));
+        }
+        if pending[..i]
+            .iter()
+            .any(|earlier| earlier.node == entry.node)
+        {
+            return Err(bad(format!(
+                "git_pending[{i}].node repeats an earlier entry"
+            )));
+        }
+        if RunId::parse(&entry.run_id).is_err() {
+            return Err(bad(format!(
+                "git_pending[{i}].run_id is not 1 to 128 characters of [A-Za-z0-9._-]"
+            )));
+        }
+        if entry.path.is_empty()
+            || entry.path.len() > PENDING_PATH_MAX
+            || entry.path.chars().any(char::is_control)
+        {
+            return Err(bad(format!(
+                "git_pending[{i}].path is empty, over {PENDING_PATH_MAX} bytes or holds a control \
+                 character"
+            )));
+        }
+        if !lower_hex64(&entry.manifest.digest) {
+            return Err(bad(format!(
+                "git_pending[{i}].manifest.digest is not 64 lowercase hex digits"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn location_error(location: &str) -> impl Fn(String) -> CoreError + '_ {
     move |problem| CoreError::DeployRunInvalid {
         run_id: "unknown".to_string(),
@@ -429,7 +613,7 @@ impl ProjectJournal {
         project: &str,
     ) -> Result<ProjectJournal, CoreError> {
         let bad = location_error(location);
-        strict_object(bytes, PROJECT_JOURNAL_MAX_BYTES, &JOURNAL_FIELDS, &bad)?;
+        let root = strict_object(bytes, PROJECT_JOURNAL_MAX_BYTES, &JOURNAL_LAYOUTS, &bad)?;
         let journal: ProjectJournal = serde_json::from_slice(bytes).map_err(|e| {
             bad(format!(
                 "a field has the wrong type (line {} column {})",
@@ -450,6 +634,13 @@ impl ProjectJournal {
         }
         let names: Vec<&str> = journal.providers.iter().map(String::as_str).collect();
         provider_names_ok(&names, "providers", &bad)?;
+        if root.get("git_pending").is_some() && journal.git_pending.is_empty() {
+            return Err(bad(
+                "git_pending[0] is missing: a list that is present names at least one save"
+                    .to_string(),
+            ));
+        }
+        pending_ok(&journal.git_pending, &bad)?;
         Ok(journal)
     }
 
@@ -471,7 +662,7 @@ impl PreImageRun {
         project: &str,
     ) -> Result<PreImageRun, CoreError> {
         let bad = location_error(location);
-        strict_object(bytes, PRE_IMAGE_MAX_BYTES, &RUN_FIELDS, &bad)?;
+        strict_object(bytes, PRE_IMAGE_MAX_BYTES, &RUN_LAYOUTS, &bad)?;
         let run: PreImageRun = serde_json::from_slice(bytes).map_err(|e| {
             bad(format!(
                 "a field has the wrong type (line {} column {})",
@@ -493,6 +684,9 @@ impl PreImageRun {
             (gateway, project),
             &bad,
         )?;
+        if run.schema_version >= 2 && run.import_sent.is_none() {
+            return Err(bad("import_sent is not true or false".to_string()));
+        }
         if Release::try_parse(&run.release).is_none() {
             return Err(bad("release is not a semver tag".to_string()));
         }
@@ -638,6 +832,7 @@ mod tests {
             state: JournalState::Applying,
             started_at: "2026-11-09T10:15:00Z".to_string(),
             providers: vec!["PlantA".to_string()],
+            git_pending: Vec::new(),
         }
     }
 
@@ -666,6 +861,7 @@ mod tests {
                 ("project.zip".to_string(), "a".repeat(64)),
                 ("tags-PlantA.json".to_string(), "b".repeat(64)),
             ]),
+            import_sent: None,
         }
     }
 
@@ -858,5 +1054,207 @@ mod tests {
         )
         .expect("an earlier set");
         assert!(parsed.providers[0].removed.is_empty() && parsed.providers[0].deleted.is_empty());
+    }
+
+    fn pending(node: &str) -> PendingSave {
+        PendingSave {
+            node: node.to_string(),
+            run_id: "20261109T101500Z-ab12".to_string(),
+            path: "ign-deploy/gw/projects/CapApp/git-save/20261109T101500Z-ab12/repo".to_string(),
+            manifest: PendingManifest {
+                files: 12,
+                bytes: 3456,
+                digest: "ab".repeat(32),
+            },
+        }
+    }
+
+    fn journal_v2() -> ProjectJournal {
+        let mut j = journal();
+        j.schema_version = 2;
+        j
+    }
+
+    fn run_v2() -> PreImageRun {
+        let mut r = run();
+        r.schema_version = 2;
+        r.import_sent = Some(false);
+        r
+    }
+
+    /// 27-53: the exact bytes today's writer produces (version 1, none of the
+    /// new fields) parse into the same values.
+    #[test]
+    fn journal_v1_loads_as_today() {
+        let j = journal();
+        let bytes = j.to_bytes();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"schema_version\": 1"), "{text}");
+        assert!(!text.contains("git_pending"), "{text}");
+        let parsed = ProjectJournal::parse(&bytes, LOC, "gw", "CapApp").expect("a version 1 file");
+        assert_eq!(parsed, j);
+        assert!(parsed.git_pending.is_empty());
+    }
+
+    #[test]
+    fn run_v1_loads_as_today() {
+        let r = run();
+        let bytes = r.to_bytes();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(text.contains("\"schema_version\": 1"), "{text}");
+        assert!(!text.contains("import_sent"), "{text}");
+        let parsed = PreImageRun::parse(&bytes, LOC, "gw", "CapApp").expect("a version 1 file");
+        assert_eq!(parsed, r);
+        assert_eq!(parsed.import_sent, None);
+    }
+
+    #[test]
+    fn run_v2_requires_import_sent() {
+        let ok = run_v2();
+        let parsed = PreImageRun::parse(&ok.to_bytes(), LOC, "gw", "CapApp").expect("version 2");
+        assert_eq!(parsed.import_sent, Some(false));
+        let mut sent = ok.clone();
+        sent.import_sent = Some(true);
+        assert_eq!(
+            PreImageRun::parse(&sent.to_bytes(), LOC, "gw", "CapApp")
+                .expect("sent")
+                .import_sent,
+            Some(true)
+        );
+        // Version 2 without the flag.
+        let mut without = run_v2();
+        without.import_sent = None;
+        let err = PreImageRun::parse(&without.to_bytes(), LOC, "gw", "CapApp")
+            .expect_err("a version 2 file needs the flag");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(
+            err.to_string().contains("missing field `import_sent`"),
+            "{err}"
+        );
+        // Version 1 carrying it.
+        let mut v1 = run();
+        v1.import_sent = Some(false);
+        let err = PreImageRun::parse(&v1.to_bytes(), LOC, "gw", "CapApp")
+            .expect_err("a version 1 file may not carry the flag");
+        assert!(
+            err.to_string().contains("unknown field `import_sent`"),
+            "{err}"
+        );
+        // The flag must be a boolean, and null is not one.
+        let mut value: Value = serde_json::from_slice(&ok.to_bytes()).unwrap();
+        value["import_sent"] = Value::from("yes");
+        let err = PreImageRun::parse(&serde_json::to_vec(&value).unwrap(), LOC, "gw", "CapApp")
+            .expect_err("not a boolean");
+        assert!(err.to_string().contains("wrong type"), "{err}");
+        value["import_sent"] = Value::Null;
+        let err = PreImageRun::parse(&serde_json::to_vec(&value).unwrap(), LOC, "gw", "CapApp")
+            .expect_err("null");
+        assert!(err.to_string().contains("import_sent"), "{err}");
+    }
+
+    #[test]
+    fn journal_v2_git_pending_round_trips() {
+        let mut j = journal_v2();
+        j.git_pending = vec![pending("nodes.master"), pending("nodes.backup")];
+        let parsed = ProjectJournal::parse(&j.to_bytes(), LOC, "gw", "CapApp").expect("parses");
+        assert_eq!(parsed, j);
+        // An empty list is not written.
+        let empty = journal_v2();
+        let text = String::from_utf8(empty.to_bytes()).unwrap();
+        assert!(!text.contains("git_pending"), "{text}");
+        assert_eq!(
+            ProjectJournal::parse(text.as_bytes(), LOC, "gw", "CapApp").expect("parses"),
+            empty
+        );
+        // A list that is present must not be empty.
+        let mut value: Value = serde_json::from_slice(&empty.to_bytes()).unwrap();
+        value["git_pending"] = Value::Array(Vec::new());
+        let err = ProjectJournal::parse(&serde_json::to_vec(&value).unwrap(), LOC, "gw", "CapApp")
+            .expect_err("an empty list");
+        assert!(err.to_string().contains("git_pending"), "{err}");
+        // Version 1 has no such field.
+        let mut v1 = journal();
+        v1.git_pending = vec![pending("nodes.master")];
+        let err = ProjectJournal::parse(&v1.to_bytes(), LOC, "gw", "CapApp")
+            .expect_err("version 1 has no pending list");
+        assert!(
+            err.to_string().contains("unknown field `git_pending`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn journal_v2_refuses_a_malformed_pending_entry() {
+        let mut cases: Vec<(&str, ProjectJournal)> = Vec::new();
+        let mut with = |what: &'static str, edit: &dyn Fn(&mut PendingSave)| {
+            let mut entry = pending("nodes.master");
+            edit(&mut entry);
+            let mut j = journal_v2();
+            j.git_pending = vec![entry];
+            cases.push((what, j));
+        };
+        with("a non-hex digest", &|e| e.manifest.digest = "zz".repeat(32));
+        with("an upper-case digest", &|e| {
+            e.manifest.digest = "AB".repeat(32)
+        });
+        with("a short digest", &|e| e.manifest.digest = "ab".repeat(31));
+        with("an empty path", &|e| e.path = String::new());
+        with("a path over 1024 bytes", &|e| e.path = "p".repeat(1025));
+        with("a path with a control character", &|e| {
+            e.path = "ign-deploy/a\nb".to_string()
+        });
+        with("another node", &|e| e.node = "nodes.other".to_string());
+        with("a bad run id", &|e| e.run_id = "../x".to_string());
+        let mut three = journal_v2();
+        three.git_pending = vec![
+            pending("nodes.master"),
+            pending("nodes.backup"),
+            pending("nodes.backup"),
+        ];
+        cases.push(("three entries", three));
+        let mut twice = journal_v2();
+        twice.git_pending = vec![pending("nodes.master"), pending("nodes.master")];
+        cases.push(("a node listed twice", twice));
+        for (what, j) in cases {
+            let err = ProjectJournal::parse(&j.to_bytes(), LOC, "gw", "CapApp").expect_err(what);
+            assert_eq!(err.code(), "deploy_run_invalid", "{what}: {err}");
+            assert!(err.to_string().contains("git_pending["), "{what}: {err}");
+        }
+    }
+
+    #[test]
+    fn schema_version_3_is_refused() {
+        let mut j = journal_v2();
+        j.schema_version = 3;
+        let err = ProjectJournal::parse(&j.to_bytes(), LOC, "gw", "CapApp").expect_err("3");
+        assert_eq!(err.code(), "deploy_run_invalid");
+        assert!(err.to_string().contains("1 and 2"), "{err}");
+        let mut r = run_v2();
+        r.schema_version = 3;
+        let err = PreImageRun::parse(&r.to_bytes(), LOC, "gw", "CapApp").expect_err("3");
+        assert!(err.to_string().contains("1 and 2"), "{err}");
+        let mut zero = journal();
+        zero.schema_version = 0;
+        assert!(ProjectJournal::parse(&zero.to_bytes(), LOC, "gw", "CapApp").is_err());
+    }
+
+    #[test]
+    fn writers_write_version_2() {
+        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(READ_VERSIONS, [1, 2]);
+        let r = PreImageRun {
+            schema_version: SCHEMA_VERSION,
+            import_sent: Some(false),
+            ..run()
+        };
+        let text = String::from_utf8(r.to_bytes()).unwrap();
+        assert!(text.contains("\"schema_version\": 2"), "{text}");
+        assert!(text.contains("\"import_sent\": false"), "{text}");
+        let j = ProjectJournal {
+            schema_version: SCHEMA_VERSION,
+            ..journal()
+        };
+        let text = String::from_utf8(j.to_bytes()).unwrap();
+        assert!(text.contains("\"schema_version\": 2"), "{text}");
     }
 }

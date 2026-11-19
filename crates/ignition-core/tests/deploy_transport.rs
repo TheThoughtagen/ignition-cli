@@ -3654,6 +3654,7 @@ mod project_run_local {
             state: JournalState::Applying,
             started_at: "2026-11-09T10:15:00Z".to_string(),
             providers: vec!["PlantA".to_string()],
+            git_pending: Vec::new(),
         }
         .to_bytes()
     }

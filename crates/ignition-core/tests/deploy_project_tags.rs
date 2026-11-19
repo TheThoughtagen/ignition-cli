@@ -3926,6 +3926,7 @@ fn put_journal(repo: &Checkout, run_id: &str, state: JournalState) {
         state,
         started_at: "2026-11-01T00:00:00Z".to_string(),
         providers: vec![PROVIDER.to_string()],
+        git_pending: Vec::new(),
     };
     put(&repo.data, JOURNAL_REL, &journal.to_bytes());
 }

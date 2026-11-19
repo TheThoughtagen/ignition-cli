@@ -304,6 +304,7 @@ use crate::deploy::project_artifact::{
 };
 use crate::deploy::project_run::{
     CreatedProof, JournalState, PreImageFile, PreImageProvider, PreImageRun, ProjectJournal,
+    SCHEMA_VERSION,
 };
 use crate::deploy::project_tags::{
     FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagRefs, TagTree,
@@ -6122,7 +6123,7 @@ async fn write_host_copy(
         })
         .collect();
     let run = PreImageRun {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         gateway: gateway.clone(),
         project: project.clone(),
         run_id: run_id.as_str().to_string(),
@@ -6132,6 +6133,7 @@ async fn write_host_copy(
         groups: pre.groups,
         providers,
         files,
+        import_sent: Some(false),
     };
     writer
         .write_pre_image(
@@ -6146,13 +6148,14 @@ async fn write_host_copy(
         files: run.files.len() + 1,
     })?;
     let journal = ProjectJournal {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         gateway: gateway.clone(),
         project: project.clone(),
         run_id: run_id.as_str().to_string(),
         state: JournalState::Applying,
         started_at: rfc3339_now_utc(),
         providers: owned.iter().map(|p| p.name.clone()).collect(),
+        git_pending: Vec::new(),
     };
     writer
         .write_journal(gateway, project, &journal.to_bytes())
@@ -9824,13 +9827,14 @@ pub async fn deploy_projects_rollback_run(
             // The journal says rolling_back before the first gateway write; a
             // host that cannot take it stops the undo with nothing written.
             let journal = ProjectJournal {
-                schema_version: 1,
+                schema_version: SCHEMA_VERSION,
                 gateway: loaded.target.gateway.clone(),
                 project: project.to_string(),
                 run_id: target.as_str().to_string(),
                 state: JournalState::RollingBack,
                 started_at: rfc3339_now_utc(),
                 providers: set.run.providers.iter().map(|p| p.name.clone()).collect(),
+                git_pending: Vec::new(),
             };
             run_writer
                 .write_journal(&loaded.target.gateway, project, &journal.to_bytes())
