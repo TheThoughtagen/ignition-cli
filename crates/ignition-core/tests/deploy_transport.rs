@@ -6089,6 +6089,263 @@ mod sftp_git {
         assert!(!sent[0].contains("eval"), "nothing is evaluated");
     }
 
+    /// A shim for `tool` that, the first time its `pwd -P` and arguments match
+    /// the `case` pattern `when`, moves `victim` aside and puts a link to
+    /// `outside` in its place (27-46): a level swapped while a script runs.
+    fn swap_once(
+        shims: &common::posix_exec::Shims,
+        tool: &str,
+        when: &str,
+        victim: &Path,
+        outside: &Path,
+    ) {
+        let marker = outside.join("swapped");
+        shims.add(
+            tool,
+            &format!(
+                "case \"$(pwd -P):$*\" in {when}) if [ ! -e {m} ]; then : > {m}; \
+                 mv {v} {v}.real && ln -s {o} {v}; fi;; esac\n\
+                 exec \"$(real {tool})\" \"$@\"",
+                m = marker.display(),
+                v = victim.display(),
+                o = outside.display(),
+            ),
+        );
+    }
+
+    /// Like [`swap_once`], but at the `nth` call of `tool` (counted in a file),
+    /// whatever its arguments.
+    fn swap_at_call(
+        shims: &common::posix_exec::Shims,
+        tool: &str,
+        nth: usize,
+        victim: &Path,
+        outside: &Path,
+    ) {
+        let count = outside.join("calls");
+        shims.add(
+            tool,
+            &format!(
+                "c=$(cat {c} 2>/dev/null || echo 0); c=$((c+1)); echo $c > {c}\n\
+                 if [ $c = {nth} ]; then mv {v} {v}.real && ln -s {o} {v}; fi\n\
+                 exec \"$(real {tool})\" \"$@\"",
+                c = count.display(),
+                v = victim.display(),
+                o = outside.display(),
+            ),
+        );
+    }
+
+    /// 27-46 (C1, POSIX half): a level above the loose refs swapped for a link
+    /// while the state read runs is refused (exit 4, naming the level), and no
+    /// ref from outside `.git` is in the answer. A `wc` shim swaps
+    /// `refs/remotes` at the last loose-ref read (the call after those of HEAD,
+    /// config, packed-refs, the reflog and the one head), between the listing
+    /// and the read, when every earlier check has passed: a script that reads
+    /// `refs/remotes/<name>/<ref>` by its multi-level path reads the outside
+    /// copy.
+    #[tokio::test]
+    async fn sftp_git_state_refuses_a_level_swapped_during_the_walk() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        std::fs::create_dir_all(git.join("refs/remotes/capapp")).expect("remote dir");
+        std::fs::write(
+            git.join("refs/remotes/capapp/production"),
+            format!("{}\n", fx.c1),
+        )
+        .expect("loose remote ref");
+        for name in [
+            "HEAD",
+            "config",
+            "packed-refs",
+            "logs/HEAD",
+            "refs/heads/production",
+            "refs/remotes/capapp/production",
+        ] {
+            assert!(git.join(name).is_file(), "the fixture holds {name}");
+        }
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("capapp")).expect("capapp");
+        std::fs::write(
+            outside.path().join("capapp/production"),
+            format!("{}\n", fx.c2),
+        )
+        .expect("outside copy");
+        let shims = common::posix_exec::Shims::new();
+        swap_at_call(&shims, "wc", 6, &git.join("refs/remotes"), outside.path());
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.read_git_state(PROJECT)
+                .await
+                .expect_err("a level swapped during the walk"),
+        );
+        assert!(why.contains("exit code 4"), "{why}");
+        assert!(why.contains("refs/remotes"), "the level is named: {why}");
+        assert!(
+            git.join("refs/remotes.real").exists(),
+            "the shim swapped the level"
+        );
+    }
+
+    /// 27-46: every loose ref, nested or not, is read by its basename after a
+    /// `cd` into its parent directory: the same bytes as the local read, and a
+    /// `head` shim sees its working directory be the ref's parent.
+    #[tokio::test]
+    async fn sftp_git_state_reads_nested_refs_by_basename() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        fx.git_in_project(&["branch", "feature/a/b"]);
+        fx.git_in_project(&["branch", "top"]);
+        let log = fx.data_dir.join("head-cwd.log");
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "head",
+            &format!("pwd -P >> {}\nexec \"$(real head)\" \"$@\"", log.display()),
+        );
+        n.count.use_shims(&shims);
+        let local: GitFiles = fx.node().read_git_state(PROJECT).await.expect("local");
+        let posix: GitFiles = n.t.read_git_state(PROJECT).await.expect("posix");
+        assert_eq!(posix, local, "the same bytes as before");
+        assert!(
+            posix
+                .loose_refs
+                .iter()
+                .any(|(name, _)| name == "refs/heads/feature/a/b"),
+            "{posix:?}"
+        );
+        let cwds = std::fs::read_to_string(&log).expect("head log");
+        assert!(
+            cwds.lines()
+                .any(|dir| dir.ends_with("/refs/heads/feature/a")),
+            "the nested ref is read from its parent directory: {cwds}"
+        );
+        assert!(
+            cwds.lines().any(|dir| dir.ends_with("/refs/heads")),
+            "{cwds}"
+        );
+    }
+
+    /// 27-46: `logs` swapped for a link is refused, both when the swap lands
+    /// before the walk enters it and when it lands after (the end check). The
+    /// outside `HEAD` is never read.
+    #[tokio::test]
+    async fn sftp_git_log_refuses_a_swapped_logs_dir() {
+        for (case, when) in [
+            ("before the walk enters it", "*\"-- packed-refs\"*"),
+            ("after the walk entered it", "*\"/logs:-ld -- HEAD\""),
+        ] {
+            let fx = GitFixture::new();
+            let n = node(&fx.data_dir);
+            let git = fx.git_dir();
+            assert!(git.join("logs/HEAD").exists(), "the fixture keeps a reflog");
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("HEAD"), "outside-reflog\n").expect("outside");
+            let shims = common::posix_exec::Shims::new();
+            swap_once(&shims, "ls", when, &git.join("logs"), outside.path());
+            n.count.use_shims(&shims);
+            let why = detail(n.t.read_git_state(PROJECT).await.expect_err(case));
+            assert!(why.contains("exit code 4"), "{case}: {why}");
+            assert!(why.contains("logs"), "{case}: {why}");
+            assert!(
+                git.join("logs.real").exists(),
+                "{case}: the shim swapped it"
+            );
+        }
+    }
+
+    /// 27-46: the digest of a nested file is taken in the checked parent
+    /// directory; a parent swapped for a link after the walk is refused and no
+    /// digest of the outside file is returned.
+    #[tokio::test]
+    async fn sftp_git_digest_refuses_a_swapped_parent() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        std::fs::create_dir_all(git.join("refs/heads/sub")).expect("sub");
+        std::fs::write(git.join("refs/heads/sub/x"), format!("{}\n", fx.c2)).expect("x");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("x"), "outside\n").expect("outside x");
+        let name = GitWriteName::BranchRef("sub/x".to_string());
+        // honest first
+        let honest = n.t.git_file_digest(PROJECT, &name).await.expect("honest");
+        assert_eq!(
+            honest.as_deref(),
+            Some(sha256_hex(format!("{}\n", fx.c2).as_bytes()).as_str())
+        );
+        let shims = common::posix_exec::Shims::new();
+        swap_once(
+            &shims,
+            "ls",
+            "*",
+            &git.join("refs/heads/sub"),
+            outside.path(),
+        );
+        n.count.use_shims(&shims);
+        let got = n.t.git_file_digest(PROJECT, &name).await;
+        let why = detail(got.expect_err("a swapped parent"));
+        assert!(why.contains("exit code 4"), "{why}");
+        assert!(why.contains("sub"), "{why}");
+    }
+
+    /// 27-46: the manifest read refuses a level above `.git` that is swapped
+    /// for a link after the walk (the end check); nothing is answered.
+    #[tokio::test]
+    async fn sftp_git_manifest_refuses_a_level_swapped_during_the_walk() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let shims = common::posix_exec::Shims::new();
+        swap_once(&shims, "find", "*", &fx.project_dir(), outside.path());
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.git_manifest(PROJECT)
+                .await
+                .expect_err("a swapped level"),
+        );
+        assert!(why.contains("exit code 4"), "{why}");
+        assert!(why.contains("changed"), "{why}");
+    }
+
+    /// 27-46: the size read, the same.
+    #[tokio::test]
+    async fn sftp_git_size_refuses_a_level_swapped_during_the_walk() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let shims = common::posix_exec::Shims::new();
+        swap_once(&shims, "find", "*", &fx.git_dir(), outside.path());
+        n.count.use_shims(&shims);
+        let why = detail(n.t.git_size(PROJECT).await.expect_err("a swapped level"));
+        assert!(why.contains("exit code 4"), "{why}");
+        assert!(why.contains("changed"), "{why}");
+    }
+
+    /// 27-46: the object listing refuses `objects` swapped for a link after the
+    /// walk reached it.
+    #[tokio::test]
+    async fn sftp_git_objects_refuses_a_swapped_objects_dir() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let outside = tempfile::tempdir().expect("outside");
+        let shims = common::posix_exec::Shims::new();
+        swap_once(
+            &shims,
+            "find",
+            "*",
+            &fx.git_dir().join("objects"),
+            outside.path(),
+        );
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.list_git_objects(PROJECT)
+                .await
+                .expect_err("a swapped objects dir"),
+        );
+        assert!(why.contains("exit code 4"), "{why}");
+        assert!(why.contains("changed"), "{why}");
+    }
+
     #[test]
     fn sftp_git_scripts_are_not_reachable_from_the_read_only_host() {
         // `ProjectHost::git` hands out the read half only; the writer trait is

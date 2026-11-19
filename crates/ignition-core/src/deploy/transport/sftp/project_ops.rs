@@ -164,6 +164,39 @@ const GIT_PROBE_NAME: &str = "ign-git-probe";
 // reviewed source and kept here as `concat!` lines so a test can run the very
 // same text under the local `sh`.
 
+/// The verified walk every POSIX reader shares (27-46, CodeRabbit #56 C1,
+/// POSIX half), as one fragment so each script carries the same bytes. `sh` has
+/// no `openat`; its anchor is the working directory. `wv DATA REL [o]` enters
+/// `DATA` and then each level of `REL`, and at every level requires a real
+/// directory (`[ -d ]` and not `[ -L ]`) and then, once it is entered, that
+/// `pwd -P` equals the path expected (the physical path of `DATA` plus the
+/// levels so far): a level swapped for a link between the check and the `cd`
+/// lands somewhere else and is refused (exit 4, "changed while it was
+/// entered"). With a third argument `o` a level that does not exist makes it
+/// return 2 instead (nothing was entered past it). Every read after that uses
+/// a basename in the checked current directory, never a path through levels
+/// that may since have been swapped. `an` re-checks `pwd -P` against the path
+/// `wv` expected; a script calls it after it has read from a directory, so a
+/// directory moved while it was read is refused (exit 4, "changed while it was
+/// read"). `sh` offers nothing better: a final component swapped between its
+/// `[ -L ]` and its read is the one window left, and it is inside a directory
+/// the walk checked.
+macro_rules! verified_walk_sh {
+    () => {
+        concat!(
+            "wv() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+            "cd -- \"$1\" || exit 3; we=$(pwd -P) || exit 3; OI=$IFS; IFS=/; ",
+            "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { ",
+            "if [ -n \"$3\" ] && [ ! -e \"$c\" ] && [ ! -L \"$c\" ]; then IFS=$OI; return 2; fi; ",
+            "if [ -L \"$c\" ]; then printf '%s is a symlink, not a real directory\\n' \"$c\" >&2; ",
+            "else printf '%s is not a real directory\\n' \"$c\" >&2; fi; exit 4; }; ",
+            "cd -- \"$c\" || exit 3; we=${we%/}/$c; wp=$(pwd -P) || exit 3; ",
+            "[ \"$wp\" = \"$we\" ] || { printf '%s changed while it was entered\\n' \"$c\" >&2; exit 4; }; done; IFS=$OI; }; ",
+            "an() { [ \"$(pwd -P)\" = \"$we\" ] || { printf '%s changed while it was read\\n' \"$we\" >&2; exit 4; }; }; "
+        )
+    };
+}
+
 pub(super) const GIT_MANIFEST_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk sort tr ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
@@ -173,37 +206,37 @@ pub(super) const GIT_MANIFEST_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    verified_walk_sh!(),
+    // A file below `objects/` is only sized. Every other file is hashed by its
+    // basename after the verified walk into its parent (the walk is repeated
+    // only when the parent changes; `find` lists a directory's entries
+    // together), and a parent moved while it was read is refused by `an`.
     "ml() { while IFS= read -r l; do case $l in *' ./'*) s=${l%% ./*}; p=${l#*' ./'}; s=$((s)); ",
     "case $p in objects/*) printf '%s\\001%s\\n' \"$p\" \"$s\";; ",
-    "*) h=$($H -- \"./$p\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; }; ",
-    "mf() { cd -- \"$1\" || exit 3; ",
-    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "*) case $p in */*) pq=${p%/*};; *) pq='';; esac; pb=${p##*/}; ",
+    "if [ \"$pq\" != \"$lw\" ]; then an; wv \"$dd\" \"$gr${pq:+/$pq}\"; lw=$pq; fi; ",
+    "[ ! -L \"$pb\" ] || { printf '%s is a symlink\\n' \"$p\" >&2; exit 4; }; ",
+    "h=$($H -- \"$pb\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; an; }; ",
+    "mf() { x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
     "a=$(find -P . -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
     "w=$(printf '%s\\n' \"$a\" | awk '/ \\.\\// {n++; s=$0; sub(/^ */,\"\",s); b+=s+0} END {printf \"%d %.0f\", n, b}') || exit 3; ",
-    "q=$(printf '%s\\n' \"$a\" | ml) || exit 3; ",
+    "lw=''; q=$(printf '%s\\n' \"$a\" | ml) || exit $?; ",
     "if [ -n \"$q\" ]; then d=$(printf '%s\\n' \"$q\" | sort | tr '\\001' '\\000' | $H) || exit 3; else d=$(: | $H) || exit 3; fi; ",
-    "printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
-    "wk \"$1\" \"$2\"; m=$(mf \"$PWD\") || exit $?; set -- $m; ",
+    "an; printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
+    "wv \"$1\" \"$2\"; dd=$1; gr=$2; m=$(mf) || exit $?; set -- $m; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
 );
 
 pub(super) const GIT_SIZE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find ls awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; ",
+    verified_walk_sh!(),
+    "wv \"$1\" \"$2\"; ",
     "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
     "a=$(find -P . -type f -exec ls -ln {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
-    "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; set -- $w; ",
+    "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; an; set -- $w; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s}\\n' \"$1\" \"$2\"",
 );
 
@@ -241,11 +274,7 @@ pub(super) const PROJECT_DIGESTS_SH: &str = concat!(
     "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
     "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
     "NL=$(printf '\\nx'); NL=${NL%x}; ",
-    "wv() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; we=$(pwd -P) || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; we=${we%/}/$c; wp=$(pwd -P) || exit 3; ",
-    "[ \"$wp\" = \"$we\" ] || { printf '%s changed while it was entered\\n' \"$c\" >&2; exit 4; }; done; IFS=$OI; }; ",
+    verified_walk_sh!(),
     "wv \"$1\" \"$2\"; gp=$(pwd -P) || exit 3; ",
     "x=$(find -P . -path ./.git -prune -o \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' -o -name '*\\\\*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { printf '%s is a symlink, a special file or a name with a control character or a backslash\\n' \"${x%%\"$NL\"*}\" >&2; exit 4; }; ",
@@ -282,11 +311,8 @@ const GIT_OBJECTS_REPORT_MAX: usize = GIT_OBJECTS_LOOSE_MAX + 2 * GIT_OBJECTS_PA
 pub(super) const GIT_OBJECTS_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; ",
+    verified_walk_sh!(),
+    "wv \"$1\" \"$2\"; ",
     "x=$(find -P . -maxdepth 2 \\( -type l -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { echo 'objects holds a symlink or a name with a control character' >&2; exit 4; }; ",
     "a=$(find -P . -maxdepth 2 -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
@@ -298,7 +324,7 @@ pub(super) const GIT_OBJECTS_SH: &str = concat!(
     r#"if((length(p)==41 && p ~ /^[0-9a-f][0-9a-f]\/[0-9a-f]+$/) || ((length(p)==55 || length(p)==54) && p ~ /^pack\/pack-[0-9a-f]+\.(pack|idx)$/)) "#,
     r#"{if(e>=cap){m=1}else{e++; printf "%.0f objects/%s\\n", s, p}}} "#,
     r#"END{printf "\",\"n\":%d,\"more\":%d}\n", e, m; exit bad}"#,
-    "') || exit $?; ",
+    "') || exit $?; an; ",
     "printf 'IGN-RESULT:%s\\n' \"$j\"",
 );
 
@@ -308,36 +334,49 @@ pub(super) const GIT_STATE_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; shift 2; NL=$(printf '\\nx'); NL=${NL%x}; ",
-    "pd() { q=''; OI=$IFS; IFS=/; for w in $1; do if [ -n \"$q\" ] && [ -L \"$q\" ]; then printf '%s is a symlink\\n' \"$q\" >&2; exit 4; fi; q=${q:+$q/}$w; done; IFS=$OI; }; ",
-    "rd() { pd \"$1\"; if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
+    verified_walk_sh!(),
+    "NL=$(printf '\\nx'); NL=${NL%x}; dd=$1; gr=$2; shift 2; ",
+    // Every read is of a basename in the directory the walk checked.
+    "rd() { if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
     "if pr \"$1\"; then [ -f \"$1\" ] || { printf '%s is not a regular file\\n' \"$1\" >&2; exit 4; }; ",
     "[ -r \"$1\" ] || { printf '%s cannot be read\\n' \"$1\" >&2; exit 3; }; ",
     "z=$(wc -c < \"$1\") || exit 3; z=$((z)); ",
     "b=$($3 -c \"$2\" < \"$1\" | base64 | tr -d '\\n'); printf '{\"n\":%s,\"b\":\"%s\"}' \"$z\" \"$b\"; ",
     "else printf null; fi; }; ",
+    // `logs/HEAD`: walk into `logs` (absent is null), read `HEAD` there, then
+    // walk back to `.git`.
+    "lg() { an; wv \"$dd\" \"$gr/logs\" o; r=$?; ",
+    "if [ $r = 0 ]; then rd HEAD 65536 tail; an; else printf null; fi; wv \"$dd\" \"$gr\"; }; ",
+    "wv \"$dd\" \"$gr\"; ",
     "printf 'IGN-RESULT:{\"head\":'; rd HEAD 65537 head; ",
     "printf ',\"config\":'; rd config 65537 head; ",
     "printf ',\"packed\":'; rd packed-refs 8388609 head; ",
-    "printf ',\"log\":'; rd logs/HEAD 65536 tail; ",
+    "printf ',\"log\":'; lg; ",
     "printf ',\"index\":'; if pr index; then printf true; else printf false; fi; ",
-    "printf ',\"markers\":['; s=''; for m in \"$@\"; do if pr \"$m\"; then printf '%s\"%s\"' \"$s\" \"$m\"; s=,; fi; done; printf ']'; ",
-    "printf ',\"refs\":['; s=''; c=0; ",
-    "for d in refs/heads refs/remotes; do pd \"$d\"; if pr \"$d\"; then ",
-    "[ -d \"$d\" ] && [ ! -L \"$d\" ] || { printf '%s is not a real directory\\n' \"$d\" >&2; exit 4; }; ",
-    "x=$(find -P \"$d\" \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    // A marker below `.git` (`objects/info/alternates`) is looked for in its
+    // own checked parent directory; only whether it exists is reported.
+    "printf ',\"markers\":['; s=''; for m in \"$@\"; do ",
+    "case $m in */*) wv \"$dd\" \"$gr/${m%/*}\" o; r=$?; mb=${m##*/};; *) r=0; mb=$m;; esac; ",
+    "if [ $r = 0 ] && pr \"$mb\"; then printf '%s\"%s\"' \"$s\" \"$m\"; s=,; fi; ",
+    "case $m in */*) wv \"$dd\" \"$gr\";; esac; done; printf ']'; an; ",
+    // The loose refs: each directory is walked into and listed from there;
+    // each ref is read by its basename after a walk into its own parent
+    // (repeated only when the parent changes), and a directory moved while its
+    // refs were read is refused.
+    "printf ',\"refs\":['; s=''; cn=0; ",
+    "for d in refs/heads refs/remotes; do wv \"$dd\" \"$gr/$d\" o; r=$?; [ $r = 0 ] || continue; ",
+    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { printf '%s holds a symlink, a special file or a name with a control character\\n' \"$d\" >&2; exit 4; }; ",
-    "L=$(find -P \"$d\" -type f 2>&1) || { printf '%s\\n' \"$L\" >&2; exit 3; }; ",
-    "IFS=$NL; for r in $L; do c=$((c+1)); [ \"$c\" -le 4097 ] || break; ",
-    "[ -r \"$r\" ] || { printf '%s cannot be read\\n' \"$r\" >&2; exit 3; }; ",
-    "z=$(wc -c < \"$r\") || exit 3; z=$((z)); ",
-    "b=$(head -c 65537 < \"$r\" | base64 | tr -d '\\n'); p=$(printf '%s' \"$r\" | base64 | tr -d '\\n'); ",
-    "printf '%s{\"p\":\"%s\",\"n\":%s,\"b\":\"%s\"}' \"$s\" \"$p\" \"$z\" \"$b\"; s=,; done; unset IFS; ",
-    "fi; done; printf ']}\\n'",
+    "L=$(find -P . -type f 2>&1) || { printf '%s\\n' \"$L\" >&2; exit 3; }; an; lw=$d; ",
+    "IFS=$NL; for r in $L; do cn=$((cn+1)); [ \"$cn\" -le 4097 ] || break; ",
+    "fr=$d/${r#./}; fp=${fr%/*}; fb=${fr##*/}; ",
+    "if [ \"$fp\" != \"$lw\" ]; then an; wv \"$dd\" \"$gr/$fp\"; lw=$fp; fi; ",
+    "if [ -L \"$fb\" ]; then printf '%s is a symlink\\n' \"$fr\" >&2; exit 4; fi; ",
+    "[ -r \"$fb\" ] || { printf '%s cannot be read\\n' \"$fr\" >&2; exit 3; }; ",
+    "z=$(wc -c < \"$fb\") || exit 3; z=$((z)); ",
+    "b=$(head -c 65537 < \"$fb\" | base64 | tr -d '\\n'); p=$(printf '%s' \"$fr\" | base64 | tr -d '\\n'); ",
+    "printf '%s{\"p\":\"%s\",\"n\":%s,\"b\":\"%s\"}' \"$s\" \"$p\" \"$z\" \"$b\"; s=,; done; unset IFS; an; ",
+    "done; printf ']}\\n'",
 );
 
 pub(super) const GIT_DIGEST_SH: &str = concat!(
@@ -349,16 +388,16 @@ pub(super) const GIT_DIGEST_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "pd() { q=''; OI=$IFS; IFS=/; for w in $1; do if [ -n \"$q\" ] && [ -L \"$q\" ]; then printf '%s is a symlink\\n' \"$q\" >&2; exit 4; fi; q=${q:+$q/}$w; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; f=$3; pd \"$f\"; ",
-    "if [ -L \"$f\" ]; then printf '%s is a symlink\\n' \"$f\" >&2; exit 4; fi; ",
-    "if pr \"$f\"; then [ -f \"$f\" ] || { printf '%s is not a regular file\\n' \"$f\" >&2; exit 4; }; ",
-    "h=$($H -- \"./$f\") || exit 3; printf 'IGN-RESULT:{\"digest\":\"%s\"}\\n' \"${h%% *}\"; ",
-    "else printf 'IGN-RESULT:{\"digest\":null}\\n'; fi",
+    verified_walk_sh!(),
+    // Walk into the file's parent (an absent parent is an absent file), hash
+    // the basename there, and refuse a parent moved while it was read.
+    "f=$3; case $f in */*) fp=${f%/*};; *) fp='';; esac; fb=${f##*/}; ",
+    "wv \"$1\" \"$2${fp:+/$fp}\" o; r=$?; ",
+    "if [ $r != 0 ]; then printf 'IGN-RESULT:{\"digest\":null}\\n'; exit 0; fi; ",
+    "if [ -L \"$fb\" ]; then printf '%s is a symlink\\n' \"$f\" >&2; exit 4; fi; ",
+    "if pr \"$fb\"; then [ -f \"$fb\" ] || { printf '%s is not a regular file\\n' \"$f\" >&2; exit 4; }; ",
+    "h=$($H -- \"$fb\") || exit 3; an; printf 'IGN-RESULT:{\"digest\":\"%s\"}\\n' \"${h%% *}\"; ",
+    "else an; printf 'IGN-RESULT:{\"digest\":null}\\n'; fi",
 );
 
 /// `<data>/git.yaml` read into the answer itself (CodeRabbit #56): the bytes
@@ -3534,6 +3573,37 @@ mod tests {
                 "{name} must not interpolate a file or use backticks"
             );
         }
+    }
+
+    /// 27-46: the six POSIX readers carry one verified walk, the same bytes
+    /// (`wv`: enter each level, then `pwd -P` must equal the path expected),
+    /// and none of them keeps the older check-then-`cd` walk or the ancestor
+    /// loop. Counted by expansion: the six readers and the two write scripts
+    /// each hold "changed while it was entered" once, eight in all (the source
+    /// holds it three times: the shared fragment and the two write walks).
+    #[test]
+    fn git_readers_share_the_verified_walk() {
+        let walk = verified_walk_sh!();
+        let mut entered = 0;
+        for (name, script) in [
+            ("GIT_STATE_SH", GIT_STATE_SH),
+            ("GIT_DIGEST_SH", GIT_DIGEST_SH),
+            ("GIT_MANIFEST_SH", GIT_MANIFEST_SH),
+            ("GIT_SIZE_SH", GIT_SIZE_SH),
+            ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
+            ("PROJECT_DIGESTS_SH", PROJECT_DIGESTS_SH),
+        ] {
+            assert!(script.contains(walk), "{name} carries the shared walk");
+            assert!(
+                !script.contains("wk() {") && !script.contains("pd() {"),
+                "{name} keeps no check-then-cd walk"
+            );
+            entered += script.matches("changed while it was entered").count();
+        }
+        for script in [GIT_WRITE_SH, GIT_WRITE_CLEAN_SH] {
+            entered += script.matches("changed while it was entered").count();
+        }
+        assert_eq!(entered, 8);
     }
 
     const ALL_GIT_SCRIPTS: [(&str, &str); 15] = [
