@@ -3976,6 +3976,11 @@ struct HostLog<'a> {
     fail_release: bool,
     /// The tag record writes fail (ultrareview U3).
     fail_tag_record: bool,
+    /// The `run.json` write that sets `import_sent` to `true` fails (27-53).
+    fail_import_flag: bool,
+    /// `import_sent` of every `run.json` write, with how many gateway calls
+    /// had been made before it (27-53).
+    run_json_flags: Mutex<Vec<(Option<bool>, usize)>>,
 }
 
 impl<'a> HostLog<'a> {
@@ -3988,7 +3993,21 @@ impl<'a> HostLog<'a> {
             fail_after: None,
             fail_release: false,
             fail_tag_record: false,
+            fail_import_flag: false,
+            run_json_flags: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The `run.json` rewrite that says the import was sent fails.
+    fn failing_import_flag(mut self) -> Self {
+        self.fail_import_flag = true;
+        self
+    }
+
+    /// `import_sent` of every `run.json` write, in order, with the gateway
+    /// calls made before it.
+    fn run_json_flags(&self) -> Vec<(Option<bool>, usize)> {
+        self.run_json_flags.lock().expect("flags").clone()
     }
 
     /// The tag record writes fail.
@@ -4057,6 +4076,23 @@ impl ProjectRunWriter for HostLog<'_> {
                 node: "nodes.master".to_string(),
                 detail: "the host refused the pre-image".to_string(),
             });
+        }
+        if name == "run.json" {
+            let flag = serde_json::from_slice::<Value>(bytes)
+                .ok()
+                .and_then(|v| v["import_sent"].as_bool());
+            if self.fail_import_flag && flag == Some(true) {
+                return Err(CoreError::TransportFailed {
+                    operation: "write".to_string(),
+                    node: "nodes.master".to_string(),
+                    detail: "the host refused the import flag".to_string(),
+                });
+            }
+            let calls = self.gateway.call_log().len();
+            self.run_json_flags
+                .lock()
+                .expect("flags")
+                .push((flag, calls));
         }
         self.note(format!("pre:{name}"));
         self.inner
@@ -4242,10 +4278,13 @@ async fn journal_green_run_writes_the_host_copy_first_and_clears_it_last() {
         assert!(names[..run_json].contains(&file), "{file}: {names:?}");
     }
     assert_eq!(journal, run_json + 1, "{names:?}");
-    // 26-REVIEW CR-01: `run.json` names the batch before it is sent.
+    // 26-REVIEW CR-01: `run.json` names the batch before it is sent. 27-53
+    // (Q2): and it is written once more, right before the project import,
+    // with `import_sent` true.
     assert_eq!(
         &names[journal + 1..],
         [
+            "pre:run.json",
             "pre:run.json",
             "release-record",
             "tag-record:PlantA",
@@ -4273,7 +4312,18 @@ async fn journal_green_run_writes_the_host_copy_first_and_clears_it_last() {
         entries[journal + 1].1 <= first_write,
         "the batch is on the host before it is sent: {entries:?} {log_calls:?}"
     );
-    for (name, calls) in &entries[journal + 2..] {
+    // 27-53: the flag write comes after the tag writes and directly before
+    // the project import, the last gateway write.
+    assert_eq!(
+        entries[journal + 2].1,
+        last_write,
+        "the import follows the flag write: {entries:?} {log_calls:?}"
+    );
+    assert!(
+        log_calls[last_write].starts_with("import:"),
+        "{log_calls:?}"
+    );
+    for (name, calls) in &entries[journal + 3..] {
         assert!(*calls > last_write, "{name} before a gateway write");
     }
 
@@ -8156,4 +8206,229 @@ async fn changed_only_run_needs_no_allow_manual_undo() {
         .await
         .expect("the run completes");
     assert!(result.ok, "{result:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 27-53 (Q2): the host copy says whether the project import was sent.
+// ---------------------------------------------------------------------------
+
+/// The host `run.json`, parsed.
+fn host_run(repo: &Checkout) -> PreImageRun {
+    let bytes = std::fs::read(repo.data.join(PRE_IMAGE_REL).join("run.json")).expect("run.json");
+    PreImageRun::parse(&bytes, "run.json", "capgw", PROJECT).expect("a set")
+}
+
+/// A changed `Line1/Count` and two lines on a gateway that imports the
+/// project, whose last Designer check (the one right before the import) finds
+/// a session that saved project work: the run is refused after its tag
+/// writes, before the import. The
+/// tag restore imports (the third and fourth tag imports) fail, so the tag
+/// rollback fails too and the host copy stays.
+async fn refused_before_the_import_and_not_rolled_back(repo: &Checkout) -> FakeProjects {
+    let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+    let gateway = changed_two(
+        repo,
+        COUNT_DOC,
+        FakeProjects::new()
+            // read 0: the plan, 1: the check right before the import (a
+            // session), 2: the retry's (gone)
+            .with_designers_script(vec![vec![], vec![session], vec![]])
+            // the Designer saved project work before it closed (CodeRabbit
+            // #57): the live project is no longer the pre-image
+            .with_project_edited_on_designers_read(1, PROJECT)
+            .with_tag_import_failure(3)
+            .with_tag_import_failure(4),
+    )
+    .await;
+    let err = apply(repo, &gateway)
+        .await
+        .expect_err("the tag rollback failed");
+    assert_eq!(err.code(), "rollback_failed", "{err}");
+    assert!(
+        gateway.import_calls().is_empty(),
+        "the run never sent its import: {:?}",
+        gateway.call_log()
+    );
+    gateway
+}
+
+/// Q2: the pre-image says the import was not sent until the run rewrites it,
+/// right before the import request.
+#[tokio::test]
+async fn pre_image_says_import_not_sent_until_the_import() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    let log = HostLog::new(&repo, &gateway, false);
+
+    let result = run_logged(&repo, &gateway, &log).await.expect("green");
+    assert_eq!(result.outcome, ProjectOutcome::Applied, "{result:?}");
+    let flags = log.run_json_flags();
+    let values: Vec<Option<bool>> = flags.iter().map(|(flag, _)| *flag).collect();
+    // the pre-image, the sent batch, then the flag rewrite
+    assert_eq!(values, [Some(false), Some(false), Some(true)], "{flags:?}");
+    let calls = gateway.call_log();
+    let import = calls
+        .iter()
+        .position(|c| c.starts_with("import:"))
+        .expect("the project import");
+    assert_eq!(
+        flags[2].1, import,
+        "the rewrite is the write right before the import: {calls:?}"
+    );
+    assert!(
+        calls[..flags[2].1]
+            .iter()
+            .any(|c| c.starts_with("tag-import:")),
+        "after the tag writes: {calls:?}"
+    );
+    assert_eq!(host_run(&repo).import_sent, Some(true));
+}
+
+/// Q2: a host that refuses the flag rewrite stops the run before the import:
+/// the tags it wrote are rolled back, nothing is imported, and the host
+/// copy still says the import was not sent.
+#[tokio::test]
+async fn import_flag_write_failure_stops_before_the_import() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let log = HostLog::new(&repo, &gateway, false).failing_import_flag();
+
+    let result = run_logged(&repo, &gateway, &log)
+        .await
+        .expect("a rolled-back verdict");
+    assert!(!result.ok, "{result:?}");
+    assert_eq!(
+        result.slug.as_deref(),
+        Some("deploy_rolled_back"),
+        "{result:?}"
+    );
+    assert!(
+        !gateway.call_log().iter().any(|c| c.starts_with("import:")),
+        "no import: {:?}",
+        gateway.call_log()
+    );
+    assert!(
+        format!("{result:?}").contains("the host refused the import flag"),
+        "the host's error is the cause: {result:?}"
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the tag is back: {count}");
+    assert_eq!(host_run(&repo).import_sent, Some(false));
+}
+
+/// Q2: the same refusal before any tag write is the run's error, as the
+/// other host failures before the import are, and nothing is imported.
+#[tokio::test]
+async fn import_flag_write_failure_without_tag_writes_is_the_hosts_error() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Speed", SPEED);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, speed_tree());
+    repo.tag_record(PROJECT, &["Line1", "Line1/Speed"]);
+    let log = HostLog::new(&repo, &gateway, false).failing_import_flag();
+
+    let err = run_logged(&repo, &gateway, &log)
+        .await
+        .expect_err("the host refused the flag");
+    assert_eq!(err.code(), "transport_failed", "{err}");
+    assert!(
+        !gateway.call_log().iter().any(|c| c.starts_with("import:")),
+        "no import: {:?}",
+        gateway.call_log()
+    );
+    assert!(host_journal(&repo).is_none(), "nothing was written");
+}
+
+/// Q2 (CodeRabbit #57 round 2): a run refused before its import whose tag
+/// rollback failed is retried by restoring only the tags: the retry never
+/// imports the pre-image. Before 27-53 the host copy said `import` from the
+/// moment it was written, so the retry imported it.
+#[tokio::test]
+async fn rollback_run_after_a_pre_import_refusal_restores_only_tags() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = refused_before_the_import_and_not_rolled_back(&repo).await;
+    let run = host_run(&repo);
+    assert_eq!(run.project_action, "import");
+    let journal = host_journal(&repo).expect("the journal stays");
+    assert_eq!(journal.state, JournalState::RollingBack);
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(
+        count["documentation"], "new",
+        "not rolled back yet: {count}"
+    );
+
+    let undo = rollback_run(&repo, &gateway, &run.run_id, false)
+        .await
+        .expect("a verdict");
+    assert!(
+        gateway.import_calls().is_empty(),
+        "the retry imports no pre-image: {:?} {undo:?}",
+        gateway.call_log()
+    );
+    assert_eq!(undo.outcome, ProjectOutcome::TagsRolledBack, "{undo:?}");
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the tag is back: {count}");
+    assert!(host_journal(&repo).is_none(), "the journal is cleared");
+}
+
+/// Q2: a run that sent its import is still undone with the project import.
+#[tokio::test]
+async fn rollback_run_after_the_import_still_restores_the_project() {
+    let repo = checkout(&[PROVIDER]);
+    repo.tag("Line1/Count", COUNT_DOC);
+    let gateway = importing(&repo, FakeProjects::new()).await;
+    gateway.set_tag_tree(PROVIDER, live_count(json!([])));
+    let applied = apply(&repo, &gateway).await.expect("green");
+    let run_id = applied.run_id.clone().expect("a run id");
+    assert_eq!(host_run(&repo).import_sent, Some(true));
+    assert_eq!(gateway.import_calls().len(), 1);
+
+    let undo = rollback_run(&repo, &gateway, &run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(
+        gateway.import_calls().len(),
+        2,
+        "the pre-image is imported: {:?}",
+        gateway.call_log()
+    );
+}
+
+/// Q2: a version 1 host set, as an earlier release wrote it (no
+/// `import_sent`), drives today's retry: the project is imported.
+#[tokio::test]
+async fn rollback_run_of_a_v1_run_behaves_as_today() {
+    let repo = checkout(&[PROVIDER]);
+    let gateway = refused_before_the_import_and_not_rolled_back(&repo).await;
+    let run = host_run(&repo);
+    // the bytes of version 1: the version number and no `import_sent`
+    let path = repo.data.join(PRE_IMAGE_REL).join("run.json");
+    let mut value: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("run.json")).expect("json");
+    value["schema_version"] = json!(1);
+    value.as_object_mut().expect("object").remove("import_sent");
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("json")).expect("write");
+    let path = repo.data.join(JOURNAL_REL);
+    let mut value: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("journal")).expect("json");
+    value["schema_version"] = json!(1);
+    std::fs::write(&path, serde_json::to_vec_pretty(&value).expect("json")).expect("write");
+    assert_eq!(host_run(&repo).import_sent, None);
+
+    let undo = rollback_run(&repo, &gateway, &run.run_id, false)
+        .await
+        .expect("a verdict");
+    assert_eq!(undo.outcome, ProjectOutcome::RolledBack, "{undo:?}");
+    assert_eq!(
+        gateway.import_calls().len(),
+        1,
+        "a version 1 retry imports the pre-image as before: {:?}",
+        gateway.call_log()
+    );
+    let count = live_node(&gateway, "Line1/Count").await.expect("live");
+    assert_eq!(count["documentation"], "old", "the tag is back: {count}");
 }

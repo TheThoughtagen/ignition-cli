@@ -1668,11 +1668,56 @@ mod published {
     use ignition_core::deploy::git_remote::HostGit as Git;
     use ignition_core::deploy::transport::local::LocalFsTransport;
     use ignition_core::deploy::transport::projects::{
-        GIT_CHANGED_OPERATION, GitEntry, ProjectHost,
+        GIT_CHANGED_OPERATION, GitEntry, ProjectHost, ProjectRunWriter,
     };
     use ignition_core::error::CoreError;
 
     const PROVIDER: &str = "PlantA";
+
+    /// The master's run writer, which refuses the `run.json` rewrite that
+    /// says the project import was sent (27-53).
+    pub struct FlagRefuser {
+        pub inner: LocalFsTransport,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectRunWriter for FlagRefuser {
+        async fn write_journal(
+            &self,
+            gateway: &str,
+            project: &str,
+            bytes: &[u8],
+        ) -> Result<(), CoreError> {
+            self.inner.write_journal(gateway, project, bytes).await
+        }
+
+        async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError> {
+            self.inner.clear_journal(gateway, project).await
+        }
+
+        async fn write_pre_image(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Result<(), CoreError> {
+            let sent = serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .and_then(|v| v["import_sent"].as_bool());
+            if name == "run.json" && sent == Some(true) {
+                return Err(CoreError::TransportFailed {
+                    operation: "write".to_string(),
+                    node: "nodes.master".to_string(),
+                    detail: "the host refused the import flag".to_string(),
+                });
+            }
+            self.inner
+                .write_pre_image(gateway, project, run_id, name, bytes)
+                .await
+        }
+    }
 
     /// A host that answers like the local transport and runs `program` as
     /// host git (a stub, to prove git is never run or to make one step fail).
@@ -1752,6 +1797,9 @@ mod published {
         /// The poll interval of the wait for the backup, which is also the
         /// settle the backup's `.git` gets before its save goes (27-35).
         pub backup_interval: std::time::Duration,
+        /// The master's host refuses the `run.json` rewrite that says the
+        /// import was sent (27-53).
+        pub fail_import_flag: bool,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1884,6 +1932,7 @@ mod published {
                 hazard_ack: None,
                 tree: None,
                 backup_interval: std::time::Duration::from_millis(5),
+                fail_import_flag: false,
             }
         }
 
@@ -2153,6 +2202,9 @@ mod published {
             )>,
         ) -> Result<DeployProjectsResult, CoreError> {
             let input = self.input();
+            let refuser = self.fail_import_flag.then(|| FlagRefuser {
+                inner: self.f.node(),
+            });
             deploy_projects_run(
                 prepared,
                 loaded,
@@ -2175,7 +2227,7 @@ mod published {
                     master: loaded.target.nodes.master.clone(),
                     record_writer: None,
                     tag_record_writer: None,
-                    run_writer: None,
+                    run_writer: refuser.as_ref().map(|w| w as &dyn ProjectRunWriter),
                     git_writer,
                     designers,
                     children_settle: std::time::Duration::from_secs(1),
@@ -8156,6 +8208,93 @@ mod published {
                 .expect("a failed probe is a finding");
             assert!(failed.starts_with("could not be checked ("), "{failed}");
         }
+    }
+    // ---- 27-53 (Q2): the import flag of the host copy, with a gateway .git ----
+
+    /// The host `run.json` of the rig's project, as JSON.
+    fn host_run_json(rig: &Rig) -> serde_json::Value {
+        let path = rig
+            .f
+            .data_dir
+            .join("ign-deploy/capgw/projects")
+            .join(PROJECT)
+            .join("pre-image/run.json");
+        serde_json::from_slice(&std::fs::read(path).expect("run.json")).expect("json")
+    }
+
+    /// Q2: a host that refuses the flag rewrite stops the run before the
+    /// import: nothing is imported, the tags roll back, the `.git` save goes
+    /// and the repository is as it was.
+    #[tokio::test]
+    async fn import_flag_write_failure_stops_before_the_import() {
+        let mut rig = Rig::tagged(true);
+        rig.fail_import_flag = true;
+        let before = rig.git_manifest().await;
+
+        let result = rig.apply().await.expect("a rolled-back verdict");
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "no import: {:?}",
+            rig.gateway.call_log()
+        );
+        assert!(!result.ok, "{:?}", result.warnings);
+        assert!(
+            format!("{result:?}").contains("the host refused the import flag"),
+            "the host's error is the cause: {result:?}"
+        );
+        assert_eq!(
+            rig.git_events(&result),
+            ["git_state_read", "git_saved", "git_save_removed"],
+            "the save is taken, then discarded"
+        );
+        assert!(rig.save_trees().is_empty(), "no save is left");
+        assert_eq!(rig.git_manifest().await, before, ".git is untouched");
+        assert_eq!(host_run_json(&rig)["import_sent"], false);
+    }
+
+    /// Q2 (CodeRabbit #57 round 2): a tag-owning run on a git-managed project
+    /// is refused before its import (a Designer saved project work at the last
+    /// check) and its tag rollback fails. The retry restores only the tags:
+    /// it never imports the pre-image over the Designer's save, so it never
+    /// removes the gateway `.git`.
+    #[tokio::test]
+    async fn rollback_run_after_a_pre_import_refusal_never_imports_or_strips_git() {
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let rig = Rig::tagged_with(true, |g| {
+            g.with_designers_script(vec![vec![], vec![session], vec![]])
+                .with_project_edited_on_designers_read(1, PROJECT)
+                .with_tag_import_failure(2)
+        });
+        let before = rig.git_manifest().await;
+        let err = rig.apply().await.expect_err("the tag rollback failed");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        assert!(rig.gateway.import_calls().is_empty(), "no import was sent");
+        let run_id = host_run_json(&rig)["run_id"]
+            .as_str()
+            .expect("a run id")
+            .to_string();
+        assert_eq!(host_run_json(&rig)["import_sent"], false);
+        assert_eq!(rig.git_manifest().await, before, ".git is untouched");
+
+        let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "the retry imports no pre-image: {:?}",
+            rig.gateway.call_log()
+        );
+        assert_eq!(
+            rig.git_manifest().await,
+            before,
+            ".git is untouched: {:?}",
+            undo.warnings
+        );
+        assert!(rig.save_trees().is_empty(), "no save is left");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::TagsRolledBack,
+            "{:?}",
+            undo.warnings
+        );
     }
 }
 

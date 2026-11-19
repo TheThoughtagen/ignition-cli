@@ -4754,7 +4754,7 @@ async fn execute(
 
     // D-07: the owned tags go first, after every pre-image and stale check.
     // A tag step that fails after its first write is rolled back (26-11).
-    let step = match deploy_owned_tags(
+    let mut step = match deploy_owned_tags(
         plan,
         tag_records,
         loaded,
@@ -5065,6 +5065,15 @@ async fn execute(
     // window to the time between this export and the import request.
     if checked.is_ok() && overwrite {
         checked = live_unchanged_since_plan(plan, gateway, project).await;
+    }
+    // 27-53 (Q2): the host copy says the import was not sent until this write,
+    // the last step before the import request. It sits before the import, so
+    // a host that refuses it stops the run with nothing imported: the saves
+    // go, or the tags roll back with no project undo, as for the checks above.
+    if checked.is_ok()
+        && let (Some(writer), Some(host)) = (writers.run, step.writes.host.as_mut())
+    {
+        checked = persist_import_sent(loaded, writer, host).await;
     }
     {
         match checked {
@@ -6164,6 +6173,34 @@ async fn write_host_copy(
         state: JournalState::Applying.as_str(),
     })?;
     Ok(HostCopy { run, journal })
+}
+
+/// Say in the host's `run.json` that the run is about to send its project
+/// import (27-53, Q2): `--rollback-run` imports the pre-image back only for a
+/// run whose copy says so, so a run refused before its import never has its
+/// project, or a gateway `.git`, replaced by the retry. A write that fails
+/// leaves the flag as it was, in memory and (the host refused the write) on
+/// the host.
+async fn persist_import_sent(
+    loaded: &LoadedProject,
+    writer: &dyn ProjectRunWriter,
+    host: &mut HostCopy,
+) -> Result<(), CoreError> {
+    let before = host.run.import_sent;
+    host.run.import_sent = Some(true);
+    let written = writer
+        .write_pre_image(
+            &loaded.target.gateway,
+            &loaded.file.project,
+            &host.run.run_id,
+            "run.json",
+            &host.run.to_bytes(),
+        )
+        .await;
+    if written.is_err() {
+        host.run.import_sent = before;
+    }
+    written
 }
 
 /// Keep the proof of a provider this run created in the host's `run.json`
@@ -9527,11 +9564,16 @@ pub async fn deploy_projects_rollback_run(
     );
     let set = read_host_set(loaded, input, surfaces.host, &target).await?;
     let mut writes = undo_writes(&set);
+    // 27-53 (Q2): the pre-image says `import` from the moment it is written,
+    // so a run refused before its import is told apart by `import_sent`. Only
+    // a run that never sent its import (`Some(false)`) leaves the project
+    // alone; a version 1 set (`None`) behaves as it always did.
+    let import_sent = set.run.import_sent != Some(false);
     let project_undo = match set.run.project_action.as_str() {
-        "import" => Some(ProjectUndo {
+        "import" if import_sent => Some(ProjectUndo {
             pre: set.project_zip.clone(),
         }),
-        "create" => Some(ProjectUndo { pre: None }),
+        "create" if import_sent => Some(ProjectUndo { pre: None }),
         _ => None,
     };
     let live_sha256 = project_sha(gateway, project).await;
