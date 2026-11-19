@@ -3445,7 +3445,6 @@ mod tests {
     /// Run `act` once, the first time the hook point named `label` is reached
     /// on this thread. The point is "just before a level or a file is opened
     /// for use": whatever the test changes there is a swap after the walk.
-    #[cfg(unix)]
     fn at_point(label: &'static str, act: impl FnOnce() + 'static) {
         let act = std::cell::Cell::new(Some(act));
         crate::deploy::transport::local::git_dir::HOOK.with(|hook| {
@@ -3459,7 +3458,6 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
     fn no_point() {
         crate::deploy::transport::local::git_dir::HOOK.with(|hook| *hook.borrow_mut() = None);
     }
@@ -3476,7 +3474,6 @@ mod tests {
     }
 
     /// A repo `CapApp` with HEAD, a branch and a log, for the swap tests.
-    #[cfg(unix)]
     fn data_with_repo() -> tempfile::TempDir {
         let dir = data_with_projects();
         let git = dir.path().join("projects/CapApp/.git");
@@ -3726,5 +3723,119 @@ mod tests {
         let err = result.expect_err("a swapped level is refused");
         assert_eq!(err.code(), "transport_failed", "{err}");
         assert!(err.to_string().contains("ignition"), "{err}");
+    }
+
+    // ---- 27-43, Windows: the same readers on held handles -----------------
+    //
+    // These run on the windows-latest CI job (they cannot run on the machines
+    // the plan is executed on). Each uses the native paths `mklink` needs.
+
+    /// `link` made a junction to `target` with `cmd /C mklink /J`, both paths
+    /// native (quick 261104-ava, W1).
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let native = |p: &Path| p.display().to_string().replace('/', "\\");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(native(link))
+            .arg(native(target))
+            .output()
+            .expect("mklink");
+        assert!(made.status.success(), "mklink /J: {made:?}");
+    }
+
+    /// Rename `at` aside and plant a junction to `target` where it was.
+    #[cfg(windows)]
+    fn swap_for_junction(at: &Path, target: &Path) {
+        let aside = at.with_file_name(format!(
+            "{}.aside",
+            at.file_name().expect("name").to_string_lossy()
+        ));
+        std::fs::rename(at, &aside).expect("rename aside");
+        junction(at, target);
+    }
+
+    /// `.git/refs` is a junction when the state is read: the read fails
+    /// naming `refs`, and nothing behind the junction is read.
+    #[cfg(windows)]
+    #[test]
+    fn local_git_dir_refuses_a_junction_level() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("heads")).expect("heads");
+        std::fs::write(outside.path().join("heads/stolen"), "1111\n").expect("ref");
+        std::fs::remove_dir_all(git.join("refs")).expect("rm refs");
+        junction(&git.join("refs"), outside.path());
+        let err = host(dir.path())
+            .read_git_state_blocking("CapApp")
+            .expect_err("a junction level is refused");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("refs"), "names the level: {text}");
+        assert!(!text.contains("stolen"), "nothing outside is read: {text}");
+    }
+
+    /// While a `GitDir` is open its `.git` cannot be renamed (the level is
+    /// held without delete sharing); once it is dropped the rename works.
+    #[cfg(windows)]
+    #[test]
+    fn local_git_dir_holds_its_levels() {
+        let dir = data_with_repo();
+        let project = dir.path().join("projects/CapApp");
+        let git = project.join(".git");
+        let moved = project.join(".git-moved");
+        let held = match GitDir::open(dir.path(), &["projects", "CapApp", ".git"]) {
+            Ok(Open::Found(held)) => held,
+            Ok(Open::Absent { path, .. }) => panic!("{path} is absent"),
+            Err(e) => panic!("the open failed: {e}"),
+        };
+        std::fs::rename(&git, &moved).expect_err("a held level cannot be renamed");
+        std::fs::rename(&project, dir.path().join("projects/Moved"))
+            .expect_err("a level above a held one cannot be renamed");
+        assert!(git.is_dir(), ".git is where it was");
+        drop(held);
+        std::fs::rename(&git, &moved).expect("released with the GitDir");
+    }
+
+    /// `HEAD` replaced by a file symlink after the open is refused on the
+    /// handle. Where the runner may not create a symlink the test says so
+    /// (`SYMLINK-UNAVAILABLE`) and asserts the junction case instead; it never
+    /// passes without asserting a refusal.
+    #[cfg(windows)]
+    #[test]
+    fn local_git_read_refuses_a_file_reparse_point() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("HEAD"), "ref: refs/heads/stolen\n").expect("head");
+        let probe = dir.path().join("symlink-probe");
+        let target = outside.path().join("HEAD");
+        let can_link = std::os::windows::fs::symlink_file(&target, &probe).is_ok();
+        if can_link {
+            std::fs::remove_file(&probe).expect("rm probe");
+            at_point("file:HEAD", move || {
+                let aside = git.join("HEAD.aside");
+                std::fs::rename(git.join("HEAD"), &aside).expect("aside");
+                std::os::windows::fs::symlink_file(&target, git.join("HEAD")).expect("plant");
+            });
+            let result = host(dir.path()).read_git_state_blocking("CapApp");
+            no_point();
+            let err = result.expect_err("a file reparse point is refused");
+            assert_eq!(err.code(), "transport_failed", "{err}");
+            assert!(err.to_string().contains("HEAD"), "{err}");
+        } else {
+            eprintln!("SYMLINK-UNAVAILABLE: file symlinks are not permitted here; junction case");
+            let outside_refs = outside.path().to_path_buf();
+            std::fs::create_dir_all(outside_refs.join("heads")).expect("heads");
+            std::fs::write(outside_refs.join("heads/stolen"), "1111\n").expect("ref");
+            at_point("level:refs", move || {
+                swap_for_junction(&git.join("refs"), &outside_refs);
+            });
+            let result = host(dir.path()).read_git_state_blocking("CapApp");
+            no_point();
+            let err = result.expect_err("a junction swapped in is refused");
+            assert!(err.to_string().contains("refs"), "{err}");
+        }
     }
 }
