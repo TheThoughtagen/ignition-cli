@@ -2187,10 +2187,10 @@ impl GitHostRead for LocalFsTransport {
         .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
 
-    async fn project_file_digests(&self, project: &str) -> Result<Option<ProjectDisk>, CoreError> {
+    async fn project_file_digests(&self, project: &str) -> Result<ProjectDisk, CoreError> {
         let this = self.clone();
         let project = project.to_string();
-        tokio::task::spawn_blocking(move || this.project_file_digests_blocking(&project).map(Some))
+        tokio::task::spawn_blocking(move || this.project_file_digests_blocking(&project))
             .await
             .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
@@ -3013,11 +3013,7 @@ mod tests {
         std::fs::write(project.join("project.json"), "{}\n").expect("file");
         std::fs::write(project.join("ignition/x/code.py"), "x = 1\n").expect("file");
         let t = host(dir.path());
-        let disk = t
-            .project_file_digests("Plain")
-            .await
-            .expect("the read")
-            .expect("a local node reads its disk");
+        let disk = t.project_file_digests("Plain").await.expect("the read");
         let want: BTreeMap<String, (u64, String)> =
             [("ignition/x/code.py", "x = 1\n"), ("project.json", "{}\n")]
                 .iter()

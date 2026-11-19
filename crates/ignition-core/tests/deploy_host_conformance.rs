@@ -3885,6 +3885,62 @@ mod git_rows {
         no_staging_left(&c.ledger);
     }
 
+    /// 27-41: every host reads the same disk of a project after an import:
+    /// size and sha256 of every file below the project directory but the `.git`
+    /// subtree, for names with spaces and a leading dash and for an empty file;
+    /// a link anywhere refuses on every host (one in `.git` is not looked at),
+    /// and so does a project that is missing.
+    pub async fn project_file_digests_same(c: &GitCtx) {
+        let project = c.fx.project_dir();
+        for (rel, body) in [
+            ("ignition/script-python/with space/plain.py", "body\n"),
+            ("ignition/script-python/-dash/-x.py", "dash\n"),
+            ("ignition/script-python/empty.py", ""),
+        ] {
+            let path = project.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            std::fs::write(&path, body).expect("file");
+        }
+        std::os::unix::fs::symlink("HEAD", c.fx.git_dir().join("a-link")).expect("link in .git");
+        let want = c
+            .reference()
+            .project_file_digests(PROJECT)
+            .await
+            .expect("reference");
+        assert!(want.len() > 10, "{want:?}");
+        assert!(want.contains_key("project.json"));
+        assert!(
+            want.keys().all(|name| !name.starts_with(".git")),
+            "{want:?}"
+        );
+        assert!(want.values().any(|file| file.size == 0), "an empty file");
+        assert_eq!(
+            c.read.project_file_digests(PROJECT).await.expect("host"),
+            want
+        );
+
+        let planted = project.join("ignition/script-python/planted");
+        std::os::unix::fs::symlink("project.json", &planted).expect("link");
+        for host in [&c.reference() as &dyn GitHostRead, c.read.as_ref()] {
+            let err = host
+                .project_file_digests(PROJECT)
+                .await
+                .expect_err("a link below the project");
+            assert!(is_transport_failed(&err), "{err:?}");
+        }
+        std::fs::remove_file(&planted).expect("rm link");
+        assert_eq!(
+            c.read.project_file_digests(PROJECT).await.expect("host"),
+            want
+        );
+        let err = c
+            .read
+            .project_file_digests("Nope")
+            .await
+            .expect_err("no project");
+        assert!(is_transport_failed(&err), "{err:?}");
+    }
+
     macro_rules! git_row_tests {
         ($($name:ident, $ctor:path, $row:ident;)*) => {
             $(
@@ -3910,6 +3966,7 @@ mod git_rows {
         conformance_git_local_git_objects_list_same, GitCtx::local, git_objects_list_same;
         conformance_git_local_git_objects_fetch_round_trip, GitCtx::local, git_objects_fetch_round_trip;
         conformance_git_local_git_objects_refuse_bad_name, GitCtx::local, git_objects_refuse_bad_name;
+        conformance_git_local_project_file_digests_same, GitCtx::local, project_file_digests_same;
     }
 
     git_row_tests! {
@@ -3925,6 +3982,7 @@ mod git_rows {
         conformance_git_sh_git_objects_list_same, GitCtx::posix, git_objects_list_same;
         conformance_git_sh_git_objects_fetch_round_trip, GitCtx::posix, git_objects_fetch_round_trip;
         conformance_git_sh_git_objects_refuse_bad_name, GitCtx::posix, git_objects_refuse_bad_name;
+        conformance_git_sh_project_file_digests_same, GitCtx::posix, project_file_digests_same;
     }
 
     macro_rules! git_pwsh_row_tests {
@@ -3955,6 +4013,7 @@ mod git_rows {
         conformance_git_pwsh_git_objects_list_same, git_objects_list_same;
         conformance_git_pwsh_git_objects_fetch_round_trip, git_objects_fetch_round_trip;
         conformance_git_pwsh_git_objects_refuse_bad_name, git_objects_refuse_bad_name;
+        conformance_git_pwsh_project_file_digests_same, project_file_digests_same;
     }
 
     /// Every row has a test for each host, so a row added without wiring fails
@@ -3975,6 +4034,7 @@ mod git_rows {
             "git_objects_list_same",
             "git_objects_fetch_round_trip",
             "git_objects_refuse_bad_name",
+            "project_file_digests_same",
         ] {
             for host in ["local", "sh"] {
                 let wired = format!("conformance_git_{host}_{row}, GitCtx::");

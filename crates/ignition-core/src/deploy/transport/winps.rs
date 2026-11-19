@@ -401,6 +401,29 @@ pub const GIT_YAML: &str = concat!(
     r##"$null=K (Z $p.a);$q=$p.a+$c+'git.yaml';$y=Z $q;if(!$y){E @{ok=1;k='none'}}elseif(([int]$y.Attributes -band 1024) -ne 0){E @{ok=1;k='symlink'}}elseif($y.PSIsContainer){E @{ok=1;k='other'}}elseif($y.Length -gt $p.m){E @{ok=1;k='big';n=$y.Length}}else{$n=$y.Length;$e=[int]$p.m+1;$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};E @{ok=1;k='file';n=$n;b=[Convert]::ToBase64String($u,0,$o)}}"##,
 );
 
+/// The post-import disk of a project (Phase 27, 27-41, D-25): the Windows half
+/// of the POSIX `PROJECT_DIGESTS_SH`. Size and SHA-256 of every regular file
+/// below `projects\<project>` except the `.git` child of the project directory,
+/// in one walk.
+///
+/// Parameters: `x` the long path prefix, `d` the native data directory, `j` the
+/// project, `m` the most files it may list. The project directory must be a
+/// real directory (a junction there is refused, not walked as its target).
+/// The walk is the one of [`GIT_MANIFEST`]: a reparse point or a name with a
+/// control character anywhere below the project is a terminating error and
+/// nothing is followed; each file is hashed through a
+/// `FileShare.ReadWrite|Delete` stream; the `.git` entry of the project
+/// directory is neither listed nor inspected. A walk past `m` files is a
+/// terminating error, never a cut-off listing. Answers
+/// `{ok:1,n:<files>,t:<lines joined by LF>}`, each line
+/// `<rel> TAB <size> TAB <sha256>` with `/` separators; the order is the
+/// directory's, and the caller reads the lines into a map.
+pub const PROJECT_DIGESTS: &str = concat!(
+    git_ps_base!(),
+    git_ps_x!(),
+    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$h=[Security.Cryptography.SHA256]::Create();$n=0;$l=New-Object Collections.ArrayList;$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]($p.x+$a),''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){if(!$q[1] -and $f.Name -eq '.git'){continue};$t=[int]$f.Attributes;if(($t -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'the project holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($t -band 16){$s.Push(@($f,($r+'/')))}else{$n++;if($n -gt $p.m){throw 'the project holds more files than a read may list'};$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()};[void]$l.Add($r+"`t"+$f.Length+"`t"+$v)}}};E @{ok=1;n=$n;t=($l -join "`n")}"##,
+);
+
 /// Save a project's `.git` below the account home with ONE host-local copy
 /// (Phase 27, D-06): `robocopy /E /COPY:DAT /R:1 /W:1 /XJ`, the tool G4
 /// measured at 1.4 s for the production-shape `.git` (the same files as
@@ -921,6 +944,17 @@ impl WinScript {
             name: "git_yaml",
             body: GIT_YAML,
             params: serde_json::json!({ "a": data, "m": cap }),
+        }
+    }
+
+    /// The script that reads the post-import disk of `project` below the native
+    /// data directory `data` ([`PROJECT_DIGESTS`]): `cap` is the most files it
+    /// may list.
+    pub fn project_digests(prefix: &str, data: &str, project: &str, cap: u64) -> WinScript {
+        WinScript {
+            name: "project_digests",
+            body: PROJECT_DIGESTS,
+            params: serde_json::json!({ "x": prefix, "d": data, "j": project, "m": cap }),
         }
     }
 

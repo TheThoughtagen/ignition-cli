@@ -8324,3 +8324,210 @@ async fn wincap_git_handover() {
     finish();
     println!("LIVE-RAN wincap_git_handover");
 }
+
+// ---- the post-import project digests of 27-41 (D-25) -------------------------
+//
+// `project_file_digests` through `SftpTransport` as the deploy account, under
+// Windows PowerShell 5.1: the real `PROJECT_DIGESTS` against a fixture project
+// in the scratch data root `ign-live-scratch\data27p` (project `CapApp27p`),
+// compared with the size and sha256 ign computes over the same bytes it wrote.
+// The fixture holds nested resources, a manifest, an empty file, a name with a
+// space, a name with an accent, bytes with CRLF line ends (nothing may translate
+// them) and a `.git` with one file (which must be absent from the answer). A
+// junction planted below the project must refuse, and one planted below `.git`
+// must not matter. The fixture and the junction targets are removed at the start
+// and at the end; `LIVE-RAN wincap_project_digests` is the last line, printed
+// only when every comparison and refusal held.
+
+const PD_PROJECT: &str = "CapApp27p";
+
+/// Write the files `$p.files` (`p` the `/`-separated path below `$p.root`, `b`
+/// the base64 of the bytes) as exact bytes, making each parent directory.
+const PD_MAKE_FILES: &str = "foreach($e in $p.files){$f=$p.x+$p.root+'\\'+$e.p.Replace('/','\\');[void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($f));[IO.File]::WriteAllBytes($f,[Convert]::FromBase64String($e.b))};E @{ok=1}";
+
+fn pd_fixture() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("project.json", b"{\"title\":\"CapApp27p\"}\n".to_vec()),
+        (
+            "ignition/script-python/cap/util/code.py",
+            b"def f():\n    return 1\n".to_vec(),
+        ),
+        (
+            "ignition/script-python/cap/util/resource.json",
+            b"{\"scope\":\"A\",\"files\":[\"code.py\"]}\n".to_vec(),
+        ),
+        (
+            "com.inductiveautomation.perspective/views/V/view.json",
+            b"{\"root\":{}}\n".to_vec(),
+        ),
+        (
+            "ignition/script-python/with space/plain.py",
+            b"plain\n".to_vec(),
+        ),
+        ("ignition/script-python/caf\u{e9}.py", b"accent\n".to_vec()),
+        ("ignition/script-python/empty.py", Vec::new()),
+        ("crlf.txt", b"one\r\ntwo\r\n".to_vec()),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "live: needs the Windows capture host and IGNITION_LIVE_WINCAP=1"]
+async fn wincap_project_digests() {
+    use base64::Engine as _;
+    use ignition_core::deploy::transport::projects::GitHostRead;
+
+    let Some(live) = live() else { return };
+    let host_repo = repo(&live, "pd27w-home", &live.data_dir, None);
+    let host_shell = shell_of(host_repo.path(), "pd27w-home");
+    let home_native = native(&home_sftp(&host_shell).await);
+    let data = format!("{home_native}\\{SCRATCH}\\data27p");
+    let project = format!("{data}\\projects\\{PD_PROJECT}");
+    let targets = format!("{home_native}\\{SCRATCH}\\pd27p-target");
+    assert!(!data.to_ascii_lowercase().contains("program files"));
+    assert!(data.contains(SCRATCH));
+
+    let facts = host_shell
+        .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
+        .await
+        .expect("facts");
+    println!(
+        "project digests host: PSEdition {} PSVersion {}",
+        facts["e"], facts["v"]
+    );
+    assert_eq!(
+        facts["e"], "Desktop",
+        "the deploy account's ssh runs Windows PowerShell"
+    );
+
+    for tree in [&data, &targets] {
+        remove_tree(&host_shell, tree).await;
+    }
+
+    // the fixture, and what ign says it holds (`.git` is written, never listed)
+    let mut files = pd_fixture();
+    let expected: BTreeMap<String, (u64, String)> = files
+        .iter()
+        .map(|(rel, bytes)| ((*rel).to_string(), (bytes.len() as u64, sha256_hex(bytes))))
+        .collect();
+    files.push((".git/config", b"[core]\n".to_vec()));
+    let wire: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(rel, bytes)| {
+            serde_json::json!({
+                "p": rel,
+                "b": base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+        })
+        .collect();
+    host_shell
+        .exec_powershell(&script(
+            "pd_make_files",
+            PD_MAKE_FILES,
+            serde_json::json!({ "x": LONG_PATH_PREFIX, "root": project, "files": wire }),
+        ))
+        .await
+        .expect("build the fixture project");
+
+    let repo_dir = repo(&live, "pd27w", &data, None);
+    let shell = shell_of(repo_dir.path(), "pd27w");
+    let (_, ssh, _) = ssh_of(repo_dir.path(), "pd27w");
+    let node = SftpTransport::new_windows(
+        shell,
+        windows_sftp_root(&ssh.data_dir).expect("scratch data dir"),
+        "nodes.master",
+    );
+
+    let body = async {
+        let started = Instant::now();
+        let disk = node
+            .project_file_digests(PD_PROJECT)
+            .await
+            .map_err(|e| format!("the read: {e}"))?;
+        println!(
+            "project digests: {} files in {} ms",
+            disk.len(),
+            started.elapsed().as_millis()
+        );
+        let got: BTreeMap<String, (u64, String)> = disk
+            .iter()
+            .map(|(rel, file)| (rel.clone(), (file.size, file.sha256.clone())))
+            .collect();
+        if got != expected {
+            return Err(format!(
+                "the digests differ:\n got {got:?}\nwant {expected:?}"
+            ));
+        }
+        if disk.keys().any(|rel| rel.starts_with(".git")) {
+            return Err(".git is in the answer".to_string());
+        }
+
+        // a junction below the project refuses
+        let link = format!("{project}\\ignition\\linked");
+        host_shell
+            .exec_powershell(&script(
+                "make_junction",
+                MAKE_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link, "target": targets }),
+            ))
+            .await
+            .map_err(|e| format!("plant the junction: {e}"))?;
+        let refused = node.project_file_digests(PD_PROJECT).await;
+        host_shell
+            .exec_powershell(&script(
+                "drop_junction",
+                DROP_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": link }),
+            ))
+            .await
+            .map_err(|e| format!("drop the junction: {e}"))?;
+        match refused {
+            Err(e) if e.to_string().contains("link") => println!("junction refused: {e}"),
+            Err(e) => return Err(format!("the junction was refused for another reason: {e}")),
+            Ok(_) => return Err("a junction below the project was read".to_string()),
+        }
+
+        // one below `.git` is not looked at
+        let git_link = format!("{project}\\.git\\linked");
+        host_shell
+            .exec_powershell(&script(
+                "make_junction",
+                MAKE_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": git_link, "target": targets }),
+            ))
+            .await
+            .map_err(|e| format!("plant the junction in .git: {e}"))?;
+        let again = node.project_file_digests(PD_PROJECT).await;
+        host_shell
+            .exec_powershell(&script(
+                "drop_junction",
+                DROP_JUNCTION,
+                serde_json::json!({ "x": LONG_PATH_PREFIX, "link": git_link }),
+            ))
+            .await
+            .map_err(|e| format!("drop the junction in .git: {e}"))?;
+        let again = again.map_err(|e| format!("a junction in .git stopped the read: {e}"))?;
+        if again != disk {
+            return Err("the read changed after a junction was planted in .git".to_string());
+        }
+        // the clean tree reads again
+        let last = node
+            .project_file_digests(PD_PROJECT)
+            .await
+            .map_err(|e| format!("the clean tree: {e}"))?;
+        if last != disk {
+            return Err("the clean tree reads differently the second time".to_string());
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+
+    // Cleanup, also after a failure: the fixture and the junction target.
+    let data_gone = remove_tree(&host_shell, &data).await;
+    let targets_gone = remove_tree(&host_shell, &targets).await;
+    println!("project digests cleanup: fixture gone {data_gone}, target gone {targets_gone}");
+    if let Err(why) = body {
+        panic!("{why}");
+    }
+    assert!(data_gone && targets_gone);
+    println!("LIVE-RAN wincap_project_digests");
+}

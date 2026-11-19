@@ -1056,6 +1056,12 @@ mod git_rehearse {
 
     #[async_trait::async_trait]
     impl GitHostRead for Unreadable {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
+            self.0.project_file_digests(project).await
+        }
         async fn read_git_state(&self, _project: &str) -> Result<GitFiles, CoreError> {
             Err(CoreError::TransportFailed {
                 operation: "read".to_string(),

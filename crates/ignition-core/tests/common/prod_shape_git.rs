@@ -1302,10 +1302,8 @@ impl<R: GitHostRead> GitHostRead for TimedRead<R> {
     async fn project_file_digests(
         &self,
         project: &str,
-    ) -> Result<
-        Option<ignition_core::deploy::git_advance::ProjectDisk>,
-        ignition_core::error::CoreError,
-    > {
+    ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, ignition_core::error::CoreError>
+    {
         self.inner.project_file_digests(project).await
     }
     async fn read_git_state(

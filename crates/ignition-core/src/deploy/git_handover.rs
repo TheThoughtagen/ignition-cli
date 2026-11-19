@@ -242,13 +242,13 @@ pub async fn restore_and_advance(
     let project = save.project.as_str();
 
     // (a) Everything that can fail without touching the gateway. The node's
-    // disk after the import is what the prediction is made from (27-40); a
-    // host that does not read it (`ssh` until 27-41) answers `None`.
+    // disk after the import is what the prediction is made from (27-40), read
+    // on every node kind (27-41).
     let disk = read
         .project_file_digests(project)
         .await
         .map_err(|e| core("advance_failed", "the project's files could not be read", e))?;
-    let plan = match finish_advance(git, checkout, prep, export_zip, disk.as_ref()).await {
+    let plan = match finish_advance(git, checkout, prep, export_zip, &disk).await {
         Ok(mut plan) => {
             // The abandoned HEAD stays reachable through a ref the advance
             // writes right before the branch ref moves (27-15, 27-26). The ref
@@ -589,6 +589,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GitHostRead for DirHost {
+        async fn project_file_digests(
+            &self,
+            _project: &str,
+        ) -> Result<crate::deploy::git_advance::ProjectDisk, CoreError> {
+            let project_dir = self.git_dir.parent().ok_or_else(not_used)?;
+            Ok(crate::deploy::git_advance::tests::disk_below(project_dir))
+        }
         async fn read_git_state(
             &self,
             _project: &str,

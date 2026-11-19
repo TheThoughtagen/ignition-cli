@@ -1864,14 +1864,28 @@ impl SftpTransport {
 #[async_trait::async_trait]
 impl GitHostRead for SftpTransport {
     /// The project's files as the node's disk holds them after the import
-    /// (27-41, D-25): one host command, [`PROJECT_DIGESTS_SH`] on a POSIX host.
-    /// The Windows host is read in the same way once its script lands.
-    async fn project_file_digests(&self, project: &str) -> Result<Option<ProjectDisk>, CoreError> {
+    /// (27-41, D-25): one host command, [`PROJECT_DIGESTS_SH`] on a POSIX host
+    /// and [`WinScript::project_digests`] on a Windows host.
+    async fn project_file_digests(&self, project: &str) -> Result<ProjectDisk, CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));
         }
         if self.windows {
-            return Ok(None);
+            let script = WinScript::project_digests(
+                LONG_PATH_PREFIX,
+                &self.win_data(),
+                project,
+                PROJECT_DIGESTS_MAX_ENTRIES as u64,
+            );
+            let answer = self
+                .git_win(PROJECT_DISK_OP, script, GIT_HEAVY_LIMIT)
+                .await?;
+            let count = answer.get("n").and_then(serde_json::Value::as_u64);
+            let text = answer
+                .get("t")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| self.git_unusable(PROJECT_DISK_OP, "t is missing"))?;
+            return self.project_disk_of(count, text);
         }
         let rel = format!("projects/{project}");
         let cap = PROJECT_DIGESTS_MAX_ENTRIES.to_string();
@@ -1892,7 +1906,7 @@ impl GitHostRead for SftpTransport {
             })
             .and_then(|raw| String::from_utf8(raw).ok())
             .ok_or_else(|| self.git_unusable(PROJECT_DISK_OP, "t is missing or not UTF-8 text"))?;
-        self.project_disk_of(count, &text).map(Some)
+        self.project_disk_of(count, &text)
     }
     async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
         if let Some(why) = self.project_name_problem(project) {

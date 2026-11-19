@@ -5926,13 +5926,8 @@ mod sftp_git {
             .node()
             .project_file_digests(PROJECT)
             .await
-            .expect("local")
-            .expect("the local node reads its disk");
-        let posix =
-            n.t.project_file_digests(PROJECT)
-                .await
-                .expect("posix")
-                .expect("an ssh POSIX node reads its disk");
+            .expect("local");
+        let posix = n.t.project_file_digests(PROJECT).await.expect("posix");
         assert_eq!(posix, local, "the two implementations read the same disk");
         assert!(posix.len() > 10, "{posix:?}");
         assert!(posix.contains_key("project.json"));
@@ -5992,8 +5987,7 @@ mod sftp_git {
         std::os::unix::fs::symlink("HEAD", fx.git_dir().join("a-link")).expect("link in .git");
         n.t.project_file_digests(PROJECT)
             .await
-            .expect("clean again")
-            .expect("some");
+            .expect("clean again");
         // the project directory itself may not be a link
         let real = fx.data_dir.join("projects/Real");
         std::fs::rename(&project, &real).expect("move");
@@ -6133,13 +6127,14 @@ mod winps_git {
             WinScript::git_save_rm(prefix, home, &format!("{save_rel}/repo"), &run),
             WinScript::git_free(home, &save_rel),
             WinScript::git_yaml(data, 1_048_576),
+            WinScript::project_digests(prefix, data, &project, 100_000),
         ]
     }
 
     #[test]
     fn winps_git_scripts_fit_budget() {
         let scripts = maximal();
-        assert_eq!(scripts.len(), 15);
+        assert_eq!(scripts.len(), 16);
         for script in &scripts {
             let command = winps::encoded_command(script, COMMAND_BUDGET)
                 .unwrap_or_else(|why| panic!("{}: {why}", script.name));
@@ -6149,6 +6144,10 @@ mod winps_git {
                 script.name
             );
             assert!(used <= COMMAND_BUDGET, "{}", script.name);
+            if script.name == "project_digests" {
+                // 27-41: room for a longer script or parameter later
+                assert!(used + 200 <= COMMAND_BUDGET, "{}", script.name);
+            }
         }
         // a chunk of the write plan with the longest names a write can carry
         // (SHA-256 pack names, 10-digit sizes, a 100-character project, the
@@ -6265,6 +6264,7 @@ mod winps_git {
             ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
             ("GIT_FREE", winps::GIT_FREE),
             ("GIT_YAML", winps::GIT_YAML),
+            ("PROJECT_DIGESTS", winps::PROJECT_DIGESTS),
         ];
         for (name, body) in bodies {
             assert!(!body.contains('\n'), "{name}: one line");
@@ -6640,6 +6640,119 @@ mod winps_git {
         let linked = fx.data_dir.join("linked-git");
         std::os::unix::fs::symlink(fx.git_dir(), &linked).expect("link root");
         let why = pwsh_exec::run(&WinScript::git_manifest("", &s(&linked))).expect_err("root");
+        assert!(why.contains("not a real directory"), "{why}");
+    }
+
+    /// The [`ProjectDisk`] of a project digests answer (`n` files in `t`).
+    fn disk_of(answer: &Value) -> ignition_core::deploy::git_advance::ProjectDisk {
+        use ignition_core::deploy::git_advance::DiskFile;
+        let text = answer["t"].as_str().expect("t");
+        let disk: ignition_core::deploy::git_advance::ProjectDisk = text
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut part = line.split('\t');
+                let (rel, size, sha) = (
+                    part.next().expect("name"),
+                    part.next().expect("size"),
+                    part.next().expect("sha"),
+                );
+                assert!(part.next().is_none(), "{line}");
+                (
+                    rel.to_string(),
+                    DiskFile {
+                        size: size.parse().expect("size"),
+                        sha256: sha.to_string(),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(disk.len() as u64, answer["n"].as_u64().expect("n"));
+        disk
+    }
+
+    /// 27-41: the project digests of a Windows script are the local reader's,
+    /// `.git` excluded, for names with spaces, an accent and an empty file; a
+    /// tree over the cap refuses.
+    #[tokio::test]
+    async fn pwsh_project_digests() {
+        if !pwsh_exec::gate("pwsh_project_digests") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let project = fx.project_dir();
+        for rel in [
+            "ignition/script-python/with space/caf\u{e9}.py",
+            "ignition/script-python/-dash/-x.py",
+            "ignition/script-python/empty.py",
+        ] {
+            let path = project.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            let body = if rel.ends_with("empty.py") {
+                ""
+            } else {
+                "body\n"
+            };
+            std::fs::write(&path, body).expect("file");
+        }
+        let local = fx
+            .node()
+            .project_file_digests(PROJECT)
+            .await
+            .expect("local");
+        let data = s(&fx.data_dir);
+        let answer =
+            pwsh_exec::run(&WinScript::project_digests("", &data, PROJECT, 1000)).expect("digests");
+        let got = disk_of(&answer);
+        assert_eq!(got, local);
+        assert!(got.len() > 10, "{got:?}");
+        assert!(got.keys().all(|name| !name.starts_with(".git")), "{got:?}");
+        assert!(got.values().any(|file| file.size == 0), "an empty file");
+        // a `.git` that holds a link is not looked at
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("a-link")).expect("link in .git");
+        let again = pwsh_exec::run(&WinScript::project_digests("", &data, PROJECT, 1000))
+            .expect("digests again");
+        assert_eq!(disk_of(&again), local);
+        // over the cap: refused, never cut off
+        let why = pwsh_exec::run(&WinScript::project_digests("", &data, PROJECT, 3))
+            .expect_err("over the cap");
+        assert!(why.contains("more files"), "{why}");
+    }
+
+    /// 27-41: a link anywhere below the project (not below `.git`), a name with
+    /// a control character, a project that is itself a link and a missing
+    /// project all refuse.
+    #[tokio::test]
+    async fn pwsh_project_digests_refuses_a_link() {
+        if !pwsh_exec::gate("pwsh_project_digests_refuses_a_link") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let data = s(&fx.data_dir);
+        let run = || pwsh_exec::run(&WinScript::project_digests("", &data, PROJECT, 1000));
+        let nested = fx.project_dir().join("ignition/script-python/cap");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), "outside\n").expect("secret");
+        for target in [outside.path().join("secret"), outside.path().to_path_buf()] {
+            let at = nested.join("planted");
+            std::os::unix::fs::symlink(&target, &at).expect("link");
+            let why = run().expect_err("a link");
+            assert!(why.contains("link"), "{why}");
+            std::fs::remove_file(&at).expect("rm link");
+        }
+        let odd = nested.join("bad\u{7}name");
+        std::fs::write(&odd, "x").expect("odd name");
+        let why = run().expect_err("a control character");
+        assert!(why.contains("control character"), "{why}");
+        std::fs::remove_file(&odd).expect("rm");
+        run().expect("clean again");
+        // the project directory itself may not be a link, or missing
+        let real = fx.data_dir.join("projects/Real");
+        std::fs::rename(fx.project_dir(), &real).expect("move");
+        let why = run().expect_err("a missing project");
+        assert!(why.contains("not a real directory"), "{why}");
+        std::os::unix::fs::symlink(&real, fx.project_dir()).expect("link project");
+        let why = run().expect_err("a linked project");
         assert!(why.contains("not a real directory"), "{why}");
     }
 

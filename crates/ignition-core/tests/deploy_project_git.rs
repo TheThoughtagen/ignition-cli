@@ -1068,7 +1068,7 @@ mod gateway_objects {
         async fn project_file_digests(
             &self,
             project: &str,
-        ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
             self.inner.project_file_digests(project).await
         }
         async fn read_git_state(
@@ -3038,7 +3038,7 @@ mod published {
         async fn project_file_digests(
             &self,
             project: &str,
-        ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
             self.0.project_file_digests(project).await
         }
         async fn read_git_state(
@@ -3194,7 +3194,7 @@ mod published {
         async fn project_file_digests(
             &self,
             project: &str,
-        ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
             self.inner.project_file_digests(project).await
         }
         async fn read_git_state(
@@ -5541,7 +5541,8 @@ mod published {
             "{config}"
         );
         f.module_import(true, &[], &[], &[]);
-        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip(), None)
+        let disk = f.node().project_file_digests(PROJECT).await.expect("disk");
+        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip(), &disk)
             .await
             .expect("the plan");
         let order: Vec<String> = plan.writes.iter().map(|w| write_label(&w.name)).collect();
@@ -5568,7 +5569,8 @@ mod published {
         let (_state, prep) = m.prepare(&host).await;
         assert!(!prep.adopted && prep.config.is_none() && prep.config_base.is_none());
         m.module_import(true, &[], &[], &[]);
-        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip(), None)
+        let disk = m.node().project_file_digests(PROJECT).await.expect("disk");
+        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip(), &disk)
             .await
             .expect("the plan");
         assert!(
@@ -8044,4 +8046,142 @@ fn write_exec(path: &std::path::Path, text: &str) {
         .expect("cp runs");
     assert!(copied.success(), "cp the script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// 27-41: an `ssh` node predicts `expected_drift` from its own disk, as a local
+/// node does since 27-40.
+#[cfg(unix)]
+mod ssh_nodes {
+    use super::common;
+    use super::common::git_fixture::{GATEWAY, GitFixture, PROJECT, UTIL_RES};
+    use super::*;
+    use ignition_core::deploy::transport::process::{
+        ProcessOutput, ProcessRunner, TokioProcessRunner,
+    };
+    use ignition_core::deploy::transport::remote::RemoteShell;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    const VIEW_RES: &str = "com.inductiveautomation.perspective/views/V/resource.json";
+
+    /// Runs the real processes, with the `stat` shim for a BSD host.
+    struct ShimRunner;
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for ShimRunner {
+        async fn run(
+            &self,
+            program: &std::ffi::OsStr,
+            args: &[std::ffi::OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: std::time::Duration,
+        ) -> ProcessOutput {
+            let (program, args) = common::posix_exec::shimmed(program, args);
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    /// `zip` with the member `name` replaced by `bytes`.
+    fn with_member(zip: &[u8], name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).expect("zip");
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut replaced = false;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).expect("entry");
+            if entry.is_dir() {
+                continue;
+            }
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).expect("member");
+            if entry.name() == name {
+                body = bytes.to_vec();
+                replaced = true;
+            }
+            writer
+                .start_file(entry.name(), zip::write::SimpleFileOptions::default())
+                .expect("start");
+            writer.write_all(&body).expect("write");
+        }
+        assert!(replaced, "{name} is an export member");
+        writer.finish().expect("finish").into_inner()
+    }
+
+    /// The gateway's rendering of a descriptor (pretty-printed).
+    fn pretty(bytes: &[u8]) -> Vec<u8> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).expect("json");
+        let mut out = serde_json::to_vec_pretty(&value).expect("pretty");
+        out.push(b'\n');
+        out
+    }
+
+    /// The over-count of 2026-11-18, on a node reached over ssh. The import
+    /// rewrote one resource (`UTIL_RES`, written in the gateway's form) and left
+    /// the other resource (`V`) alone: its disk bytes are the release's, while
+    /// the export renders it in the gateway's form. The prediction must list
+    /// only the rewritten path, which is what JGit lists on that disk.
+    async fn predicts_from_disk(windows: bool) {
+        let f = GitFixture::new();
+        let host = HostGit::new();
+        let home = tempfile::tempdir().expect("home");
+        let data = posix_root(&f.data_dir.display().to_string()).expect("posix root");
+        let shell = |runner: Arc<dyn ProcessRunner>| {
+            RemoteShell::local_sftp_server(
+                &common::sftp_server::sftp_server_path(),
+                runner,
+                std::time::Duration::from_secs(120),
+            )
+            .local_exec()
+        };
+        let node = if windows {
+            let runner = common::pwsh_exec::PwshHomeRunner {
+                home: home.path().to_path_buf(),
+            };
+            SftpTransport::new_windows(shell(Arc::new(runner)), data, "nodes.pwsh")
+                .with_home(common::pwsh_exec::SEAM_HOME)
+        } else {
+            let home_root = posix_root(&home.path().display().to_string()).expect("home root");
+            SftpTransport::new(shell(Arc::new(ShimRunner)), data, "nodes.sh").with_home(&home_root)
+        };
+
+        let (state, prep) = f.prepare(&host).await;
+        let saved = save(&node, &node, LedgerRoot::AccountHome, GATEWAY, PROJECT, RUN)
+            .await
+            .expect("save");
+        // the import: the release's bytes everywhere, `UTIL_RES` rewritten
+        f.module_import(true, &[UTIL_RES], &[], &[]);
+        // the export renders `V`'s descriptor in the gateway's form as well
+        let view = std::fs::read(f.project_dir().join(VIEW_RES)).expect("V descriptor");
+        let export = with_member(&f.export_zip(), VIEW_RES, &pretty(&view));
+        let report = restore_and_advance(
+            &node,
+            &node,
+            &host,
+            &f.checkout,
+            &state,
+            &saved,
+            &prep,
+            &export,
+            None,
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("the handover: {failure:?}"));
+        assert!(report.advanced && report.verified, "{report:?}");
+        assert_eq!(
+            report.expected_drift,
+            vec![UTIL_RES.to_string()],
+            "only the rewritten resource is drift"
+        );
+        assert_eq!(f.status_paths(), report.expected_drift);
+    }
+
+    #[tokio::test]
+    async fn ssh_node_predicts_from_its_disk() {
+        predicts_from_disk(false).await;
+        if common::pwsh_exec::gate("ssh_node_predicts_from_its_disk (windows shape)") {
+            predicts_from_disk(true).await;
+        }
+    }
 }

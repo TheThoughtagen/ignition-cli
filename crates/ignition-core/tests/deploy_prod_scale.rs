@@ -3951,6 +3951,13 @@ struct SharedRead(Arc<ignition_core::deploy::transport::sftp::SftpTransport>);
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl ignition_core::deploy::transport::projects::GitHostRead for SharedRead {
+    async fn project_file_digests(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, ignition_core::error::CoreError>
+    {
+        self.0.project_file_digests(project).await
+    }
     async fn read_git_state(
         &self,
         project: &str,

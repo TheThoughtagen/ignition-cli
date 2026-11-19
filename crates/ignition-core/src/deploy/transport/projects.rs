@@ -320,17 +320,14 @@ pub trait GitHostRead: Send + Sync {
     /// tree over the entry cap, and an unreadable host is
     /// [`CoreError::TransportFailed`], never an empty answer.
     ///
-    /// `Ok(None)` is a host that does not read its disk this way (the
-    /// default). An `ssh` node answers `None` until 27-41 adds the POSIX and
-    /// Windows reads; the advance then predicts from the export alone, as
-    /// before 27-40. Placed next to [`git_manifest`](Self::git_manifest),
-    /// which walks `.git` the same way.
+    /// Every node kind answers this: the local node walks the directory, an
+    /// `ssh` node runs one host script (27-41), so `expected_drift` is
+    /// predicted from the node's own disk everywhere. Placed next to
+    /// [`git_manifest`](Self::git_manifest), which walks `.git` the same way.
     async fn project_file_digests(
         &self,
-        _project: &str,
-    ) -> Result<Option<crate::deploy::git_advance::ProjectDisk>, CoreError> {
-        Ok(None)
-    }
+        project: &str,
+    ) -> Result<crate::deploy::git_advance::ProjectDisk, CoreError>;
 
     /// The [`GitManifest`] of the save of run `run_id`.
     async fn save_manifest(

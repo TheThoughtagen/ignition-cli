@@ -6139,8 +6139,13 @@ advance (`restore.post_status` `matched`, or `mismatch` and the reason
 `post_status_mismatch`); it must equal `expected_drift` exactly, with no
 tolerance, so a file that changes between the prediction and that status ends
 the run. On an `ssh` node (`post_status: not_checked`) the disk status is not
-run, because the gateway host runs no git, and the node's disk is not read in
-this release: the prediction there is made from the read-back export alone.
+run, because the gateway host runs no git. The prediction there is made from the
+node's own disk all the same: after the import the run reads the size and sha256
+of every file of the project on the node (one host command, on a Linux or a
+Windows host), so `expected_drift` is what the module lists on that disk. The
+read refuses a link, a special file or a name with a control character (on
+Linux, or a backslash) below the project (the `.git` subtree is not looked
+at), and a project of more than 100,000 files.
 
 **Reading the result.** `data.git` is `null` for a project without a `.git`.
 Otherwise it has `release_commit`, `nodes` (one per node, `master` first),
