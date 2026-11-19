@@ -1859,6 +1859,9 @@ const OWNER_UID: &str = r##"echo "IGN-RESULT:{\"ok\":1,\"uid\":$(stat -c %u -- "
 const COPY_GIT: &str = r##"cp -a -- "$1" "$2" && echo 'IGN-RESULT:{"ok":1}'"##;
 /// `rm -rf $1/.git`: the removal the import does, on the disposable project
 /// only (the caller checks the path).
+/// Remove the directory `$2` below the project directory `$1` (the simulated
+/// import of 27-41 clears the artifact's top-level directories first).
+const REMOVE_PROJECT_DIR: &str = r##"rm -rf -- "$1/$2"; if [ -e "$1/$2" ]; then echo 'IGN-RESULT:{"ok":1,"gone":0}'; else echo 'IGN-RESULT:{"ok":1,"gone":1}'; fi"##;
 const REMOVE_PROJECT_GIT: &str = r##"rm -rf -- "$1/.git"; if [ -e "$1/.git" ]; then echo 'IGN-RESULT:{"ok":1,"gone":0}'; else echo 'IGN-RESULT:{"ok":1,"gone":1}'; fi"##;
 /// The `user:<uid>:` line of `getfacl -n -p $1`, and nothing else.
 const ACL_ENTRY: &str = r##"e=$(getfacl -n -p -- "$1" 2>/dev/null | grep "^user:$2:" | tr '\t' ' '); echo "IGN-RESULT:{\"ok\":1,\"e\":\"$e\"}""##;
@@ -2076,6 +2079,26 @@ async fn lnxvm_git_handover() {
             .await
             .expect("remove .git");
         assert_eq!(removed["gone"], 1, ".git is removed");
+        // The simulated import also writes the artifact's files (27-41): the
+        // run predicts `expected_drift` from the node's own disk, so the disk
+        // must hold the bytes the export returns.
+        let stage = common::vm_git_handover::stage_artifact(&before.artifact_zip);
+        for top in stage.tops() {
+            let gone = sh_json(&shell, "clear", REMOVE_PROJECT_DIR, &[&project_dir, top])
+                .await
+                .expect("clear a top-level directory");
+            assert_eq!(gone["gone"], 1, "{top} is removed");
+        }
+        let put_started = Instant::now();
+        sftp(&shell, &stage.ops(&project_dir)).await;
+        note(
+            "lnxvm_git_handover",
+            &format!(
+                "simulated import: {} files put in {} ms",
+                stage.file_count(),
+                put_started.elapsed().as_millis()
+            ),
+        );
         let report = handover.after_import(&release, &before).await;
 
         // The D-G1 restore path with a non-root gateway account: the named

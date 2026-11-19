@@ -82,6 +82,9 @@ pub const HOST_LINUX_UPLOAD: Duration = Duration::from_secs(30);
 pub const HOST_LINUX_PREFLIGHT: Duration = Duration::from_secs(10);
 /// Linux host: gateway-object read for an unknown HEAD.
 pub const HOST_LINUX_GATEWAY_OBJECTS: Duration = Duration::from_secs(60);
+/// Linux host: the post-import project digests (27-41, one script over every
+/// file of the project). Inside the host read budget, by the 27-40 rule.
+pub const HOST_LINUX_PROJECT_DIGESTS: Duration = Duration::from_secs(10);
 
 /// Windows host: read and parse the gateway `.git` state over ssh.
 pub const HOST_WINDOWS_READ: Duration = Duration::from_secs(20);
@@ -95,6 +98,9 @@ pub const HOST_WINDOWS_UPLOAD: Duration = Duration::from_secs(60);
 pub const HOST_WINDOWS_PREFLIGHT: Duration = Duration::from_secs(20);
 /// Windows host: gateway-object read for an unknown HEAD.
 pub const HOST_WINDOWS_GATEWAY_OBJECTS: Duration = Duration::from_secs(120);
+/// Windows host: the post-import project digests (27-41). Inside the host read
+/// budget, by the 27-40 rule.
+pub const HOST_WINDOWS_PROJECT_DIGESTS: Duration = Duration::from_secs(20);
 
 // ---- the shape --------------------------------------------------------------
 

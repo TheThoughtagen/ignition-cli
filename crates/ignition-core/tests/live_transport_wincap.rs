@@ -8259,6 +8259,27 @@ async fn wincap_git_handover() {
         let before = handover.before_import(&release, "w27h").await;
         // The import removes `.git`: one host command, on the disposable project.
         assert!(remove_tree(&host_shell, &git_dir).await, ".git is removed");
+        // The simulated import also writes the artifact's files (27-41): the
+        // run predicts `expected_drift` from the node's own disk, so the disk
+        // must hold the bytes the export returns.
+        let stage = common::vm_git_handover::stage_artifact(&before.artifact_zip);
+        for top in stage.tops() {
+            remove_tree(&host_shell, &format!("{project_dir}\\{top}")).await;
+        }
+        let project_sftp = format!(
+            "{}/projects/{GIT_PROJECT}",
+            windows_sftp_root(&live.data_dir).expect("the data directory")
+        );
+        let put_started = Instant::now();
+        sftp(&host_shell, &stage.ops(&project_sftp)).await;
+        note(
+            "wincap_git_handover",
+            &format!(
+                "simulated import: {} files put in {} ms",
+                stage.file_count(),
+                put_started.elapsed().as_millis()
+            ),
+        );
         let report = handover.after_import(&release, &before).await;
 
         // G8: the restored `.git` is Hidden again.
