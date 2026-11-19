@@ -4678,6 +4678,7 @@ async fn execute(
                 },
                 &wait,
                 &artifact.sha256,
+                tag_owning,
             )
             .await;
             git::merge_backup(report, single, backup_owns_discard(&writers));
@@ -4694,6 +4695,19 @@ async fn execute(
             surfaces,
             opts,
             backup_since_ms,
+            &mut events,
+        )
+        .await;
+        // 27-55 (Q3): the backup's save outlived that step and its resync; its
+        // `.git` is looked at once more before the save goes.
+        git_failed |= recheck_backup(
+            &mut result,
+            &writers,
+            gateway,
+            opts,
+            &plan.gateway,
+            project,
+            &zip,
             &mut events,
         )
         .await;
@@ -5401,6 +5415,7 @@ async fn execute(
                 },
                 &wait,
                 &artifact.sha256,
+                tag_owning,
             )
             .await;
             git::merge_backup(report, single, backup_owns_discard(&writers));
@@ -5576,19 +5591,40 @@ async fn execute(
     if matches!(
         result.outcome,
         ProjectOutcome::Applied | ProjectOutcome::GitRestoreFailed
-    ) && backup_step(
-        &mut result,
-        &owned_names,
-        surfaces,
-        opts,
-        backup_since_ms,
-        &mut events,
-    )
-    .await
-        == Some(false)
-        && result.outcome == ProjectOutcome::Applied
-    {
-        mark_backup_unsynced(&mut result);
+    ) {
+        let backup_unsynced = backup_step(
+            &mut result,
+            &owned_names,
+            surfaces,
+            opts,
+            backup_since_ms,
+            &mut events,
+        )
+        .await
+            == Some(false);
+        // 27-55 (Q3): the backup's save outlived that step and its resync (the
+        // resync can delete the backup's `.git` again); the `.git` is looked
+        // at once more before the save goes. A failure is the git verdict.
+        if let Some(zip) = readback.as_deref()
+            && recheck_backup(
+                &mut result,
+                &writers,
+                gateway,
+                opts,
+                &plan.gateway,
+                project,
+                zip,
+                &mut events,
+            )
+            .await
+        {
+            result.outcome = ProjectOutcome::GitRestoreFailed;
+            result.ok = false;
+            result.slug = Some(GIT_RESTORE_FAILED_SLUG.to_string());
+        }
+        if backup_unsynced && result.outcome == ProjectOutcome::Applied {
+            mark_backup_unsynced(&mut result);
+        }
     }
     events.emit_late(ProjectsEvent::Finished {
         outcome: result.outcome,
@@ -10847,6 +10883,60 @@ fn backup_event(event: TagsBackupEvent) -> ProjectsEvent {
             reason: reason.map(|reason| reason.as_str()),
         },
     }
+}
+
+/// 27-55 (Q3): the recheck of a tag-owning pair's backup `.git`, after
+/// [`backup_step`] and its resync. The backup's settle left its save pending
+/// removal ([`git::recheck_backup_git`]); here its `.git` is looked at once
+/// more, and the save goes, or the repository is restored from it, or the node
+/// ends `git_recreated` with the save kept. Whether the node failed. A node
+/// with no save pending changes nothing.
+#[allow(clippy::too_many_arguments)]
+async fn recheck_backup(
+    result: &mut DeployProjectsResult,
+    writers: &Writers<'_>,
+    gateway: &dyn ProjectGateway,
+    opts: &ProjectsRunOptions<'_>,
+    plan_gateway: &str,
+    project: &str,
+    export_zip: &[u8],
+    events: &mut RunEvents<'_>,
+) -> bool {
+    let (Some(backup_run), Some(read), Some(report)) = (
+        writers.backup_git,
+        writers.backup_git.and_then(|b| b.host.git()),
+        result.git.as_mut(),
+    ) else {
+        return false;
+    };
+    let Some(mut single) = git::backup_view(report) else {
+        return false;
+    };
+    if single.master().pending_removal.is_none() {
+        return false;
+    }
+    let after = git::recheck_backup_git(
+        backup_run.prepared,
+        &mut single,
+        &git::AfterInputs {
+            read,
+            write: backup_run.writer,
+            git: &backup_run.host_git,
+            gateway: plan_gateway,
+            project,
+            export_zip,
+            post_status: &backup_run.post_status,
+            api: gateway,
+            designers: &opts.designers,
+        },
+    )
+    .await;
+    git::merge_backup(report, single, backup_owns_discard(writers));
+    for event in after.events {
+        events.emit_late(event);
+    }
+    result.warnings.extend(after.warnings);
+    after.failed
 }
 
 /// On a pair (`opts.backup`), wait for the backup to hold the master's

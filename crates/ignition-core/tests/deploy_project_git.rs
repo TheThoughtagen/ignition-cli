@@ -2191,6 +2191,8 @@ mod published {
                 drop_project_json_at_first_read: false,
                 tags_differ: false,
                 backup_git: self.f.backup_git_dir(),
+                on_tag_export: None,
+                tag_exports: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -6273,6 +6275,12 @@ mod published {
         /// The backup's copy of the owned tags is not the master's: one
         /// documentation value differs (27-34).
         pub tags_differ: bool,
+        /// Run the closure once, on the backup's `n`th (1-based) tag export:
+        /// the redundancy sync reaching the backup late, after the run's wait
+        /// for its project (27-55, Q3). Only the backup's tag check reads tag
+        /// exports, so this fires inside `backup_step`.
+        pub on_tag_export: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
+        pub tag_exports: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeBackupNode<'_> {
@@ -6287,6 +6295,15 @@ mod published {
             // A tag-owning pair run also waits for the owned tags (26-13): the
             // backup answers with the master's export in the backup's shape
             // (no live values, children reversed).
+            let nth = self
+                .tag_exports
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if let Some((at, hook)) = &self.on_tag_export
+                && *at == nth
+            {
+                hook();
+            }
             self.reads
                 .lock()
                 .expect("reads")
@@ -6982,6 +6999,195 @@ mod published {
         wait_for_backup_project(&wait, PROJECT, &want)
             .await
             .expect("the fake's answer is taken with nothing left of the wait");
+    }
+
+    // ---- 27-55 (Q3): the backup's save outlives backup_step and its resync ----
+
+    /// The `git_*` and backup events of a pair run, `(name, node)` in order.
+    fn pair_events(rig: &Rig, result: &DeployProjectsResult) -> Vec<(String, Option<String>)> {
+        rig.events(result)
+            .iter()
+            .filter_map(|e| {
+                let name = e["event"].as_str()?;
+                (name.starts_with("git_") || name.starts_with("backup_"))
+                    .then(|| (name.to_string(), e["node"].as_str().map(str::to_string)))
+            })
+            .collect()
+    }
+
+    /// Q3: on a tag-owning pair the redundancy resync that `backup_step` may
+    /// send, or the sync reaching the backup late, deletes the backup's `.git`
+    /// after the settle looked at it. Before 27-55 the settle had already
+    /// removed the save: the backup ended with neither. Now the save stays
+    /// through `backup_step`, the recheck finds `.git` absent, restores it from
+    /// the save, advances it, and only then removes the save.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_pair_backup_git_deleted_by_the_resync_is_restored() {
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node_with(1, false);
+        let git_dir = rig.f.backup_git_dir();
+        backup.on_tag_export = Some((
+            1,
+            Box::new(move || {
+                std::fs::remove_dir_all(&git_dir).expect("the resync deletes the backup's .git");
+            }),
+        ));
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert!(
+            rig.f.backup_git_dir().exists(),
+            "the backup must not end without a .git: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(
+            rig.f.git_in_backup(&["rev-parse", "HEAD"]),
+            rig.f.c2,
+            "the backup's repository is advanced again"
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert!(restore.restored && restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None, "{restore:?}");
+        assert!(!restore.save_kept, "{restore:?}");
+        assert!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).is_empty(),
+            "the save goes only after the restore"
+        );
+    }
+
+    /// Q3: with no late delete the save of a tag-owning pair's backup is
+    /// removed after `backup_step` (after its resync, or after its verdict when
+    /// none was needed), never before.
+    #[tokio::test]
+    async fn tag_pair_backup_save_removed_only_after_the_recheck() {
+        let rig = Rig::tagged_pair(true);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig.apply_pair(&backup, WAIT).await.expect("green");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            result.warnings
+        );
+        let events = pair_events(&rig, &result);
+        let at = |name: &str, node: Option<&str>| {
+            events
+                .iter()
+                .position(|(n, o)| n == name && (node.is_none() || o.as_deref() == node))
+        };
+        let verdict = at("backup_verdict", None).expect("the backup's tag verdict");
+        let removed = at("git_save_removed", Some("nodes.backup")).expect("the backup's save goes");
+        assert!(
+            removed > verdict,
+            "the save goes after backup_step, not before: {events:?}"
+        );
+        if let Some(resync) = at("backup_resync", None) {
+            assert!(removed > resync, "{events:?}");
+        }
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+    }
+
+    /// Q3: a `.git` changed after the resync is not the repository that was
+    /// advanced: the backup ends `git_recreated`, the repository is left as it
+    /// is and the save is kept and named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_pair_backup_git_changed_after_the_resync_is_git_recreated() {
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node_with(1, false);
+        let work = rig.f.backup_project_dir();
+        backup.on_tag_export = Some((
+            1,
+            Box::new(move || {
+                common::git_fixture::git(
+                    &work,
+                    &["commit", "-q", "--allow-empty", "-m", "late writer"],
+                );
+            }),
+        ));
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert_eq!(
+            restore.reason.as_deref(),
+            Some("git_recreated"),
+            "{restore:?}"
+        );
+        assert!(restore.save_kept, "{restore:?}");
+        assert_eq!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).len(),
+            1,
+            "the save is kept"
+        );
+        assert!(rig.f.backup_git_dir().exists(), ".git is left as it is");
+    }
+
+    /// Q3 with 27-37: the `project.json` check still runs at the save's removal
+    /// point, which is now the recheck: a `project.json` the resync takes after
+    /// the settle fails the node `backup_project_json_missing` and the save is
+    /// kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_pair_backup_project_json_removed_after_the_resync_is_found() {
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node_with(1, false);
+        let file = backup_project_json(&rig);
+        backup.on_tag_export = Some((
+            1,
+            Box::new(move || {
+                std::fs::remove_file(&file).expect("the resync deletes project.json");
+            }),
+        ));
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert_eq!(
+            restore.reason.as_deref(),
+            Some("backup_project_json_missing"),
+            "{restore:?}"
+        );
+        assert!(restore.save_kept, "{restore:?}");
+        assert_eq!(rig.save_trees_in(&rig.f.backup_data_dir()).len(), 1);
+    }
+
+    /// Q3: a pair without owned tags keeps the 27-35 settle exactly: the save
+    /// goes at the settle, and nothing reads the backup's tags afterwards (no
+    /// `backup_step`, so no recheck).
+    #[tokio::test]
+    async fn non_tag_pair_settle_is_unchanged() {
+        let rig = pair();
+        let backup = rig.backup_node_with(1, false);
+        let result = rig.apply_pair(&backup, WAIT).await.expect("green");
+        assert!(result.ok, "{:?}", result.warnings);
+        assert!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).is_empty(),
+            "the save went at the settle"
+        );
+        let events = backup_git_events(&rig, &result);
+        assert!(events.iter().any(|e| e == "git_save_removed"), "{events:?}");
+        assert!(
+            !backup.reads().iter().any(|r| r == "GET tag_export"),
+            "no tag check: {:?}",
+            backup.reads()
+        );
     }
 
     // ---- 27-35: the backup's `.git` settles before its save goes (WR-08) ----

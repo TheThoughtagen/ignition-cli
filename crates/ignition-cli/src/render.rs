@@ -5279,6 +5279,7 @@ mod tests {
             hazards: Vec::new(),
             save: None,
             restore: None,
+            pending_removal: None,
         }
     }
 
