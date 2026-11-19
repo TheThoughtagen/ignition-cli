@@ -26,7 +26,11 @@
 #                 header of the git module's own clone CapApp27g
 #   g1-after      after the human grant: probe create/remove in the project and in
 #                 a `.git` copied there from src.git, owner/mode/ACL of what the
-#                 copy created, then the copy is removed
+#                 copy created, then the copy is removed. The `.git` is claimed
+#                 by an exclusive create, holds a nonce marker and its recorded
+#                 identity, and is removed only after a rename to a probe-private
+#                 name proves it is still that directory (X2); the step refuses
+#                 when an ign save ledger entry exists for the project
 #   project-down  remove CapApp27 only and quote the REST project list
 #   scratch-down  remove ign-live-scratch/git27 (NOT run in 27-07: 27-09 and 27-11
 #                 run their WinScripts on the uploaded `.git`; 27-25 runs it last)
@@ -266,12 +270,46 @@ proj_dir="$DATA/projects/$PROJ"
 gitdir="$proj_dir/.git"
 src="$HOME/$SCRATCH_REL/src.git"
 [ -d "$src" ] || { echo "no src.git: run upload first" >&2; exit 2; }
-# the probe copies src.git in as .git and removes it again: a .git that is
-# already there is not this run's, so it is never replaced or removed
-if [ -e "$gitdir" ] || [ -L "$gitdir" ]; then
-  echo "REFUSING: $PROJ already has a .git; g1-after only probes a project without one" >&2
+# X2: an ign save ledger entry for the project means a handover is in flight
+# (its .git is saved and waits for a restore): the probe stays away from it.
+if ls -d "$HOME"/ign-deploy/*/projects/"$PROJ"/git-save/* > /dev/null 2>&1; then
+  echo "REFUSING: an ign save ledger entry exists for $PROJ; g1-after does not run beside a handover" >&2
   exit 2
 fi
+# X2: the probe claims .git by an exclusive create (mkdir without -p fails on
+# an existing directory, file or link, so a .git that is already there is not
+# this run's and is never replaced or removed). It then writes a nonce marker
+# into it and records the directory's identity (device:inode). Before every
+# removal the directory is renamed to a probe-private name and removed only
+# when the nonce and the identity still match; otherwise it is renamed back.
+nonce="" ident="" trash=""
+claim() {
+  if ! mkdir "$gitdir" 2> /dev/null; then
+    echo "REFUSING: $PROJ already has a .git (or it cannot be created); g1-after only probes a project without one" >&2
+    exit 2
+  fi
+  nonce=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  if ! printf '%s\n' "$nonce" > "$gitdir/.ign-probe-nonce"; then
+    echo "REFUSING: the claimed .git cannot hold the nonce marker" >&2
+    rmdir "$gitdir" 2> /dev/null
+    exit 2
+  fi
+  ident=$(stat -c '%d:%i' "$gitdir")
+  trash="$proj_dir/.ign-probe-trash-$nonce"
+}
+unclaim() {
+  if ! mv -T "$gitdir" "$trash" 2> /dev/null; then
+    echo "REFUSING: the claimed .git cannot be renamed; it is left in place" >&2
+    exit 2
+  fi
+  if [ "$(cat "$trash/.ign-probe-nonce" 2> /dev/null)" = "$nonce" ] && [ "$(stat -c '%d:%i' "$trash")" = "$ident" ]; then
+    rm -rf "$trash"
+  else
+    echo "REFUSING: the .git at the claimed path is not the one this probe made (nonce or identity differs); renaming it back" >&2
+    mv -T "$trash" "$gitdir" 2> /dev/null || echo "it could not be renamed back; it is at the probe-private name next to the project" >&2
+    exit 2
+  fi
+}
 err=$(mktemp)
 probe() { # DIR LABEL
   if { : > "$1/.ign-probe-27"; } 2> "$err"; then rm -f "$1/.ign-probe-27"; echo "probe-file $2: created and removed"; else echo "probe-file $2: denied: $(cat "$err")"; fi
@@ -286,12 +324,12 @@ show "$proj_dir"
 probe "$proj_dir" "project-dir"
 for variant in cp-a cp-R-no-preserve-mode; do
   echo "######## variant $variant"
-  rm -rf "$gitdir"
+  claim
   case "$variant" in
-    cp-a) cp -a "$src" "$gitdir" ;;
-    cp-R-no-preserve-mode) cp -R --no-preserve=mode,ownership "$src" "$gitdir" ;;
+    cp-a) cp -a "$src/." "$gitdir/" ;;
+    cp-R-no-preserve-mode) cp -R --no-preserve=mode,ownership "$src/." "$gitdir/" ;;
   esac
-  echo "copied: $(find "$gitdir" -type f | wc -l | tr -d ' ') files"
+  echo "copied: $(find "$gitdir" -type f ! -name .ign-probe-nonce | wc -l | tr -d ' ') files"
   probe "$gitdir" "inside-.git"
   probe "$gitdir/objects" "inside-.git/objects"
   pack=$(find "$gitdir/objects/pack" -type f -name '*.pack' 2>/dev/null | head -n1)
@@ -300,9 +338,9 @@ for variant in cp-a cp-R-no-preserve-mode; do
     echo "-- $(echo "$p" | sed "s|^$DATA|<data>|")"
     show "$p"
   done
+  unclaim
 done
-echo "== removing the copy as the deploy account"
-rm -rf "$gitdir"
+echo "== the copy was removed as the deploy account (after the claim check)"
 if [ -e "$gitdir" ]; then echo "removed: NO"; else echo "removed: yes"; fi
 ls -la "$proj_dir" 2>&1
 rm -f "$err"
@@ -782,16 +820,46 @@ $projDir = Join-Path $Data "projects\$Proj"
 $gitdir = Join-Path $projDir '.git'
 $src = Join-Path $Scratch 'src.git'
 if (-not (Test-Path -LiteralPath $src)) { Write-Output 'no src.git: run upload first'; exit 2 }
-# the probe copies src.git in as .git and removes it again: a .git that is
-# already there is not this run's, so it is never replaced or removed
-if (Test-Path -LiteralPath $gitdir) { Write-Output "REFUSING: $Proj already has a .git; g1-after only probes a project without one"; exit 2 }
+# X2: an ign save ledger entry for the project means a handover is in flight
+# (its .git is saved and waits for a restore): the probe stays away from it.
+$ledger = Join-Path $env:USERPROFILE 'ign-deploy'
+if (Test-Path -LiteralPath $ledger) {
+  $saves = @(Get-ChildItem -Path (Join-Path $ledger "*\projects\$Proj\git-save\*") -Force -ErrorAction SilentlyContinue)
+  if ($saves.Count -gt 0) { Write-Output "REFUSING: an ign save ledger entry exists for $Proj; g1-after does not run beside a handover"; exit 2 }
+}
+# X2: the probe claims .git by an exclusive create (New-Item -ItemType Directory
+# without -Force fails on an existing directory, file or link, so a .git that is
+# already there is not this run's and is never replaced or removed). It then
+# writes a nonce marker into it and records the directory's identity. Before the
+# removal the directory is renamed to a probe-private name and removed only when
+# the nonce and the identity still match; otherwise it is renamed back, and a
+# failed rename (a sharing violation) is a refusal. The identity is the NTFS file
+# id when `fsutil file queryfileid` answers for this account, plus the creation
+# time; both are read the same way at the claim and at the check.
+function Get-Identity([string]$Dir) {
+  $id = ''
+  try { $id = ((& fsutil.exe file queryfileid $Dir 2>$null) -join ' ').Trim() } catch { $id = '' }
+  if ($LASTEXITCODE -ne 0) { $id = '' }
+  return ($id + '|' + [IO.Directory]::GetCreationTimeUtc($Dir).Ticks)
+}
+try { New-Item -ItemType Directory -Path $gitdir -ErrorAction Stop | Out-Null }
+catch { Write-Output "REFUSING: $Proj already has a .git (or it cannot be created); g1-after only probes a project without one"; exit 2 }
+$nonce = [Guid]::NewGuid().ToString('N')
+$marker = Join-Path $gitdir '.ign-probe-nonce'
+try { [IO.File]::WriteAllText($marker, $nonce) }
+catch { Write-Output "REFUSING: the claimed .git cannot hold the nonce marker"; Remove-Item -LiteralPath $gitdir -Force -ErrorAction SilentlyContinue; exit 2 }
+$ident = Get-Identity $gitdir
+$trashName = ".ign-probe-trash-$nonce"
+$trash = Join-Path $projDir $trashName
+Write-Output ("claimed .git: identity recorded ({0})" -f $(if ($ident.StartsWith('|')) { 'creation time only' } else { 'file id and creation time' }))
 Write-Output "== identity"; Write-Output (& whoami.exe)
 Write-Output "== project directory after the grant"
 Show-Acl $projDir
 Test-Probe $projDir 'project-dir'
-Write-Output ("== copying src.git into the project as .git with {0}" -f $Tool)
-Copy-With $Tool $src $gitdir
-$n = (Get-ChildItem -LiteralPath $gitdir -Recurse -Force -File | Measure-Object).Count
+Write-Output ("== copying src.git into the claimed .git with {0}" -f $Tool)
+if ($Tool -eq 'robocopy') { Copy-Robo $src $gitdir }
+else { foreach ($e in @(Get-ChildItem -LiteralPath $src -Force)) { Copy-Item -LiteralPath $e.FullName -Destination $gitdir -Recurse -Force } }
+$n = (Get-ChildItem -LiteralPath $gitdir -Recurse -Force -File | Where-Object { $_.Name -ne '.ign-probe-nonce' } | Measure-Object).Count
 Write-Output ("copied: {0} files" -f $n)
 $it = Get-Item -LiteralPath $gitdir -Force
 Write-Output ("copied .git attributes: {0} ({1})" -f [int]$it.Attributes, $it.Attributes)
@@ -805,8 +873,17 @@ Show-Acl (Join-Path $gitdir 'objects')
 if ($pack) { Show-Acl $pack.FullName }
 Write-Output "== gateway service accounts (the rows above must carry an inherited Modify or FullControl entry for one of them, or a group it is in)"
 Show-GwService
-Write-Output "== removing the copy as the deploy account"
-Remove-Tree $gitdir
+Write-Output "== removing the copy as the deploy account (after the claim check)"
+try { Rename-Item -LiteralPath $gitdir -NewName $trashName -ErrorAction Stop }
+catch { Write-Output "REFUSING: the claimed .git cannot be renamed (something holds it); it is left in place"; exit 2 }
+$seen = ''
+try { $seen = ([IO.File]::ReadAllText((Join-Path $trash '.ign-probe-nonce'))).Trim() } catch { $seen = '' }
+if ($seen -eq $nonce -and (Get-Identity $trash) -eq $ident) { Remove-Tree $trash }
+else {
+  Write-Output "REFUSING: the .git at the claimed path is not the one this probe made (nonce or identity differs); renaming it back"
+  try { Rename-Item -LiteralPath $trash -NewName '.git' -ErrorAction Stop } catch { Write-Output "it could not be renamed back; it is at the probe-private name next to the project" }
+  exit 2
+}
 Write-Output ("removed: " + (-not (Test-Path -LiteralPath $gitdir)))
 EOS
 }
