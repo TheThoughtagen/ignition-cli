@@ -106,7 +106,7 @@
 use super::{Budget, EntryKind, FoundFile, ReadBase, SftpTransport, windows_native_path};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
-use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, ProjectDisk};
 use crate::deploy::git_state::{
     GIT_LOG_TAIL_MAX, GIT_LOOSE_REFS_MAX, GIT_MARKERS, GIT_PACKED_REFS_MAX, GitFiles,
 };
@@ -205,6 +205,63 @@ pub(super) const GIT_SIZE_SH: &str = concat!(
     "a=$(find -P . -type f -exec ls -ln {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
     "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; set -- $w; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s}\\n' \"$1\" \"$2\"",
+);
+
+/// The most files `project_file_digests` lists before it refuses (never
+/// truncates). A production project holds about 2,200 files; the answer is one
+/// line of about 150 bytes per file, so this cap keeps it well inside the
+/// 32 MiB stdout cap of a host command, which refuses an answer past it in any
+/// case.
+pub(super) const PROJECT_DIGESTS_MAX_ENTRIES: usize = 100_000;
+
+/// The post-import disk of a project (27-41, D-25): the size and sha256 of every
+/// regular file below `<data>/projects/<p>` except the `.git` subtree, in one
+/// host command. Arguments: `$1` the data directory, `$2` `projects/<p>`,
+/// `$3` the most files it may list. Digests and sizes only, never content.
+///
+/// The walk to the project is verified level by level (each level is a real
+/// directory, entered, and `pwd -P` must then equal the path expected), and
+/// everything is read from that entered directory; the same check at the end
+/// refuses a project directory that was swapped or moved while it was read.
+/// `find -P` follows nothing. A symlink, a special file, a name with a control
+/// character or a backslash anywhere but below `.git` refuses (exit 4, naming
+/// the first such entry); the `.git` subtree is neither listed nor inspected.
+/// Sizes come from `wc -c` and digests from the host's sha256 tool, both in
+/// batches (one process per few thousand files, not one per file), and are
+/// joined on the path by `awk`, which refuses a file the two reads do not both
+/// show (one that changed while it was read) and a project over the cap.
+///
+/// Answers `{"n":<files>,"t":"<base64>"}`; `t` decodes to the lines
+/// `<rel> TAB <size> TAB <sha256>` joined by LF (no control character is
+/// allowed in a name, so the tab and the line break are unambiguous).
+pub(super) const PROJECT_DIGESTS_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; set -f; ",
+    "for c in find wc awk tr base64; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
+    "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
+    "NL=$(printf '\\nx'); NL=${NL%x}; ",
+    "wv() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+    "cd -- \"$1\" || exit 3; we=$(pwd -P) || exit 3; OI=$IFS; IFS=/; ",
+    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
+    "cd -- \"$c\" || exit 3; we=${we%/}/$c; wp=$(pwd -P) || exit 3; ",
+    "[ \"$wp\" = \"$we\" ] || { printf '%s changed while it was entered\\n' \"$c\" >&2; exit 4; }; done; IFS=$OI; }; ",
+    "wv \"$1\" \"$2\"; gp=$(pwd -P) || exit 3; ",
+    "x=$(find -P . -path ./.git -prune -o \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' -o -name '*\\\\*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { printf '%s is a symlink, a special file or a name with a control character or a backslash\\n' \"${x%%\"$NL\"*}\" >&2; exit 4; }; ",
+    "a=$(find -P . -path ./.git -prune -o -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "e=$(find -P . -path ./.git -prune -o -type f -exec $H -- {} + 2>&1) || { printf '%s\\n' \"$e\" >&2; exit 3; }; ",
+    "u=$( { printf '%s\\n' \"$a\" | awk '{print \"S\" $0}'; printf '%s\\n' \"$e\" | awk '{print \"H\" $0}'; } | awk -v lim=\"$3\" '",
+    r#"/^S/{l=substr($0,2);i=index(l," ./");if(i==0)next;s=substr(l,1,i-1)+0;p=substr(l,i+3);n++;"#,
+    r#"if(n>lim){print "the project holds more files than a read may list" > "/dev/stderr";bad=4;exit}z[p]=s;next} "#,
+    r#"/^H/{l=substr($0,2);if(l=="")next;if(!match(l,/^[0-9a-f]+ [ *]\.\//)||RLENGTH!=68){print "a hash line is not a digest and a name" > "/dev/stderr";bad=3;exit}k[substr(l,69)]=substr(l,1,64);m++;next} "#,
+    r#"END{if(bad)exit bad;if(m!=n){print "the size and digest reads list " n " and " m " files; a file changed while it was read" > "/dev/stderr";exit 3} "#,
+    r#"for(p in z){if(!(p in k)){print p " is not in the digest read; a file changed while it was read" > "/dev/stderr";exit 3}printf "%s\t%.0f\t%s\n",p,z[p],k[p]}}"#,
+    "') || exit $?; ",
+    "n=$(printf '%s' \"$u\" | awk 'END{print NR}') || exit 3; ",
+    "t=$(printf '%s' \"$u\" | base64 | tr -d '\\n') || exit 3; ",
+    "[ \"$(pwd -P)\" = \"$gp\" ] || { echo 'the project directory changed while it was read' >&2; exit 4; }; ",
+    "printf 'IGN-RESULT:{\"n\":%s,\"t\":\"%s\"}\\n' \"$n\" \"$t\"",
 );
 
 /// The most object files a listing reports before it says `more` (a cut-off
@@ -1431,6 +1488,7 @@ impl SftpTransport {
 // | `GIT_STATE_SH` | reads the files `classify` needs: HEAD, config, packed-refs, logs/HEAD tail, loose refs, markers, index |
 // | `GIT_MANIFEST_SH` | `GitManifest` of a directory: sizes below `objects/`, sha256 elsewhere |
 // | `GIT_SIZE_SH` | file count and total size from `ls -ln`, nothing opened |
+// | `PROJECT_DIGESTS_SH` | size and sha256 of every file of a project but the `.git` subtree (27-41) |
 // | `GIT_DIGEST_SH` | sha256 of one file below `.git` |
 // | `GIT_SAVE_SH` | `cp -a` of `.git` into the private save, then both manifests compared |
 // | `GIT_RESTORE_SH` | `cp -a` of the save beside `.git`, the D-G1 ACL step, manifest compare, `mv` into place |
@@ -1454,6 +1512,9 @@ impl SftpTransport {
 
 /// The `$0` the git scripts run under.
 const GIT_SCRIPT_NAME: &str = "ign-git";
+
+/// The operation name of the project digests read in error texts.
+const PROJECT_DISK_OP: &str = "project_file_digests";
 
 /// Longest a heavy git script (a save, restore, manifest or removal of a
 /// whole `.git`) may run.
@@ -1734,6 +1795,65 @@ impl SftpTransport {
         }
     }
 
+    /// The [`ProjectDisk`] of a project digests answer: `count` files in `text`,
+    /// one `rel TAB size TAB sha256` line each. Strict (27-41): a line of any
+    /// other shape, a name that is not a plain relative path, a duplicate, a
+    /// count that does not add up or a listing over the cap is
+    /// `transport_failed`, never a partial disk. The order of the lines is not
+    /// part of the answer (the map is sorted by name).
+    fn project_disk_of(&self, count: Option<u64>, text: &str) -> Result<ProjectDisk, CoreError> {
+        let bad = |what: &str| self.git_unusable(PROJECT_DISK_OP, what);
+        let Some(count) = count else {
+            return Err(bad("n is missing or malformed"));
+        };
+        let mut disk = ProjectDisk::new();
+        if !text.is_empty() {
+            for line in text.split('\n') {
+                let mut parts = line.split('\t');
+                let (Some(rel), Some(size), Some(sha), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(bad("a line is not `name TAB size TAB sha256`"));
+                };
+                if rel.is_empty()
+                    || rel == ".git"
+                    || rel.starts_with(".git/")
+                    || rel
+                        .split('/')
+                        .any(|c| c.is_empty() || c == "." || c == "..")
+                    || rel.chars().any(|c| c.is_control() || c == '\\')
+                {
+                    return Err(bad("a name is not a plain relative path"));
+                }
+                let size = (!size.is_empty() && size.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| size.parse::<u64>().ok())
+                    .flatten()
+                    .ok_or_else(|| bad("a size is not a number"))?;
+                if sha.len() != 64
+                    || !sha
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(bad("a digest is not 64 lowercase hex characters"));
+                }
+                if disk.len() >= PROJECT_DIGESTS_MAX_ENTRIES {
+                    return Err(bad("the listing is longer than it may be"));
+                }
+                let file = DiskFile {
+                    size,
+                    sha256: sha.to_string(),
+                };
+                if disk.insert(rel.to_string(), file).is_some() {
+                    return Err(bad("a name is listed twice"));
+                }
+            }
+        }
+        if disk.len() as u64 != count {
+            return Err(bad("the file count does not match n"));
+        }
+        Ok(disk)
+    }
+
     /// The `ign-deploy/.../git-save/<run>` directory below the account home.
     fn git_save_dir_rel(gateway: &str, project: &str, run_id: &str) -> String {
         let repo = git_save_rel(gateway, project, run_id);
@@ -1743,13 +1863,36 @@ impl SftpTransport {
 
 #[async_trait::async_trait]
 impl GitHostRead for SftpTransport {
-    /// 27-40 does not read an `ssh` node's disk: the advance keeps its
-    /// export-based prediction there. 27-41 adds the POSIX and Windows reads.
-    async fn project_file_digests(
-        &self,
-        _project: &str,
-    ) -> Result<Option<crate::deploy::git_advance::ProjectDisk>, CoreError> {
-        Ok(None)
+    /// The project's files as the node's disk holds them after the import
+    /// (27-41, D-25): one host command, [`PROJECT_DIGESTS_SH`] on a POSIX host.
+    /// The Windows host is read in the same way once its script lands.
+    async fn project_file_digests(&self, project: &str) -> Result<Option<ProjectDisk>, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        if self.windows {
+            return Ok(None);
+        }
+        let rel = format!("projects/{project}");
+        let cap = PROJECT_DIGESTS_MAX_ENTRIES.to_string();
+        let answer = self
+            .git_run(
+                PROJECT_DISK_OP,
+                PROJECT_DIGESTS_SH,
+                &[&self.data_dir, &rel, &cap],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        let count = answer.get("n").and_then(serde_json::Value::as_u64);
+        let text = answer
+            .get("t")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|b64| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+            })
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .ok_or_else(|| self.git_unusable(PROJECT_DISK_OP, "t is missing or not UTF-8 text"))?;
+        self.project_disk_of(count, &text).map(Some)
     }
     async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
         if let Some(why) = self.project_name_problem(project) {
@@ -3374,7 +3517,8 @@ mod tests {
         }
     }
 
-    const ALL_GIT_SCRIPTS: [(&str, &str); 14] = [
+    const ALL_GIT_SCRIPTS: [(&str, &str); 15] = [
+        ("PROJECT_DIGESTS_SH", PROJECT_DIGESTS_SH),
         ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
         ("GIT_YAML_SH", GIT_YAML_SH),
         ("GIT_STATE_SH", GIT_STATE_SH),
@@ -4938,6 +5082,55 @@ mod tests {
             );
             assert_eq!(out.code, 0, "{}", out.stderr);
             assert!(out.stdout.contains("\"digest\":null"), "{}", out.stdout);
+        }
+
+        /// 27-41: more files than the cap refuses (exit 4) and never answers
+        /// a truncated listing; at the cap it answers every file.
+        #[test]
+        fn sftp_project_digests_posix_answer_over_the_cap_refuses() {
+            let rig = Rig::new();
+            let project = rig.root.path().join("data/projects/CapApp");
+            for i in 0..5 {
+                std::fs::write(project.join(format!("f{i}.txt")), format!("{i}\n")).expect("file");
+            }
+            let data = rig.data();
+            let at_cap = run(
+                PROJECT_DIGESTS_SH,
+                &[&data, "projects/CapApp", "5"],
+                &system_path(),
+            );
+            assert_eq!(at_cap.code, 0, "{}", at_cap.stderr);
+            assert!(at_cap.stdout.contains("\"n\":5"), "{}", at_cap.stdout);
+            let over = run(
+                PROJECT_DIGESTS_SH,
+                &[&data, "projects/CapApp", "4"],
+                &system_path(),
+            );
+            assert_eq!(over.code, 4, "{}", over.stderr);
+            assert!(over.stderr.contains("more files"), "{}", over.stderr);
+            assert!(
+                !over.stdout.contains("IGN-RESULT"),
+                "no answer: {}",
+                over.stdout
+            );
+        }
+
+        /// 27-41: a project named with a glob character is walked as that
+        /// literal name, and the `.git` subtree is not listed.
+        #[test]
+        fn project_digests_script_takes_a_glob_character_literally() {
+            let rig = Rig::new();
+            let glob = rig.root.path().join("data/projects/proj*");
+            std::fs::create_dir_all(glob.join(".git")).expect("glob project");
+            std::fs::write(glob.join(".git/HEAD"), "ref: refs/heads/glob\n").expect("head");
+            std::fs::write(glob.join("project.json"), "{}\n").expect("manifest");
+            let out = run(
+                PROJECT_DIGESTS_SH,
+                &[&rig.data(), "projects/proj*", "9"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.contains("\"n\":1"), "{}", out.stdout);
         }
 
         #[test]

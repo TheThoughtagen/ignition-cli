@@ -5884,6 +5884,175 @@ mod sftp_git {
         assert!(!sent[0].contains("eval"), "nothing is evaluated");
     }
 
+    /// 27-41: the POSIX read of the project's files after the import (D-25).
+    /// Every regular file below `projects/<p>` but the `.git` subtree, with
+    /// size and sha256, equal to the local reader's on the same tree, for names
+    /// a shell or an awk could trip over.
+    #[tokio::test]
+    async fn sftp_project_digests_posix() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let project = fx.project_dir();
+        // Apple's `wc` re-encodes a non-ASCII name it prints, so the size and
+        // digest reads cannot be joined there (the read then refuses, as it
+        // must); the production hosts are GNU, where the name is verbatim.
+        #[cfg(target_os = "linux")]
+        {
+            let path = project.join("ignition/script-python/with space/caf\u{e9}.py");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            std::fs::write(&path, "accent\n").expect("file");
+        }
+        for rel in [
+            "ignition/script-python/with space/plain.py",
+            "ignition/script-python/-dash/-x.py",
+            "ignition/script-python/q/it's \"here\".py",
+            "ignition/script-python/q/$HOME `x` *.py",
+            "ignition/script-python/d ./y.py",
+            "ignition/script-python/empty.py",
+        ] {
+            let path = project.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            let body = if rel.ends_with("empty.py") {
+                String::new()
+            } else {
+                format!("body of {rel}\n")
+            };
+            std::fs::write(&path, body).expect("file");
+        }
+        // below `.git` nothing is read, not even what the project walk refuses
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("a-link")).expect("link in .git");
+
+        let local = fx
+            .node()
+            .project_file_digests(PROJECT)
+            .await
+            .expect("local")
+            .expect("the local node reads its disk");
+        let posix =
+            n.t.project_file_digests(PROJECT)
+                .await
+                .expect("posix")
+                .expect("an ssh POSIX node reads its disk");
+        assert_eq!(posix, local, "the two implementations read the same disk");
+        assert!(posix.len() > 10, "{posix:?}");
+        assert!(posix.contains_key("project.json"));
+        assert!(
+            posix.keys().all(|name| !name.starts_with(".git")),
+            "{posix:?}"
+        );
+        let sizes: Vec<u64> = posix.values().map(|file| file.size).collect();
+        assert!(sizes.contains(&0), "an empty file is listed with size 0");
+        // one host command and no sftp session
+        assert_eq!(n.count.execs(), 1);
+        assert_eq!(n.count.sftp(), 0);
+    }
+
+    /// 27-41: a link, a special file, a name with a control character or a
+    /// backslash anywhere below the project refuses with exit 4 naming the
+    /// entry; the same entry below `.git` does not matter.
+    #[tokio::test]
+    async fn sftp_project_digests_posix_refuses_a_link() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let project = fx.project_dir();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("secret"), "outside\n").expect("secret");
+        let nested = project.join("ignition/script-python/cap");
+
+        for (what, make) in [
+            (
+                "a symlink to a file",
+                Box::new(|at: &Path| std::os::unix::fs::symlink(outside.path().join("secret"), at))
+                    as Box<dyn Fn(&Path) -> std::io::Result<()>>,
+            ),
+            (
+                "a symlink to a directory",
+                Box::new(|at: &Path| std::os::unix::fs::symlink(outside.path(), at)),
+            ),
+            (
+                "a dangling symlink",
+                Box::new(|at: &Path| std::os::unix::fs::symlink("nowhere", at)),
+            ),
+        ] {
+            let at = nested.join("planted");
+            make(&at).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let why = detail(n.t.project_file_digests(PROJECT).await.expect_err(what));
+            assert!(why.contains("exit code 4"), "{what}: {why}");
+            assert!(why.contains("planted"), "{what} names the entry: {why}");
+            std::fs::remove_file(&at).expect("rm link");
+        }
+        for name in ["bad\u{1}name", "back\\slash"] {
+            let at = nested.join(name);
+            std::fs::write(&at, "x").expect("odd name");
+            let why = detail(n.t.project_file_digests(PROJECT).await.expect_err(name));
+            assert!(why.contains("exit code 4"), "{name:?}: {why}");
+            std::fs::remove_file(&at).expect("rm");
+        }
+        // the clean tree reads again, and a link in `.git` is not looked at
+        std::os::unix::fs::symlink("HEAD", fx.git_dir().join("a-link")).expect("link in .git");
+        n.t.project_file_digests(PROJECT)
+            .await
+            .expect("clean again")
+            .expect("some");
+        // the project directory itself may not be a link
+        let real = fx.data_dir.join("projects/Real");
+        std::fs::rename(&project, &real).expect("move");
+        std::os::unix::fs::symlink(&real, &project).expect("link project");
+        let why = detail(n.t.project_file_digests(PROJECT).await.expect_err("linked"));
+        assert!(why.contains("exit code 4"), "{why}");
+    }
+
+    /// 27-41: a project directory swapped for a link while the read runs is
+    /// refused. A `find` shim moves the verified directory away and puts a link
+    /// to other content in its place after the walk entered it; the answer is
+    /// never built from what the link shows.
+    #[tokio::test]
+    async fn sftp_project_digests_posix_refuses_a_level_swapped_during_the_walk() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let project = fx.project_dir();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("project.json"), "{\"other\":1}\n").expect("other");
+        let marker = outside.path().join("done");
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "find",
+            &format!(
+                "if [ ! -e {m} ]; then : > {m}; mv {p} {p}.real && ln -s {o} {p}; fi\n\
+                 exec \"$(real find)\" \"$@\"",
+                m = marker.display(),
+                p = project.display(),
+                o = outside.path().display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let why = detail(
+            n.t.project_file_digests(PROJECT)
+                .await
+                .expect_err("a swapped level"),
+        );
+        assert!(why.contains("exit code 4"), "{why}");
+        assert!(why.contains("changed"), "{why}");
+    }
+
+    /// 27-41: what is sent is fixed text of one line, and no git runs there.
+    #[tokio::test]
+    async fn sftp_project_digests_sh_one_line() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        n.t.project_file_digests(PROJECT).await.expect("read");
+        let sent = n.count.execs.lock().expect("execs").clone();
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0].chars().any(char::is_control), "{:?}", sent[0]);
+        assert!(sent[0].contains("IGN-RESULT"), "the answer sentinel");
+        assert!(
+            !sent[0].contains(" git ") && !sent[0].contains("$(git"),
+            "no git runs on the host: {:?}",
+            sent[0]
+        );
+        assert!(!sent[0].contains("eval"), "nothing is evaluated");
+    }
+
     #[test]
     fn sftp_git_scripts_are_not_reachable_from_the_read_only_host() {
         // `ProjectHost::git` hands out the read half only; the writer trait is
