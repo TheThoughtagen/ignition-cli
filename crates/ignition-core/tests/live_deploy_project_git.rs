@@ -3052,6 +3052,31 @@ async fn git_prodscale_rig() {
         first_change: true,
         ..DeployFlags::default()
     };
+    // CodeRabbit #60 (Y3): the module's start sync can still write after the
+    // check above (wait_clone only proves an index and a ref), and the timed
+    // save reads the .git as it is now. So it is measured again right before
+    // the timed apply, after every write this gate makes: it must still have
+    // the configured shape, and its packs, loose objects and tag refs must
+    // equal the first measurement. Names only, never a value.
+    let before_apply = prod_shape_git::measure_git_dir(&rig.project_dir().join(".git"));
+    let mut changed_since = prod_shape_git::placed_mismatches(&before_apply, &emitted_git, &shape);
+    for (name, now, first) in [
+        ("packs_changed", before_apply.packs, live_git.packs),
+        ("loose_objects_changed", before_apply.loose, live_git.loose),
+        ("tag_refs_changed", before_apply.tag_refs, live_git.tag_refs),
+    ] {
+        if now != first {
+            changed_since.push(name);
+        }
+    }
+    eprintln!(
+        "LIVE-SCALE shape before the timed apply: unchanged and configured={} differing={changed_since:?}",
+        changed_since.is_empty()
+    );
+    assert!(
+        changed_since.is_empty(),
+        "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
+    );
     let timed = TimedWriter::new(rig.node());
     let timeline = Timeline::new();
     let extras = Extras {
