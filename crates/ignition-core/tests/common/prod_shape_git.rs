@@ -803,7 +803,7 @@ pub const RIG_REMOTE_URL: &str = "http://git-server/git/capapp.git";
 /// (the emitted one names the generator's scratch path). The rig seed places
 /// this copy instead of letting the module clone the remote: a clone carries
 /// none of the padding (CodeRabbit #58 follow-up X3). Refused when `to`
-/// exists or is inside this repository.
+/// exists, is inside this repository or is at or below the emitted project.
 pub fn stage_gateway_project(emitted: &Path, to: &Path, url: &str) -> PathBuf {
     let source = emitted.join("data").join("projects").join(PROJECT);
     assert!(
@@ -812,7 +812,14 @@ pub fn stage_gateway_project(emitted: &Path, to: &Path, url: &str) -> PathBuf {
     );
     // Checked, but used as given: the canonical form is a `\\?\` path on
     // Windows, which git does not read.
-    outside_repository(to).unwrap_or_else(|e| panic!("PRODSHAPE_STAGE_TO: {e}"));
+    let resolved = outside_repository(to).unwrap_or_else(|e| panic!("PRODSHAPE_STAGE_TO: {e}"));
+    // CodeRabbit #60 (Y1): a stage at or below the emitted project would be
+    // copied into itself (and change the emitted fixture). A sibling is fine.
+    let source_real = source.canonicalize().expect("the emitted project resolves");
+    assert!(
+        !resolved.starts_with(&source_real),
+        "PRODSHAPE_STAGE_TO is at or below the emitted project: name a path outside it"
+    );
     let to = to.to_path_buf();
     assert!(
         std::fs::symlink_metadata(&to).is_err(),

@@ -3000,6 +3000,57 @@ fn prodshape_seed_places_the_configured_shape() {
     );
 }
 
+/// CodeRabbit #60 (Y1): a stage at or below the emitted project would copy
+/// itself into itself and change the emitted fixture; it is refused before
+/// anything is written. A sibling of the project stays a valid stage.
+#[test]
+fn prodshape_stage_refuses_a_destination_inside_the_emitted_project() {
+    let emitted = tempfile::tempdir().expect("tempdir");
+    let source = emitted.path().join("data").join("projects").join(PROJECT);
+    std::fs::create_dir_all(source.join(".git")).expect("mkdir");
+    std::fs::write(source.join(".git").join("config"), "").expect("write");
+    std::fs::write(source.join("project.json"), "{}").expect("write");
+    let entries = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    for inside in [
+        source.clone(),
+        source.join("staged"),
+        source.join(".git").join("staged"),
+    ] {
+        let refused = std::panic::catch_unwind(|| {
+            shape_git::stage_gateway_project(emitted.path(), &inside, shape_git::RIG_REMOTE_URL)
+        });
+        assert!(
+            refused.is_err(),
+            "a stage inside the emitted project was accepted"
+        );
+        assert_eq!(
+            entries(&source),
+            [".git", "project.json"],
+            "the emitted project changed"
+        );
+        assert_eq!(
+            entries(&source.join(".git")),
+            ["config"],
+            "the emitted .git changed"
+        );
+    }
+    let sibling = emitted
+        .path()
+        .join("data")
+        .join("projects")
+        .join("CapApp-stage");
+    let staged =
+        shape_git::stage_gateway_project(emitted.path(), &sibling, shape_git::RIG_REMOTE_URL);
+    assert!(staged.join("project.json").is_file());
+}
+
 /// CodeRabbit #58 (W1): the generator's git acts on the fixture whatever
 /// repository-selection variables the test process inherited (a git hook sets
 /// `GIT_DIR`, and with it set `-C` does not pick the fixture's repository).
