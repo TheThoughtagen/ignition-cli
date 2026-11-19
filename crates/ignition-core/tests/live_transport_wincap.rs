@@ -7248,6 +7248,175 @@ const GIT_HOST_UNTOUCH: &str =
 const GIT_HOST_CREATENEW: &str = "$d=$p.dir;[void][IO.Directory]::CreateDirectory($d);$t1=$d+'\\tgt1';[void][IO.Directory]::CreateDirectory($t1);$j=$d+'\\jl.lock';cmd /c mklink /J $j $t1|Out-Null;$r1='ok';try{$s=[IO.File]::Open($j,'CreateNew','Write','None');$s.Dispose()}catch{$r1=$_.Exception.GetType().Name};$k=$d+'\\sl.lock';$m=$d+'\\nothing';$mk=1;try{cmd /c mklink $k $m 2>&1|Out-Null;$mk=[int]$LASTEXITCODE}catch{};$r2='no link made';if($mk -eq 0){$r2='ok';try{$s=[IO.File]::Open($k,'CreateNew','Write','None');$s.Dispose()}catch{$r2=$_.Exception.GetType().Name}};$made=[int][IO.File]::Exists($m);if($mk -eq 0){[IO.File]::Delete($k)};if([IO.File]::Exists($m)){[IO.File]::Delete($m)};[IO.Directory]::Delete($j);[IO.Directory]::Delete($t1);E @{ok=1;junction=$r1;mklink=$mk;symlink=$r2;behind=$made}";
 const GIT_HOST_FACTS: &str = "E @{ok=1;e=[string]$PSVersionTable.PSEdition;v=[string]$PSVersionTable.PSVersion;c=$env:COMPUTERNAME}";
 
+// ---- W17: one Windows git gate at a time on the VM (27-57) --------------------
+//
+// `wincap_git_scripts` and `wincap_git_handover` both clear the saves below
+// `ign-deploy\live-scratch27` at their start, so two gates running at once could
+// remove each other's state. Each takes a VM-side lock first: the file
+// `<home>\ign-deploy\live-scratch27.lock`, made by an exclusive create
+// (`New-Item -ItemType File` without `-Force` fails when it exists) and holding
+// the run id and the UTC start time. A second gate that finds it refuses and
+// names the holder. The file sits BESIDE the saves directory, not inside it, so
+// the startup cleanup never removes it. With the lock held no other gate is
+// live, so removing the saves of earlier runs is safe; each gate releases the
+// lock in its finish, and the guard's drop releases it when the gate fails. The
+// release removes the file only when it still holds this run's id.
+
+/// The lock file, beside (not inside) `ign-deploy\<GIT_GATEWAY>`.
+const VM_LOCK_FILE: &str = "live-scratch27.lock";
+/// Exclusive create of the lock; when it exists, report its holder.
+const VM_LOCK_TAKE: &str = "$d=$p.dir;[IO.Directory]::CreateDirectory($d)|Out-Null;$f=$p.path;$h=$p.run+' '+[DateTime]::UtcNow.ToString('u');$t=1;try{New-Item -ItemType File -Path $f -Value $h|Out-Null}catch{$t=0};$o='';if($t -eq 0){$o=[IO.File]::ReadAllText($f).Trim()};E @{ok=1;taken=$t;holder=$o}";
+/// Remove the lock only when it holds this run's id.
+const VM_LOCK_RELEASE: &str = "$f=$p.path;$r=0;if([IO.File]::Exists($f)){if([IO.File]::ReadAllText($f).StartsWith($p.run)){[IO.File]::Delete($f);$r=1}};E @{ok=1;released=$r;held=[int][IO.File]::Exists($f)}";
+
+fn vm_lock_params(home_native: &str, run: &str) -> serde_json::Value {
+    serde_json::json!({
+        "dir": format!("{home_native}\\ign-deploy"),
+        "path": format!("{home_native}\\ign-deploy\\{VM_LOCK_FILE}"),
+        "run": run,
+    })
+}
+
+/// The VM run lock held by one gate.
+struct VmRunLock {
+    repo: PathBuf,
+    env: &'static str,
+    home_native: String,
+    run: String,
+    held: bool,
+}
+
+impl VmRunLock {
+    /// Take the lock, or panic naming the holder's run id and start time.
+    async fn take(
+        shell: &RemoteShell,
+        repo: &Path,
+        env: &'static str,
+        home_native: &str,
+        run: &str,
+    ) -> VmRunLock {
+        let got = shell
+            .exec_powershell(&script(
+                "vm_lock_take",
+                VM_LOCK_TAKE,
+                vm_lock_params(home_native, run),
+            ))
+            .await
+            .expect("take the VM run lock");
+        assert_eq!(
+            got["taken"], 1,
+            "another gate holds the VM run lock {VM_LOCK_FILE} (run id and UTC start time: {}); wait for it, or remove the file when that run is dead",
+            got["holder"]
+        );
+        println!("VM run lock taken by {run}");
+        VmRunLock {
+            repo: repo.to_path_buf(),
+            env,
+            home_native: home_native.to_string(),
+            run: run.to_string(),
+            held: true,
+        }
+    }
+
+    /// Release the lock in the gate's finish.
+    async fn release(mut self, shell: &RemoteShell) {
+        let got = shell
+            .exec_powershell(&script(
+                "vm_lock_release",
+                VM_LOCK_RELEASE,
+                vm_lock_params(&self.home_native, &self.run),
+            ))
+            .await
+            .expect("release the VM run lock");
+        self.held = false;
+        assert_eq!(
+            got["held"], 0,
+            "the VM run lock is still held and is not this run's to remove"
+        );
+        println!("VM run lock released by {}", self.run);
+    }
+}
+
+impl Drop for VmRunLock {
+    /// A gate that failed before its finish still releases the lock: a
+    /// separate thread runs the release on its own runtime (a drop cannot await).
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        let (repo, env, home_native, run) = (
+            self.repo.clone(),
+            self.env,
+            self.home_native.clone(),
+            self.run.clone(),
+        );
+        let _ = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async {
+                let shell = shell_of(&repo, env);
+                let _ = shell
+                    .exec_powershell(&script(
+                        "vm_lock_release",
+                        VM_LOCK_RELEASE,
+                        vm_lock_params(&home_native, &run),
+                    ))
+                    .await;
+            });
+        })
+        .join();
+    }
+}
+
+#[test]
+fn vm_run_lock_scripts_are_one_ascii_line_within_the_command_budget() {
+    for (name, body) in [
+        ("vm_lock_take", VM_LOCK_TAKE),
+        ("vm_lock_release", VM_LOCK_RELEASE),
+    ] {
+        assert!(
+            body.is_ascii() && !body.contains('\n'),
+            "{name}: one line of ASCII"
+        );
+        assert!(body.contains("E @{"), "{name}: ends by calling E");
+        let command = winps::encoded_command(
+            &script(
+                name,
+                body,
+                vm_lock_params("C:\\Users\\svc-ignition-deploy", GIT_RUN),
+            ),
+            COMMAND_BUDGET,
+        );
+        assert!(command.is_ok(), "{name}: {:?}", command.err());
+    }
+    // An exclusive create: no -Force, so an existing lock fails the create.
+    assert!(VM_LOCK_TAKE.contains("New-Item -ItemType File") && !VM_LOCK_TAKE.contains("-Force"));
+}
+
+#[test]
+fn vm_run_lock_sits_beside_the_saves_the_gates_clear() {
+    let home = "C:\\Users\\svc-ignition-deploy";
+    let saves = format!("{home}\\ign-deploy\\{GIT_GATEWAY}");
+    let params = vm_lock_params(home, GIT_RUN);
+    let lock = params["path"].as_str().expect("path");
+    assert!(
+        lock.ends_with(&format!("\\{GIT_GATEWAY}.lock")) && lock.ends_with(VM_LOCK_FILE),
+        "{lock}"
+    );
+    assert!(
+        !lock.starts_with(&format!("{saves}\\")) && lock != saves,
+        "the startup cleanup of the saves must not remove the lock: {lock}"
+    );
+    assert_ne!(
+        GIT_RUN, HANDOVER_RUN,
+        "the two gates hold different run ids"
+    );
+}
+
 fn git_step(name: &str, took: Duration, budget: Option<Duration>) {
     match budget {
         Some(budget) => {
@@ -7305,6 +7474,17 @@ async fn wincap_git_scripts() {
     // the scratch root is the account's own, never the gateway's data directory
     assert!(!data27.to_ascii_lowercase().contains("program files"));
     assert!(data27.contains(SCRATCH));
+
+    // W17: one Windows git gate at a time on the VM. The lock is taken before
+    // anything is cleared; with it held, no other gate is live.
+    let run_lock = VmRunLock::take(
+        &host_shell,
+        host_repo.path(),
+        "git27-home",
+        &home_native,
+        GIT_RUN,
+    )
+    .await;
 
     let facts = host_shell
         .exec_powershell(&script("facts", GIT_HOST_FACTS, serde_json::Value::Null))
@@ -7696,6 +7876,7 @@ async fn wincap_git_scripts() {
     // cleanup: the scratch root and the saves, both quoted
     let data_gone = remove_tree(&host_shell, &data27).await;
     let saves_gone = remove_tree(&host_shell, &saves).await;
+    run_lock.release(&host_shell).await;
     host_shell
         .exec_powershell(&script(
             "remove_if_empty",
@@ -8222,6 +8403,16 @@ async fn wincap_git_handover() {
         &format!("host: PSEdition {} PSVersion {}", facts["e"], facts["v"]),
     );
     assert_eq!(facts["e"], "Desktop");
+    // W17: one Windows git gate at a time on the VM. The lock is taken before
+    // the saves are cleared; with it held, no other gate is live.
+    let run_lock = VmRunLock::take(
+        &host_shell,
+        repo_dir.path(),
+        "git27h",
+        &home_native,
+        HANDOVER_RUN,
+    )
+    .await;
     remove_tree(&host_shell, &saves).await;
     assert!(
         enumerate(&host_shell, &src_git).await.is_some(),
@@ -8334,8 +8525,9 @@ async fn wincap_git_handover() {
     }))
     .await;
 
-    // Cleanup, also after a failure: the saves below `ign-deploy`.
+    // Cleanup, also after a failure: the saves below `ign-deploy`, then the lock.
     let saves_gone = remove_tree(&host_shell, &saves).await;
+    run_lock.release(&host_shell).await;
     host_shell
         .exec_powershell(&script(
             "remove_if_empty",
