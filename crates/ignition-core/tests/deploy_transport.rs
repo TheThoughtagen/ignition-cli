@@ -6759,6 +6759,230 @@ mod sftp_git {
     }
 }
 
+/// 27-48: the one reviewed C# block of the Windows git scripts
+/// (`winps::GIT_NATIVE_CS`), its pin and its loader. User decision of
+/// 2026-11-18: the Windows git scripts may compile exactly one fixed, reviewed
+/// `Add-Type` block for handle-anchored `.git` I/O, and nothing else. These
+/// tests do not need a Windows host or `pwsh`, so they run on every platform
+/// (the block itself is compiled only on Windows, by the scripts that load it
+/// from 27-49 on).
+mod winps_git_native {
+    use ignition_core::deploy::transport::winps;
+    use ignition_core::deploy::tree::sha256_hex;
+
+    /// The kernel32 functions the block may declare, and nothing else.
+    const ALLOWED_IMPORTS: [&str; 4] = [
+        "CreateFileW",
+        "GetFileInformationByHandleEx",
+        "MoveFileExW",
+        "SetFileInformationByHandle",
+    ];
+
+    /// What the block must never hold (the plan's list, plus the ways to load
+    /// a library, resolve an address, emit code or reach the network).
+    const FORBIDDEN: [&str; 24] = [
+        "unsafe",
+        "Marshal.Copy",
+        "Process",
+        "Assembly",
+        "Reflection",
+        "WebClient",
+        "Socket",
+        "Registry",
+        "Environment.SetEnvironmentVariable",
+        "LoadLibrary",
+        "GetProcAddress",
+        "Activator",
+        "Delegate",
+        "Emit",
+        "System.Net",
+        "Http",
+        "stackalloc",
+        "fixed(",
+        "Invoke(",
+        "Marshal.PtrTo",
+        "Marshal.Alloc",
+        "Marshal.Write",
+        "Marshal.Read",
+        "Marshal.GetDelegate",
+    ];
+
+    /// The block text on one line of printable ASCII, a single-quoted
+    /// PowerShell literal's worth: no newline and no quote of any kind that
+    /// would end the literal.
+    #[test]
+    fn git_native_block_is_pinned() {
+        let block = winps::GIT_NATIVE_CS;
+        // printed once with `--nocapture`, for the review
+        println!(
+            "GIT_NATIVE_CS ({} characters):\n{block}",
+            block.chars().count()
+        );
+        let sha = sha256_hex(block.as_bytes());
+        println!("GIT_NATIVE_SHA256 = {sha}");
+        assert_eq!(
+            sha,
+            winps::GIT_NATIVE_SHA256,
+            "the block changed: review it again, then change the pin in the same diff"
+        );
+        assert_eq!(winps::GIT_NATIVE_SHA256.len(), 64);
+        assert!(
+            winps::GIT_NATIVE_SHA256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+
+        // one line of printable ASCII, no single quote
+        assert!(
+            block.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+            "the block is one line of printable ASCII"
+        );
+        assert!(
+            !block.contains('\''),
+            "a single quote would end the PowerShell literal it sits in"
+        );
+
+        // exactly the allow-listed kernel32 functions, each with SetLastError
+        assert_eq!(block.matches("DllImport").count(), 4, "four imports");
+        assert_eq!(block.matches("extern ").count(), 4, "four extern members");
+        let mut declared: Vec<String> = Vec::new();
+        for (at, _) in block.match_indices("[DllImport(") {
+            let attr_end = block[at..].find(']').expect("attribute end") + at;
+            let attribute = &block[at..attr_end];
+            assert!(
+                attribute.contains("\"kernel32.dll\""),
+                "kernel32 only: {attribute}"
+            );
+            assert!(
+                attribute.contains("SetLastError=true"),
+                "SetLastError: {attribute}"
+            );
+            let after = &block[attr_end + 1..];
+            let head = after.split('(').next().expect("signature");
+            assert!(head.starts_with("static extern "), "{head}");
+            declared.push(head.rsplit(' ').next().expect("name").to_string());
+        }
+        declared.sort();
+        assert_eq!(declared, ALLOWED_IMPORTS);
+
+        // nothing that starts a process, loads code, reaches the network or
+        // the registry, or leaves managed memory
+        for token in FORBIDDEN {
+            assert!(!block.contains(token), "the block holds `{token}`");
+        }
+        // `Marshal` is used for the last Win32 error and for nothing else
+        for (at, _) in block.match_indices("Marshal.") {
+            assert!(
+                block[at..].starts_with("Marshal.GetLastWin32Error()"),
+                "only GetLastWin32Error may be taken from Marshal: {}",
+                &block[at..(at + 40).min(block.len())]
+            );
+        }
+        // four namespaces are used, so no other API can be named unqualified
+        let mut using: Vec<&str> = block
+            .split(';')
+            .filter_map(|part| part.trim_start().strip_prefix("using "))
+            .collect();
+        using.sort();
+        assert_eq!(
+            using,
+            [
+                "Microsoft.Win32.SafeHandles",
+                "System",
+                "System.IO",
+                "System.Runtime.InteropServices",
+            ]
+        );
+        // every open goes through the one CreateFileW call, which always asks
+        // not to follow a reparse point
+        assert_eq!(block.matches("CreateFileW(").count(), 2, "decl + 1 call");
+        assert!(block.contains("f|FILE_FLAG_OPEN_REPARSE_POINT"));
+        // the namespace and type the loader's guard looks for
+        assert!(block.contains("namespace IgnGit{public static class N{"));
+        // the seven public entry points of the plan and no other
+        let mut public: Vec<&str> = block
+            .match_indices("public static ")
+            .map(|(at, _)| &block[at + "public static ".len()..])
+            .filter(|rest| !rest.starts_with("class "))
+            .map(|rest| {
+                rest.split('(')
+                    .next()
+                    .expect("signature")
+                    .rsplit(' ')
+                    .next()
+                    .expect("name")
+            })
+            .collect();
+        public.sort();
+        assert_eq!(
+            public,
+            [
+                "CreateNew",
+                "DeleteOnClose",
+                "FileId",
+                "Move",
+                "OpenDir",
+                "OpenFile",
+                "OpenForDelete",
+            ]
+        );
+    }
+
+    /// The loader is fixed text with the fail-closed shape of the record
+    /// replace's (25-20, G-25-5): FullLanguage first, the type guard, one
+    /// `Add-Type` inside a try whose catch throws a fixed prefix plus the
+    /// bounded cause. It embeds the pinned block, once, and nothing else.
+    #[test]
+    fn git_native_load_is_fixed_fail_closed_text() {
+        let load = winps::GIT_NATIVE_LOAD;
+        assert!(
+            load.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+            "one line of printable ASCII"
+        );
+        assert!(load.starts_with(
+            "if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw ("
+        ));
+        let guard = load
+            .find("if(-not ('IgnGit.N' -as [type])){try{")
+            .expect("guard");
+        let language = load.find("'FullLanguage'").expect("language check");
+        assert!(language < guard, "FullLanguage is checked before anything");
+        assert_eq!(load.matches("Add-Type").count(), 1, "exactly one Add-Type");
+        let add = load.find("Add-Type").expect("Add-Type");
+        assert!(guard < add, "Add-Type is behind the type guard, in the try");
+        let tail = "}catch{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}};";
+        assert!(
+            load.ends_with(tail),
+            "the catch throws the fixed prefix and IgnCause"
+        );
+        // outside the C# (which has a catch of its own): IgnCause's catch and the loader's
+        let powershell = load.replace(winps::GIT_NATIVE_CS, "");
+        assert_eq!(powershell.matches("catch{").count(), 2);
+        // the block is compiled from exactly the pinned text, once
+        let literal = format!("Add-Type -TypeDefinition '{}'", winps::GIT_NATIVE_CS);
+        assert_eq!(load.matches(&literal).count(), 1);
+        assert_eq!(
+            load.matches(winps::GIT_NATIVE_CS).count(),
+            1,
+            "the pinned text is in the loader once"
+        );
+        // the bounded-cause helpers are the record replace's, character for
+        // character (the loader is not a second implementation of them)
+        let record = winps::RECORD_REPLACE;
+        let from = record.find("function IgnLine").expect("IgnLine");
+        let to = record.find("if(-not ('IgnRecord.Native'").expect("guard");
+        assert!(
+            load.contains(&record[from..to]),
+            "IgnLine and IgnCause match the record replace's"
+        );
+        // no parameter is read and nothing is evaluated here
+        assert!(!load.contains("$p."));
+        for forbidden in ["Invoke-Expression", "iex ", "Start-Process", "-Command"] {
+            assert!(!load.contains(forbidden), "{forbidden}");
+        }
+    }
+}
+
 /// The Windows git scripts of 27-09 (`winps::GIT_*`): their size against the
 /// command budget, their parameter discipline, and their behaviour under the
 /// local `pwsh` against the same fixture the POSIX and local implementations
@@ -6946,6 +7170,108 @@ mod winps_git {
         }
     }
 
+    /// The Add-Type rule of the Windows git scripts (user decision of
+    /// 2026-11-18, 27-48): `Add-Type` is allowed zero times, or exactly once as
+    /// the reviewed loader (`GIT_NATIVE_LOAD`) that starts the body. A second
+    /// `Add-Type`, one outside the loader, or the loader anywhere but the
+    /// start, is refused. PowerShell is case-insensitive, so the match is too.
+    /// Outside the loader's own text the ways to declare or load native code
+    /// by another road stay forbidden.
+    fn add_type_problem(body: &str) -> Option<String> {
+        let lower = body.to_ascii_lowercase();
+        match lower.matches("add-type").count() {
+            0 => {}
+            1 if body.starts_with(winps::GIT_NATIVE_LOAD) => {}
+            1 => return Some("Add-Type outside the reviewed loader at the start".to_string()),
+            n => return Some(format!("{n} Add-Type: at most one, as the loader")),
+        }
+        let rest = body.strip_prefix(winps::GIT_NATIVE_LOAD).unwrap_or(body);
+        for forbidden in [
+            "DllImport",
+            "-MemberDefinition",
+            "-TypeDefinition",
+            "DefinePInvokeMethod",
+            "Reflection.Emit",
+            "[Reflection.",
+            "[System.Reflection.",
+            "LoadLibrary",
+            "GetProcAddress",
+        ] {
+            if rest.contains(forbidden) {
+                return Some(format!("holds {forbidden} outside the loader"));
+            }
+        }
+        None
+    }
+
+    /// Every rule of `winps_git_params_only` on one body, as the reason it
+    /// fails or `Ok`: so a test can show the rule is red on a broken body.
+    fn params_only_problem(body: &str) -> Result<(), String> {
+        if body.contains('\n') {
+            return Err("not one line".to_string());
+        }
+        // no host path or drive in the text: paths exist only as `$p.*`
+        for drive in ["C:\\", "c:\\", "\\\\?\\", "/Users", "/home", "/tmp"] {
+            if body.contains(drive) {
+                return Err(format!("holds a path ({drive})"));
+            }
+        }
+        // nothing that evaluates or re-parses text
+        for forbidden in [
+            "Invoke-Expression",
+            "iex ",
+            "Invoke-Command",
+            "Start-Process",
+            "-Command",
+            "cmd ",
+            "[scriptblock]::Create",
+        ] {
+            if body.contains(forbidden) {
+                return Err(format!("holds {forbidden}"));
+            }
+        }
+        if let Some(why) = add_type_problem(body) {
+            return Err(why);
+        }
+        // a double-quoted string never carries a parameter: a parameter
+        // value inside quotes would be parsed as script
+        let mut quoted = false;
+        let mut at = 0;
+        let bytes: Vec<char> = body.chars().collect();
+        let mut text = String::new();
+        while at < bytes.len() {
+            let c = bytes[at];
+            if c == '\'' && !quoted {
+                // skip a single-quoted literal
+                at += 1;
+                while at < bytes.len() && bytes[at] != '\'' {
+                    at += 1;
+                }
+            } else if c == '"' {
+                if quoted {
+                    if text.contains("$p.") {
+                        return Err(format!("a parameter inside a double-quoted string: {text}"));
+                    }
+                    text.clear();
+                }
+                quoted = !quoted;
+            } else if quoted {
+                text.push(c);
+            }
+            at += 1;
+        }
+        if quoted {
+            return Err("unbalanced quotes".to_string());
+        }
+        // the parameters are decoded from the base64 blob, never spliced
+        if body.contains("FromBase64String") {
+            return Err("the blob is the command's".to_string());
+        }
+        Ok(())
+    }
+
+    /// The rule on every Windows git script body: see `add_type_problem` for
+    /// the one thing 27-48 changed (`Add-Type` as the reviewed loader only).
     #[test]
     fn winps_git_params_only() {
         let bodies = [
@@ -6956,7 +7282,9 @@ mod winps_git {
             ("GIT_SIZE", winps::GIT_SIZE),
             ("GIT_OBJECTS", winps::GIT_OBJECTS),
             ("GIT_DIGEST", winps::GIT_DIGEST),
+            ("GIT_STAGE", winps::GIT_STAGE),
             ("GIT_LOCK", winps::GIT_LOCK),
+            ("GIT_UNLOCK", winps::GIT_UNLOCK),
             ("GIT_REPLACE", winps::GIT_REPLACE),
             ("GIT_PROBE", winps::GIT_PROBE),
             ("GIT_SAVE_RM", winps::GIT_SAVE_RM),
@@ -6965,58 +7293,9 @@ mod winps_git {
             ("PROJECT_DIGESTS", winps::PROJECT_DIGESTS),
         ];
         for (name, body) in bodies {
-            assert!(!body.contains('\n'), "{name}: one line");
-            // no host path or drive in the text: paths exist only as `$p.*`
-            for drive in ["C:\\", "c:\\", "\\\\?\\", "/Users", "/home", "/tmp"] {
-                assert!(!body.contains(drive), "{name} holds a path ({drive})");
+            if let Err(why) = params_only_problem(body) {
+                panic!("{name}: {why}");
             }
-            // nothing that evaluates or re-parses text
-            for forbidden in [
-                "Invoke-Expression",
-                "iex ",
-                "Invoke-Command",
-                "Start-Process",
-                "-Command",
-                "cmd ",
-                "Add-Type",
-                "[scriptblock]::Create",
-            ] {
-                assert!(!body.contains(forbidden), "{name} holds {forbidden}");
-            }
-            // a double-quoted string never carries a parameter: a parameter
-            // value inside quotes would be parsed as script
-            let mut quoted = false;
-            let mut at = 0;
-            let bytes: Vec<char> = body.chars().collect();
-            let mut text = String::new();
-            while at < bytes.len() {
-                let c = bytes[at];
-                if c == '\'' && !quoted {
-                    // skip a single-quoted literal
-                    at += 1;
-                    while at < bytes.len() && bytes[at] != '\'' {
-                        at += 1;
-                    }
-                } else if c == '"' {
-                    if quoted {
-                        assert!(
-                            !text.contains("$p."),
-                            "{name}: a parameter inside a double-quoted string: {text}"
-                        );
-                        text.clear();
-                    }
-                    quoted = !quoted;
-                } else if quoted {
-                    text.push(c);
-                }
-                at += 1;
-            }
-            assert!(!quoted, "{name}: balanced quotes");
-            // the parameters are decoded from the base64 blob, never spliced
-            assert!(
-                !body.contains("FromBase64String"),
-                "{name}: the blob is the command's"
-            );
         }
         // a hostile value is data: it is inside the encoding and not in the
         // text of the command
@@ -7025,6 +7304,221 @@ mod winps_git {
         let command = winps::encoded_command(&script, COMMAND_BUDGET).expect("fits");
         assert!(!command.as_str().contains("it's"));
         assert_eq!(script.params["j"], odd);
+    }
+
+    /// 27-48: the rule admits the reviewed loader at the start of a body and
+    /// nothing else. Each broken body below is built here and must be refused;
+    /// the good one is the same script with the loader in front.
+    #[test]
+    fn winps_git_add_type_rule_admits_only_the_loader() {
+        let load = winps::GIT_NATIVE_LOAD;
+        let script = winps::GIT_SIZE;
+        // a script that starts with the loader passes every rule
+        let good = format!("{load}{script}");
+        assert_eq!(params_only_problem(&good), Ok(()));
+        assert_eq!(params_only_problem(script), Ok(()), "and one without it");
+
+        let altered_block = load.replacen("IsInvalid", "IsInvalid ", 1);
+        assert_ne!(altered_block, load, "the alteration took");
+        let broken: Vec<(&str, String)> = vec![
+            (
+                "an Add-Type that is not the loader",
+                format!("Add-Type -TypeDefinition 'class A{{}}';{script}"),
+            ),
+            (
+                "a second Add-Type behind the loader",
+                format!("{load}Add-Type -AssemblyName System.IO.Compression;{script}"),
+            ),
+            ("the loader twice", format!("{load}{load}{script}")),
+            ("the loader after other text", format!("{script}{load}")),
+            (
+                "Add-Type in other case",
+                format!("add-type -TypeDefinition 'class A{{}}';{script}"),
+            ),
+            (
+                "a loader whose block was edited",
+                format!("{altered_block}{script}"),
+            ),
+            (
+                "a second declaration by another road",
+                format!("{load}$a=Add-Member;[DllImport(\"kernel32.dll\")]{script}"),
+            ),
+            (
+                "reflection emit after the loader",
+                format!(
+                    "{load}[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly();{script}"
+                ),
+            ),
+            (
+                "Invoke-Expression after the loader",
+                format!("{load}Invoke-Expression $p.a;{script}"),
+            ),
+            (
+                "a path in the text",
+                format!("{load}$q='C:\\Windows';{script}"),
+            ),
+            (
+                "a parameter inside a double-quoted string",
+                format!("{load}$q=\"x $p.a\";{script}"),
+            ),
+        ];
+        for (what, body) in &broken {
+            assert!(
+                params_only_problem(body).is_err(),
+                "the rule accepted {what}"
+            );
+        }
+        // the Add-Type cases are refused for that reason
+        for (what, body) in broken.iter().take(5) {
+            let why = params_only_problem(body).expect_err(what);
+            assert!(why.contains("Add-Type"), "{what}: {why}");
+        }
+    }
+
+    /// The staged loader of the budget table (27-48, layout B): the same head as
+    /// the inline loader (FullLanguage check and the bounded-cause helpers),
+    /// then it reads the source file the run uploaded to
+    /// `<home>\ign-deploy\git-native\IgnGitNative-<pin12>.cs`, compares the
+    /// SHA-256 of the bytes it read with the pin written in its own text, and
+    /// compiles those same bytes, decoded. The bytes hashed are the bytes
+    /// compiled. This is a measuring draft: no script carries it.
+    fn staged_loader() -> String {
+        let load = winps::GIT_NATIVE_LOAD;
+        let head = load
+            .split_once("if(-not ('IgnGit.N' -as [type])){try{Add-Type")
+            .expect("the inline loader's guard")
+            .0;
+        let pin = winps::GIT_NATIVE_SHA256;
+        let pin12 = &pin[..12];
+        format!(
+            "{head}if(-not ('IgnGit.N' -as [type])){{try{{$ib=[IO.File]::ReadAllBytes([IO.Path]::Combine($p.h,'ign-deploy','git-native','IgnGitNative-{pin12}.cs'));if([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($ib)).Replace('-','').ToLower() -ne '{pin}'){{throw 'the staged source is not the pinned text'}};Add-Type -TypeDefinition ([Text.Encoding]::ASCII.GetString($ib))}}catch{{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}}}};"
+        )
+    }
+
+    /// The encoded length of `script` with `prefix` in front of its body. The
+    /// staged layout needs the account home in `$p.h`; a script that does not
+    /// carry one gets it for the measurement (it is part of the staged cost).
+    fn encoded_with(script: &WinScript, prefix: &str, staged_home: Option<&str>) -> usize {
+        let body: &'static str = Box::leak(format!("{prefix}{}", script.body).into_boxed_str());
+        let mut params = script.params.clone();
+        if let (Some(home), Some(map)) = (staged_home, params.as_object_mut()) {
+            map.entry("h")
+                .or_insert_with(|| Value::String(home.to_string()));
+        }
+        let measured = WinScript {
+            name: script.name,
+            body,
+            params,
+        };
+        winps::encoded_command(&measured, usize::MAX)
+            .unwrap_or_else(|why| panic!("{}: {why}", measured.name))
+            .as_str()
+            .chars()
+            .count()
+    }
+
+    /// 27-48, the input of the review (Task 2): the encoded length of every
+    /// Windows git script (a) as it is today, (b) with the loader and the block
+    /// inline, (c) with the staged loader, against the budget of 8000 with a
+    /// 200-character margin. It asserts nothing about (b) and (c) beyond that
+    /// they can be built; it prints the table and the scripts that would need a
+    /// split. Three rows are the largest chunk of a write plan with the longest
+    /// names, for the three scripts that take a chunk.
+    #[test]
+    fn winps_git_native_budget_table() {
+        const MARGIN: usize = 200;
+        let home = "C:\\Users\\svc-ignition-deploy";
+        let inline = winps::GIT_NATIVE_LOAD.to_string();
+        let staged = staged_loader();
+        println!(
+            "winps_git_native_budget_table: block {} chars, inline loader {} chars, staged loader {} chars",
+            winps::GIT_NATIVE_CS.chars().count(),
+            inline.chars().count(),
+            staged.chars().count()
+        );
+
+        let mut rows: Vec<(String, WinScript)> = maximal()
+            .into_iter()
+            .map(|script| (script.name.to_string(), script))
+            .collect();
+        // the largest chunk of a plan, as `winps_git_scripts_fit_budget` builds it
+        let data = "C:\\Program Files\\Inductive Automation\\Ignition\\data";
+        let project = "P".repeat(100);
+        let stage = format!("git-stage-{}", "R".repeat(64));
+        let chunk_size = ignition_core::deploy::transport::sftp::GIT_WIN_CHUNK;
+        let plan: Vec<(String, u64)> = (0..12)
+            .map(|i| {
+                let ext = if i % 2 == 0 { "pack" } else { "idx" };
+                (
+                    format!("objects/pack/pack-{}{i:02}.{ext}", "b".repeat(62)),
+                    4_000_000_000 + i as u64,
+                )
+            })
+            .collect();
+        for (n, chunk) in plan.chunks(chunk_size).enumerate() {
+            let offset = n * chunk_size;
+            for script in [
+                WinScript::git_lock(data, &project, home, &stage, offset, chunk),
+                WinScript::git_unlock(data, &project, home, &stage, offset, chunk, true),
+                WinScript::git_replace(data, &project, home, &stage, chunk, 3, true),
+            ] {
+                let name = format!("{} chunk of {}", script.name, chunk.len());
+                let at = rows.iter().position(|(row, _)| *row == name);
+                // keep the longest chunk of each script
+                let longer = at.is_none_or(|i| {
+                    encoded_with(&script, "", None) > encoded_with(&rows[i].1, "", None)
+                });
+                if longer {
+                    match at {
+                        Some(i) => rows[i] = (name, script),
+                        None => rows.push((name, script)),
+                    }
+                }
+            }
+        }
+
+        println!(
+            "| script | today | inline | staged | inline vs {} | staged vs {} |",
+            COMMAND_BUDGET - MARGIN,
+            COMMAND_BUDGET - MARGIN
+        );
+        println!("|---|---|---|---|---|---|");
+        let (mut split_inline, mut split_staged) = (Vec::new(), Vec::new());
+        for (name, script) in &rows {
+            let today = encoded_with(script, "", None);
+            let inline_len = encoded_with(script, &inline, None);
+            let staged_len = encoded_with(script, &staged, Some(home));
+            let limit = COMMAND_BUDGET - MARGIN;
+            let verdict = |len: usize| {
+                if len <= limit {
+                    format!("fits ({} spare)", limit - len)
+                } else {
+                    format!("SPLIT (over by {})", len - limit)
+                }
+            };
+            println!(
+                "| {name} | {today} | {inline_len} | {staged_len} | {} | {} |",
+                verdict(inline_len),
+                verdict(staged_len)
+            );
+            if inline_len > limit {
+                split_inline.push(name.clone());
+            }
+            if staged_len > limit {
+                split_staged.push(name.clone());
+            }
+        }
+        println!(
+            "winps_git_native_budget_table: inline needs a split: {} of {}: {split_inline:?}",
+            split_inline.len(),
+            rows.len()
+        );
+        println!(
+            "winps_git_native_budget_table: staged needs a split: {} of {}: {split_staged:?}",
+            split_staged.len(),
+            rows.len()
+        );
+        assert_eq!(rows.len(), 16 + 3, "sixteen scripts and three chunk rows");
     }
 
     /// 27-11: the object listing fits the command budget with the longest
@@ -7046,8 +7540,9 @@ mod winps_git {
     }
 
     /// 27-11: every value reaches the object listing as data in `$p`; the
-    /// text holds no path, no evaluation and no `Add-Type`, and a hostile
-    /// project is inside the encoding, not in the command text.
+    /// text holds no path and no evaluation, `Add-Type` only as the reviewed
+    /// loader (27-48), and a hostile project is inside the encoding, not in
+    /// the command text.
     #[test]
     fn winps_git_objects_params_only() {
         let body = winps::GIT_OBJECTS;
@@ -7062,12 +7557,13 @@ mod winps_git {
             "Start-Process",
             "-Command",
             "cmd ",
-            "Add-Type",
             "[scriptblock]::Create",
             "FromBase64String",
         ] {
             assert!(!body.contains(forbidden), "holds {forbidden}");
         }
+        // 27-48: `Add-Type` only as the reviewed loader at the start (none today)
+        assert_eq!(add_type_problem(body), None);
         // the parameters it reads are exactly the ones the constructor sends
         let mut read: Vec<String> = body
             .match_indices("$p.")

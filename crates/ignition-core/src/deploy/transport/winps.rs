@@ -314,6 +314,123 @@ pub const GIT_ENTRY: &str = concat!(
     "E @{ok=1;projects=(W $a);project=(W $b);kind=$c.k;hidden=$c.h;reparse=$c.r}"
 );
 
+// Phase 27 (27-48): the one reviewed C# block of the Windows git scripts.
+//
+// The block is one line of printable ASCII (a GIT_* body is one line), built
+// from one piece per line of C# so this source can be read and a diff of it is
+// a diff of the C#. C# 5 only: Windows PowerShell 5.1 compiles it with the
+// .NET Framework's csc, so no string interpolation, no expression-bodied
+// members, no `out var`.
+macro_rules! git_native_cs {
+    () => {
+        concat!(
+            "using System;using System.IO;using System.Runtime.InteropServices;using Microsoft.Win32.SafeHandles;",
+            "namespace IgnGit{public static class N{",
+            "/* Win32 constants, named as in the Windows headers. */",
+            "const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,DELETE=0x10000,FILE_READ_ATTRIBUTES=0x80,",
+            "FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,FILE_SHARE_DELETE=4,CREATE_NEW=1,OPEN_EXISTING=3,",
+            "FILE_FLAG_BACKUP_SEMANTICS=0x2000000,FILE_FLAG_OPEN_REPARSE_POINT=0x200000,",
+            "FILE_ATTRIBUTE_DIRECTORY=0x10,FILE_ATTRIBUTE_REPARSE_POINT=0x400,",
+            "MOVEFILE_REPLACE_EXISTING=1,MOVEFILE_WRITE_THROUGH=8;",
+            "const int FileDispositionInfo=4,FileAttributeTagInfo=9,FileIdInfo=18;",
+            "[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]",
+            "static extern SafeFileHandle CreateFileW(string n,uint a,uint s,IntPtr z,uint d,uint f,IntPtr t);",
+            "[DllImport(\"kernel32.dll\",SetLastError=true)]",
+            "static extern bool GetFileInformationByHandleEx(SafeFileHandle h,int c,byte[] b,uint n);",
+            "[DllImport(\"kernel32.dll\",SetLastError=true)]",
+            "static extern bool SetFileInformationByHandle(SafeFileHandle h,int c,byte[] b,uint n);",
+            "[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]",
+            "static extern bool MoveFileExW(string a,string b,uint f);",
+            "static IOException X(string w){return new IOException(w+\" (Win32 error \"+Marshal.GetLastWin32Error()+\")\");}",
+            // The only CreateFileW call. It never follows a reparse point. k=0: no
+            // check (a new file), k=1: must be a directory, k=2: must be a regular
+            // file; both checks read the attribute tag of the handle just opened.
+            "static SafeFileHandle O(string p,uint a,uint s,uint d,uint f,int k){",
+            "SafeFileHandle h=CreateFileW(p,a,s,IntPtr.Zero,d,f|FILE_FLAG_OPEN_REPARSE_POINT,IntPtr.Zero);",
+            "if(h.IsInvalid)throw X(\"cannot open the path\");if(k==0)return h;",
+            "try{byte[] b=new byte[8];",
+            "if(!GetFileInformationByHandleEx(h,FileAttributeTagInfo,b,8))throw X(\"cannot read the attributes\");",
+            "uint t=BitConverter.ToUInt32(b,0);",
+            "if((t&FILE_ATTRIBUTE_REPARSE_POINT)!=0)throw new IOException(\"the path is a reparse point\");",
+            "if(((t&FILE_ATTRIBUTE_DIRECTORY)!=0)!=(k==1))throw new IOException(k==1?\"the path is not a directory\":\"the path is not a regular file\");",
+            "return h;}catch{h.Dispose();throw;}}",
+            // No FILE_SHARE_DELETE: while held, the directory cannot be renamed or replaced.
+            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
+            "public static SafeFileHandle OpenFile(string p,bool write){return O(p,GENERIC_READ|(write?GENERIC_WRITE:0),FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+            // No sharing at all: nobody else can open, delete or replace the new file while it is held.
+            "public static SafeFileHandle CreateNew(string p){return O(p,GENERIC_WRITE,0,CREATE_NEW,0,0);}",
+            "public static SafeFileHandle OpenForDelete(string p){return O(p,DELETE|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+            // Volume serial number (8 bytes) and 128-bit file id, as 48 hex digits.
+            "public static string FileId(SafeFileHandle h){byte[] b=new byte[24];",
+            "if(!GetFileInformationByHandleEx(h,FileIdInfo,b,24))throw X(\"cannot read the file id\");",
+            "return BitConverter.ToString(b).Replace(\"-\",\"\");}",
+            // The file is deleted when the last handle to it is closed.
+            "public static void DeleteOnClose(SafeFileHandle h){",
+            "if(!SetFileInformationByHandle(h,FileDispositionInfo,new byte[]{1},1))throw X(\"cannot mark the file for deletion\");}",
+            "public static void Move(string a,string b,bool replace){",
+            "if(!MoveFileExW(a,b,MOVEFILE_WRITE_THROUGH|(replace?MOVEFILE_REPLACE_EXISTING:0)))throw X(\"cannot move the file\");}",
+            "}}"
+        )
+    };
+}
+
+/// The one reviewed C# block of the Windows git scripts (Phase 27, 27-48; the
+/// user decision of 2026-11-18 allows exactly this much `Add-Type`). It is the
+/// handle-anchored `.git` I/O that Windows PowerShell 5.1 cannot do with a
+/// managed API: `FileStream` rejects a `FileOptions` that opens a reparse point
+/// itself, so the block declares `CreateFileW`.
+///
+/// `IgnGit.N`, every method throwing `IOException` with a fixed English text and
+/// the Win32 error number (no path in any message):
+///
+/// - `OpenDir(path)`: `FILE_READ_ATTRIBUTES`, shared for read and write and NOT
+///   for delete, so a directory that is held cannot be renamed or replaced (the
+///   Windows anchor, there being no `openat`); must be a directory and not a
+///   reparse point, read from the attribute tag of the handle that is returned.
+/// - `OpenFile(path, write)`: `GENERIC_READ` (and `GENERIC_WRITE` when `write`),
+///   shared for read, write and delete; must be a regular file, not a reparse
+///   point.
+/// - `CreateNew(path)`: `GENERIC_WRITE`, no sharing, `CREATE_NEW`.
+/// - `OpenForDelete(path)`: `DELETE | FILE_READ_ATTRIBUTES`, shared for read,
+///   write and delete; a regular file, not a reparse point.
+/// - `FileId(handle)`: `GetFileInformationByHandleEx(FileIdInfo)` as hex.
+/// - `DeleteOnClose(handle)`: `SetFileInformationByHandle(FileDispositionInfo)`,
+///   so a file is removed by the handle whose file id was just compared.
+/// - `Move(from, to, replace)`: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, and
+///   `MOVEFILE_REPLACE_EXISTING` only when `replace`.
+///
+/// Every `CreateFileW` is made with `FILE_FLAG_OPEN_REPARSE_POINT`. The text is
+/// pinned by [`GIT_NATIVE_SHA256`]. It is compiled only on Windows (by `csc`
+/// through `Add-Type`, C# 5): nothing here compiles or runs it, and the first
+/// compile is the Windows test VM and the windows-latest leg of 27-49.
+pub const GIT_NATIVE_CS: &str = git_native_cs!();
+
+/// The SHA-256 of [`GIT_NATIVE_CS`], lowercase hex. A test compares it with the
+/// block, so an edit of the block fails until this changes in the same diff,
+/// after the block has been reviewed again.
+pub const GIT_NATIVE_SHA256: &str =
+    "d8dfa7a5f714044f3f31994c53c314fd5318d57ef454eada773f3cb7a360c773";
+
+/// The loader a Windows git script puts at the start of its body to use
+/// [`GIT_NATIVE_CS`] (the inline layout): the RECORD_REPLACE form. It fails
+/// closed. Unless the session is `FullLanguage` it throws naming the language
+/// mode; the type is compiled only when `IgnGit.N` is not loaded yet; a failing
+/// `Add-Type` throws "the .git reader cannot declare its native calls: " plus
+/// the bounded cause (`IgnLine`, `IgnCause`: one line of printable ASCII, at
+/// most 200 characters, every drive-letter or UNC path replaced by `<path>`),
+/// so no script falls back to a path-based read. No script carries it yet.
+///
+/// This is the only text in which `Add-Type` is allowed in a GIT_* body
+/// (`winps_git_params_only`).
+pub const GIT_NATIVE_LOAD: &str = concat!(
+    r#"if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw ('the .git reader needs a FullLanguage PowerShell session, not '+$ExecutionContext.SessionState.LanguageMode)};"#,
+    r#"function IgnLine($t){$s=[regex]::Replace([string]$t,'[\x00-\x1f]+',' ');$s=[regex]::Replace($s,'(?:[A-Za-z]:[\\/]|\\\\)[^''"]*','<path>');$s=[regex]::Replace($s,'[^\x20-\x7e]','?').Trim();if($s.Length -gt 200){$s=$s.Substring(0,200)+'...'};$s};"#,
+    r#"function IgnCause($x){try{while($x.InnerException){$x=$x.InnerException};$m=[string]$x.Message;$k=$x.GetType().FullName+' '+('0x{0:X8}' -f $x.HResult);if($m){$k+=': '+$m};IgnLine $k}catch{'the cause could not be read'}};"#,
+    "if(-not ('IgnGit.N' -as [type])){try{Add-Type -TypeDefinition '",
+    git_native_cs!(),
+    r#"'}catch{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}};"#,
+);
+
 // Phase 27 (27-09): the Windows half of the git host channel. Each script is
 // one `const` built from shared pieces so the text a test runs is the text a
 // host receives; every path travels in `$p`.
