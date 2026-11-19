@@ -154,15 +154,47 @@ fn local_url_guard_accepts_loopback() {
     }
 }
 
-/// Run host git in `dir` with no user or system config; trimmed stdout.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+/// The variables that choose which repository a git child acts on. A caller's
+/// environment must never steer a test's git commands at another repository
+/// (T-27-199, the W1 pattern of `git_remote::SCRUBBED_ENV`).
+const REPOSITORY_SELECTION_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_COMMON_DIR",
+];
+
+/// A host-git command in `dir` with no user or system config and no
+/// repository-selection variable. A caller that needs one of them (an index
+/// file) sets it on the returned command, after this clears them.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    git_command_with(dir, args, &[])
+}
+
+/// [`git_command`] with `injected` variables set before the repository
+/// selection is cleared. Only a test passes any: it proves the clearing wins.
+fn git_command_with(dir: &Path, args: &[&str], injected: &[(&str, &str)]) -> Command {
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git runs");
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for (key, value) in injected {
+        command.env(key, value);
+    }
+    for var in REPOSITORY_SELECTION_ENV {
+        command.env_remove(var);
+    }
+    command
+}
+
+/// Run host git in `dir` with no user or system config; trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = git_command(dir, args).output().expect("git runs");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -906,12 +938,8 @@ const CODE_PY: &str = "ignition/script-python/cap/util/code.py";
 /// `git` with an explicit environment and optional stdin; trimmed stdout.
 fn git_with(dir: &Path, env: &[(&str, &str)], args: &[&str], stdin: Option<&[u8]>) -> String {
     use std::io::Write;
-    let mut command = Command::new("git");
+    let mut command = git_command(dir, args);
     command
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(if stdin.is_some() {
             std::process::Stdio::piped()
         } else {
@@ -4544,6 +4572,380 @@ async fn git_pair_detect_live() {
 // private repository); nothing is committed anywhere. Output here is counts
 // only: no path, no name and no byte of the real repository is printed.
 
+/// The D-20 normalization patch of `gateway` against the release tree: every
+/// member is written as a blob from its raw bytes, so no attribute, filter or
+/// line-ending setting of the repository can hide a change (W16, T-27-198).
+fn normalization_patch(
+    release_checkout: &Path,
+    release_tag: &str,
+    gateway: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    normalization_patch_with(release_checkout, release_tag, gateway, &|_| {})
+}
+
+/// [`normalization_patch`] with `tamper` run on the patch before it is
+/// verified. Only a test passes one: it proves a bad patch is refused.
+///
+/// The patch is built tree to tree, with no work tree and no conversion:
+/// 1. a temporary index is read from the release tree;
+/// 2. each gateway member is written as a blob (`hash-object -w --no-filters`)
+///    and entered in that index with the mode the release tree gives it;
+/// 3. `write-tree`, then `diff --binary <release tree> <gateway tree>`;
+/// 4. the patch is applied (`apply --cached`) onto a second temporary index
+///    from the release tree, and every member's blob is compared byte for byte
+///    with the gateway bytes. The result tree must be the gateway tree.
+///
+/// Errors name the member that differs; a caller printing counts only must not
+/// print them.
+fn normalization_patch_with(
+    release_checkout: &Path,
+    release_tag: &str,
+    gateway: &BTreeMap<String, Vec<u8>>,
+    tamper: &dyn Fn(&mut Vec<u8>),
+) -> Result<Vec<u8>, String> {
+    if release_tag.is_empty() || release_tag.starts_with('-') {
+        return Err("the release tag is not a revision name".to_string());
+    }
+    let scratch = tempfile::tempdir().map_err(|e| e.kind().to_string())?;
+    let build_index = scratch.path().join("index-gateway");
+    let check_index = scratch.path().join("index-check");
+    let utf8 = |p: &Path| p.to_str().map(str::to_string).ok_or("a non-UTF-8 path");
+
+    let release_tree = String::from_utf8_lossy(&norm_git(
+        release_checkout,
+        None,
+        &["rev-parse", "--verify", &format!("{release_tag}^{{tree}}")],
+        None,
+    )?)
+    .trim()
+    .to_string();
+
+    // The modes the release tree gives its files: a member keeps its own.
+    let listing = norm_git(
+        release_checkout,
+        None,
+        &["ls-tree", "-r", "-z", &release_tree],
+        None,
+    )?;
+    let mut modes: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("an ls-tree entry has no tab")?;
+        let mode =
+            String::from_utf8_lossy(&entry[..entry.iter().position(|b| *b == b' ').unwrap_or(0)])
+                .to_string();
+        modes.insert(entry[tab + 1..].to_vec(), mode);
+    }
+
+    // The gateway tree, from raw bytes.
+    let build = utf8(&build_index)?;
+    norm_git(
+        release_checkout,
+        Some(&build),
+        &["read-tree", &release_tree],
+        None,
+    )?;
+    let mut index_info: Vec<u8> = Vec::new();
+    for (path, bytes) in gateway {
+        let mode = modes
+            .get(path.as_bytes())
+            .filter(|mode| matches!(mode.as_str(), "100644" | "100755"))
+            .ok_or_else(|| format!("{path}: not a regular file of the release tree"))?;
+        let blob = String::from_utf8_lossy(&norm_git(
+            release_checkout,
+            Some(&build),
+            &["hash-object", "-w", "--no-filters", "--stdin"],
+            Some(bytes),
+        )?)
+        .trim()
+        .to_string();
+        index_info.extend_from_slice(format!("{mode} {blob}\t{path}").as_bytes());
+        index_info.push(0);
+    }
+    norm_git(
+        release_checkout,
+        Some(&build),
+        &["update-index", "-z", "--index-info"],
+        Some(&index_info),
+    )?;
+    let gateway_tree = String::from_utf8_lossy(&norm_git(
+        release_checkout,
+        Some(&build),
+        &["write-tree"],
+        None,
+    )?)
+    .trim()
+    .to_string();
+
+    // The patch, tree to tree.
+    let mut patch = norm_git(
+        release_checkout,
+        None,
+        &[
+            "diff",
+            "--binary",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            &release_tree,
+            &gateway_tree,
+        ],
+        None,
+    )?;
+    if patch.is_empty() {
+        // The gateway bytes are the release bytes: nothing to carry.
+        return if gateway_tree == release_tree {
+            Ok(patch)
+        } else {
+            Err("the trees differ but the diff is empty".to_string())
+        };
+    }
+    tamper(&mut patch);
+
+    // The check: apply onto a second index, compare every member's blob.
+    let check = utf8(&check_index)?;
+    norm_git(
+        release_checkout,
+        Some(&check),
+        &["read-tree", &release_tree],
+        None,
+    )?;
+    norm_git(
+        release_checkout,
+        Some(&check),
+        &["apply", "--cached", "--whitespace=nowarn", "-"],
+        Some(&patch),
+    )
+    .map_err(|e| format!("the patch does not apply to the release tree: {e}"))?;
+    let result_tree = String::from_utf8_lossy(&norm_git(
+        release_checkout,
+        Some(&check),
+        &["write-tree"],
+        None,
+    )?)
+    .trim()
+    .to_string();
+    for (path, bytes) in gateway {
+        let blob = norm_git(
+            release_checkout,
+            None,
+            &["cat-file", "blob", &format!("{result_tree}:{path}")],
+            None,
+        )?;
+        if &blob != bytes {
+            return Err(format!(
+                "{path}: the patch does not reproduce the gateway bytes"
+            ));
+        }
+    }
+    if result_tree != gateway_tree {
+        return Err("the patch changes something other than the listed members".to_string());
+    }
+    Ok(patch)
+}
+
+/// Run host git in `dir` for the normalization patch: no conversion setting,
+/// no user or system config, no repository-selection variable (only the index
+/// file this function chose); the stdout bytes, or a redacted error.
+fn norm_git(
+    dir: &Path,
+    index: Option<&str>,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut full = vec!["-c", "core.autocrlf=false", "-c", "core.safecrlf=false"];
+    full.extend_from_slice(args);
+    let mut command = git_command(dir, &full);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.kind().to_string())?;
+    let mut handle = child.stdin.take().ok_or("no stdin")?;
+    if let Some(bytes) = stdin {
+        // A child that exits early closes the pipe; its status says why.
+        let _ = handle.write_all(bytes);
+    }
+    drop(handle);
+    let out = child.wait_with_output().map_err(|e| e.kind().to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            ignition_core::deploy::git_state::redact_text(&String::from_utf8_lossy(&out.stderr))
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// A scratch repository with `files` committed under the tag `rel`.
+#[cfg(test)]
+fn norm_fixture(attributes: Option<&str>, files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("release");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q"]);
+    if let Some(text) = attributes {
+        std::fs::write(repo.join(".gitattributes"), text).expect("attributes");
+    }
+    for (path, bytes) in files {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("dirs");
+        std::fs::write(file, bytes).expect("file");
+    }
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "release",
+        ],
+    );
+    git(&repo, &["tag", "rel"]);
+    (dir, repo)
+}
+
+/// Apply `patch` onto a fresh index read from the tag `rel` and return the
+/// blob it leaves at `path`. The check the function runs, made again here.
+#[cfg(test)]
+fn applied_blob(repo: &Path, patch: &[u8], path: &str) -> Vec<u8> {
+    use std::io::Write;
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let index = scratch.path().join("index");
+    let index = index.to_str().expect("utf8");
+    let run = |args: &[&str], stdin: Option<&[u8]>| -> Vec<u8> {
+        let mut command = git_command(repo, args);
+        command
+            .env("GIT_INDEX_FILE", index)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("git spawns");
+        let mut handle = child.stdin.take().expect("stdin");
+        if let Some(bytes) = stdin {
+            handle.write_all(bytes).expect("stdin write");
+        }
+        drop(handle);
+        let out = child.wait_with_output().expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+        out.stdout
+    };
+    run(&["read-tree", "rel^{tree}"], None);
+    run(
+        &["apply", "--cached", "--whitespace=nowarn", "-"],
+        Some(patch),
+    );
+    let tree = String::from_utf8(run(&["write-tree"], None)).expect("utf8");
+    let spec = format!("{}:{path}", tree.trim());
+    run(&["cat-file", "blob", &spec], None)
+}
+
+#[test]
+fn normalization_patch_carries_a_crlf_only_change() {
+    let (_dir, repo) = norm_fixture(
+        Some("* text eol=crlf\n"),
+        &[("a/resource.json", b"{\"a\":1}\n")],
+    );
+    let gateway = BTreeMap::from([("a/resource.json".to_string(), b"{\"a\":1}\r\n".to_vec())]);
+    let patch = normalization_patch(&repo, "rel", &gateway).expect("the patch is built");
+    assert!(!patch.is_empty(), "a CRLF-only change must not vanish");
+    assert_eq!(
+        applied_blob(&repo, &patch, "a/resource.json"),
+        b"{\"a\":1}\r\n".to_vec(),
+        "the patch must carry the gateway bytes exactly"
+    );
+}
+
+#[test]
+fn normalization_patch_refuses_when_the_check_differs() {
+    let (_dir, repo) = norm_fixture(None, &[("a/resource.json", b"{\"a\":1}\n")]);
+    let gateway = BTreeMap::from([("a/resource.json".to_string(), b"{\"a\":2}\n".to_vec())]);
+    let corrupt = |patch: &mut Vec<u8>| {
+        let at = patch
+            .windows(8)
+            .position(|w| w == b"+{\"a\":2}")
+            .expect("the added line");
+        patch[at + 6] = b'3';
+    };
+    let err = normalization_patch_with(&repo, "rel", &gateway, &corrupt)
+        .expect_err("a patch that does not reproduce the gateway bytes is refused");
+    assert!(err.contains("a/resource.json"), "{err}");
+    assert_eq!(
+        git(&repo, &["status", "--porcelain"]),
+        "",
+        "a refused patch leaves the repository clean"
+    );
+}
+
+#[test]
+fn normalization_patch_is_empty_when_the_gateway_kept_the_release_bytes() {
+    let (_dir, repo) = norm_fixture(None, &[("a/resource.json", b"{\"a\":1}\n")]);
+    let gateway = BTreeMap::from([("a/resource.json".to_string(), b"{\"a\":1}\n".to_vec())]);
+    let patch =
+        normalization_patch(&repo, "rel", &gateway).expect("nothing to carry is not an error");
+    assert!(patch.is_empty());
+}
+
+#[test]
+fn normalization_patch_refuses_a_member_the_release_does_not_hold() {
+    let (_dir, repo) = norm_fixture(None, &[("a/resource.json", b"{\"a\":1}\n")]);
+    let gateway = BTreeMap::from([("a/other.json".to_string(), b"{}\n".to_vec())]);
+    let err =
+        normalization_patch(&repo, "rel", &gateway).expect_err("an unknown member is refused");
+    assert!(err.contains("a/other.json"), "{err}");
+}
+
+#[test]
+fn normalization_patch_carries_binary_bytes_and_keeps_the_mode() {
+    let bytes: Vec<u8> = (0u8..=255).collect();
+    let (_dir, repo) = norm_fixture(
+        Some("*.bin -text\n"),
+        &[("run.bin", &[1, 2, 3, 0, 4]), ("a/resource.json", b"{}\n")],
+    );
+    let gateway = BTreeMap::from([("run.bin".to_string(), bytes.clone())]);
+    let patch = normalization_patch(&repo, "rel", &gateway).expect("the patch is built");
+    assert_eq!(applied_blob(&repo, &patch, "run.bin"), bytes);
+}
+
+#[test]
+fn live_git_helper_clears_repository_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let here = dir.path().join("here");
+    let other = dir.path().join("other");
+    for repo in [&here, &other] {
+        std::fs::create_dir_all(repo).expect("dir");
+        git(repo, &["init", "-q"]);
+    }
+    let foreign_git_dir = other.join(".git");
+    let injected = [
+        ("GIT_DIR", foreign_git_dir.to_str().expect("utf8")),
+        ("GIT_COMMON_DIR", foreign_git_dir.to_str().expect("utf8")),
+    ];
+    let out = git_command_with(&here, &["rev-parse", "--absolute-git-dir"], &injected)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success());
+    let answered = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert_eq!(
+        answered.canonicalize().expect("resolves"),
+        here.join(".git").canonicalize().expect("resolves"),
+        "the helper must act on its own directory, not the injected repository"
+    );
+}
+
 const NORM_PROJECT: &str = "G2Norm";
 
 #[tokio::test]
@@ -4626,30 +5028,16 @@ async fn git_g2norm() {
         .filter(|path| !released.contains_key(*path))
         .count();
 
-    // The files and the patch: the release tree with the gateway-form bytes.
-    for (path, bytes) in &drift {
-        let file = work.join(path);
-        assert!(
-            file.is_file(),
-            "a drift member is a file of the release tree"
-        );
-        std::fs::write(&file, bytes).expect("gateway-form bytes");
-    }
-    let patch = Command::new("git")
-        .args([
-            "-c",
-            "core.autocrlf=false",
-            "-c",
-            "core.safecrlf=false",
-            "diff",
-            "--binary",
-        ])
-        .current_dir(&work)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git diff runs");
-    assert!(patch.status.success(), "git diff failed");
+    // The files and the patch: the release tree with the gateway-form bytes,
+    // built from raw bytes tree to tree (W16): no work-tree write, so no
+    // attribute or line-ending setting can hide a change. The error text names
+    // a member, so none of it is printed here (counts only).
+    let gateway: BTreeMap<String, Vec<u8>> = drift
+        .iter()
+        .map(|(path, bytes)| ((*path).clone(), (*bytes).clone()))
+        .collect();
+    let patch = normalization_patch(&work, &tag, &gateway)
+        .unwrap_or_else(|_| panic!("the normalization patch failed its raw-byte verification"));
     let mut names: Vec<&str> = drift.iter().map(|(path, _)| path.as_str()).collect();
     names.sort_unstable();
     let mut listing = names.join("\n");
@@ -4657,13 +5045,13 @@ async fn git_g2norm() {
         listing.push('\n');
     }
     std::fs::write(out.join("drift-files.txt"), listing).expect("the file list");
-    std::fs::write(out.join("normalize.patch"), &patch.stdout).expect("the patch");
+    std::fs::write(out.join("normalize.patch"), &patch).expect("the patch");
     println!(
         "LIVE-G2NORM tracked={tracked} artifact_members={} export_members={} drift={} dropped={dropped} extra={extra} patch_bytes={}",
         released.len(),
         exported.len(),
         drift.len(),
-        patch.stdout.len()
+        patch.len()
     );
     println!("LIVE-RAN git_g2norm");
 }
