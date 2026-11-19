@@ -891,7 +891,8 @@ impl SftpTransport {
         let projects = windows_native_path(&self.abs(&["projects".to_string()]));
         let project_dir = format!("{projects}\\{project}");
         let git = format!("{project_dir}\\{entry}");
-        let script = WinScript::git_entry(&projects, &project_dir, &git);
+        let script = WinScript::git_entry(&projects, &project_dir, &git, &self.win_home().await?);
+        self.git_native_staged().await?;
         let answer = self.shell.exec_powershell(&script).await?;
         windows_git_entry_of(&answer, project, entry).map_err(|why| self.fail(why))
     }
@@ -1688,6 +1689,100 @@ impl SftpTransport {
         Ok(windows_native_path(&self.account_home().await?))
     }
 
+    /// The manifest of the native directory `dir` of a Windows node, read
+    /// through the reviewed C# block ([`winps::GIT_MANIFEST`], 27-50).
+    async fn win_manifest(
+        &self,
+        op: &str,
+        dir: &str,
+        home: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let script = WinScript::git_manifest(LONG_PATH_PREFIX, dir, home);
+        let answer = self.git_win(op, script, GIT_HEAVY_LIMIT).await?;
+        self.git_manifest_of(op, &answer)
+    }
+
+    /// The save of a Windows node (27-50): the manifest of the source through
+    /// the reviewed block (a link or a name with a control character in the tree
+    /// is refused before one byte is copied), the copy ([`winps::GIT_SAVE`]), the
+    /// manifest of the copy, and their comparison. A copy that cannot be read
+    /// back, or that differs, is removed again ([`winps::GIT_SAVE_RM`]) before the
+    /// error is returned. The answer is the manifest of the copy.
+    async fn save_git_windows(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        const OP: &str = "save_git";
+        let home = self.win_home().await?;
+        let before = self.win_manifest(OP, &self.win_git(project), &home).await?;
+        let script = WinScript::git_save(
+            LONG_PATH_PREFIX,
+            &self.win_data(),
+            project,
+            &home,
+            gateway,
+            run_id,
+        );
+        self.git_win(OP, script, GIT_HEAVY_LIMIT).await?;
+        let rel = git_save_rel(gateway, project, run_id);
+        let repo = format!("{home}\\{}", rel.replace('/', "\\"));
+        let after = match self.win_manifest(OP, &repo, &home).await {
+            Ok(after) if after == before => return Ok(after),
+            Ok(_) => self.mirror_fail(
+                OP,
+                "the saved copy does not match the .git it was taken from",
+            ),
+            Err(why) => why,
+        };
+        // best effort: the failure above is the error, a copy that stays is
+        // named by the cleanup of the run (`remove_git_save`)
+        let rm = WinScript::git_save_rm(LONG_PATH_PREFIX, &home, &rel, run_id);
+        let _ = self.git_win("remove_git_save", rm, GIT_HEAVY_LIMIT).await;
+        Err(after)
+    }
+
+    /// The restore of a Windows node (27-50): the stage beside `.git`
+    /// ([`winps::GIT_RESTORE`]), the manifests of the save and of the stage
+    /// through the reviewed block, and only when they are equal the rename
+    /// ([`winps::GIT_RESTORE_MOVE`]). A stage that cannot be compared, or that
+    /// differs, is removed again before the error is returned. The answer is the
+    /// manifest of the restored `.git`.
+    async fn restore_git_windows(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        const OP: &str = "restore_git";
+        let (data, home) = (self.win_data(), self.win_home().await?);
+        let script =
+            WinScript::git_restore(LONG_PATH_PREFIX, &data, project, &home, gateway, run_id);
+        self.git_win(OP, script, GIT_HEAVY_LIMIT).await?;
+        let repo = format!(
+            "{home}\\{}",
+            git_save_rel(gateway, project, run_id).replace('/', "\\")
+        );
+        let stage = format!("{data}\\projects\\{project}\\.ign-restore-{run_id}");
+        let compared = async {
+            let saved = self.win_manifest(OP, &repo, &home).await?;
+            let staged = self.win_manifest(OP, &stage, &home).await?;
+            if saved == staged {
+                Ok(())
+            } else {
+                Err(self.mirror_fail(OP, "the stage does not match the save it was copied from"))
+            }
+        }
+        .await;
+        let drop = compared.is_err();
+        let mv = WinScript::git_restore_move(LONG_PATH_PREFIX, &data, project, run_id, drop);
+        let moved = self.git_win(OP, mv, GIT_HEAVY_LIMIT).await;
+        compared?;
+        moved?;
+        self.win_manifest(OP, &self.win_git(project), &home).await
+    }
+
     /// The names gateway, project and run id as safe components on this host's
     /// family, before any path is built (T-27-22).
     fn git_names_problem(&self, gateway: &str, project: &str, run_id: &str) -> Option<String> {
@@ -1897,7 +1992,7 @@ impl SftpTransport {
         let cap = YAML_MAX_BYTES;
         let limit = self.shell.op_timeout();
         let answer = if self.windows {
-            let script = WinScript::git_yaml(&self.win_data(), cap as u64);
+            let script = WinScript::git_yaml(&self.win_data(), cap as u64, &self.win_home().await?);
             self.git_win(OP, script, limit).await?
         } else {
             let cap_text = cap.to_string();
@@ -2010,6 +2105,7 @@ impl GitHostRead for SftpTransport {
                 &self.win_data(),
                 project,
                 PROJECT_DIGESTS_MAX_ENTRIES as u64,
+                &self.win_home().await?,
             );
             let answer = self
                 .git_win(PROJECT_DISK_OP, script, GIT_HEAVY_LIMIT)
@@ -2089,11 +2185,10 @@ impl GitHostRead for SftpTransport {
             return Err(self.fail(why));
         }
         if self.windows {
-            let script = WinScript::git_manifest(LONG_PATH_PREFIX, &self.win_git(project));
-            let answer = self
-                .git_win("git_manifest", script, GIT_HEAVY_LIMIT)
-                .await?;
-            return self.git_manifest_of("git_manifest", &answer);
+            let home = self.win_home().await?;
+            return self
+                .win_manifest("git_manifest", &self.win_git(project), &home)
+                .await;
         }
         let rel = Self::git_rel(project);
         let answer = self
@@ -2117,11 +2212,9 @@ impl GitHostRead for SftpTransport {
         if self.windows {
             let home = self.win_home().await?;
             let repo = git_save_rel(gateway, project, run_id).replace('/', "\\");
-            let script = WinScript::git_manifest(LONG_PATH_PREFIX, &format!("{home}\\{repo}"));
-            let answer = self
-                .git_win("save_manifest", script, GIT_HEAVY_LIMIT)
-                .await?;
-            return self.git_manifest_of("save_manifest", &answer);
+            return self
+                .win_manifest("save_manifest", &format!("{home}\\{repo}"), &home)
+                .await;
         }
         let home = self.account_home().await?;
         let rel = git_save_rel(gateway, project, run_id);
@@ -2147,7 +2240,8 @@ impl GitHostRead for SftpTransport {
         name.check_shape()
             .map_err(|why| self.fail(format!("a .git file name is refused: {why}")))?;
         if self.windows {
-            let script = WinScript::git_digest(&self.win_git(project), &name.rel());
+            let script =
+                WinScript::git_digest(&self.win_git(project), &name.rel(), &self.win_home().await?);
             let answer = self
                 .git_win("git_file_digest", script, self.shell.op_timeout())
                 .await?;
@@ -2217,7 +2311,11 @@ impl GitHostRead for SftpTransport {
             return Err(self.fail(why));
         }
         let answer = if self.windows {
-            let script = WinScript::git_size(LONG_PATH_PREFIX, &self.win_git(project));
+            let script = WinScript::git_size(
+                LONG_PATH_PREFIX,
+                &self.win_git(project),
+                &self.win_home().await?,
+            );
             self.git_win("git_size", script, self.shell.op_timeout())
                 .await?
         } else {
@@ -2540,16 +2638,7 @@ impl GitStateWriter for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
         if self.windows {
-            let script = WinScript::git_save(
-                LONG_PATH_PREFIX,
-                &self.win_data(),
-                project,
-                &self.win_home().await?,
-                gateway,
-                run_id,
-            );
-            let answer = self.git_win("save_git", script, GIT_HEAVY_LIMIT).await?;
-            return self.git_manifest_of("save_git", &answer);
+            return self.save_git_windows(gateway, project, run_id).await;
         }
         let home = self.account_home().await?;
         let (rel, dir) = (
@@ -2575,16 +2664,7 @@ impl GitStateWriter for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
         if self.windows {
-            let script = WinScript::git_restore(
-                LONG_PATH_PREFIX,
-                &self.win_data(),
-                project,
-                &self.win_home().await?,
-                gateway,
-                run_id,
-            );
-            let answer = self.git_win("restore_git", script, GIT_HEAVY_LIMIT).await?;
-            return self.git_manifest_of("restore_git", &answer);
+            return self.restore_git_windows(gateway, project, run_id).await;
         }
         let home = self.account_home().await?;
         let (project_rel, dir) = (
@@ -3438,6 +3518,15 @@ mod tests {
         ok(&format!("IGN-RESULT:{{\"ok\":1,\"present\":{present}}}\n"))
     }
 
+    /// `outs` with the staging check's answer in front: the first script of a
+    /// transport that loads the reviewed block (the probe of a project's `.git`
+    /// is one, since 27-50) is preceded by the check that the staged source is
+    /// there (27-49); here it is, with the pinned hash.
+    fn staged(mut outs: Vec<ProcessOutput>) -> Vec<ProcessOutput> {
+        outs.insert(0, stage_answer(1));
+        outs
+    }
+
     /// The three answers of a Windows state read (27-49), made from the one
     /// merged answer the old single script gave: `ok` and the fields of each
     /// script (`winps::merge_git_state` puts them back together).
@@ -3493,19 +3582,20 @@ mod tests {
             ("none", 0, 0, GitEntry::Absent),
         ];
         for (kind, hidden, reparse, want) in cases {
-            let (runner, t) = host(
-                vec![ok(&win_answer("dir", "dir", kind, hidden, reparse))],
-                true,
-            );
+            let (runner, t) = win_host(staged(vec![ok(&win_answer(
+                "dir", "dir", kind, hidden, reparse,
+            ))]));
             assert_eq!(
                 t.git_entry("CapApp").await.expect(kind),
                 want,
                 "{kind} hidden={hidden} reparse={reparse}"
             );
-            assert_eq!(runner.argv.lock().expect("argv").len(), 1, "one call");
+            // the check of the staged source of the block, then the probe: one
+            // script of its own
+            assert_eq!(runner.argv.lock().expect("argv").len(), 2, "two calls");
         }
         // a missing project directory is absent (the create case)
-        let (_, t) = host(vec![ok(&win_answer("dir", "none", "skip", 0, 0))], true);
+        let (_, t) = win_host(staged(vec![ok(&win_answer("dir", "none", "skip", 0, 0))]));
         assert_eq!(
             t.git_entry("CapApp").await.expect("absent"),
             GitEntry::Absent
@@ -3555,7 +3645,7 @@ mod tests {
             ok("IGN-RESULT:{\"ok\":1,\"projects\":\"dir\",\"project\":\"dir\",\"kind\":\"dir\"}\n"),
         ];
         for out in failures {
-            let (_, t) = host(vec![out], true);
+            let (_, t) = win_host(staged(vec![out]));
             let err = t.git_entry("CapApp").await.expect_err("failure");
             assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
         }
@@ -3567,7 +3657,9 @@ mod tests {
             ("dir", "symlink", "junction or symlink"),
             ("dir", "file", "not a directory"),
         ] {
-            let (_, t) = host(vec![ok(&win_answer(projects, project, "skip", 0, 0))], true);
+            let (_, t) = win_host(staged(vec![ok(&win_answer(
+                projects, project, "skip", 0, 0,
+            ))]));
             let why = detail(t.git_entry("CapApp").await.expect_err(needle));
             assert!(why.contains(needle), "{projects}/{project}: {why}");
         }
@@ -3580,7 +3672,15 @@ mod tests {
         // the body is a constant: no host or repo value is in it, and it never
         // uses the probes C-H ruled out
         assert!(!GIT_ENTRY.chars().any(|c| c == '\n'), "one line");
-        assert!(GIT_ENTRY.contains("Get-Item -LiteralPath $x -Force"));
+        // 27-50: it runs on the reviewed block (the loader first), every level
+        // is held with OpenDir, and the entry is classified from the listing of
+        // the held project directory
+        assert!(GIT_ENTRY.starts_with(winps::GIT_NATIVE_LOAD));
+        assert_eq!(GIT_ENTRY.matches("[IgnGit.N]::OpenDir(").count(), 1);
+        assert!(GIT_ENTRY.contains("GetFileSystemInfos("));
+        let own = GIT_ENTRY
+            .strip_prefix(winps::GIT_NATIVE_LOAD)
+            .unwrap_or_default();
         for forbidden in [
             "Test-Path",
             "Exists(",
@@ -3588,12 +3688,14 @@ mod tests {
             "Remove-",
             "Set-",
             "New-",
+            "Get-Item",
         ] {
-            assert!(!GIT_ENTRY.contains(forbidden), "{forbidden} in GIT_ENTRY");
+            assert!(!own.contains(forbidden), "{forbidden} in GIT_ENTRY");
         }
-        // an error other than ObjectNotFound is rethrown, never read as none
-        assert!(GIT_ENTRY.contains("'ObjectNotFound'){return"));
-        assert!(GIT_ENTRY.contains(";throw}"));
+        // only a failed open with Win32 error 2 or 3 is `none`; any other
+        // failure is rethrown, never read as none (the C-H finding)
+        assert!(own.contains("'error [23]\\)'"));
+        assert!(own.contains("else{throw ($n+': '+$w)}"));
 
         // a hostile project name never reaches the script text: it is refused
         // by the component gate before anything is built, and a legal but odd
@@ -3603,6 +3705,7 @@ mod tests {
             "C:\\gw\\data\\projects",
             &format!("C:\\gw\\data\\projects\\{odd}"),
             &format!("C:\\gw\\data\\projects\\{odd}\\.git"),
+            "C:\\Users\\svc",
         );
         assert_eq!(script.body, GIT_ENTRY);
         let command = encoded_command(&script, COMMAND_BUDGET).expect("fits the budget");
@@ -3617,14 +3720,15 @@ mod tests {
             "C:\\Program Files\\Inductive Automation\\Ignition\\data\\projects",
             &long,
             &format!("{long}\\.git"),
+            "C:\\Users\\svc-ignition-deploy",
         );
         assert!(encoded_command(&script, COMMAND_BUDGET).is_ok());
 
         // through the transport: the paths are native, the sftp spelling is gone
-        let (runner, t) = host(vec![ok(&win_answer("dir", "none", "skip", 0, 0))], true);
+        let (runner, t) = win_host(staged(vec![ok(&win_answer("dir", "none", "skip", 0, 0))]));
         t.git_entry("CapApp").await.expect("absent");
         let argv = runner.argv.lock().expect("argv");
-        let text = argv[0].join(" ");
+        let text = argv[1].join(" ");
         assert!(text.contains("-EncodedCommand"), "{text}");
         assert!(
             !text.contains("CapApp"),
@@ -3881,26 +3985,43 @@ mod tests {
     async fn sftp_git_windows_arms_run_one_script_each() {
         let name = GitWriteName::Head;
         // (what ran, its answer, the parameters it must carry)
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        // (27-50: a script that loads the reviewed block is preceded, once per
+        // transport, by the check that its staged source is there, and carries
+        // the account home for the loader)
+        let (runner, t) = win_host(staged(vec![ok(WIN_MANIFEST)]));
         let m = t.git_manifest("CapApp").await.expect("manifest");
         assert_eq!((m.files, m.bytes), (3, 42));
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
         assert_eq!(p["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
         assert_eq!(p["x"], "\\\\?\\");
+        assert_eq!(p["h"], "C:\\Users\\svc");
 
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        let (runner, t) = win_host(staged(vec![ok(WIN_MANIFEST)]));
         t.save_manifest("gw", "CapApp", "r1")
             .await
             .expect("save manifest");
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
         assert_eq!(
             p["a"],
             "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\git-save\\r1\\repo"
         );
 
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        // the save: the manifest of the source, the copy, the manifest of the
+        // copy (27-50)
+        let (runner, t) = win_host(staged(vec![
+            ok(WIN_MANIFEST),
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            ok(WIN_MANIFEST),
+        ]));
         t.save_git("gw", "CapApp", "r1").await.expect("save");
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 4);
+        let sent = script_params(&runner.argv.lock().expect("argv"));
+        assert_eq!(sent[1]["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
+        assert_eq!(
+            sent[3]["a"],
+            "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\git-save\\r1\\repo"
+        );
+        let p = sent[2].clone();
         for (key, want) in [
             ("d", "C:\\gw\\data"),
             ("j", "CapApp"),
@@ -3911,24 +4032,39 @@ mod tests {
             assert_eq!(p[key], want, "{key}");
         }
 
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        // the restore: the stage, the check of the staged source, the manifests
+        // of the save and of the stage, the rename, the manifest of the result
+        let (runner, t) = win_host(vec![
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            stage_answer(1),
+            ok(WIN_MANIFEST),
+            ok(WIN_MANIFEST),
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            ok(WIN_MANIFEST),
+        ]);
         t.restore_git("gw", "CapApp", "r1").await.expect("restore");
-        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 6);
+        let sent = script_params(&runner.argv.lock().expect("argv"));
+        assert_eq!(sent[4]["j"], "CapApp");
+        assert_eq!(sent[4]["i"], "r1");
+        assert!(sent[4].get("k").is_none(), "the rename, not the removal");
 
-        let (runner, t) = win_host(vec![ok(
+        let (runner, t) = win_host(staged(vec![ok(
             "IGN-RESULT:{\"ok\":1,\"digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}\n",
-        )]);
+        )]));
         let digest = t.git_file_digest("CapApp", &name).await.expect("digest");
         assert_eq!(digest.as_deref().map(str::len), Some(64));
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
         assert_eq!(p["f"], "HEAD");
-        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"digest\":null}\n")]);
+        let (_, t) = win_host(staged(vec![ok("IGN-RESULT:{\"ok\":1,\"digest\":null}\n")]));
         assert_eq!(
             t.git_file_digest("CapApp", &name).await.expect("none"),
             None
         );
 
-        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"files\":7,\"bytes\":9}\n")]);
+        let (_, t) = win_host(staged(vec![ok(
+            "IGN-RESULT:{\"ok\":1,\"files\":7,\"bytes\":9}\n",
+        )]));
         let size = t.git_size("CapApp").await.expect("size");
         assert_eq!((size.files, size.bytes), (7, 9));
 
@@ -3952,11 +4088,12 @@ mod tests {
         assert_eq!(p["j"], "CapApp");
         assert_eq!(p["n"], ".ign-probe-r1");
 
-        // state (27-49): the probe, the check of the staged source of the
-        // reviewed block (it is there), then three scripts, the marker names
-        // as data and the account home in every script that loads the block
+        // state (27-49, 27-50): the check of the staged source of the reviewed
+        // block (it is there; the probe loads the block too), the probe, then
+        // three scripts, the marker names as data and the account home in every
+        // script that loads the block
         let state = "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":3,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[\"shallow\"],\"refs\":[]}\n";
-        let mut outs = vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), stage_answer(1)];
+        let mut outs = vec![stage_answer(1), ok(&win_answer("dir", "dir", "dir", 1, 0))];
         outs.extend(state_answers(state));
         let (runner, t) = win_host(outs);
         let files = t.read_git_state("CapApp").await.expect("state");
@@ -3965,9 +4102,10 @@ mod tests {
         assert_eq!(runner.argv.lock().expect("argv").len(), 5);
         let sent = script_params(&runner.argv.lock().expect("argv"));
         assert_eq!(sent.len(), 5);
-        assert_eq!(sent[1]["n"], GIT_NATIVE_STAGED_FILE);
-        assert_eq!(sent[1]["s"], winps::GIT_NATIVE_SHA256);
-        assert_eq!(sent[1]["h"], "C:\\Users\\svc");
+        assert_eq!(sent[0]["n"], GIT_NATIVE_STAGED_FILE);
+        assert_eq!(sent[0]["s"], winps::GIT_NATIVE_SHA256);
+        assert_eq!(sent[0]["h"], "C:\\Users\\svc");
+        assert_eq!(sent[1]["h"], "C:\\Users\\svc", "the probe carries the home");
         for script in &sent[2..] {
             assert_eq!(script["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
             assert_eq!(script["h"], "C:\\Users\\svc");
@@ -3979,10 +4117,10 @@ mod tests {
         );
         assert!(sent[2].get("m").is_none() && sent[4].get("m").is_none());
         // a `.git` that is not a directory is answered by kind, never read
-        let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "file", 0, 0))]);
+        let (runner, t) = win_host(staged(vec![ok(&win_answer("dir", "dir", "file", 0, 0))]));
         let files = t.read_git_state("CapApp").await.expect("file");
         assert_eq!(files, GitFiles::without_contents(GitEntry::File));
-        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 2);
     }
 
     /// Every Windows arm refuses an answer that does not say `ok: 1` with the
@@ -4007,24 +4145,34 @@ mod tests {
             "no result\n",
         ];
         for answer in bad_answers {
-            let (_, t) = win_host(vec![ok(answer)]);
+            let (_, t) = win_host(staged(vec![ok(answer)]));
             assert!(t.git_manifest("CapApp").await.is_err(), "manifest {answer}");
             if !answer.contains("\"files\":3") {
                 // (an answer with a count and a size is a good size answer)
-                let (_, t) = win_host(vec![ok(answer)]);
+                let (_, t) = win_host(staged(vec![ok(answer)]));
                 assert!(t.git_size("CapApp").await.is_err(), "size {answer}");
             }
-            let (_, t) = win_host(vec![ok(answer)]);
+            let (_, t) = win_host(staged(vec![ok(answer)]));
             assert!(
                 t.save_git("gw", "CapApp", "r1").await.is_err(),
                 "save {answer}"
             );
-            let (_, t) = win_host(vec![ok(answer)]);
+            // the restore: the stage answers `answer`; when that is `ok: 1` the
+            // manifest of the save does too (and is unusable), and the stage is
+            // removed (27-50), so there are answers left for those calls
+            let (_, t) = win_host(vec![
+                ok(answer),
+                stage_answer(1),
+                ok(answer),
+                ok(answer),
+                ok("IGN-RESULT:{\"ok\":1}\n"),
+                ok("IGN-RESULT:{\"ok\":1}\n"),
+            ]);
             assert!(
                 t.restore_git("gw", "CapApp", "r1").await.is_err(),
                 "restore {answer}"
             );
-            let (_, t) = win_host(vec![ok(answer)]);
+            let (_, t) = win_host(staged(vec![ok(answer)]));
             assert!(
                 t.git_file_digest("CapApp", &name).await.is_err(),
                 "digest {answer}"
@@ -4053,7 +4201,7 @@ mod tests {
             "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":9,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[],\"refs\":[]}\n",
         ];
         for answer in bad_state {
-            let mut outs = vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), stage_answer(1)];
+            let mut outs = vec![stage_answer(1), ok(&win_answer("dir", "dir", "dir", 1, 0))];
             outs.extend(state_answers(answer));
             let (_, t) = win_host(outs);
             assert!(t.read_git_state("CapApp").await.is_err(), "state {answer}");
@@ -4065,7 +4213,7 @@ mod tests {
             ok("IGN-RESULT:{\"ok\":1}\n"),
             ok("IGN-RESULT:{\"ok\":1,\"present\":2}\n"),
         ] {
-            let (_, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), stage]);
+            let (_, t) = win_host(vec![stage, ok(&win_answer("dir", "dir", "dir", 1, 0))]);
             assert!(t.read_git_state("CapApp").await.is_err(), "stage answer");
         }
         // a script that died is transport_failed
@@ -4089,9 +4237,9 @@ mod tests {
     async fn sftp_git_native_stage_runs_once_per_run_and_uploads_only_when_missing() {
         let probe = || ok(&win_answer("dir", "dir", "dir", 1, 0));
         let state = "IGN-RESULT:{\"ok\":1,\"head\":null,\"config\":null,\"packed\":null,\"log\":null,\"index\":false,\"markers\":[],\"refs\":[]}\n";
-        // an empty host: probe, check (absent), the upload, three scripts; then
-        // the second read of the run: probe and three scripts, nothing else
-        let mut outs = vec![probe(), stage_answer(0), ok("")];
+        // an empty host: check (absent), the upload, the probe, three scripts;
+        // then the second read of the run: probe and three scripts, nothing else
+        let mut outs = vec![stage_answer(0), ok(""), probe()];
         outs.extend(state_answers(state));
         outs.push(probe());
         outs.extend(state_answers(state));
@@ -4132,10 +4280,10 @@ mod tests {
                 }
             })
             .collect();
-        assert_eq!(order[..4], ["script", "script", "sftp", "script"]);
+        assert_eq!(order[..4], ["script", "sftp", "script", "script"]);
 
         // the pinned source is already there: no upload at all
-        let mut outs = vec![probe(), stage_answer(1)];
+        let mut outs = vec![stage_answer(1), probe()];
         outs.extend(state_answers(state));
         let (runner, t) = win_host(outs);
         t.read_git_state("CapApp").await.expect("present");
@@ -4156,14 +4304,7 @@ mod tests {
             code: 1,
             timed_out: false,
         };
-        let mut outs = vec![
-            probe(),
-            stage_answer(0),
-            failed,
-            probe(),
-            stage_answer(0),
-            ok(""),
-        ];
+        let mut outs = vec![stage_answer(0), failed, stage_answer(0), ok(""), probe()];
         outs.extend(state_answers(state));
         let (runner, t) = win_host(outs);
         assert!(

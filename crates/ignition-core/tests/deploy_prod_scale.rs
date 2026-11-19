@@ -3871,6 +3871,12 @@ fn git_prodshape_posix_project_digests() {
     });
 }
 
+/// The native account home of the Windows scripts that load the reviewed block
+/// (the loader's `$p.h`); under the `IgnGit.N` stand-in the staged source is
+/// never read, so any value will do.
+#[cfg(unix)]
+const HOME: &str = "/ign-test-home";
+
 /// The same read through the Windows script under PowerShell 7 (27-41): equal
 /// to the local reader's answer, within
 /// [`HOST_WINDOWS_PROJECT_DIGESTS`](shape_git::HOST_WINDOWS_PROJECT_DIGESTS).
@@ -3898,8 +3904,10 @@ fn git_prodshape_pwsh_project_digests() {
             .await
             .expect("reference");
         let started = Instant::now();
-        let answer = pwsh_exec::run(&WinScript::project_digests("", &data, PROJECT, 100_000))
-            .expect("project digests");
+        let answer = pwsh_exec::run(&WinScript::project_digests(
+            "", &data, PROJECT, 100_000, HOME,
+        ))
+        .expect("project digests");
         let took = started.elapsed();
         let text = answer["t"].as_str().expect("t");
         let disk: ProjectDisk = text
@@ -4181,13 +4189,13 @@ fn git_prodshape_pwsh_save_restore() {
 
         // the preflight: one enumeration, no file read
         let started = Instant::now();
-        let size = pwsh_exec::run(&WinScript::git_size("", &git)).expect("size");
+        let size = pwsh_exec::run(&WinScript::git_size("", &git, HOME)).expect("size");
         let size_took = started.elapsed();
         assert_eq!(size["files"].as_u64(), Some(reference.files as u64));
         assert_eq!(size["bytes"].as_u64(), Some(reference.bytes));
         prodshape_within("git_prodshape_pwsh_size", size_took, HOST_WINDOWS_PREFLIGHT);
 
-        let live = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("live manifest");
+        let live = pwsh_exec::run(&WinScript::git_manifest("", &git, HOME)).expect("live manifest");
         assert_eq!(
             manifest_of(&live),
             want,
@@ -4195,15 +4203,8 @@ fn git_prodshape_pwsh_save_restore() {
         );
 
         let started = Instant::now();
-        let saved = pwsh_exec::run(&WinScript::git_save(
-            "",
-            &data,
-            PROJECT,
-            &home_s,
-            GATEWAY,
-            GIT_PRODSHAPE_RUN,
-        ))
-        .expect("save");
+        let saved =
+            pwsh_exec::run_save(&data, PROJECT, &home_s, GATEWAY, GIT_PRODSHAPE_RUN).expect("save");
         let save_took = started.elapsed();
         assert_eq!(
             manifest_of(&saved),
@@ -4215,16 +4216,10 @@ fn git_prodshape_pwsh_save_restore() {
         // the import deletes `.git`; restore plus the manifest of the result
         std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
         let started = Instant::now();
-        let back = pwsh_exec::run(&WinScript::git_restore(
-            "",
-            &data,
-            PROJECT,
-            &home_s,
-            GATEWAY,
-            GIT_PRODSHAPE_RUN,
-        ))
-        .expect("restore");
-        let after = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("manifest after");
+        let back = pwsh_exec::run_restore(&data, PROJECT, &home_s, GATEWAY, GIT_PRODSHAPE_RUN)
+            .expect("restore");
+        let after =
+            pwsh_exec::run(&WinScript::git_manifest("", &git, HOME)).expect("manifest after");
         let restore_took = started.elapsed();
         assert_eq!(manifest_of(&back), want);
         assert_eq!(manifest_of(&after), want);

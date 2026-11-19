@@ -60,6 +60,7 @@ const GIT_NATIVE_STANDIN_CS: &str = r#"
 using System;using System.IO;using Microsoft.Win32.SafeHandles;
 namespace IgnGit{public static class N{
 static IOException X(string w,int e){return new IOException(w+" (Win32 error "+e+")");}
+static void L(string k,string p){string f=Environment.GetEnvironmentVariable("IGN_STANDIN_LOG");if(f!=null)File.AppendAllText(f,k+"\t"+p+"\n");}
 static FileAttributes A(string p){
 try{return File.GetAttributes(p);}
 catch(FileNotFoundException){throw X("cannot open the path",2);}
@@ -68,12 +69,12 @@ static void C(string p,int k){
 FileAttributes t=A(p);
 if((t&FileAttributes.ReparsePoint)!=0)throw new IOException("the path is a reparse point");
 if(((t&FileAttributes.Directory)!=0)!=(k==1))throw new IOException(k==1?"the path is not a directory":"the path is not a regular file");}
-public static SafeFileHandle OpenDir(string p){C(p,1);return new SafeFileHandle(IntPtr.Zero,false);}
-public static SafeFileHandle OpenFile(string p){C(p,2);return File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);}
+public static SafeFileHandle OpenDir(string p){L("D",p);C(p,1);return new SafeFileHandle(IntPtr.Zero,false);}
+public static SafeFileHandle OpenFile(string p){L("F",p);C(p,2);return File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);}
 public static SafeFileHandle CreateNew(string p){
-try{return File.OpenHandle(p,FileMode.CreateNew,FileAccess.Write,FileShare.None);}
+L("N",p);try{return File.OpenHandle(p,FileMode.CreateNew,FileAccess.Write,FileShare.None);}
 catch(IOException){throw X("cannot open the path",80);}}
-public static SafeFileHandle OpenForDelete(string p){C(p,2);return File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);}
+public static SafeFileHandle OpenForDelete(string p){L("X",p);C(p,2);return File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);}
 public static string FileId(SafeFileHandle h){return BitConverter.ToString(BitConverter.GetBytes(h.DangerousGetHandle().ToInt64())).Replace("-","").PadRight(48,(char)48);}
 public static void DeleteOnClose(SafeFileHandle h){throw new IOException("DeleteOnClose has no stand-in");}
 public static void Move(string a,string b,bool replace){
@@ -196,6 +197,16 @@ pub fn output_without_standin(script: &WinScript) -> Result<ProcessOutput, Strin
 }
 
 fn output_with(script: &WinScript, standin: bool) -> Result<ProcessOutput, String> {
+    output_logged(script, standin, None)
+}
+
+/// [`output_with`], with the stand-in's log of what it was asked to open
+/// written to `log` (see [`run_logged`]).
+fn output_logged(
+    script: &WinScript,
+    standin: bool,
+    log: Option<&std::path::Path>,
+) -> Result<ProcessOutput, String> {
     let pwsh = pwsh().ok_or_else(|| "no pwsh".to_string())?;
     let command = encoded_command(script, COMMAND_BUDGET)?;
     let encoded = command
@@ -213,10 +224,15 @@ fn output_with(script: &WinScript, standin: bool) -> Result<ProcessOutput, Strin
         standin_dir().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new(pwsh)
+    let mut command = Command::new(pwsh);
+    command
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded])
         .env("PATH", path)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    if let Some(log) = log {
+        command.env("IGN_STANDIN_LOG", log);
+    }
+    let out = command
         .output()
         .map_err(|e| format!("pwsh did not start: {e}"))?;
     Ok(ProcessOutput {
@@ -230,6 +246,27 @@ fn output_with(script: &WinScript, standin: bool) -> Result<ProcessOutput, Strin
 /// The `IGN-RESULT` JSON of `script`, or the host's failure text.
 pub fn run(script: &WinScript) -> Result<serde_json::Value, String> {
     interpret_output(&output(script)?, 600, None)
+}
+
+/// The `IGN-RESULT` JSON of `script` and what the script asked the reviewed
+/// block to open, in order, as `(kind, path)`: `D` a directory (`OpenDir`), `F`
+/// a file (`OpenFile`), `N` a new file (`CreateNew`), `X` a file for removal
+/// (`OpenForDelete`). The stand-in writes one line per call, a refused call
+/// included, before it checks the path. This is how a test sees that a script
+/// holds every level it lists and opens every file it reads through the block,
+/// which a script that reads by path (the text of before 27-50) never does.
+pub fn run_logged(script: &WinScript) -> (Result<serde_json::Value, String>, Vec<(char, String)>) {
+    let dir = tempfile::tempdir().expect("log dir");
+    let log = dir.path().join("standin.log");
+    let answer =
+        output_logged(script, true, Some(&log)).and_then(|out| interpret_output(&out, 600, None));
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let calls = text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter_map(|(kind, path)| Some((kind.chars().next()?, path.to_string())))
+        .collect();
+    (answer, calls)
 }
 
 /// The `IGN-RESULT` JSON of `script` run without the `IgnGit.N` stand-in.
@@ -246,6 +283,83 @@ pub fn run_state(git: &str, markers: &[&str], home: &str) -> Result<serde_json::
         answers.push(run(&script)?);
     }
     merge_git_state(&answers)
+}
+
+/// The manifest answer of `dir` through the reviewed block (the stand-in).
+fn manifest_of(dir: &str, home: &str) -> Result<serde_json::Value, String> {
+    run(&WinScript::git_manifest("", dir, home))
+}
+
+/// A project's save of a run as the transport runs it (27-50): the manifest of
+/// the source `.git` (a link or a name with a control character is refused
+/// before one byte is copied), [`GIT_SAVE`](ignition_core::deploy::transport::winps::GIT_SAVE),
+/// the manifest of the copy and their comparison; a copy that differs is
+/// removed again and refused. `data` is the data directory and `home` the
+/// account home, both as native spellings (here: local paths). The answer is the
+/// manifest of the copy.
+pub fn run_save(
+    data: &str,
+    project: &str,
+    home: &str,
+    gateway: &str,
+    run_id: &str,
+) -> Result<serde_json::Value, String> {
+    let git = format!("{data}/projects/{project}/.git");
+    let before = manifest_of(&git, home)?;
+    run(&WinScript::git_save(
+        "", data, project, home, gateway, run_id,
+    ))?;
+    let rel = format!("ign-deploy/{gateway}/projects/{project}/git-save/{run_id}");
+    let after = manifest_of(&format!("{home}/{rel}/repo"), home);
+    match after {
+        Ok(after) if after == before => Ok(after),
+        other => {
+            let _ = run(&WinScript::git_save_rm(
+                "",
+                home,
+                &format!("{rel}/repo"),
+                run_id,
+            ));
+            Err(match other {
+                Ok(_) => "the saved copy does not match the .git it was taken from".to_string(),
+                Err(why) => why,
+            })
+        }
+    }
+}
+
+/// The restore of the save of a run as the transport runs it (27-50): the stage
+/// ([`GIT_RESTORE`](ignition_core::deploy::transport::winps::GIT_RESTORE)), the
+/// manifests of the save and of the stage, and only when they are equal the
+/// rename ([`GIT_RESTORE_MOVE`](ignition_core::deploy::transport::winps::GIT_RESTORE_MOVE));
+/// a stage that differs is removed again and refused. The answer is the
+/// manifest of the restored `.git`.
+pub fn run_restore(
+    data: &str,
+    project: &str,
+    home: &str,
+    gateway: &str,
+    run_id: &str,
+) -> Result<serde_json::Value, String> {
+    run(&WinScript::git_restore(
+        "", data, project, home, gateway, run_id,
+    ))?;
+    let rel = format!("ign-deploy/{gateway}/projects/{project}/git-save/{run_id}");
+    let stage = format!("{data}/projects/{project}/.ign-restore-{run_id}");
+    let saved = manifest_of(&format!("{home}/{rel}/repo"), home);
+    let staged = saved.as_ref().ok().map(|_| manifest_of(&stage, home));
+    let equal = matches!((&saved, &staged), (Ok(a), Some(Ok(b))) if a == b);
+    let moved = run(&WinScript::git_restore_move(
+        "", data, project, run_id, !equal,
+    ));
+    if !equal {
+        return Err(match (saved, staged) {
+            (Err(why), _) | (_, Some(Err(why))) => why,
+            _ => "the stage does not match the save it was copied from".to_string(),
+        });
+    }
+    moved?;
+    manifest_of(&format!("{data}/projects/{project}/.git"), home)
 }
 
 /// Write the pinned source where the loader reads it below `home`
