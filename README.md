@@ -354,7 +354,8 @@ advanced, the run is a finished run with a verdict, and it ends **exit 6**:
 - `restore.reason` is one of the words of the table in
   [Projects the git module manages](#projects-the-git-module-manages)
   (`restore_failed`, `advance_failed`, `status_unexpected`, `git_recreated`,
-  `git_changed`, `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`).
+  `git_changed`, `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`,
+  `git_save_missing`).
 - `backup_project_json_missing` (on `nodes.backup` only) is not a `.git`
   failure: after the backup's project converged, its
   `data/projects/<project>/project.json` is absent or not a regular file, and the
@@ -5652,6 +5653,23 @@ long as it is there, a `--check` of the project on that gateway reports it in
 `deploy_journal_present` (exit 6) before any write, naming the run and the
 command that undoes it.
 
+**A `.git` the rollback could not put back.** When a rollback has to leave the
+gateway's `.git` out (the import removed it and a Designer is attached, so
+nothing is written) the saved copy is the only copy of the repository. The host
+journal, still `rolling_back`, then names it in `git_pending`: the node, the run
+that took the save, the save's path and its manifest. `--rollback-run` reads the
+entry: a node with no `.git` and an entry has pending git work, not no git
+work, so after the project step, and once no Designer is attached, it puts the
+saved copy back unchanged and takes the entry out. The journal is cleared only
+when no entry is left; an entry that is still pending is a line in the
+rollback's `left` list, so the undo ends `rollback_failed`, never green. A
+saved copy that is gone, or cannot be read, ends the node `git_save_missing`:
+nothing is written and the entry stays (restore the repository from its remote
+with the module, then clear the journal by hand as for any `rollback_failed`).
+A node that holds a repository again keeps its entry too, and ign never writes
+over a repository that is there. On a redundant pair the same holds for
+`nodes.backup`, through the backup's own host.
+
 **`--rollback-run`.**
 
 ```sh
@@ -6221,6 +6239,7 @@ word is a change to the repository, the checkout or the target file:
 | `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |
 | `designer_attached` | a Designer session was attached at the check before a `.git` write | close the Designer session, deploy again |
 | `backup_project_json_missing` | the backup's `data/projects/<p>/project.json` is absent or not a regular file after the deploy; redundancy project sync removed it (a git module and redundancy defect) | put `project.json` back on the backup before it restarts; ign does not repair it |
+| `git_save_missing` | a `--rollback-run` retry found that the saved `.git` the journal names (`git_pending`) is no longer on the host, or cannot be read; nothing was written to `.git` | the repository cannot be put back from ign's copy; restore it from its remote with the module, then clear the journal as **Undoing a run** says (when the host was only unreachable, run `--rollback-run` again) |
 
 When a restore or the advance fails the run ends `git_restore_failed` (slug
 `deploy_git_restore_failed`, exit 6): see [the verdict
