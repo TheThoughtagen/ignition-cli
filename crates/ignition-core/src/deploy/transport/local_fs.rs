@@ -93,7 +93,7 @@ mod unix {
     use std::io::Write;
     use std::path::Path;
 
-    use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat};
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, openat};
 
     use super::{FsError, FsResult, Kind, TEMP_SUFFIX, Visibility, leftover};
     use crate::deploy::tree::dirfd::{self, FdError};
@@ -142,6 +142,16 @@ mod unix {
         pub(in crate::deploy::transport) size: u64,
         /// `st_mode & 0o777`.
         pub(in crate::deploy::transport) mode: u32,
+    }
+
+    /// What [`Dir::stat`] reports of one name.
+    #[derive(Debug, Clone, Copy)]
+    pub(in crate::deploy::transport) struct RawStat {
+        pub(in crate::deploy::transport) kind: Kind,
+        /// `st_mode & 0o777`.
+        pub(in crate::deploy::transport) mode: u32,
+        /// `(st_dev, st_ino)`.
+        pub(in crate::deploy::transport) ident: (u64, u64),
     }
 
     /// An opened directory.
@@ -299,6 +309,136 @@ mod unix {
             }
             out.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
             Ok(out)
+        }
+
+        // ---- single-name write primitives (27-44) ----------------------
+        //
+        // Each takes one name directly below this handle: a name that is
+        // empty, `.`, `..` or holds a separator is `Changed`, so a caller's
+        // mistake cannot walk out of the directory the handle names.
+
+        fn single(name: &str) -> FsResult<&str> {
+            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                Err(FsError::Changed)
+            } else {
+                Ok(name)
+            }
+        }
+
+        /// `mkdirat` of `name` below this directory with `mode` (under the
+        /// umask). An existing name of any kind is `Exists`.
+        #[allow(clippy::unnecessary_cast)] // the raw mode width differs per platform
+        pub(in crate::deploy::transport) fn mkdir(&self, name: &str, mode: u32) -> FsResult<()> {
+            mkdirat(
+                &self.fd,
+                Self::single(name)?,
+                Mode::from_raw_mode(mode as rustix::fs::RawMode),
+            )
+            .map_err(lift_errno)
+        }
+
+        /// Create the regular file `name` below this directory with
+        /// `openat(O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW)`: an existing
+        /// name of any kind, a symlink included, is `Exists`, and nothing is
+        /// followed.
+        #[allow(clippy::unnecessary_cast)] // the raw mode width differs per platform
+        pub(in crate::deploy::transport) fn create_excl(
+            &self,
+            name: &str,
+            mode: u32,
+        ) -> FsResult<File> {
+            openat(
+                &self.fd,
+                Self::single(name)?,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(mode as rustix::fs::RawMode),
+            )
+            .map(File::from)
+            .map_err(lift_errno)
+        }
+
+        /// `renameat` of `from` to `to`, both below this directory
+        /// (replacing a file at `to`).
+        pub(in crate::deploy::transport) fn rename_within(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> FsResult<()> {
+            dirfd::rename_at(&self.fd, Self::single(from)?, &self.fd, Self::single(to)?)
+                .map_err(lift)
+        }
+
+        /// What `name` below this directory is, with its size, mode and
+        /// identity from one `fstatat(AT_SYMLINK_NOFOLLOW)`; `None` when
+        /// absent.
+        #[allow(clippy::unnecessary_cast)] // the raw widths differ per platform
+        pub(in crate::deploy::transport) fn stat(&self, name: &str) -> FsResult<Option<RawStat>> {
+            match rustix::fs::statat(&self.fd, Self::single(name)?, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => Ok(Some(RawStat {
+                    kind: match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+                        rustix::fs::FileType::Directory => Kind::Dir,
+                        rustix::fs::FileType::RegularFile => Kind::File,
+                        rustix::fs::FileType::Symlink => Kind::Symlink,
+                        _ => Kind::Other,
+                    },
+                    mode: (stat.st_mode as u32) & 0o777,
+                    ident: (stat.st_dev as u64, stat.st_ino as u64),
+                })),
+                Err(rustix::io::Errno::NOENT) => Ok(None),
+                Err(e) => Err(lift_errno(e)),
+            }
+        }
+
+        /// The owner (`st_uid`) of this directory, from its handle.
+        pub(in crate::deploy::transport) fn owner(&self) -> FsResult<u32> {
+            use std::os::unix::fs::MetadataExt;
+            Ok(self.fd.metadata().map_err(FsError::Io)?.uid())
+        }
+
+        /// Give this directory exactly `mode`, with an `fchmod` on its own
+        /// descriptor (never by name).
+        pub(in crate::deploy::transport) fn chmod_self(&self, mode: u32) -> FsResult<()> {
+            use std::os::unix::fs::PermissionsExt;
+            self.fd
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(FsError::Io)
+        }
+
+        /// Move `from` below this directory to `to` below `to_dir` WITHOUT
+        /// replacing anything at `to`: `renameat2(RENAME_NOREPLACE)` on Linux
+        /// and `renameatx_np(RENAME_EXCL)` on macOS. The raw errno is
+        /// returned: `EEXIST` is "something is there", and the caller maps a
+        /// file system that does not know the flag. Never a plain rename.
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        pub(in crate::deploy::transport) fn rename_noreplace(
+            &self,
+            from: &str,
+            to_dir: &Dir,
+            to: &str,
+        ) -> Result<(), rustix::io::Errno> {
+            if Self::single(from).is_err() || Self::single(to).is_err() {
+                return Err(rustix::io::Errno::INVAL);
+            }
+            rustix::fs::renameat_with(
+                &self.fd,
+                from,
+                &to_dir.fd,
+                to,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+        }
+
+        /// A unix target with no no-replace rename: it fails closed (the
+        /// caller reads `ENOSYS` as "the host cannot publish without
+        /// replacing") and never falls back to a plain rename.
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        pub(in crate::deploy::transport) fn rename_noreplace(
+            &self,
+            _from: &str,
+            _to_dir: &Dir,
+            _to: &str,
+        ) -> Result<(), rustix::io::Errno> {
+            Err(rustix::io::Errno::NOSYS)
         }
 
         fn create_in(dir: &File, name: &str, vis: Visibility) -> FsResult<File> {

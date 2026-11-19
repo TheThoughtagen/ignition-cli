@@ -46,6 +46,31 @@
 //! which is one read call: a child `GitDir` is valid while the `GitDir` it was
 //! taken from is alive.
 //!
+//! # Writes (27-44, CodeRabbit #56 C2 and C12)
+//!
+//! The writes of the advance, the save and the restore go through the same
+//! handles. A parent is opened (or made) from the held directory above it,
+//! one level per `openat(O_NOFOLLOW)` / `mkdirat`; a lock or a file is created
+//! with `openat(O_CREAT | O_EXCL | O_NOFOLLOW)` in its parent's handle and
+//! published with `renameat` inside that one handle. A parent swapped for a
+//! symlink after the preflight is refused naming it, and nothing is created
+//! behind the link (`local_git_write_refuses_a_parent_swapped_after_the_preflight`);
+//! a `.git` swapped after the open is not followed either
+//! (`local_git_write_refuses_a_git_swapped_after_the_open`).
+//!
+//! The restore publish is [`GitDir::publish_noreplace`]: `renameat2(RENAME_NOREPLACE)`
+//! on Linux and `renameatx_np(RENAME_EXCL)` on macOS, so it can never replace
+//! anything, an empty directory included
+//! (`local_git_restore_keeps_an_empty_git_planted_before_the_publish`). A file
+//! system that does not know the flag (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`) fails
+//! closed with "the host cannot publish without replacing"
+//! (`local_noreplace_unsupported_fails_closed`); there is no plain-rename
+//! fallback. On Windows `std::fs::rename` is the publish: the target is
+//! checked on its parent's held handle first, and std refuses a directory
+//! target (`local_git_restore_refuses_an_existing_git_on_windows`,
+//! `local_noreplace_windows_rename_refuses_a_directory_target`). The residual
+//! there is the final component, as for the reads.
+//!
 //! The error texts are value-free: level names only, never a path outside the
 //! data directory.
 
@@ -99,6 +124,8 @@ pub(super) struct GitDirError {
     /// The tree is not what a read may trust (a link, a swapped level or file,
     /// a non-regular file), as opposed to an I/O failure.
     refusal: bool,
+    /// A create found the name already there (a write that never replaces).
+    exists: bool,
 }
 
 impl GitDirError {
@@ -106,6 +133,15 @@ impl GitDirError {
         GitDirError {
             text: text.into(),
             refusal: false,
+            exists: false,
+        }
+    }
+
+    fn already(text: impl Into<String>) -> GitDirError {
+        GitDirError {
+            text: text.into(),
+            refusal: false,
+            exists: true,
         }
     }
 
@@ -113,12 +149,18 @@ impl GitDirError {
         GitDirError {
             text: text.into(),
             refusal: true,
+            exists: false,
         }
     }
 
     /// A refusal of the tree, not an I/O failure.
     pub(super) fn is_refusal(&self) -> bool {
         self.refusal
+    }
+
+    /// The name a create or a no-replace publish wanted was already there.
+    pub(super) fn already_exists(&self) -> bool {
+        self.exists
     }
 }
 
@@ -156,6 +198,29 @@ pub(super) struct FileMeta {
     pub(super) size: u64,
     pub(super) mode: u32,
 }
+
+/// The text of the fail-closed outcome of the no-replace rename: the host
+/// cannot publish without replacing, and ign never falls back to a plain
+/// rename.
+#[cfg(unix)]
+pub(super) const NOREPLACE_UNSUPPORTED: &str = "the host cannot publish without replacing";
+
+/// What one name below a held directory is, never followed.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Stat {
+    pub(super) kind: Kind,
+    /// The Unix permission bits (`0` where the platform has none).
+    pub(super) mode: u32,
+}
+
+/// Who a lock this call created is: `(device, inode)` of the descriptor
+/// [`GitDir::create_lock`] returned, so a lock another writer put at the same
+/// name (same bytes or not) is never taken for it. `None` where the platform
+/// has no such identity (Windows, where the handle held without delete
+/// sharing keeps the name from being replaced while this call holds it).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(windows, allow(dead_code))] // Windows has no identity to compare
+pub(super) struct LockId(Option<(u64, u64)>);
 
 /// A directory held open (see the module doc).
 pub(super) struct GitDir {
@@ -343,6 +408,179 @@ impl GitDir {
     }
 }
 
+/// An I/O error for a failed primitive of this module.
+#[cfg(unix)]
+fn fs_io(e: FsError) -> std::io::Error {
+    match e {
+        FsError::Io(e) => e,
+        FsError::Exists => std::io::ErrorKind::AlreadyExists.into(),
+        FsError::Missing => std::io::ErrorKind::NotFound.into(),
+        other => std::io::Error::other(other.describe()),
+    }
+}
+
+/// What the kernel's answer to a no-replace rename means. `EEXIST` is "a
+/// `.git` is there"; `EINVAL`, `ENOSYS` and `EOPNOTSUPP` are a host (or a
+/// file system) that does not know the flag and fail closed with
+/// [`NOREPLACE_UNSUPPORTED`]. No other errno is read as either.
+#[cfg(unix)]
+pub(super) fn noreplace_error(e: rustix::io::Errno) -> GitDirError {
+    use rustix::io::Errno;
+    if e == Errno::EXIST {
+        GitDirError::already("the target already exists")
+    } else if e == Errno::INVAL || e == Errno::NOSYS || e == Errno::OPNOTSUPP {
+        GitDirError::new(NOREPLACE_UNSUPPORTED)
+    } else {
+        GitDirError::new(format!(
+            "the restored .git cannot be put in place ({})",
+            std::io::Error::from(e).kind()
+        ))
+    }
+}
+
+/// Writes through a held directory (27-44): every one is relative to this
+/// handle, never to a path looked at earlier.
+impl GitDir {
+    /// Create the directory `name` below this one with `mode` and open it
+    /// (not followed). The name already being there is
+    /// [`GitDirError::already_exists`].
+    pub(super) fn create_dir_child(&self, name: &str, mode: u32) -> Result<GitDir, GitDirError> {
+        self.make_dir(name, mode)?;
+        self.child(name)?.ok_or_else(|| {
+            GitDirError::refused(format!(
+                "{} changed while it was opened (it is gone)",
+                join(&self.prefix, name)
+            ))
+        })
+    }
+
+    /// Open the directory `name` below this one, or make it with `mode` and
+    /// open it. Whether it was made is the second answer; a directory another
+    /// writer made first is opened and not reported as made.
+    fn open_or_make(
+        &self,
+        name: &str,
+        mode: u32,
+        at_open: bool,
+    ) -> Result<(GitDir, bool), GitDirError> {
+        if let Some(dir) = self.step(name, at_open)? {
+            return Ok((dir, false));
+        }
+        let made = match self.make_dir(name, mode) {
+            Ok(()) => true,
+            Err(e) if e.already_exists() => false,
+            Err(e) => return Err(e),
+        };
+        let dir = self.step(name, false)?.ok_or_else(|| {
+            GitDirError::refused(format!(
+                "{} changed while it was opened (it is gone)",
+                join(&self.prefix, name)
+            ))
+        })?;
+        Ok((dir, made))
+    }
+
+    /// The directory at `parts` below this one (at least one), every level
+    /// opened from the handle above it, a missing level made with the mode of
+    /// the level above it (WR-B1) and given that mode on its own handle.
+    /// `made` is told the path (below this directory) of each level this call
+    /// made, so a failure can take the empty ones away again.
+    pub(super) fn ensure_parent(
+        &self,
+        parts: &[&str],
+        made: &mut Vec<String>,
+    ) -> Result<GitDir, GitDirError> {
+        let mut current: Option<GitDir> = None;
+        for part in parts {
+            let next = {
+                let from = current.as_ref().unwrap_or(self);
+                let mode = from.mode()?;
+                let (next, was_made) = from.open_or_make(part, mode, false)?;
+                if was_made {
+                    next.set_mode_self(mode)?;
+                    made.push(join(&from.prefix, part));
+                }
+                next
+            };
+            current = Some(match current.take() {
+                Some(prev) => {
+                    let mut next = next;
+                    next.absorb(prev);
+                    next
+                }
+                None => next,
+            });
+        }
+        current.ok_or_else(|| GitDirError::new("a parent needs at least one level"))
+    }
+
+    /// Open `parts` below `data_dir` like [`GitDir::open`], making each
+    /// missing level with the mode `mode_of(index)` gives. Every level is
+    /// kept: the handle of the data directory first, then one per part. The
+    /// flags say which levels this call made.
+    pub(super) fn ensure_open(
+        data_dir: &Path,
+        parts: &[&str],
+        mode_of: impl Fn(usize) -> u32,
+    ) -> Result<(Vec<GitDir>, Vec<bool>), GitDirError> {
+        let mut levels = vec![Self::data_root(data_dir)?];
+        let mut made = Vec::with_capacity(parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            let (next, was_made) = levels
+                .last()
+                .ok_or_else(|| GitDirError::new("no level"))?
+                .open_or_make(part, mode_of(index), true)?;
+            levels.push(next);
+            made.push(was_made);
+        }
+        Ok((levels, made))
+    }
+
+    /// Remove the directory `rel` below this one if it is empty, and only
+    /// then (`rmdir`); a directory that is not empty, or gone, is left.
+    pub(super) fn remove_empty_dir(&self, rel: &str) -> Result<(), GitDirError> {
+        self.in_parent(rel, (), |dir, name| {
+            let _ = dir.rmdir_here(name);
+            Ok(())
+        })
+    }
+
+    /// The kind and mode of `rel` below this directory, never followed;
+    /// `None` when it, or a level above it, is absent.
+    pub(super) fn stat(&self, rel: &str) -> Result<Option<Stat>, GitDirError> {
+        self.in_parent(rel, None, |dir, name| dir.stat_here(name))
+    }
+
+    /// Create the lock `name` here, exclusively and without following a link.
+    /// The name being taken is `ErrorKind::AlreadyExists` and is another
+    /// writer's: the caller never removes it. The returned id names this
+    /// file for [`Self::remove_own_lock`].
+    pub(super) fn create_lock(&self, name: &str, mode: u32) -> std::io::Result<(File, LockId)> {
+        let file = self.create_file(name, mode)?;
+        let id = self.lock_id(&file)?;
+        Ok((file, id))
+    }
+
+    /// Publish the lock `lock` as `name`, a `renameat` inside this one
+    /// directory (replacing a file at `name`, as a ref or a config is).
+    pub(super) fn publish(&self, lock: &str, name: &str) -> std::io::Result<()> {
+        self.rename_here(lock, name)
+    }
+
+    /// Remove the lock `name` only when it is the file `id` names, compared on
+    /// the name just before the unlink: a lock another writer holds there is
+    /// never touched, whatever its bytes.
+    pub(super) fn remove_own_lock(&self, name: &str, id: LockId) -> std::io::Result<()> {
+        self.unlink_if_own(name, id)
+    }
+
+    /// Remove the non-directory `name` here (a link is removed, never its
+    /// target).
+    pub(super) fn unlink_file(&self, name: &str) -> std::io::Result<()> {
+        self.unlink_here(name)
+    }
+}
+
 #[cfg(unix)]
 impl GitDir {
     fn data_root(path: &Path) -> Result<GitDir, GitDirError> {
@@ -398,6 +636,109 @@ impl GitDir {
             }
             Err(e) => Err(fs_text(&rel, "cannot be read", &e)),
         }
+    }
+
+    fn make_dir(&self, name: &str, mode: u32) -> Result<(), GitDirError> {
+        match self.dir.mkdir(name, mode) {
+            Ok(()) => Ok(()),
+            Err(FsError::Exists) => Err(GitDirError::already(format!(
+                "{} already exists",
+                join(&self.prefix, name)
+            ))),
+            Err(e) => Err(fs_text(&join(&self.prefix, name), "cannot be created", &e)),
+        }
+    }
+
+    /// Give this directory exactly `mode` through its own handle, after
+    /// checking that this account owns it (a swapped-in directory of another
+    /// owner is refused). Windows has no permission bits to give.
+    pub(super) fn set_mode_self(&self, mode: u32) -> Result<(), GitDirError> {
+        let shown = if self.prefix.is_empty() {
+            "the repo"
+        } else {
+            self.prefix.as_str()
+        };
+        let owner = self
+            .dir
+            .owner()
+            .map_err(|e| fs_text(shown, "cannot be inspected", &e))?;
+        let uid = super::project_ops::current_uid()
+            .map_err(|e| io_text(shown, "cannot be inspected", &e))?;
+        if owner != uid {
+            return Err(GitDirError::refused(format!(
+                "{shown} is not a directory owned by this account"
+            )));
+        }
+        self.dir
+            .chmod_self(mode)
+            .map_err(|e| fs_text(shown, "cannot be given its mode", &e))
+    }
+
+    /// Create the regular file `name` here exclusively (`O_CREAT | O_EXCL |
+    /// O_NOFOLLOW`): an existing name of any kind is `AlreadyExists`.
+    pub(super) fn create_file(&self, name: &str, mode: u32) -> std::io::Result<File> {
+        self.dir.create_excl(name, mode).map_err(fs_io)
+    }
+
+    fn lock_id(&self, file: &File) -> std::io::Result<LockId> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(LockId(Some((meta.dev(), meta.ino()))))
+    }
+
+    fn rename_here(&self, from: &str, to: &str) -> std::io::Result<()> {
+        self.dir.rename_within(from, to).map_err(fs_io)
+    }
+
+    fn rmdir_here(&self, name: &str) -> std::io::Result<()> {
+        self.dir.rmdir(&[name]).map_err(fs_io)
+    }
+
+    fn unlink_here(&self, name: &str) -> std::io::Result<()> {
+        self.dir.unlink(&[name]).map_err(fs_io)
+    }
+
+    fn unlink_if_own(&self, name: &str, id: LockId) -> std::io::Result<()> {
+        match self.dir.stat(name).map_err(fs_io)? {
+            Some(st) if st.kind == Kind::File && Some(st.ident) == id.0 => {
+                self.dir.unlink(&[name]).map_err(fs_io)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn stat_here(&self, name: &str) -> Result<Option<Stat>, GitDirError> {
+        self.dir
+            .stat(name)
+            .map(|found| {
+                found.map(|st| Stat {
+                    kind: st.kind,
+                    mode: st.mode,
+                })
+            })
+            .map_err(|e| fs_text(&join(&self.prefix, name), "cannot be inspected", &e))
+    }
+
+    /// Remove `name` below this directory and everything under it; nothing
+    /// is followed. Absent is success.
+    pub(super) fn remove_tree(&self, name: &str) -> Result<(), GitDirError> {
+        self.dir
+            .remove_tree(&[name])
+            .map_err(|e| fs_text(&join(&self.prefix, name), "cannot be removed", &e))
+    }
+
+    /// Move `from` below this directory to `to` below `to_dir` without
+    /// replacing anything at `to` (see the module doc); the outcome is
+    /// [`noreplace_error`] of the kernel's answer.
+    pub(super) fn publish_noreplace(
+        &self,
+        from: &str,
+        to_dir: &GitDir,
+        to: &str,
+    ) -> Result<(), GitDirError> {
+        self.dir
+            .rename_noreplace(from, &to_dir.dir, to)
+            .map_err(noreplace_error)
     }
 
     /// Every entry of this directory, sorted by name, each statted relative
@@ -574,6 +915,112 @@ impl GitDir {
                 mode: meta_mode(&meta),
             },
         )))
+    }
+
+    fn make_dir(&self, name: &str, _mode: u32) -> Result<(), GitDirError> {
+        match std::fs::create_dir(self.path.join(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(GitDirError::already(
+                format!("{} already exists", join(&self.prefix, name)),
+            )),
+            Err(e) => Err(io_text(&join(&self.prefix, name), "cannot be created", &e)),
+        }
+    }
+
+    pub(super) fn set_mode_self(&self, _mode: u32) -> Result<(), GitDirError> {
+        Ok(())
+    }
+
+    /// Create `name` exclusively as a handle that does not follow a reparse
+    /// point and does not share delete. The residual is the final component,
+    /// created by its full path below the held levels.
+    pub(super) fn create_file(&self, name: &str, _mode: u32) -> std::io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(SHARE_READ_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(self.path.join(name))
+    }
+
+    fn lock_id(&self, _file: &File) -> std::io::Result<LockId> {
+        Ok(LockId(None))
+    }
+
+    fn rename_here(&self, from: &str, to: &str) -> std::io::Result<()> {
+        std::fs::rename(self.path.join(from), self.path.join(to))
+    }
+
+    fn rmdir_here(&self, name: &str) -> std::io::Result<()> {
+        std::fs::remove_dir(self.path.join(name))
+    }
+
+    fn unlink_here(&self, name: &str) -> std::io::Result<()> {
+        std::fs::remove_file(self.path.join(name))
+    }
+
+    /// There is no `(dev, ino)` to compare here; the lock this call created
+    /// was held without delete sharing until it was closed, so the name is
+    /// this call's. Documented residual of the final component.
+    fn unlink_if_own(&self, name: &str, _id: LockId) -> std::io::Result<()> {
+        match std::fs::remove_file(self.path.join(name)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+
+    fn stat_here(&self, name: &str) -> Result<Option<Stat>, GitDirError> {
+        match std::fs::symlink_metadata(self.path.join(name)) {
+            Ok(meta) => Ok(Some(Stat {
+                kind: kind_of_meta(&meta),
+                mode: 0,
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_text(
+                &join(&self.prefix, name),
+                "cannot be inspected",
+                &e,
+            )),
+        }
+    }
+
+    /// Remove `name` below this directory and everything under it; a link
+    /// inside is removed, not entered. Absent is success.
+    pub(super) fn remove_tree(&self, name: &str) -> Result<(), GitDirError> {
+        match std::fs::remove_dir_all(self.path.join(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io_text(&join(&self.prefix, name), "cannot be removed", &e)),
+        }
+    }
+
+    /// Move `from` below this directory to `to` below `to_dir`, never over
+    /// anything: the target is looked at on its parent's held handle, and
+    /// `std::fs::rename` refuses a directory target (the Windows tests prove
+    /// it). The residual is the final component.
+    pub(super) fn publish_noreplace(
+        &self,
+        from: &str,
+        to_dir: &GitDir,
+        to: &str,
+    ) -> Result<(), GitDirError> {
+        if to_dir.kind_here(to)? != Kind::Missing {
+            return Err(GitDirError::already("the target already exists"));
+        }
+        std::fs::rename(self.path.join(from), to_dir.path.join(to)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                || e.kind() == std::io::ErrorKind::PermissionDenied
+                    && to_dir.kind_here(to).is_ok_and(|k| k != Kind::Missing)
+            {
+                GitDirError::already("the target already exists")
+            } else {
+                GitDirError::new(format!(
+                    "the restored .git cannot be put in place ({})",
+                    e.kind()
+                ))
+            }
+        })
     }
 
     /// Every entry of this directory, sorted by name. The directory and every

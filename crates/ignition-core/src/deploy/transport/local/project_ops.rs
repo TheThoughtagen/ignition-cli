@@ -32,12 +32,12 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
 use super::LocalFsTransport;
-use super::git_dir::{GitDir, GitDirError, Open};
+use super::git_dir::{GitDir, GitDirError, LockId, Open};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
 use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, ProjectDisk};
@@ -75,14 +75,6 @@ fn fs_kind(e: &FsError) -> String {
         FsError::Io(e) => e.kind().to_string(),
         other => other.describe(),
     }
-}
-
-/// What [`LocalFsTransport::require_save_chain`] found above a save's `repo`.
-enum SaveChain {
-    /// Every level is a real directory.
-    Complete,
-    /// Nothing at some level.
-    Absent,
 }
 
 impl LocalFsTransport {
@@ -617,70 +609,29 @@ struct WalkEntry {
     mode: u32,
 }
 
-/// The Unix mode bits of `meta`, `0` where the platform has none.
-#[cfg(unix)]
-fn mode_of(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o777
-}
-
-#[cfg(not(unix))]
-fn mode_of(_meta: &std::fs::Metadata) -> u32 {
-    0
-}
-
-/// Create the directory `path` (one level) with `mode` on Unix.
-fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+/// Give the open file exactly `mode` (Unix; elsewhere there are no modes to
+/// set), through the handle, never a path.
+fn set_file_mode(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(mode).create(path)
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
     }
     #[cfg(not(unix))]
     {
-        let _ = mode;
-        std::fs::DirBuilder::new().create(path)
-    }
-}
-
-/// Give the directory `path` exactly `mode` (27-31, security review 3).
-///
-/// Linux has no `lchmod` and `fchmodat(AT_SYMLINK_NOFOLLOW)` is unsupported for
-/// a chmod, so a chmod by path could land on whatever was swapped in after the
-/// `mkdir`. The directory is therefore opened itself, with `O_NOFOLLOW |
-/// O_DIRECTORY` (a symlink or a file at the name fails the open), `fstat`-ed on
-/// the descriptor (it must be a directory owned by this account), and the mode
-/// is set with an `fchmod` on that descriptor.
-fn set_dir_mode_no_follow(path: &Path, mode: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::DIRECTORY;
-        let dir = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(flags.bits() as i32)
-            .open(path)?;
-        let meta = dir.metadata()?;
-        if !meta.is_dir() || meta.uid() != current_uid()? {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "not a directory owned by this account",
-            ));
-        }
-        dir.set_permissions(std::fs::Permissions::from_mode(mode))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
+        let _ = (file, mode);
         Ok(())
     }
 }
+
+/// The directory beside a save that a restore fills before it is published.
+const RESTORE_STAGE: &str = "restoring";
 
 /// The effective uid of this process, read from the owner of an anonymous
 /// temporary file this process just created (no libc call, no extra rustix
 /// feature).
 #[cfg(unix)]
-fn current_uid() -> std::io::Result<u32> {
+pub(super) fn current_uid() -> std::io::Result<u32> {
     use std::os::unix::fs::MetadataExt;
     static UID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     if let Some(uid) = UID.get() {
@@ -792,20 +743,6 @@ impl CopyMode<'_> {
     }
 }
 
-/// Set `path` to exactly `mode` (Unix; elsewhere there are no modes to set).
-fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
-    }
-}
-
 impl LocalFsTransport {
     fn git_fail(&self, op: &str, detail: impl std::fmt::Display) -> CoreError {
         self.mirror_fail(op, detail)
@@ -827,16 +764,11 @@ impl LocalFsTransport {
         Ok(())
     }
 
-    fn project_git_dir(&self, project: &str) -> PathBuf {
-        self.data_dir.join("projects").join(project).join(".git")
-    }
-
     /// The directory chain of a save down to the run directory (every level
     /// above `repo`), opened level by level and none followed (27-43): a
     /// symlink or an entry that is not a directory refuses, naming the level.
-    /// A level with nothing at it answers [`SaveChain::Absent`]; the remove
-    /// reads that as "nothing to remove", the restore and the manifest read as
-    /// an error (WR-B6). Every level is held by the returned handle too.
+    /// A level with nothing at it is the `Err` answer (its name); the restore
+    /// and the manifest read it as an error (WR-B6). Every level is held by the returned handle too.
     fn open_save_run(
         &self,
         op: &str,
@@ -852,21 +784,6 @@ impl LocalFsTransport {
             Open::Found(run) => Ok(Ok(run)),
             Open::Absent { level, .. } => Ok(Err(level)),
         }
-    }
-
-    /// [`Self::open_save_run`] as the answer of [`SaveChain`], for the caller
-    /// that only needs to know the chain is whole (the removal).
-    fn require_save_chain(
-        &self,
-        op: &str,
-        gateway: &str,
-        project: &str,
-        run_id: &str,
-    ) -> Result<SaveChain, CoreError> {
-        Ok(match self.open_save_run(op, gateway, project, run_id)? {
-            Ok(_) => SaveChain::Complete,
-            Err(_) => SaveChain::Absent,
-        })
     }
 
     /// The run directory and the `repo` below it, for a caller that needs the
@@ -900,7 +817,8 @@ impl LocalFsTransport {
         }
     }
 
-    fn git_save_repo(&self, gateway: &str, project: &str, run_id: &str) -> PathBuf {
+    #[cfg(test)]
+    fn git_save_repo(&self, gateway: &str, project: &str, run_id: &str) -> std::path::PathBuf {
         let mut path = self.data_dir.clone();
         for part in git_save_rel(gateway, project, run_id).split('/') {
             path.push(part);
@@ -923,26 +841,6 @@ impl LocalFsTransport {
             Ok(_) => Ok(()),
             Err(e) => Err(self.git_fail(op, format!("{what} cannot be inspected ({})", e.kind()))),
         }
-    }
-
-    /// The live `.git` of `project` as a verified real directory: every level
-    /// from `data_dir` to `.git` is checked and none is followed. A path
-    /// check for the write side (27-44 moves it onto handles); the readers use
-    /// [`Self::open_git`].
-    fn live_git_dir(&self, op: &str, project: &str) -> Result<PathBuf, CoreError> {
-        if let Some(why) = component_problem(project) {
-            return Err(self.git_fail(op, format!("the project name {why}")));
-        }
-        self.require_data_dir()?;
-        self.require_real_dir(op, &self.data_dir.join("projects"), "projects")?;
-        self.require_real_dir(
-            op,
-            &self.data_dir.join("projects").join(project),
-            &format!("projects/{project}"),
-        )?;
-        let git = self.project_git_dir(project);
-        self.require_real_dir(op, &git, &format!("projects/{project}/.git"))?;
-        Ok(git)
     }
 
     /// The live `.git` of `project`, opened level by level from the data
@@ -1158,31 +1056,46 @@ impl LocalFsTransport {
     }
 
     /// The manifest of `parts` below the data directory.
+    #[cfg(test)]
     fn manifest_at(&self, op: &str, parts: &[&str]) -> Result<GitManifest, CoreError> {
         let root = self.open_below_data(op, parts)?;
         self.manifest_blocking(op, &root)
     }
 
-    /// Copy the walked `entries` of `src` below the (already created) `to`.
-    /// The source side is read through handles opened relative to `src`; the
-    /// destination writes are still by path (27-44).
+    /// Copy the walked `entries` of `src` below `to` (already created). The
+    /// source side is read through handles opened relative to `src`; the
+    /// destination is written through handles too (27-44): each file is
+    /// created exclusively in the handle of its own directory, and each
+    /// directory is made from the handle of the one above it. The walk is
+    /// depth first, so the parent of the next entry is the last directory
+    /// made or one above it.
     fn copy_git(
         &self,
         op: &str,
         src: &GitDir,
         entries: &[WalkEntry],
-        to: &Path,
+        to: &GitDir,
         mode: &CopyMode<'_>,
     ) -> Result<(), CoreError> {
+        let mut stack: Vec<(String, GitDir)> = Vec::new();
         for entry in entries {
-            let target = to.join(&entry.rel);
+            let (parent_rel, name) = entry.rel.rsplit_once('/').unwrap_or(("", &entry.rel));
+            while stack.last().is_some_and(|(rel, _)| rel != parent_rel) {
+                stack.pop();
+            }
+            if !parent_rel.is_empty() && stack.is_empty() {
+                return Err(
+                    self.git_fail(op, format!("{} was walked before its directory", entry.rel))
+                );
+            }
+            let parent: &GitDir = stack.last().map_or(to, |(_, dir)| dir);
             if entry.is_dir {
-                create_dir_mode(&target, mode.dir_mode()).map_err(|e| {
-                    self.git_fail(
-                        op,
-                        format!("{} cannot be created ({})", entry.rel, e.kind()),
-                    )
-                })?;
+                let child = parent
+                    .create_dir_child(name, mode.dir_mode())
+                    .map_err(|e| {
+                        self.git_fail(op, format!("{} cannot be created ({e})", entry.rel))
+                    })?;
+                stack.push((entry.rel.clone(), child));
                 continue;
             }
             let Some((mut source, meta)) = src.open_file(&entry.rel).map_err(self.gd(op))? else {
@@ -1191,7 +1104,8 @@ impl LocalFsTransport {
                     format!("{} changed while it was copied; refused", entry.rel),
                 ));
             };
-            let mut dest = create_new_file(&target, mode.file_mode(&entry.rel, meta.mode))
+            let mut dest = parent
+                .create_file(name, mode.file_mode(&entry.rel, meta.mode))
                 .map_err(|e| {
                     self.git_fail(
                         op,
@@ -1207,11 +1121,10 @@ impl LocalFsTransport {
                     format!("{} cannot be flushed ({})", entry.rel, e.kind()),
                 )
             })?;
-            drop(dest);
             // The umask may have taken bits off at creation; the recorded
-            // mode is applied exactly.
+            // mode is applied exactly, on the open file.
             if let CopyMode::Restore(set) = mode {
-                set_mode(&target, set.file(&entry.rel)).map_err(|e| {
+                set_file_mode(&dest, set.file(&entry.rel)).map_err(|e| {
                     self.git_fail(
                         op,
                         format!("{} cannot be given its mode ({})", entry.rel, e.kind()),
@@ -1220,55 +1133,6 @@ impl LocalFsTransport {
             }
         }
         Ok(())
-    }
-
-    /// Create the save directories down to `<run>` (not `repo`), each level a
-    /// real directory or newly created: `git-save` and below `0700`. Returns
-    /// whether `<run>` was created by this call.
-    fn ensure_save_run_dir(
-        &self,
-        op: &str,
-        gateway: &str,
-        project: &str,
-        run_id: &str,
-    ) -> Result<bool, CoreError> {
-        let mut path = self.data_dir.clone();
-        let parts = [
-            "ign-deploy",
-            gateway,
-            "projects",
-            project,
-            GIT_SAVE_DIR,
-            run_id,
-        ];
-        let mut created_run = false;
-        for (index, part) in parts.iter().enumerate() {
-            path.push(part);
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(
-                        self.git_fail(op, format!("{part} is a symlink; symlinks are refused"))
-                    );
-                }
-                Ok(m) if !m.file_type().is_dir() => {
-                    return Err(self.git_fail(op, format!("{part} is not a directory")));
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let mode = if index >= 4 { 0o700 } else { 0o755 };
-                    create_dir_mode(&path, mode).map_err(|e| {
-                        self.git_fail(op, format!("{part} cannot be created ({})", e.kind()))
-                    })?;
-                    created_run = index == parts.len() - 1;
-                }
-                Err(e) => {
-                    return Err(
-                        self.git_fail(op, format!("{part} cannot be inspected ({})", e.kind()))
-                    );
-                }
-            }
-        }
-        Ok(created_run)
     }
 
     fn save_git_blocking(
@@ -1285,69 +1149,95 @@ impl LocalFsTransport {
         let before = self.manifest_of(OP, &source, &entries)?;
 
         let root_mode = source.mode().map_err(self.gd(OP))?;
-        let created_run = self.ensure_save_run_dir(OP, gateway, project, run_id)?;
+        // Every level from the data directory down to `<run>` is opened from
+        // the one above it, or made (`git-save` and below `0700`); the
+        // handles are kept (27-44).
+        let (mut levels, made) = GitDir::ensure_open(
+            &self.data_dir,
+            &[
+                "ign-deploy",
+                gateway,
+                "projects",
+                project,
+                GIT_SAVE_DIR,
+                run_id,
+            ],
+            |index| if index >= 4 { 0o700 } else { 0o755 },
+        )
+        .map_err(self.gd(OP))?;
+        let created_run = made.last().copied().unwrap_or(false);
         #[cfg(test)]
         tests::AFTER_RUN_DIR.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
             }
         });
-        let repo = self.git_save_repo(gateway, project, run_id);
-        let run_dir = repo.parent().map(Path::to_path_buf).unwrap_or_default();
-        let modes_path = run_dir.join(GIT_SAVE_MODES_FILE);
         // `repo` and the `modes` record are removed only when this call made
         // them: a save that loses a race to another save of the run never
         // removes the winner's. The run directories go only when this call
-        // made them and they are empty.
-        let made_modes = std::cell::Cell::new(false);
-        let cleanup = |made_repo: bool| {
-            if made_repo {
-                let _ = std::fs::remove_dir_all(&repo);
-            }
-            if made_modes.get() {
-                let _ = std::fs::remove_file(&modes_path);
+        // made them and they are empty; their own handles are let go first
+        // (a held directory cannot be removed on Windows).
+        let made_modes: std::cell::Cell<Option<LockId>> = std::cell::Cell::new(None);
+        let tidy = |levels: &mut Vec<GitDir>, made_repo: bool| {
+            if let Some(run) = levels.last() {
+                if made_repo {
+                    let _ = run.remove_tree("repo");
+                }
+                if let Some(id) = made_modes.get() {
+                    let _ = run.remove_own_lock(GIT_SAVE_MODES_FILE, id);
+                }
             }
             if created_run {
-                let _ = std::fs::remove_dir(&run_dir);
-                if let Some(save_dir) = run_dir.parent() {
-                    // Only when this run made it and nothing else lives there.
-                    let _ = std::fs::remove_dir(save_dir);
+                drop(levels.pop());
+                if let Some(save_dir) = levels.last() {
+                    let _ = save_dir.remove_empty_dir(run_id);
+                }
+                drop(levels.pop());
+                // Only when this run made it and nothing else lives there.
+                if let Some(project_dir) = levels.last() {
+                    let _ = project_dir.remove_empty_dir(GIT_SAVE_DIR);
                 }
             }
         };
-        if std::fs::symlink_metadata(&repo).is_ok() {
-            if created_run {
-                cleanup(false);
-            }
-            return Err(self.git_fail(
+        let exists = |this: &Self| {
+            this.git_fail(
                 OP,
                 format!(
                     "{} already exists; a save is never overwritten",
                     git_save_location(LedgerRoot::DataDir, gateway, project, run_id)
                 ),
-            ));
+            )
+        };
+        let Some(run) = levels.last() else {
+            return Err(self.git_fail(OP, "the save directories cannot be opened"));
+        };
+        match run.kind("repo") {
+            Ok(Kind::Missing) => {}
+            Ok(_) => {
+                tidy(&mut levels, false);
+                return Err(exists(self));
+            }
+            Err(e) => {
+                tidy(&mut levels, false);
+                return Err(self.git_fail(OP, e.to_string()));
+            }
         }
-        if let Err(e) = create_dir_mode(&repo, CopyMode::Private.dir_mode()) {
-            cleanup(false);
-            return Err(self.git_fail(
-                OP,
-                format!("the save directory cannot be created ({})", e.kind()),
-            ));
-        }
+        let repo = match run.create_dir_child("repo", CopyMode::Private.dir_mode()) {
+            Ok(repo) => repo.into_root(),
+            Err(e) if e.already_exists() => {
+                tidy(&mut levels, false);
+                return Err(exists(self));
+            }
+            Err(e) => {
+                tidy(&mut levels, false);
+                return Err(
+                    self.git_fail(OP, format!("the save directory cannot be created ({e})"))
+                );
+            }
+        };
         let outcome = (|| {
             self.copy_git(OP, &source, &entries, &repo, &CopyMode::Private)?;
-            let after = self.manifest_at(
-                OP,
-                &[
-                    "ign-deploy",
-                    gateway,
-                    "projects",
-                    project,
-                    GIT_SAVE_DIR,
-                    run_id,
-                    "repo",
-                ],
-            )?;
+            let after = self.manifest_blocking(OP, &repo)?;
             if after != before {
                 return Err(self.git_fail(
                     OP,
@@ -1355,13 +1245,13 @@ impl LocalFsTransport {
                 ));
             }
             // The original modes, beside the private copy.
-            let mut modes = create_new_file(&modes_path, 0o600).map_err(|e| {
+            let (mut modes, id) = run.create_lock(GIT_SAVE_MODES_FILE, 0o600).map_err(|e| {
                 self.git_fail(
                     OP,
                     format!("the modes record cannot be created ({})", e.kind()),
                 )
             })?;
-            made_modes.set(true);
+            made_modes.set(Some(id));
             modes
                 .write_all(modes_text(root_mode, &entries).as_bytes())
                 .and_then(|()| modes.sync_all())
@@ -1374,7 +1264,10 @@ impl LocalFsTransport {
             Ok(after)
         })();
         if outcome.is_err() {
-            cleanup(true);
+            // The copy's handles go first: a held directory cannot be removed
+            // on Windows.
+            drop(repo);
+            tidy(&mut levels, true);
         }
         outcome
     }
@@ -1400,16 +1293,13 @@ impl LocalFsTransport {
         const OP: &str = "write";
         self.git_save_names(gateway, project, run_id)?;
         self.require_data_dir()?;
-        self.require_real_dir(OP, &self.data_dir.join("projects"), "projects")?;
-        self.require_real_dir(
-            OP,
-            &self.data_dir.join("projects").join(project),
-            &format!("projects/{project}"),
-        )?;
-        let git = self.project_git_dir(project);
+        // The project directory is opened from the data directory and held:
+        // the publish lands in this handle (27-44).
+        let project_dir = self.open_below_data(OP, &["projects", project])?;
         // Never overwrite: anything at `.git`, a symlink included, refuses.
-        match std::fs::symlink_metadata(&git) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // The cheap early refusal; the publish itself can never replace.
+        match project_dir.kind(".git") {
+            Ok(Kind::Missing) => {}
             Ok(_) => {
                 return Err(self.git_fail(
                     OP,
@@ -1419,92 +1309,91 @@ impl LocalFsTransport {
             Err(e) => {
                 return Err(self.git_fail(
                     OP,
-                    format!("projects/{project}/.git cannot be inspected ({})", e.kind()),
+                    format!("projects/{project}/.git cannot be inspected ({e})"),
                 ));
             }
         }
         let (run, saved_repo) = self.open_save(OP, gateway, project, run_id)?;
-        let repo = self.git_save_repo(gateway, project, run_id);
         let entries = self.walk_git(OP, &saved_repo)?;
         let saved = self.manifest_of(OP, &saved_repo, &entries)?;
 
         // Copy beside the save, then rename into place: `.git` is never seen
         // half written.
-        let staging = repo
-            .parent()
-            .map(|run| run.join("restoring"))
-            .ok_or_else(|| self.git_fail(OP, "the save has no parent directory"))?;
-        match std::fs::symlink_metadata(&staging) {
-            Ok(m) if m.file_type().is_dir() => {
-                let _ = std::fs::remove_dir_all(&staging);
+        match run.kind(RESTORE_STAGE).map_err(self.gd(OP))? {
+            Kind::Missing => {}
+            Kind::Dir => {
+                let _ = run.remove_tree(RESTORE_STAGE);
             }
-            Ok(_) => {
+            _ => {
                 return Err(self.git_fail(OP, "restoring is not a directory; it is left alone"));
             }
-            Err(_) => {}
         }
         let modes = self.read_save_modes(&run);
         let mode = CopyMode::Restore(&modes);
         let outcome = (|| {
-            create_dir_mode(&staging, mode.dir_mode()).map_err(|e| {
-                self.git_fail(
-                    OP,
-                    format!("the staging directory cannot be created ({})", e.kind()),
-                )
-            })?;
-            self.copy_git(OP, &saved_repo, &entries, &staging, &mode)?;
-            let staged = self.manifest_at(
-                OP,
-                &[
-                    "ign-deploy",
-                    gateway,
-                    "projects",
-                    project,
-                    GIT_SAVE_DIR,
-                    run_id,
-                    "restoring",
-                ],
-            )?;
-            if staged != saved {
-                return Err(self.git_fail(
-                    OP,
-                    "the restored copy does not match the save; nothing was restored",
-                ));
-            }
-            // Directories get their recorded modes now that they are filled,
-            // deepest first, the root last.
-            for entry in entries.iter().rev().filter(|e| e.is_dir) {
-                set_mode(&staging.join(&entry.rel), modes.dir(&entry.rel)).map_err(|e| {
+            // The stage's handles live only inside this block: a held
+            // directory could not be renamed on Windows, and nothing may
+            // refer to the stage by a name looked at earlier.
+            let staged = {
+                let stage = run
+                    .create_dir_child(RESTORE_STAGE, mode.dir_mode())
+                    .map_err(|e| {
+                        self.git_fail(OP, format!("the staging directory cannot be created ({e})"))
+                    })?
+                    .into_root();
+                self.copy_git(OP, &saved_repo, &entries, &stage, &mode)?;
+                let staged = self.manifest_blocking(OP, &stage)?;
+                if staged != saved {
+                    return Err(self.git_fail(
+                        OP,
+                        "the restored copy does not match the save; nothing was restored",
+                    ));
+                }
+                // Directories get their recorded modes now that they are
+                // filled, deepest first, the root last, each on its own
+                // handle.
+                for entry in entries.iter().rev().filter(|e| e.is_dir) {
+                    let dir = stage.at(&entry.rel).map_err(self.gd(OP))?.ok_or_else(|| {
+                        self.git_fail(
+                            OP,
+                            format!("{} changed while it was opened (it is gone)", entry.rel),
+                        )
+                    })?;
+                    dir.set_mode_self(modes.dir(&entry.rel)).map_err(|e| {
+                        self.git_fail(OP, format!("{} cannot be given its mode ({e})", entry.rel))
+                    })?;
+                }
+                stage.set_mode_self(modes.dir(".")).map_err(|e| {
                     self.git_fail(
                         OP,
-                        format!("{} cannot be given its mode ({})", entry.rel, e.kind()),
+                        format!("the restored .git cannot be given its mode ({e})"),
                     )
                 })?;
-            }
-            set_mode(&staging, modes.dir(".")).map_err(|e| {
-                self.git_fail(
-                    OP,
-                    format!("the restored .git cannot be given its mode ({})", e.kind()),
-                )
-            })?;
-            // The last look: `.git` appeared meanwhile, so do not rename.
-            if std::fs::symlink_metadata(&git).is_ok() {
-                return Err(self.git_fail(
-                    OP,
-                    format!("projects/{project}/.git appeared; it is never replaced"),
-                ));
-            }
-            std::fs::rename(&staging, &git).map_err(|e| {
-                self.git_fail(
-                    OP,
-                    format!("the restored .git cannot be put in place ({})", e.kind()),
-                )
-            })?;
+                staged
+            };
+            let _ = staged;
+            super::git_dir::fire(|| format!("publish:{project}"));
+            // The publish never replaces (C12): a `.git` that appeared, an
+            // empty directory included, is kept. A host that cannot refuse to
+            // replace fails closed: "the host cannot publish without
+            // replacing", and there is no plain-rename fallback.
+            run.publish_noreplace(RESTORE_STAGE, &project_dir, ".git")
+                .map_err(|e| {
+                    if e.already_exists() {
+                        self.git_fail(
+                            OP,
+                            format!("projects/{project}/.git appeared; it is never replaced"),
+                        )
+                    } else {
+                        self.git_fail(OP, e.to_string())
+                    }
+                })?;
             let restored = self.open_git(OP, project)?;
             self.manifest_blocking(OP, &restored)
         })();
         if outcome.is_err() {
-            let _ = std::fs::remove_dir_all(&staging);
+            // Only the stage goes: never `.git`, never the save.
+            let _ = run.remove_tree(RESTORE_STAGE);
         }
         outcome
     }
@@ -1535,172 +1424,184 @@ impl LocalFsTransport {
         const OP: &str = "write";
         self.git_save_names(gateway, project, run_id)?;
         self.require_data_dir()?;
-        let repo = self.git_save_repo(gateway, project, run_id);
-        // Every level above `repo` must be a real directory or absent.
-        if let SaveChain::Absent = self.require_save_chain(OP, gateway, project, run_id)? {
-            return Ok(());
+        // Every level above `repo` must be a real directory or absent; the
+        // removal is made through the handles of the run directory and of
+        // the one above it (27-44).
+        let rel = git_save_rel(gateway, project, run_id);
+        let parts: Vec<&str> = rel.split('/').collect();
+        let Some(save_parts) = parts.len().checked_sub(2).map(|n| &parts[..n]) else {
+            return Err(self.git_fail(OP, "the save has no run directory"));
+        };
+        let save_dir = match GitDir::open(&self.data_dir, save_parts).map_err(self.gd(OP))? {
+            Open::Found(dir) => dir,
+            Open::Absent { .. } => return Ok(()),
+        };
+        {
+            let Some(run) = save_dir.child(run_id).map_err(self.gd(OP))? else {
+                return Ok(());
+            };
+            match run
+                .kind("repo")
+                .map_err(|e| self.git_fail(OP, format!("the save cannot be inspected ({e})")))?
+            {
+                Kind::Missing => {}
+                Kind::Dir => {
+                    run.remove_tree("repo").map_err(|e| {
+                        self.git_fail(OP, format!("the save cannot be removed ({e})"))
+                    })?;
+                }
+                _ => {
+                    return Err(self.git_fail(OP, "the save is not a directory; it is left alone"));
+                }
+            }
+            // The modes record goes too.
+            if run
+                .kind(GIT_SAVE_MODES_FILE)
+                .is_ok_and(|kind| kind == Kind::File)
+            {
+                let _ = run.unlink_file(GIT_SAVE_MODES_FILE);
+            }
         }
-        match std::fs::symlink_metadata(&repo) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(m) if m.file_type().is_dir() => {
-                std::fs::remove_dir_all(&repo).map_err(|e| {
-                    self.git_fail(OP, format!("the save cannot be removed ({})", e.kind()))
-                })?;
-            }
-            Ok(_) => {
-                return Err(self.git_fail(OP, "the save is not a directory; it is left alone"));
-            }
-            Err(e) => {
-                return Err(
-                    self.git_fail(OP, format!("the save cannot be inspected ({})", e.kind()))
-                );
-            }
-        }
-        // The modes record and the now-empty run directory go too; a
-        // non-empty run directory stays.
-        if let Some(run_dir) = repo.parent() {
-            let modes = run_dir.join(GIT_SAVE_MODES_FILE);
-            if std::fs::symlink_metadata(&modes).is_ok_and(|m| m.file_type().is_file()) {
-                let _ = std::fs::remove_file(&modes);
-            }
-            let _ = std::fs::remove_dir(run_dir);
-        }
+        // The now-empty run directory goes too; a non-empty one stays.
+        let _ = save_dir.remove_empty_dir(run_id);
         Ok(())
     }
 
-    /// Write `writes` inside the project's existing `.git`.
+    /// Write `writes` inside the project's existing `.git`, every one
+    /// through handles opened from the held `.git` (27-44, CodeRabbit #56
+    /// C2): each target's parent is opened (or made) level by level from that
+    /// handle, the lock is created exclusively in the parent's handle without
+    /// following a link, and the publish is a `renameat` inside that one
+    /// handle. A parent swapped for a link after the preflight is refused and
+    /// nothing is created behind it.
     fn write_git_files_blocking(
         &self,
         project: &str,
         writes: &[GitWrite],
     ) -> Result<(), CoreError> {
         const OP: &str = "write";
-        let git = self.live_git_dir(OP, project)?;
+        let git = self.open_git(OP, project)?;
         // Every shape and every lock is checked before the first byte is
-        // written, so a refusal leaves the repo as it was.
-        let mut plan: Vec<(PathBuf, PathBuf, Vec<String>, &GitWrite)> = Vec::new();
+        // written, so a refusal leaves the repo as it was. The checks are
+        // made on the held handle, the same anchor the writes use.
+        struct Planned<'a> {
+            rel: String,
+            parents: Vec<String>,
+            name: String,
+            temp: String,
+            write: &'a GitWrite,
+        }
+        let mut plan: Vec<Planned<'_>> = Vec::new();
         for write in writes {
             write
                 .name
                 .check_shape()
                 .map_err(|why| self.git_fail(OP, format!("a .git write is refused: {why}")))?;
             let rel = write.name.rel();
-            let parts: Vec<String> = rel.split('/').map(str::to_string).collect();
-            let target = parts.iter().fold(git.clone(), |p, part| p.join(part));
+            let mut parents: Vec<String> = rel.split('/').map(str::to_string).collect();
+            let name = parents.pop().unwrap_or_default();
             let temp_suffix = match write.name {
                 GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => ".ign-tmp",
                 _ => ".lock",
             };
-            let mut temp_name = parts.last().cloned().unwrap_or_default();
-            temp_name.push_str(temp_suffix);
-            let temp = target.with_file_name(&temp_name);
-            // Existing parents must be real directories.
-            let mut dir = git.clone();
-            for part in &parts[..parts.len() - 1] {
-                dir.push(part);
-                match std::fs::symlink_metadata(&dir) {
-                    Ok(m) if m.file_type().is_dir() => {}
-                    Ok(_) => {
-                        return Err(self.git_fail(
-                            OP,
-                            format!("{part} below .git is a symlink or not a directory; refused"),
-                        ));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) => {
-                        return Err(self.git_fail(
-                            OP,
-                            format!("{part} below .git cannot be inspected ({})", e.kind()),
-                        ));
-                    }
-                }
-            }
-            match std::fs::symlink_metadata(&temp) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(_) => {
+            let temp = format!("{name}{temp_suffix}");
+            let temp_rel = if parents.is_empty() {
+                temp.clone()
+            } else {
+                format!("{}/{temp}", parents.join("/"))
+            };
+            // Existing parents must be real directories (the kind lookup
+            // opens each one without following it).
+            match git.kind(&temp_rel).map_err(self.gd(OP))? {
+                Kind::Missing => {}
+                _ => {
                     return Err(self.git_fail(
                         OP,
                         format!("{rel}{temp_suffix} exists; another writer holds it, nothing was written"),
                     ));
                 }
-                Err(e) => {
-                    return Err(self.git_fail(
-                        OP,
-                        format!("{rel}{temp_suffix} cannot be inspected ({})", e.kind()),
-                    ));
-                }
             }
-            if let Ok(m) = std::fs::symlink_metadata(&target)
-                && !m.file_type().is_file()
-            {
-                return Err(
-                    self.git_fail(OP, format!("{rel} is not a regular file; it is left alone"))
-                );
-            }
-            plan.push((target, temp, parts, write));
-        }
-        for (target, temp, parts, write) in plan {
-            let mut dir = git.clone();
-            for part in &parts[..parts.len() - 1] {
-                dir.push(part);
-                match std::fs::symlink_metadata(&dir) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        // WR-B1: a directory the advance makes takes its
-                        // parent directory's permission bits.
-                        let parent_mode = dir
-                            .parent()
-                            .and_then(|p| std::fs::symlink_metadata(p).ok())
-                            .map_or(0o755, |m| mode_of(&m));
-                        create_dir_mode(&dir, parent_mode)
-                            .and_then(|()| set_dir_mode_no_follow(&dir, parent_mode))
-                            .map_err(|e| {
-                                self.git_fail(
-                                    OP,
-                                    format!("{part} cannot be created ({})", e.kind()),
-                                )
-                            })?;
-                    }
-                }
-            }
-            let rel = write.name.rel();
-            // WR-B1: the mode of the file this replaces, never wider (and
-            // never an execute bit); a new `config` is owner-only (it can hold
-            // a remote URL with userinfo), any other new file `0644`.
-            let file_mode = match std::fs::symlink_metadata(&target) {
-                Ok(m) => mode_of(&m) & 0o666,
-                Err(_) if matches!(write.name, GitWriteName::Config) => 0o600,
-                Err(_) => 0o644,
-            };
-            // A lock this call failed to create is another writer's: only a
-            // failure after the create removes it.
-            let mut file = match create_new_file(&temp, file_mode) {
-                Ok(file) => file,
-                Err(e) => {
+            match git.kind(&rel).map_err(self.gd(OP))? {
+                Kind::Missing | Kind::File => {}
+                _ => {
                     return Err(
-                        self.git_fail(OP, format!("{rel} cannot be written ({})", e.kind()))
+                        self.git_fail(OP, format!("{rel} is not a regular file; it is left alone"))
                     );
                 }
-            };
-            let result = (|| -> std::io::Result<()> {
-                #[cfg(unix)]
-                {
+            }
+            plan.push(Planned {
+                rel,
+                parents,
+                name,
+                temp,
+                write,
+            });
+        }
+        // The levels this pass makes, so a failure can take the empty ones
+        // away again.
+        let mut made: Vec<String> = Vec::new();
+        let outcome = (|| -> Result<(), CoreError> {
+            for item in &plan {
+                super::git_dir::fire(|| format!("write:{}", item.rel));
+                let owned;
+                let parent: &GitDir = if item.parents.is_empty() {
+                    &git
+                } else {
+                    let parts: Vec<&str> = item.parents.iter().map(String::as_str).collect();
+                    owned = git.ensure_parent(&parts, &mut made).map_err(self.gd(OP))?;
+                    &owned
+                };
+                // WR-B1: the mode of the file this replaces, never wider (and
+                // never an execute bit); a new `config` is owner-only (it can
+                // hold a remote URL with userinfo), any other new file `0644`.
+                let file_mode = match parent.stat(&item.name).map_err(self.gd(OP))? {
+                    Some(found) if found.kind == Kind::File => found.mode & 0o666,
+                    Some(_) => {
+                        return Err(self.git_fail(
+                            OP,
+                            format!("{} is not a regular file; it is left alone", item.rel),
+                        ));
+                    }
+                    None if matches!(item.write.name, GitWriteName::Config) => 0o600,
+                    None => 0o644,
+                };
+                // A lock this call failed to create is another writer's: only
+                // a failure after the create removes it, and then only the
+                // file this call created.
+                let (mut file, id) = match parent.create_lock(&item.temp, file_mode) {
+                    Ok(created) => created,
+                    Err(e) => {
+                        return Err(self.git_fail(
+                            OP,
+                            format!("{} cannot be written ({})", item.rel, e.kind()),
+                        ));
+                    }
+                };
+                super::git_dir::fire(|| format!("locked:{}", item.rel));
+                let result = (|| -> std::io::Result<()> {
                     // the umask may have narrowed the create; the file gets
                     // exactly the mode it replaces (an fchmod on the open file)
-                    use std::os::unix::fs::PermissionsExt;
-                    file.set_permissions(std::fs::Permissions::from_mode(file_mode))?;
+                    set_file_mode(&file, file_mode)?;
+                    file.write_all(&item.write.bytes)?;
+                    file.sync_all()?;
+                    drop(file);
+                    parent.publish(&item.temp, &item.name)
+                })();
+                if let Err(e) = result {
+                    let _ = parent.remove_own_lock(&item.temp, id);
+                    return Err(
+                        self.git_fail(OP, format!("{} cannot be written ({})", item.rel, e.kind()))
+                    );
                 }
-                file.write_all(&write.bytes)?;
-                file.sync_all()?;
-                drop(file);
-                std::fs::rename(&temp, &target)
-            })();
-            if let Err(e) = result {
-                let _ = std::fs::remove_file(&temp);
-                return Err(self.git_fail(OP, format!("{rel} cannot be written ({})", e.kind())));
+            }
+            Ok(())
+        })();
+        if outcome.is_err() {
+            for rel in made.iter().rev() {
+                let _ = git.remove_empty_dir(rel);
             }
         }
-        Ok(())
+        outcome
     }
 
     /// Every loose ref below `dir` (named `prefix`), at most one past the
@@ -2046,24 +1947,26 @@ impl LocalFsTransport {
                 "the run id is not 1 to 128 characters of [A-Za-z0-9._-]",
             ));
         }
-        let git = self.live_git_dir(OP, project)?;
+        self.require_data_dir()?;
+        // Both places are opened from the data directory without following a
+        // link, and the probe is made and removed through those handles
+        // (27-44).
+        let project_dir = self.open_below_data(OP, &["projects", project])?;
+        let git = self.open_below_data(OP, &["projects", project, ".git"])?;
         let name = git_probe_name(run_id);
         let places = [
-            (
-                self.data_dir.join("projects").join(project),
-                format!("projects/{project}"),
-            ),
-            (git, format!("projects/{project}/.git")),
+            (&project_dir, format!("projects/{project}")),
+            (&git, format!("projects/{project}/.git")),
         ];
         for (dir, shown) in places {
-            let probe = dir.join(&name);
-            create_new_file(&probe, 0o600).map_err(|e| {
+            let (file, id) = dir.create_lock(&name, 0o600).map_err(|e| {
                 self.git_fail(
                     OP,
                     format!("a probe file cannot be created in {shown} ({})", e.kind()),
                 )
             })?;
-            std::fs::remove_file(&probe).map_err(|e| {
+            drop(file);
+            dir.remove_own_lock(&name, id).map_err(|e| {
                 self.git_fail(
                     OP,
                     format!("the probe file in {shown} cannot be removed ({})", e.kind()),
@@ -2597,29 +2500,39 @@ mod tests {
     /// 27-31 (security review 3): a directory is given its mode through an
     /// open of the directory itself, never by path. A symlink, a regular file
     /// or a directory the current account does not own is refused and nothing
-    /// is changed.
+    /// is changed. (27-44: the primitive is [`GitDir::set_mode_self`] on the
+    /// handle opened from the held parent.)
     #[cfg(unix)]
     #[test]
     fn local_dir_mode_is_set_on_the_directory_itself() {
         use std::os::unix::fs::PermissionsExt;
         let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
         let dir = tempfile::tempdir().expect("dir");
+        let Ok(Open::Found(parent)) = GitDir::open(dir.path(), &[]) else {
+            panic!("the temporary directory opens");
+        };
+        let set = |name: &str, mode: u32| {
+            parent.child(name).and_then(|found| match found {
+                Some(child) => child.set_mode_self(mode),
+                None => Ok(()),
+            })
+        };
         let real = dir.path().join("real");
         std::fs::create_dir(&real).expect("real");
-        set_dir_mode_no_follow(&real, 0o750).expect("a directory of ours");
+        set("real", 0o750).expect("a directory of ours");
         assert_eq!(mode(&real), 0o750);
 
         // a regular file is not a directory: refused, mode untouched
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").expect("file");
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-        assert!(set_dir_mode_no_follow(&file, 0o777).is_err());
+        assert!(set("file", 0o777).is_err());
         assert_eq!(mode(&file), 0o600, "a file is never chmod-ed");
 
         // a symlink swapped in for the directory is not followed
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).expect("link");
-        assert!(set_dir_mode_no_follow(&link, 0o777).is_err());
+        assert!(set("link", 0o777).is_err());
         assert_eq!(mode(&real), 0o750, "the link's target is untouched");
     }
 
@@ -3837,5 +3750,355 @@ mod tests {
             let err = result.expect_err("a junction swapped in is refused");
             assert!(err.to_string().contains("refs"), "{err}");
         }
+    }
+
+    // ---- 27-44: handle-anchored writes ---------------------------------
+
+    /// A repo `CapApp` with `refs/heads/sub` (an existing parent), for the
+    /// write-swap tests.
+    #[cfg(unix)]
+    fn data_with_sub_ref() -> tempfile::TempDir {
+        let dir = data_with_repo();
+        std::fs::create_dir_all(dir.path().join("projects/CapApp/.git/refs/heads/sub"))
+            .expect("sub");
+        dir
+    }
+
+    /// Every file below `root`, as `(relative path, bytes)`, sorted.
+    #[cfg(unix)]
+    fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
+        fn visit(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("below root")
+                    .to_string_lossy()
+                    .into_owned();
+                if path.is_dir() {
+                    out.push((format!("{rel}/"), Vec::new()));
+                    visit(root, &path, out);
+                } else {
+                    out.push((rel, std::fs::read(&path).expect("read")));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// CodeRabbit #56 C2 (27-44): a parent of a write swapped for a symlink
+    /// after the preflight and before the first create is refused, naming it.
+    /// Nothing is created or written in the directory behind the link, and no
+    /// lock is left in `.git`.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_write_refuses_a_parent_swapped_after_the_preflight() {
+        let dir = data_with_sub_ref();
+        let git = dir.path().join("projects/CapApp/.git");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("keep"), "outside").expect("keep");
+        let before = tree_snapshot(outside.path());
+        let (g, target) = (git.clone(), outside.path().to_path_buf());
+        at_point("write:refs/heads/sub/x", move || {
+            swap_for_link(&g.join("refs/heads/sub"), &target)
+        });
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[GitWrite {
+                name: GitWriteName::BranchRef("sub/x".to_string()),
+                bytes: b"1111\n".to_vec(),
+            }],
+        );
+        no_point();
+        let err = result.expect_err("a swapped parent is refused");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(err.to_string().contains("sub"), "names the level: {err}");
+        assert_eq!(
+            tree_snapshot(outside.path()),
+            before,
+            "nothing was created or written behind the link"
+        );
+        for lock in ["refs/heads/sub.aside/x.lock", "refs/heads/sub/x.lock"] {
+            assert!(
+                std::fs::symlink_metadata(git.join(lock)).is_err(),
+                "no lock left: {lock}"
+            );
+        }
+    }
+
+    /// `.git` itself renamed aside and replaced with a symlink after the
+    /// open: the write goes to the held `.git` (or fails) and is never made
+    /// through the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_write_refuses_a_git_swapped_after_the_open() {
+        let dir = data_with_repo();
+        let project = dir.path().join("projects/CapApp");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(outside.path().join("HEAD"), "ref: refs/heads/outside\n").expect("HEAD");
+        let before = tree_snapshot(outside.path());
+        let (p, target) = (project.clone(), outside.path().to_path_buf());
+        at_point("write:HEAD", move || {
+            swap_for_link(&p.join(".git"), &target)
+        });
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            }],
+        );
+        no_point();
+        assert_eq!(
+            tree_snapshot(outside.path()),
+            before,
+            "nothing was written through the symlink ({result:?})"
+        );
+        if result.is_ok() {
+            assert_eq!(
+                std::fs::read(project.join(".git.aside/HEAD")).expect("held HEAD"),
+                b"ref: refs/heads/other\n",
+                "the write went to the .git it held"
+            );
+        }
+    }
+
+    /// Restore the save of `data_with_save` with `planted` files created in a
+    /// `.git` that appears just before the publish; returns the error text.
+    fn restore_with_git_planted(planted: &'static [(&'static str, &'static [u8])]) -> String {
+        let dir = data_with_save();
+        let t = host(dir.path());
+        let before = t
+            .save_manifest_blocking("gw", "CapApp", SAVE_RUN)
+            .expect("save manifest");
+        let git = dir.path().join("projects/CapApp/.git");
+        let g = git.clone();
+        at_point("publish:CapApp", move || {
+            std::fs::create_dir(&g).expect("plant .git");
+            for (name, bytes) in planted {
+                std::fs::write(g.join(name), bytes).expect("plant file");
+            }
+        });
+        let result = t.restore_git_blocking("gw", "CapApp", SAVE_RUN);
+        no_point();
+        let err = result.expect_err("a .git that appeared is never replaced");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("projects/CapApp/.git appeared; it is never replaced"),
+            "{text}"
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&git)
+            .expect("the planted .git is still there")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = planted.iter().map(|(n, _)| (*n).to_string()).collect();
+        want.sort();
+        assert_eq!(names, want, "the planted .git is unchanged");
+        for (name, bytes) in planted {
+            assert_eq!(&std::fs::read(git.join(name)).expect("planted file"), bytes);
+        }
+        assert_eq!(
+            t.save_manifest_blocking("gw", "CapApp", SAVE_RUN)
+                .expect("the save is intact"),
+            before
+        );
+        let run = dir
+            .path()
+            .join("ign-deploy/gw/projects/CapApp/git-save")
+            .join(SAVE_RUN);
+        assert!(
+            std::fs::symlink_metadata(run.join("restoring")).is_err(),
+            "the stage is removed"
+        );
+        text
+    }
+
+    /// CodeRabbit #56 C12 (27-44): rename(2) replaces an empty directory, so
+    /// an empty `.git` that appeared after the last look was silently
+    /// replaced. The publish never replaces.
+    #[test]
+    fn local_git_restore_keeps_an_empty_git_planted_before_the_publish() {
+        restore_with_git_planted(&[]);
+    }
+
+    #[test]
+    fn local_git_restore_keeps_a_full_git_planted_before_the_publish() {
+        restore_with_git_planted(&[
+            ("HEAD", b"ref: refs/heads/theirs\n"),
+            ("config", b"[core]\n"),
+        ]);
+    }
+
+    /// 27-44 (C12): a host whose file system does not know the no-replace
+    /// flag fails closed. EINVAL, ENOSYS and EOPNOTSUPP are "the host cannot
+    /// publish without replacing" (a `transport_failed`, never a plain
+    /// rename); EEXIST is "a `.git` appeared"; no other errno is either.
+    #[cfg(unix)]
+    #[test]
+    fn local_noreplace_unsupported_fails_closed() {
+        use rustix::io::Errno;
+        let dir = data_with_projects();
+        let t = host(dir.path());
+        let text = "the host cannot publish without replacing";
+        for errno in [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP] {
+            let e = super::super::git_dir::noreplace_error(errno);
+            assert!(!e.already_exists(), "{errno:?}");
+            let core = t.git_fail("write", e.to_string());
+            assert_eq!(core.code(), "transport_failed", "{errno:?}");
+            assert!(core.to_string().contains(text), "{errno:?}: {core}");
+        }
+        let appeared = super::super::git_dir::noreplace_error(Errno::EXIST);
+        assert!(appeared.already_exists());
+        assert!(!appeared.to_string().contains(text));
+        for errno in [
+            Errno::NOENT,
+            Errno::ACCESS,
+            Errno::NOTEMPTY,
+            Errno::XDEV,
+            Errno::NOTDIR,
+            Errno::IO,
+        ] {
+            let e = super::super::git_dir::noreplace_error(errno);
+            assert!(!e.already_exists(), "{errno:?}");
+            assert!(
+                !e.to_string().contains(text),
+                "{errno:?} is not a missing flag: {e}"
+            );
+        }
+    }
+
+    /// 27-44 on Windows: an empty `.git` planted before the publish is kept
+    /// and the restore refuses with the same wording (std's rename refuses a
+    /// directory target; the publish also looks at the target on its parent's
+    /// handle). Pending windows-latest CI.
+    #[cfg(windows)]
+    #[test]
+    fn local_git_restore_refuses_an_existing_git_on_windows() {
+        restore_with_git_planted(&[]);
+    }
+
+    /// The assumption the Windows publish relies on, proven directly: std's
+    /// rename of a directory onto an existing empty directory fails and both
+    /// survive. Pending windows-latest CI.
+    #[cfg(windows)]
+    #[test]
+    fn local_noreplace_windows_rename_refuses_a_directory_target() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        std::fs::create_dir(&from).expect("from");
+        std::fs::write(from.join("f"), b"x").expect("f");
+        std::fs::create_dir(&to).expect("to");
+        std::fs::rename(&from, &to).expect_err("a directory target is not replaced");
+        assert!(from.join("f").is_file(), "the source is untouched");
+        assert!(to.is_dir(), "the target is untouched");
+        assert_eq!(std::fs::read_dir(&to).expect("to").count(), 0);
+    }
+
+    /// C10/C11 kept (27-44): when a write fails after its lock was created,
+    /// the lock is removed only if it is still the file this call created. A
+    /// lock another writer put at the name meanwhile, with the same bytes or
+    /// not, stays. The publish is made to fail by turning the target into a
+    /// directory after the lock exists.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_write_failure_keeps_a_foreign_lock_at_the_same_name() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        let g = git.clone();
+        at_point("locked:HEAD", move || {
+            // the other writer: takes the lock name with the same bytes this
+            // call is about to write, and the target stops being a file
+            std::fs::remove_file(g.join("HEAD.lock")).expect("drop this call's lock");
+            std::fs::write(g.join("HEAD.lock"), b"ref: refs/heads/other\n").expect("foreign lock");
+            std::fs::remove_file(g.join("HEAD")).expect("rm HEAD");
+            std::fs::create_dir(g.join("HEAD")).expect("HEAD is a directory");
+        });
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/other\n".to_vec(),
+            }],
+        );
+        no_point();
+        let err = result.expect_err("the publish cannot replace a directory");
+        assert!(err.to_string().contains("HEAD"), "{err}");
+        assert_eq!(
+            std::fs::read(git.join("HEAD.lock")).expect("the foreign lock stays"),
+            b"ref: refs/heads/other\n"
+        );
+    }
+
+    /// A failed write takes away the directories it made, when they are
+    /// still empty (27-44). `refs/heads/new` is made by this pass and is
+    /// closed to writes just before the next level is made, so the pass
+    /// fails; `new` is removed again and `refs/heads`, which was there,
+    /// stays.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_write_failure_removes_the_empty_levels_it_made() {
+        use std::os::unix::fs::PermissionsExt;
+        if current_uid().is_ok_and(|uid| uid == 0) {
+            return; // root ignores the mode this test closes the level with
+        }
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        let g = git.clone();
+        at_point("level:refs/heads/new/deep", move || {
+            std::fs::set_permissions(
+                g.join("refs/heads/new"),
+                std::fs::Permissions::from_mode(0o500),
+            )
+            .expect("close new");
+        });
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[GitWrite {
+                name: GitWriteName::BranchRef("new/deep/x".to_string()),
+                bytes: b"1111\n".to_vec(),
+            }],
+        );
+        no_point();
+        result.expect_err("the next level cannot be made");
+        assert!(
+            std::fs::symlink_metadata(git.join("refs/heads/new")).is_err(),
+            "the level this pass made is removed again"
+        );
+        assert!(git.join("refs/heads").is_dir(), "an existing level stays");
+    }
+
+    /// 27-44: a level of the save's directory chain swapped for a symlink
+    /// after the walk, while the save opens its levels from the ledger root,
+    /// is refused naming the level; nothing is created behind the link.
+    #[cfg(unix)]
+    #[test]
+    fn local_git_save_refuses_a_save_level_swapped_after_the_open() {
+        let dir = data_with_repo();
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("CapApp")).expect("outside project");
+        let before = tree_snapshot(outside.path());
+        let (d, target) = (dir.path().to_path_buf(), outside.path().to_path_buf());
+        std::fs::create_dir_all(d.join("ign-deploy/gw/projects")).expect("chain");
+        at_point("level:ign-deploy/gw/projects", move || {
+            swap_for_link(&d.join("ign-deploy/gw/projects"), &target)
+        });
+        let result = host(dir.path()).save_git_blocking("gw", "CapApp", "run1");
+        no_point();
+        let err = result.expect_err("a swapped level is refused");
+        assert_eq!(err.code(), "transport_failed", "{err}");
+        assert!(
+            err.to_string().contains("ign-deploy/gw/projects"),
+            "names the level: {err}"
+        );
+        assert_eq!(
+            tree_snapshot(outside.path()),
+            before,
+            "nothing behind the link"
+        );
     }
 }
