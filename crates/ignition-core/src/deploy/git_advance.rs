@@ -415,6 +415,101 @@ pub fn predict_drift(
     prediction
 }
 
+/// One regular file of a project directory on a node: what the node's disk
+/// holds after the import (27-40). Size and sha256 only, never content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskFile {
+    /// Size in bytes.
+    pub size: u64,
+    /// Lowercase hex sha256 of the bytes.
+    pub sha256: String,
+}
+
+/// Every regular file below `data/projects/<project>` on a node except the
+/// `.git` subtree, by `/`-separated path (byte-sorted), as read after the
+/// import by [`GitHostRead::project_file_digests`](crate::deploy::transport::projects::GitHostRead::project_file_digests).
+pub type ProjectDisk = BTreeMap<String, DiskFile>;
+
+/// [`predict_drift`] over what the node's disk holds after the import.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskDrift {
+    /// The classification: `modified` and `untracked` are the paths whose
+    /// bytes on disk differ from the release (a path whose disk bytes equal
+    /// the release is never in it, whatever the export renders).
+    pub prediction: DriftPrediction,
+    /// Export members whose disk bytes equal the release blob: clean, so the
+    /// self-check's work tree holds the release bytes for them.
+    pub release_form: BTreeSet<String>,
+    /// Export members whose disk bytes equal neither the release blob nor the
+    /// export's bytes. Nothing is guessed: the advance stops on them.
+    pub unknown: Vec<String>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The drift of the work tree the node will hold once its index holds the
+/// release: the paths whose bytes on disk, after the import, differ from the
+/// release's bytes (27-40, D-25 as amended).
+///
+/// The export says which members the gateway holds and what it would render
+/// for them; the disk says what is in the work tree. For each artifact member
+/// the export holds:
+///
+/// - on disk with the release blob's bytes: clean, never drift (the import
+///   left it alone, whatever the export renders);
+/// - on disk with the export's bytes: drift (`modified`, or `untracked` when
+///   the release tree lacks it);
+/// - on disk with any other bytes: unknown, and the caller refuses;
+/// - absent on disk: the export's own bytes decide, as before (git then sees
+///   a deletion, which the post-advance check on a local node reports; the
+///   27-37 `project.json` detection relies on this).
+///
+/// Assume-unchanged, `unexpected` and `dropped` are the export's, unchanged.
+pub fn predict_drift_from_disk(
+    prep: &AdvancePrep,
+    export_members: &BTreeMap<String, Vec<u8>>,
+    disk: &ProjectDisk,
+) -> DiskDrift {
+    let mut prediction = predict_drift(prep, export_members);
+    let in_tree: BTreeSet<&str> = prep.tree_paths.iter().map(String::as_str).collect();
+    let mut modified: BTreeSet<String> = prediction.modified.iter().cloned().collect();
+    let mut release_form = BTreeSet::new();
+    let mut unknown = BTreeSet::new();
+    for (path, bytes) in export_members {
+        if !prep.artifact_members.contains(path) {
+            continue;
+        }
+        let Some(file) = disk.get(path) else {
+            continue;
+        };
+        let export_sha = sha256_hex(bytes);
+        let tracked = in_tree.contains(path.as_str());
+        let release_sha = if tracked {
+            prep.release_blobs.get(path).map(|b| sha256_hex(b))
+        } else {
+            None
+        };
+        if release_sha.as_deref() == Some(file.sha256.as_str()) {
+            modified.remove(path);
+            release_form.insert(path.clone());
+        } else if file.sha256 == export_sha {
+            if tracked {
+                modified.insert(path.clone());
+            }
+        } else {
+            unknown.insert(path.clone());
+        }
+    }
+    prediction.modified = modified.into_iter().collect();
+    DiskDrift {
+        prediction,
+        release_form,
+        unknown: unknown.into_iter().collect(),
+    }
+}
+
 /// The advance stopped before any write because the export is not what the
 /// prediction says (reason word `status_unexpected` for callers).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,12 +634,16 @@ impl AdvancePlan {
     }
 }
 
-/// Build the advance from the read-back export (`export_zip`). Local work on
-/// ign's machine: it reads the export and runs host git on temp files, and
-/// touches no gateway file, so a failure leaves the gateway repo as it was.
+/// Build the advance from the read-back export (`export_zip`) and, where the
+/// node's disk could be read, the digests of the project's files on it
+/// (`disk`, 27-40). Local work on ign's machine: it reads the export and runs
+/// host git on temp files, and touches no gateway file, so a failure leaves the
+/// gateway repo as it was.
 ///
-/// In order: unpack the export; [`predict_drift`]; a member outside the
-/// artifact is a mismatch; assume-unchanged is the release tree minus the
+/// In order: unpack the export; [`predict_drift_from_disk`] with a disk (a
+/// member whose disk bytes are neither the release's nor the export's is a
+/// mismatch, naming the path) or [`predict_drift`] without one; a member
+/// outside the artifact is a mismatch; assume-unchanged is the release tree minus the
 /// export's members; build the index; host git's status over the extracted
 /// export must equal the prediction (modified and untracked) with no deleted
 /// path. A non-empty `dropped` alone is not a mismatch.
@@ -553,9 +652,22 @@ pub async fn finish_advance(
     checkout: &Path,
     prep: &AdvancePrep,
     export_zip: &[u8],
+    disk: Option<&ProjectDisk>,
 ) -> Result<AdvancePlan, AdvanceFailure> {
     let (export, duplicates) = read_export(export_zip)?;
-    let prediction = predict_drift(prep, &export);
+    let (prediction, release_form) = match disk {
+        Some(disk) => {
+            let drift = predict_drift_from_disk(prep, &export, disk);
+            let mut stop: BTreeSet<String> = drift.unknown.iter().cloned().collect();
+            stop.extend(drift.prediction.unexpected.iter().cloned());
+            stop.extend(duplicates.iter().cloned());
+            if !stop.is_empty() {
+                return Err(AdvanceFailure::Mismatch(AdvanceMismatch::of(stop)));
+            }
+            (drift.prediction, drift.release_form)
+        }
+        None => (predict_drift(prep, &export), BTreeSet::new()),
+    };
     let mut unexpected: BTreeSet<String> = prediction.unexpected.iter().cloned().collect();
     unexpected.extend(duplicates);
     if !unexpected.is_empty() {
@@ -576,7 +688,12 @@ pub async fn finish_advance(
         detail: format!("a private temp dir could not be made: {e}"),
     })?;
     for (path, bytes) in &export {
-        write_member(work.path(), path, bytes)?;
+        // A member whose disk bytes are the release blob's is clean there.
+        let held = release_form
+            .contains(path)
+            .then(|| prep.release_blobs.get(path))
+            .flatten();
+        write_member(work.path(), path, held.unwrap_or(bytes))?;
     }
     let status = git.status_over(checkout, &index, work.path()).await?;
     let mut differ: BTreeSet<String> = BTreeSet::new();
@@ -1058,7 +1175,7 @@ pub(crate) mod tests {
         let export = f
             .import(&host, &[], &[(LOCAL_ONLY, "x = 1\n")], Some(UTIL_RES))
             .await;
-        let plan = finish_advance(&host, &f.seed, &prep, &export)
+        let plan = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect("plan");
         assert_eq!(plan.expected_drift, vec![LOCAL_ONLY, UTIL_RES]);
@@ -1104,7 +1221,7 @@ pub(crate) mod tests {
         let prep = prepared(&f, &host, &[]).await;
         assert!(prep.pack.is_some());
         let export = f.import(&host, &[], &[], None).await;
-        let plan = finish_advance(&host, &f.seed, &prep, &export)
+        let plan = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect("plan");
         f.apply(&plan);
@@ -1158,7 +1275,7 @@ pub(crate) mod tests {
         assert!(prep.pack.is_none());
         assert_eq!(prep.pack_bases, vec![f.c2.clone()]);
         let export = f.import(&host, &[], &[], None).await;
-        let plan = finish_advance(&host, &f.seed, &prep, &export)
+        let plan = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect("plan");
         assert_eq!(kinds(&plan), vec!["index", "remote", "branch", "head"]);
@@ -1280,6 +1397,165 @@ pub(crate) mod tests {
         assert_eq!(got.dropped, vec!["e"]);
     }
 
+    fn disk_of(entries: &[(&str, &str)]) -> ProjectDisk {
+        entries
+            .iter()
+            .map(|(path, body)| {
+                (
+                    (*path).to_string(),
+                    DiskFile {
+                        size: body.len() as u64,
+                        sha256: sha256_hex(body.as_bytes()),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// The digests of the files below `dir`, `.git` excluded.
+    fn disk_below(dir: &Path) -> ProjectDisk {
+        fn walk(dir: &Path, prefix: &str, out: &mut ProjectDisk) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let name = entry.file_name().to_string_lossy().to_string();
+                if prefix.is_empty() && name == ".git" {
+                    continue;
+                }
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.path().is_dir() {
+                    walk(&entry.path(), &rel, out);
+                } else {
+                    let bytes = std::fs::read(entry.path()).expect("read");
+                    out.insert(
+                        rel,
+                        DiskFile {
+                            size: bytes.len() as u64,
+                            sha256: sha256_hex(&bytes),
+                        },
+                    );
+                }
+            }
+        }
+        let mut out = ProjectDisk::new();
+        walk(dir, "", &mut out);
+        out
+    }
+
+    /// A disk equal to the release on one path, to the export on another and
+    /// to neither on a third: the first is not drift, the second is modified,
+    /// and the third is unknown (the advance stops on it).
+    #[test]
+    fn predict_drift_from_disk_classes() {
+        let prep = prep_of(
+            &["a", "b", "c"],
+            &["a", "b", "c", "d", "f"],
+            &[("a", "A"), ("b", "B"), ("c", "C")],
+        );
+        let export: BTreeMap<String, Vec<u8>> = [
+            ("a", "A2"),
+            ("b", "B2"),
+            ("c", "C2"),
+            ("d", "D"),
+            ("f", "F"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
+        .collect();
+        // Without a disk, every path whose export differs is drift.
+        assert_eq!(predict_drift(&prep, &export).modified, vec!["a", "b", "c"]);
+        let disk = disk_of(&[
+            ("a", "A"),
+            ("b", "B2"),
+            ("c", "something else"),
+            ("d", "D"),
+            ("f", "also something else"),
+        ]);
+        let got = predict_drift_from_disk(&prep, &export, &disk);
+        assert_eq!(got.prediction.modified, vec!["b", "c"]);
+        assert_eq!(got.prediction.untracked, vec!["d", "f"]);
+        assert_eq!(
+            got.release_form,
+            ["a".to_string()].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(got.unknown, vec!["c", "f"]);
+        // A path absent from the disk keeps the export's judgement.
+        let disk = disk_of(&[("a", "A")]);
+        let got = predict_drift_from_disk(&prep, &export, &disk);
+        assert_eq!(got.prediction.modified, vec!["b", "c"]);
+        assert!(got.unknown.is_empty());
+    }
+
+    /// Assume-unchanged stays "release tree paths absent from the export"; a
+    /// member the export holds that is absent on disk is never made
+    /// assume-unchanged (the 27-37 rule), and a disk file that matches neither
+    /// the release nor the export stops the advance before any write.
+    #[tokio::test]
+    async fn predict_drift_from_disk_keeps_assume_unchanged_from_the_export() {
+        let f = Fixture::new();
+        let host = HostGit::new();
+        let prep = prepared(&f, &host, &[]).await;
+        let export = f.import(&host, &[NOTES], &[], Some(UTIL_RES)).await;
+        let mut disk = disk_below(&f.gw);
+        // The manifest is absent on disk although the export holds it.
+        assert!(disk.remove("project.json").is_some());
+        let plan = finish_advance(&host, &f.seed, &prep, &export, Some(&disk))
+            .await
+            .expect("a member absent on disk is not a mismatch here");
+        assert!(plan.assume_unchanged.contains(&NOTES.to_string()));
+        assert!(
+            !plan.assume_unchanged.contains(&"project.json".to_string()),
+            "{:?}",
+            plan.assume_unchanged
+        );
+        assert!(plan.expected_drift.contains(&UTIL_RES.to_string()));
+        // A file on disk that is neither the release's nor the export's.
+        let mut disk = disk_below(&f.gw);
+        disk.insert(
+            CODE.to_string(),
+            DiskFile {
+                size: 1,
+                sha256: sha256_hex(b"neither"),
+            },
+        );
+        match finish_advance(&host, &f.seed, &prep, &export, Some(&disk))
+            .await
+            .expect_err("a disk file nobody explains")
+        {
+            AdvanceFailure::Mismatch(m) => assert_eq!(m.unexpected, vec![CODE]),
+            other => panic!("not a mismatch: {other:?}"),
+        }
+    }
+
+    /// The re-serialised descriptor the import left alone is clean on disk:
+    /// the work tree holds the release's bytes, so a git status lists nothing
+    /// although the export renders it differently.
+    #[tokio::test]
+    async fn finish_with_a_disk_predicts_what_status_lists() {
+        let f = Fixture::new();
+        let host = HostGit::new();
+        let prep = prepared(&f, &host, &[]).await;
+        let export = f.import(&host, &[NOTES], &[], Some(UTIL_RES)).await;
+        // The import left UTIL_RES alone: the disk keeps the release's bytes.
+        let release = prep.release_blobs[UTIL_RES].clone();
+        std::fs::write(f.gw.join(UTIL_RES), release).expect("restore the release bytes");
+        let disk = disk_below(&f.gw);
+        let plan = finish_advance(&host, &f.seed, &prep, &export, Some(&disk))
+            .await
+            .expect("plan");
+        assert_eq!(plan.expected_drift, Vec::<String>::new());
+        f.apply(&plan);
+        assert_eq!(f.status_paths(), plan.expected_drift);
+        // The export-only prediction would have listed it.
+        let blind = finish_advance(&host, &f.seed, &prep, &export, None)
+            .await
+            .expect("plan");
+        assert_eq!(blind.expected_drift, vec![UTIL_RES]);
+    }
+
     #[test]
     fn predict_drift_reports_unlisted_in_scope_release_files_as_dropped() {
         // NOTES.txt sits in a resource folder whose resource.json does not list
@@ -1314,7 +1590,7 @@ pub(crate) mod tests {
         assert!(prep.artifact_members.contains(NOTES));
         // The gateway dropped NOTES.txt (a file its resource.json does not list).
         let export = f.import(&host, &[NOTES], &[], Some(UTIL_RES)).await;
-        let plan = finish_advance(&host, &f.seed, &prep, &export)
+        let plan = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect("a dropped member is not a mismatch");
         assert_eq!(plan.dropped, vec![NOTES]);
@@ -1333,7 +1609,7 @@ pub(crate) mod tests {
         let prep = prepared(&f, &host, &[]).await;
         let extra = "ignition/script-python/cap/extra.txt";
         let export = f.import(&host, &[], &[(extra, "x\n")], None).await;
-        let failure = finish_advance(&host, &f.seed, &prep, &export)
+        let failure = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect_err("an export member outside the artifact");
         match failure {
@@ -1355,7 +1631,7 @@ pub(crate) mod tests {
         // release's own bytes: host status lists a modified path it lacks.
         let on_disk = std::fs::read(f.gw.join(UTIL_RES)).expect("read");
         prep.release_blobs.insert(UTIL_RES.to_string(), on_disk);
-        let failure = finish_advance(&host, &f.seed, &prep, &export)
+        let failure = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect_err("status differs from the prediction");
         match failure {
@@ -1370,7 +1646,7 @@ pub(crate) mod tests {
         let host = HostGit::new();
         let prep = prepared(&f, &host, &[]).await;
         let export = f.import(&host, &[], &[], None).await;
-        let plan = finish_advance(&host, &f.seed, &prep, &export)
+        let plan = finish_advance(&host, &f.seed, &prep, &export, None)
             .await
             .expect("plan");
         assert_eq!(

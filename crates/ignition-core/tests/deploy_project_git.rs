@@ -1065,6 +1065,12 @@ mod gateway_objects {
 
     #[async_trait::async_trait]
     impl GitHostRead for Recording {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+            self.inner.project_file_digests(project).await
+        }
         async fn read_git_state(
             &self,
             project: &str,
@@ -2897,6 +2903,74 @@ mod published {
         assert_eq!(rig.f.status_paths(), drift);
     }
 
+    /// A git writer that does the advance and then edits one file of the work
+    /// tree, as a change between the prediction and the post-advance status.
+    struct EditAfterAdvance(LocalFsTransport, PathBuf);
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for EditAfterAdvance {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(
+            &self,
+            project: &str,
+            writes: &[GitWrite],
+        ) -> Result<(), CoreError> {
+            self.0.write_git_files(project, writes).await?;
+            let mut bytes = std::fs::read(&self.1).expect("the file to edit");
+            bytes.extend_from_slice(b" ");
+            std::fs::write(&self.1, bytes).expect("the edit");
+            Ok(())
+        }
+        async fn remove_git_save(&self, g: &str, p: &str, r: &str) -> Result<(), CoreError> {
+            self.0.remove_git_save(g, p, r).await
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.0.probe_write(project, run_id).await
+        }
+    }
+
+    /// D-25 is not loosened: a file changed on disk after the prediction (here
+    /// the unchanged resource the import left alone) still ends the run with
+    /// `post_status_mismatch`, one path being enough.
+    #[tokio::test]
+    async fn post_status_mismatch_still_fails_on_one_extra_path() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_rewrites_changed_only()
+                .with_disk_mirror_gateway_form(&[VIEW_RES, UTIL_RES, UTIL2_RES])
+        });
+        let host = rig.host();
+        let writer = EditAfterAdvance(rig.f.node(), rig.f.project_dir().join(VIEW_RES));
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert!(restore.advanced && restore.verified, "{restore:?}");
+        assert_eq!(restore.post_status, Some("mismatch"));
+        assert_eq!(restore.reason.as_deref(), Some("post_status_mismatch"));
+        assert!(restore.save_kept);
+        let note = restore.post_status_note.expect("the path is named");
+        assert!(note.contains(VIEW_RES) && note.contains("1 path"), "{note}");
+    }
+
     #[test]
     fn post_advance_status_not_checked_on_ssh() {
         use ignition_core::actions::deploy_projects::git::{PostStatusMode, RestoreInfo};
@@ -2961,6 +3035,12 @@ mod published {
 
     #[async_trait::async_trait]
     impl GitHostRead for FailingFetch {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+            self.0.project_file_digests(project).await
+        }
         async fn read_git_state(
             &self,
             project: &str,
@@ -3111,6 +3191,12 @@ mod published {
 
     #[async_trait::async_trait]
     impl GitHostRead for Metered {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+            self.inner.project_file_digests(project).await
+        }
         async fn read_git_state(
             &self,
             project: &str,
@@ -5455,7 +5541,7 @@ mod published {
             "{config}"
         );
         f.module_import(true, &[], &[], &[]);
-        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip())
+        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip(), None)
             .await
             .expect("the plan");
         let order: Vec<String> = plan.writes.iter().map(|w| write_label(&w.name)).collect();
@@ -5482,7 +5568,7 @@ mod published {
         let (_state, prep) = m.prepare(&host).await;
         assert!(!prep.adopted && prep.config.is_none() && prep.config_base.is_none());
         m.module_import(true, &[], &[], &[]);
-        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip())
+        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip(), None)
             .await
             .expect("the plan");
         assert!(

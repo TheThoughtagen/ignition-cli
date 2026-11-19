@@ -331,6 +331,12 @@ struct TimedRead<'a> {
 
 #[async_trait::async_trait]
 impl GitHostRead for TimedRead<'_> {
+    async fn project_file_digests(
+        &self,
+        project: &str,
+    ) -> Result<Option<ignition_core::deploy::git_advance::ProjectDisk>, CoreError> {
+        self.inner.project_file_digests(project).await
+    }
     async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
         self.inner.read_git_state(project).await
     }

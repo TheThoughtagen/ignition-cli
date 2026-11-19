@@ -1743,6 +1743,14 @@ impl SftpTransport {
 
 #[async_trait::async_trait]
 impl GitHostRead for SftpTransport {
+    /// 27-40 does not read an `ssh` node's disk: the advance keeps its
+    /// export-based prediction there. 27-41 adds the POSIX and Windows reads.
+    async fn project_file_digests(
+        &self,
+        _project: &str,
+    ) -> Result<Option<crate::deploy::git_advance::ProjectDisk>, CoreError> {
+        Ok(None)
+    }
     async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));

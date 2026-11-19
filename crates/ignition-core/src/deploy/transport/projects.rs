@@ -312,6 +312,26 @@ pub trait GitHostRead: Send + Sync {
     /// inside it refuses.
     async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError>;
 
+    /// Size and sha256 of every regular file below
+    /// `<data_dir>/projects/<project>`, the `.git` subtree excluded: what the
+    /// node's disk holds after the import (27-40, D-25). Digests and sizes
+    /// only, never content. Nothing is followed: a symlink or any entry that
+    /// is neither a directory nor a regular file refuses the read, as does a
+    /// tree over the entry cap, and an unreadable host is
+    /// [`CoreError::TransportFailed`], never an empty answer.
+    ///
+    /// `Ok(None)` is a host that does not read its disk this way (the
+    /// default). An `ssh` node answers `None` until 27-41 adds the POSIX and
+    /// Windows reads; the advance then predicts from the export alone, as
+    /// before 27-40. Placed next to [`git_manifest`](Self::git_manifest),
+    /// which walks `.git` the same way.
+    async fn project_file_digests(
+        &self,
+        _project: &str,
+    ) -> Result<Option<crate::deploy::git_advance::ProjectDisk>, CoreError> {
+        Ok(None)
+    }
+
     /// The [`GitManifest`] of the save of run `run_id`.
     async fn save_manifest(
         &self,

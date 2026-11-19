@@ -241,8 +241,14 @@ pub async fn restore_and_advance(
     };
     let project = save.project.as_str();
 
-    // (a) Everything that can fail without touching the gateway.
-    let plan = match finish_advance(git, checkout, prep, export_zip).await {
+    // (a) Everything that can fail without touching the gateway. The node's
+    // disk after the import is what the prediction is made from (27-40); a
+    // host that does not read it (`ssh` until 27-41) answers `None`.
+    let disk = read
+        .project_file_digests(project)
+        .await
+        .map_err(|e| core("advance_failed", "the project's files could not be read", e))?;
+    let plan = match finish_advance(git, checkout, prep, export_zip, disk.as_ref()).await {
         Ok(mut plan) => {
             // The abandoned HEAD stays reachable through a ref the advance
             // writes right before the branch ref moves (27-15, 27-26). The ref

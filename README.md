@@ -6111,8 +6111,11 @@ run `git_restore_failed` with `restore.reason` `designer_attached` naming the
 open sessions; the deploy and the release record stay and the save is kept.
 
 **`expected_drift`.** The files the module will list as uncommitted after the
-deploy: the import rewrites every artifact member, so the set is known only
-after an import. `data.git.expected_drift` is `null` (with
+deploy: the files whose bytes on disk after the import differ from the
+release's bytes, which is what the module lists as uncommitted once the index
+holds the release. A file whose bytes on disk equal the release's is never in
+it, whatever the export renders for it. The set is known only after an
+import. `data.git.expected_drift` is `null` (with
 `expected_drift_complete: false`) in `--check` and in a run that stopped before
 the repository was advanced; after the advance it is the byte-sorted
 prediction (capped at 200, with `expected_drift_count`) and
@@ -6122,13 +6125,22 @@ committed before a Designer push or pull. In-scope files the gateway did not
 keep are listed under `restore.dropped` and are not drift.
 
 **How the run proves the repository (D-25).** With no git on the gateway
-host, the proof is the status computed over the read-back export before any
-write to `.git` (it must equal the prediction), plus a read-back of every file
-written. On a `local` node the run also runs a status over the project
-directory on disk after the advance (`restore.post_status` `matched`, or
-`mismatch` and the reason `post_status_mismatch`). On an `ssh` node
-(`post_status: not_checked`) the disk status is not run, because the gateway
-host runs no git and the bytes on disk equal the export's.
+host, the run reads the digests (size and sha256, never content) of the
+project's files on the node after the import, `.git` excluded and nothing
+followed. For each member the read-back export holds, a file whose bytes equal
+the release's is clean, a file whose bytes equal the export's is drift, and a
+file that matches neither ends the run `git_restore_failed` with
+`restore.reason` `status_unexpected` before any write to `.git`. The proof is
+the status computed over a work tree rebuilt from those digests (the release's
+bytes or the export's bytes per path), before any write to `.git`: it must
+equal the prediction. A read-back of every file written follows. On a `local`
+node the run also runs a status over the project directory on disk after the
+advance (`restore.post_status` `matched`, or `mismatch` and the reason
+`post_status_mismatch`); it must equal `expected_drift` exactly, with no
+tolerance, so a file that changes between the prediction and that status ends
+the run. On an `ssh` node (`post_status: not_checked`) the disk status is not
+run, because the gateway host runs no git, and the node's disk is not read in
+this release: the prediction there is made from the read-back export alone.
 
 **Reading the result.** `data.git` is `null` for a project without a `.git`.
 Otherwise it has `release_commit`, `nodes` (one per node, `master` first),
@@ -6172,7 +6184,7 @@ word is a change to the repository, the checkout or the target file:
 | `nodes_disagree` | on a redundant pair, the two nodes' repositories differ in origin, tracked branch or HEAD (the message names both) | bring the backup's repository to the master's state, then check again |
 | `restore_failed` | the saved `.git` could not be put back | restore the copy `data.git.nodes[].save.path` names |
 | `advance_failed` | the advance could not be built or written | the run's warning names the cause; fix it and deploy again (the saved copy is kept) |
-| `status_unexpected` | the status over the read-back export differs from the prediction; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
+| `status_unexpected` | the status over the work tree rebuilt from the read-back export and the node's disk digests differs from the prediction, or a project file on disk matches neither the release nor the export; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
 | `git_recreated` | the `.git` after the import is not the one prepared against | check the repository, then deploy again; it was left as it is |
 | `backup_unsynced` | the backup's project did not equal the release within `--backup-timeout`, so its `.git` was not touched | wait for the pair to converge; the saved copy is `data.git.nodes[1].save.path` on the backup host |
 | `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |

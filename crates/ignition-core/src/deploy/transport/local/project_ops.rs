@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use super::LocalFsTransport;
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
-use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, ProjectDisk};
 use crate::deploy::git_objects::{
     GIT_OBJECTS_LIST_MAX_ENTRIES, GitObjectEntry, GitObjectEntryKind, GitObjectFile, GitObjectList,
     check_object_rel,
@@ -933,15 +933,25 @@ impl LocalFsTransport {
     /// not a directory or a regular file refuses the walk.
     fn walk_git(&self, op: &str, root: &Path) -> Result<Vec<WalkEntry>, CoreError> {
         let mut out = Vec::new();
-        self.walk_git_into(op, root, "", &mut out)?;
+        self.walk_git_into(op, root, "", None, &mut out)?;
         Ok(out)
     }
 
+    /// [`walk_git`](Self::walk_git) of a project directory without its `.git`
+    /// subtree, which is neither listed nor inspected (27-40).
+    fn walk_project(&self, op: &str, root: &Path) -> Result<Vec<WalkEntry>, CoreError> {
+        let mut out = Vec::new();
+        self.walk_git_into(op, root, "", Some(".git"), &mut out)?;
+        Ok(out)
+    }
+
+    /// `skip` names an entry of `root` itself that the walk leaves out.
     fn walk_git_into(
         &self,
         op: &str,
         dir: &Path,
         prefix: &str,
+        skip: Option<&str>,
         out: &mut Vec<WalkEntry>,
     ) -> Result<(), CoreError> {
         let read = std::fs::read_dir(dir).map_err(|e| {
@@ -962,6 +972,9 @@ impl LocalFsTransport {
         }
         names.sort();
         for name in names {
+            if prefix.is_empty() && skip.is_some_and(|skipped| name == skipped) {
+                continue;
+            }
             let Some(text) = name.to_str() else {
                 return Err(self.git_fail(
                     op,
@@ -1004,7 +1017,7 @@ impl LocalFsTransport {
                     size: 0,
                     mode: mode_of(&meta),
                 });
-                self.walk_git_into(op, &path, &rel, out)?;
+                self.walk_git_into(op, &path, &rel, None, out)?;
             } else if kind.is_file() {
                 out.push(WalkEntry {
                     rel,
@@ -1063,6 +1076,45 @@ impl LocalFsTransport {
             bytes,
             digest: format!("{:x}", digest.finalize()),
         })
+    }
+
+    /// The size and sha256 of every regular file of the project directory but
+    /// `.git` (27-40, [`GitHostRead::project_file_digests`]).
+    fn project_file_digests_blocking(&self, project: &str) -> Result<ProjectDisk, CoreError> {
+        const OP: &str = "read";
+        if let Some(why) = component_problem(project) {
+            return Err(self.git_fail(OP, format!("the project name {why}")));
+        }
+        self.require_data_dir()?;
+        self.require_real_dir(OP, &self.data_dir.join("projects"), "projects")?;
+        let dir = self.data_dir.join("projects").join(project);
+        self.require_real_dir(OP, &dir, &format!("projects/{project}"))?;
+        let entries = self.walk_project(OP, &dir)?;
+        let mut disk = ProjectDisk::new();
+        for entry in entries.iter().filter(|e| !e.is_dir) {
+            let mut file = std::fs::File::open(&entry.path).map_err(|e| {
+                self.git_fail(OP, format!("{} cannot be read ({})", entry.rel, e.kind()))
+            })?;
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 65_536];
+            loop {
+                let n = file.read(&mut buf).map_err(|e| {
+                    self.git_fail(OP, format!("{} cannot be read ({})", entry.rel, e.kind()))
+                })?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            disk.insert(
+                entry.rel.clone(),
+                DiskFile {
+                    size: entry.size,
+                    sha256: format!("{:x}", hasher.finalize()),
+                },
+            );
+        }
+        Ok(disk)
     }
 
     fn manifest_blocking(&self, op: &str, root: &Path) -> Result<GitManifest, CoreError> {
@@ -2135,6 +2187,14 @@ impl GitHostRead for LocalFsTransport {
         .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
     }
 
+    async fn project_file_digests(&self, project: &str) -> Result<Option<ProjectDisk>, CoreError> {
+        let this = self.clone();
+        let project = project.to_string();
+        tokio::task::spawn_blocking(move || this.project_file_digests_blocking(&project).map(Some))
+            .await
+            .map_err(|e| CoreError::Internal(format!("local read task failed: {e}")))?
+    }
+
     async fn save_manifest(
         &self,
         gateway: &str,
@@ -2941,6 +3001,46 @@ mod tests {
             std::os::unix::fs::symlink("HEAD", dir.path().join("projects/Plain/.git/l"))
                 .expect("symlink");
             let err = t.git_size("Plain").await.expect_err("symlink");
+            assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_project_file_digests_skip_git_and_refuse_a_link() {
+        let dir = data_with_git();
+        let project = dir.path().join("projects/Plain");
+        std::fs::create_dir_all(project.join("ignition/x")).expect("dirs");
+        std::fs::write(project.join("project.json"), "{}\n").expect("file");
+        std::fs::write(project.join("ignition/x/code.py"), "x = 1\n").expect("file");
+        let t = host(dir.path());
+        let disk = t
+            .project_file_digests("Plain")
+            .await
+            .expect("the read")
+            .expect("a local node reads its disk");
+        let want: BTreeMap<String, (u64, String)> =
+            [("ignition/x/code.py", "x = 1\n"), ("project.json", "{}\n")]
+                .iter()
+                .map(|(p, body)| ((*p).to_string(), (body.len() as u64, sha256_text(body))))
+                .collect();
+        let got: BTreeMap<String, (u64, String)> = disk
+            .iter()
+            .map(|(p, f)| (p.clone(), (f.size, f.sha256.clone())))
+            .collect();
+        assert_eq!(got, want, "everything but .git, with size and sha256");
+        assert!(disk.keys().all(|p| !p.starts_with(".git")));
+        // A missing project and a bad name refuse, never an empty answer.
+        let err = t.project_file_digests("Nope").await.expect_err("missing");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        let err = t.project_file_digests("../x").await.expect_err("bad name");
+        assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+        // A symlink anywhere in the project refuses the read; one named
+        // `.git` is not inspected at all.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("code.py", project.join("ignition/x/link"))
+                .expect("symlink");
+            let err = t.project_file_digests("Plain").await.expect_err("symlink");
             assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
         }
     }
