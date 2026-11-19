@@ -1286,11 +1286,10 @@ mod verify_tests {
         for file in files {
             let target = dir.path().join(&file.rel);
             std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
-            std::fs::copy(repo.join(".git").join(&file.rel), &target).expect("copy");
-            // git writes its objects read-only; a download is ours to change
-            let mut mode = std::fs::metadata(&target).expect("meta").permissions();
-            mode.set_readonly(false);
-            std::fs::set_permissions(&target, mode).expect("writable");
+            // written, not copied: git makes its objects read-only and a copy
+            // keeps that, while a download is ours to change
+            let bytes = std::fs::read(repo.join(".git").join(&file.rel)).expect("read");
+            std::fs::write(&target, bytes).expect("write");
         }
         dir
     }
