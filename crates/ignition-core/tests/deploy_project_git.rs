@@ -1800,6 +1800,10 @@ mod published {
         /// The master's host refuses the `run.json` rewrite that says the
         /// import was sent (27-53).
         pub fail_import_flag: bool,
+        /// The `--designers` policy of a `--rollback-run` (`fail` with the
+        /// production wait when `None`): a test that leaves a session
+        /// attached shortens it (27-54).
+        pub rollback_designers: Option<DesignersPolicy>,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1933,6 +1937,7 @@ mod published {
                 tree: None,
                 backup_interval: std::time::Duration::from_millis(5),
                 fail_import_flag: false,
+                rollback_designers: None,
             }
         }
 
@@ -2045,7 +2050,7 @@ mod published {
                     tag_record_writer: None,
                     run_writer: None,
                     git_writer,
-                    designers: Default::default(),
+                    designers: self.rollback_designers.unwrap_or_default(),
                     children_settle: std::time::Duration::from_secs(1),
                     children_poll: std::time::Duration::from_millis(5),
                     tag_verify_settle: std::time::Duration::from_secs(1),
@@ -8295,6 +8300,258 @@ mod published {
             "{:?}",
             undo.warnings
         );
+    }
+    // ---- 27-54 (P3): a save a rollback could not put back is pending ----
+
+    /// The host journal of the rig's project, as JSON, when there is one.
+    fn host_journal_json(rig: &Rig) -> Option<serde_json::Value> {
+        let path = rig
+            .f
+            .data_dir
+            .join("ign-deploy/capgw/projects")
+            .join(PROJECT)
+            .join("journal.json");
+        let bytes = std::fs::read(path).ok()?;
+        Some(serde_json::from_slice(&bytes).expect("a journal"))
+    }
+
+    /// A tag-owning managed deploy that fails after its import (a child
+    /// changed behind the run) with a Designer attached throughout: the
+    /// automatic rollback re-imports the pre-image, which removes `.git`, and
+    /// cannot put the save back. Returns the rig, the manifest of the `.git`
+    /// before the run and the run's id.
+    async fn rollback_stuck_behind_a_designer() -> (
+        Rig,
+        ignition_core::deploy::transport::projects::GitManifest,
+        String,
+    ) {
+        let rig = Rig::tagged_with(true, |g| g.with_designers_after_exports(3, 100_000));
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before = rig.git_manifest().await;
+        let err = rig
+            .apply_designers(wait_ms(60))
+            .await
+            .expect_err("the rollback ends rollback_failed");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        assert!(!rig.f.git_dir().exists(), ".git is still absent");
+        let journal = host_journal_json(&rig).expect("the journal stays");
+        let run_id = journal["run_id"].as_str().expect("a run id").to_string();
+        (rig, before, run_id)
+    }
+
+    /// P3: the rollback that leaves a save names it in the host journal (state
+    /// `rolling_back`): node, the save's run id, path and manifest.
+    #[tokio::test]
+    async fn rollback_with_a_designer_attached_writes_git_pending() {
+        let (rig, before, run_id) = rollback_stuck_behind_a_designer().await;
+        let journal = host_journal_json(&rig).expect("the journal");
+        assert_eq!(journal["state"], "rolling_back");
+        assert_eq!(journal["schema_version"], 2);
+        let pending = journal["git_pending"].as_array().expect("git_pending");
+        assert_eq!(pending.len(), 1, "{journal}");
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save is kept");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(pending[0]["node"], "nodes.master");
+        assert_eq!(pending[0]["run_id"], run_id.as_str());
+        assert_eq!(pending[0]["path"], save.as_str());
+        assert_eq!(pending[0]["manifest"]["files"], before.files);
+        assert_eq!(pending[0]["manifest"]["bytes"], before.bytes);
+        assert_eq!(pending[0]["manifest"]["digest"], before.digest.as_str());
+    }
+
+    /// P3: `--rollback-run` with the Designer gone finds `.git` absent and a
+    /// pending entry, and puts the save back unchanged, removes the entry and
+    /// the save, and clears the journal. Before 27-54 the retry saw no git
+    /// work and `.git` stayed absent.
+    #[tokio::test]
+    async fn rollback_run_retry_restores_the_pending_save() {
+        let (rig, before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+
+        let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            undo.warnings
+        );
+        assert_eq!(rig.git_manifest().await, before, ".git is as it was saved");
+        let restore = git_of(&undo).master().restore.clone().expect("restore");
+        assert!(restore.restored && !restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None);
+        assert!(!restore.save_kept);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert!(host_journal_json(&rig).is_none(), "the journal is cleared");
+        assert_eq!(
+            rig.git_events(&undo),
+            ["git_restored", "git_save_removed"],
+            "the retry puts the save back and removes it"
+        );
+    }
+
+    /// P3: the same retry with the save deleted: the node ends
+    /// `git_save_missing` naming the path, nothing else is changed on `.git`,
+    /// and the journal stays with its entry.
+    #[tokio::test]
+    async fn rollback_run_retry_with_the_save_gone_ends_rollback_failed() {
+        let (rig, _before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+        let journal = host_journal_json(&rig).expect("the journal");
+        let path = journal["git_pending"][0]["path"]
+            .as_str()
+            .expect("a path")
+            .to_string();
+        let tree = rig.save_trees().remove(0);
+        std::fs::remove_dir_all(tree.parent().expect("the run's save directory"))
+            .expect("the save is deleted");
+
+        let err = rig
+            .rollback_run(&run_id, false)
+            .await
+            .expect_err("the save is gone");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("git_save_missing"), "{text}");
+        assert!(text.contains(&path), "the line names the path: {text}");
+        assert!(!rig.f.git_dir().exists(), "nothing was written to .git");
+        let kept = host_journal_json(&rig).expect("the journal stays");
+        assert_eq!(kept["git_pending"][0]["path"], path.as_str(), "{kept}");
+        // the retry's own run directory records the failed restore
+        let mut runs: Vec<PathBuf> = std::fs::read_dir(rig.repo.join(".ign/deploy/capgw"))
+            .expect("run dirs")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        runs.sort();
+        let events: Vec<String> = runs
+            .iter()
+            .filter_map(|dir| std::fs::read_to_string(dir.join("events.ndjson")).ok())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|log| log.contains("git_restore_failed") && log.contains("git_save_missing")),
+            "{events:?}"
+        );
+    }
+
+    /// P3: a journal without pending saves, a version 1 one and a version 2 one
+    /// with none listed, drives today's retry (the tags only, the project
+    /// never imported, `.git` untouched).
+    #[tokio::test]
+    async fn rollback_run_of_a_journal_without_git_pending_behaves_as_today() {
+        for version in [2, 1] {
+            let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+            let rig = Rig::tagged_with(true, |g| {
+                g.with_designers_script(vec![vec![], vec![session], vec![]])
+                    .with_project_edited_on_designers_read(1, PROJECT)
+                    .with_tag_import_failure(2)
+            });
+            let before = rig.git_manifest().await;
+            let err = rig.apply().await.expect_err("the tag rollback failed");
+            assert_eq!(err.code(), "rollback_failed", "{err}");
+            let mut journal = host_journal_json(&rig).expect("the journal stays");
+            assert!(journal.get("git_pending").is_none(), "{journal}");
+            let run_id = journal["run_id"].as_str().expect("a run id").to_string();
+            if version == 1 {
+                journal["schema_version"] = serde_json::json!(1);
+                std::fs::write(
+                    rig.f
+                        .data_dir
+                        .join("ign-deploy/capgw/projects")
+                        .join(PROJECT)
+                        .join("journal.json"),
+                    serde_json::to_vec_pretty(&journal).expect("json"),
+                )
+                .expect("the journal is rewritten");
+            }
+            let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+            assert_eq!(
+                undo.outcome,
+                ProjectOutcome::TagsRolledBack,
+                "version {version}: {:?}",
+                undo.warnings
+            );
+            assert!(rig.gateway.import_calls().is_empty(), "version {version}");
+            assert_eq!(rig.git_manifest().await, before, "version {version}");
+            assert!(host_journal_json(&rig).is_none(), "version {version}");
+        }
+    }
+    /// P3 on a pair: both nodes end the automatic rollback behind an attached
+    /// Designer, so the journal names both saves. The retry, with the session
+    /// attached again only once the master is done, puts the master's save
+    /// back and removes its entry, keeps the backup's entry, ends
+    /// `rollback_failed` with a line for the backup, and leaves the journal.
+    #[tokio::test]
+    async fn rollback_run_retry_keeps_the_journal_while_one_entry_is_pending() {
+        let mut rig = Rig::tagged_with(true, |g| g.with_designers_after_exports(3, 100_000));
+        rig.tree = Some(rig.f.node());
+        rig.rollback_designers = Some(wait_ms(60));
+        rig.add_backup();
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before_master = rig.git_manifest().await;
+        let mut backup = rig.backup_node(0);
+        // the sync already removed the backup's `.git` when the content changed
+        backup.drop_git_at_first_read = true;
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("the plan");
+        let err = rig
+            .run_prepared_full(
+                &host,
+                &loaded,
+                prepared,
+                None,
+                wait_ms(60),
+                Some((&backup, WAIT)),
+            )
+            .await
+            .expect_err("both repositories stay behind the Designer");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        let journal = host_journal_json(&rig).expect("the journal stays");
+        let run_id = journal["run_id"].as_str().expect("a run id").to_string();
+        let nodes: Vec<&str> = journal["git_pending"]
+            .as_array()
+            .expect("git_pending")
+            .iter()
+            .map(|e| e["node"].as_str().expect("a node"))
+            .collect();
+        assert_eq!(nodes.len(), 2, "{journal}");
+        assert!(nodes.contains(&"nodes.master") && nodes.contains(&"nodes.backup"));
+
+        // The session goes for the project check and the master's restore (two
+        // reads), then is attached again for the backup's.
+        rig.gateway.detach_designers();
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let mut script = vec![Vec::new(); rig.gateway.designers_reads() + 2];
+        script.push(vec![session]);
+        rig.gateway.set_designers_script(script);
+        let err = rig
+            .rollback_run_with(&run_id, false, Some((&backup, WAIT)))
+            .await
+            .expect_err("the backup's save is still pending");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("1 item(s) are left") && text.contains("designer_attached"),
+            "one line, for the backup: {text}"
+        );
+        assert_eq!(
+            rig.git_manifest().await,
+            before_master,
+            "the master is back"
+        );
+        let kept = host_journal_json(&rig).expect("the journal stays");
+        let left: Vec<&str> = kept["git_pending"]
+            .as_array()
+            .expect("the backup's entry stays")
+            .iter()
+            .map(|e| e["node"].as_str().expect("a node"))
+            .collect();
+        assert_eq!(left, ["nodes.backup"], "{kept}");
     }
 }
 

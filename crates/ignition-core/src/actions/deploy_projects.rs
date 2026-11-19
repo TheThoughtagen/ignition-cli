@@ -303,8 +303,8 @@ use crate::deploy::project_artifact::{
     Artifact, CanonicalDigest, build_artifact, canonical_digest,
 };
 use crate::deploy::project_run::{
-    CreatedProof, JournalState, PreImageFile, PreImageProvider, PreImageRun, ProjectJournal,
-    SCHEMA_VERSION,
+    CreatedProof, JournalState, PendingManifest, PendingSave, PreImageFile, PreImageProvider,
+    PreImageRun, ProjectJournal, SCHEMA_VERSION,
 };
 use crate::deploy::project_tags::{
     FILES_PER_ENTRY, Lookup, MISSING_TAGS_LIMIT, MissingTag, TagRef, TagRefs, TagTree,
@@ -338,10 +338,10 @@ use crate::deploy::tag_plan::{
 use crate::deploy::tag_record::TagRecord;
 use crate::deploy::target::{NodeTarget, Target};
 use crate::deploy::transport::projects::{
-    GitStateWriter, ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter,
-    git_state_writer_for_node, local_data_dir_for_node, project_host_for_node,
-    project_run_writer_for_node, release_writer_for_node, tag_record_names_problem,
-    tag_record_writer_for_node,
+    GitEntry, GitHostRead, GitManifest, GitStateWriter, ProjectHost, ProjectRunWriter,
+    ReleaseRecordWriter, TagRecordWriter, git_state_writer_for_node, local_data_dir_for_node,
+    project_host_for_node, project_run_writer_for_node, release_writer_for_node,
+    tag_record_names_problem, tag_record_writer_for_node,
 };
 use crate::deploy::transport::remote::safe_remote_path;
 use crate::deploy::transport::{TreeReader, apply_host_for_node, for_node};
@@ -5531,6 +5531,7 @@ async fn execute(
                 },
                 &wait,
                 want.as_deref(),
+                false,
             )
             .await;
             git::merge_backup(report, single, false);
@@ -5943,6 +5944,10 @@ struct BackupUndo<'a> {
     writer: &'a dyn GitStateWriter,
     /// What was saved before the project changed.
     saved: &'a GitSaveReport,
+    /// `saved` is a pending save the host journal names (27-54), not one this
+    /// run took: it is checked against the journal first, and never removed
+    /// by a stop before the import.
+    pending: bool,
 }
 
 /// The backup's step of a rollback of this run: set only once its `.git` was
@@ -5956,6 +5961,7 @@ fn backup_undo<'a>(
             host: run.host,
             writer: run.writer,
             saved,
+            pending: false,
         }),
         _ => None,
     }
@@ -5968,6 +5974,10 @@ struct GitUndo<'a> {
     writer: &'a dyn GitStateWriter,
     /// What was saved before the project changed.
     saved: &'a GitSaveReport,
+    /// `saved` is a pending save the host journal names (27-54), not one this
+    /// run took: it is checked against the journal first, and never removed
+    /// by a stop before the import.
+    pending: bool,
 }
 
 /// A refusal of a step on the backup, naming the node (27-22).
@@ -5981,6 +5991,7 @@ fn git_undo<'a>(writers: &Writers<'a>, saved: Option<&'a GitSaveReport>) -> Opti
         (Some(run), Some(saved)) => Some(GitUndo {
             writer: run.writer,
             saved,
+            pending: false,
         }),
         _ => None,
     }
@@ -6433,7 +6444,7 @@ async fn discard_saves_before_import(
     events: &mut RunEvents<'_>,
 ) -> CoreError {
     let mut saves: Vec<(&str, &dyn GitStateWriter, &GitSaveReport)> = Vec::new();
-    if let Some(GitUndo { writer, saved }) = master {
+    if let Some(GitUndo { writer, saved, .. }) = master {
         saves.push((git::MASTER, writer, saved));
     }
     if let Some(BackupUndo { writer, saved, .. }) = backup {
@@ -6512,6 +6523,105 @@ fn name_kept_saves(err: CoreError, kept: &[String]) -> CoreError {
 
 /// Switch the run's host journal to `rolling_back` as its rollback starts
 /// (26-12). A failure is a warning: the journal still names the run.
+/// A save the journal names, as a [`GitSaveReport`] (27-54).
+fn pending_report(gateway: &str, project: &str, entry: &PendingSave) -> GitSaveReport {
+    GitSaveReport {
+        gateway: gateway.to_string(),
+        project: project.to_string(),
+        run_id: entry.run_id.clone(),
+        path: entry.path.clone(),
+        manifest: GitManifest {
+            files: usize::try_from(entry.manifest.files).unwrap_or(usize::MAX),
+            bytes: entry.manifest.bytes,
+            digest: entry.manifest.digest.clone(),
+        },
+    }
+}
+
+/// A save as the journal names it (27-54).
+fn pending_entry(node: &str, saved: &GitSaveReport) -> PendingSave {
+    PendingSave {
+        node: node.to_string(),
+        run_id: saved.run_id.clone(),
+        path: saved.path.clone(),
+        manifest: PendingManifest {
+            files: saved.manifest.files as u64,
+            bytes: saved.manifest.bytes,
+            digest: saved.manifest.digest.clone(),
+        },
+    }
+}
+
+/// What a rollback's git step did to `node`'s entry of the pending list
+/// (27-54): a pending save that was put back (`put_back`) comes out; a save
+/// the rollback could not put back goes in when the node holds no `.git` (the
+/// repository is lost without it); a pending save that was not put back stays
+/// as it is. A repository that is there, even one that differs, keeps its
+/// save named in the `left` line and needs no entry: nothing is lost.
+async fn settle_pending(
+    pending: &mut Vec<PendingSave>,
+    node: &str,
+    saved: &GitSaveReport,
+    was_pending: bool,
+    put_back: bool,
+    read: &dyn GitHostRead,
+    project: &str,
+) {
+    if put_back {
+        if was_pending {
+            pending.retain(|entry| entry.node != node);
+        }
+        return;
+    }
+    if was_pending {
+        return;
+    }
+    let absent = matches!(
+        read.read_git_state(project).await,
+        Ok(files) if files.kind == GitEntry::Absent
+    );
+    if absent && !pending.iter().any(|entry| entry.node == node) {
+        pending.push(pending_entry(node, saved));
+    }
+}
+
+/// Write the host journal again when its pending list changed (27-54). A host
+/// that refuses is a warning naming each save: the verdict is
+/// `rollback_failed` whenever a save is pending, and the saves stay.
+async fn sync_git_pending(
+    result: &mut DeployProjectsResult,
+    loaded: &LoadedProject,
+    writer: Option<&dyn ProjectRunWriter>,
+    host: Option<&mut HostCopy>,
+    pending: &[PendingSave],
+) {
+    let (Some(writer), Some(host)) = (writer, host) else {
+        return;
+    };
+    if host.journal.git_pending == pending {
+        return;
+    }
+    let before = std::mem::replace(&mut host.journal.git_pending, pending.to_vec());
+    if let Err(err) = writer
+        .write_journal(
+            &loaded.target.gateway,
+            &loaded.file.project,
+            &host.journal.to_bytes(),
+        )
+        .await
+    {
+        host.journal.git_pending = before;
+        let saves: Vec<&str> = pending.iter().map(|entry| entry.path.as_str()).collect();
+        result.warnings.push(format!(
+            "the host journal {} could not record the saved .git that was not put back ({}); \
+             the save stays at {}",
+            host_journal_location(loaded),
+            err.code(),
+            saves.join(", ")
+        ));
+    }
+}
+
 async fn journal_rolling_back(
     result: &mut DeployProjectsResult,
     loaded: &LoadedProject,
@@ -8050,6 +8160,15 @@ async fn roll_back(
     )
     .await;
     let mut left: Vec<String> = Vec::new();
+    // 27-54: the `.git` saves the host journal names as pending, as the
+    // rollback leaves them, and the nodes a step looked at.
+    let mut pending: Vec<PendingSave> = writes
+        .host
+        .as_ref()
+        .map(|host| host.journal.git_pending.clone())
+        .unwrap_or_default();
+    let carried_in = pending.clone();
+    let mut handled: BTreeSet<&str> = BTreeSet::new();
     let mut reimported: Vec<String> = Vec::new();
     let mut carried_back: Vec<String> = Vec::new();
     // The shape-changed nodes the restore's prune batches left out.
@@ -8123,23 +8242,36 @@ async fn roll_back(
         result.git.as_deref_mut(),
     ) {
         let gateway_name = loaded.target.gateway.clone();
-        let step = git::git_after_rollback(
-            report,
-            undo.saved,
-            &git::UnverifiedInputs {
-                read,
-                write: undo.writer,
-                gateway: &gateway_name,
-                project: &project,
-                api: gateway,
-                designers: &opts.designers,
-            },
-        )
-        .await;
+        let inputs = git::UnverifiedInputs {
+            read,
+            write: undo.writer,
+            gateway: &gateway_name,
+            project: &project,
+            api: gateway,
+            designers: &opts.designers,
+        };
+        let step = if undo.pending {
+            git::git_after_pending(report, undo.saved, &inputs).await
+        } else {
+            git::git_after_rollback(report, undo.saved, &inputs).await
+        };
         for event in step.after.events {
             events.emit_late(event);
         }
         result.warnings.extend(step.after.warnings);
+        settle_pending(
+            &mut pending,
+            git::MASTER,
+            undo.saved,
+            undo.pending,
+            step.left.is_empty(),
+            read,
+            &project,
+        )
+        .await;
+        if undo.pending {
+            handled.insert(git::MASTER);
+        }
         left.extend(step.left);
     }
 
@@ -8172,6 +8304,7 @@ async fn roll_back(
             },
             &wait,
             want.as_deref(),
+            undo.pending,
         )
         .await;
         git::merge_backup(report, single, false);
@@ -8179,8 +8312,45 @@ async fn roll_back(
             events.emit_late(event);
         }
         result.warnings.extend(step.after.warnings);
+        settle_pending(
+            &mut pending,
+            git::BACKUP,
+            undo.saved,
+            undo.pending,
+            step.left.is_empty(),
+            read,
+            &project,
+        )
+        .await;
+        if undo.pending {
+            handled.insert(git::BACKUP);
+        }
         left.extend(step.left);
     }
+
+    // 27-54 (P3): a `.git` save the rollbacks above could not put back goes
+    // in the host journal, so a `--rollback-run` retry restores it; one the
+    // retry put back comes out. An entry the retry found and no step looked at
+    // (its node holds a repository again, or has no git surface) is carried
+    // and is a line in `left`, so the verdict is never green while a save is
+    // pending.
+    for entry in &pending {
+        if carried_in.contains(entry) && !handled.contains(entry.node.as_str()) {
+            left.push(format!(
+                "project {project}: the saved .git of {} at {} (run {}) was left by an earlier \
+                 rollback and is still not put back; it was not touched",
+                entry.node, entry.path, entry.run_id
+            ));
+        }
+    }
+    sync_git_pending(
+        &mut result,
+        loaded,
+        run_writer,
+        writes.host.as_mut(),
+        &pending,
+    )
+    .await;
 
     // 2. The tags of every provider the run imported into.
     let empty = BTreeMap::new();
@@ -9564,6 +9734,35 @@ pub async fn deploy_projects_rollback_run(
     );
     let set = read_host_set(loaded, input, surfaces.host, &target).await?;
     let mut writes = undo_writes(&set);
+    // 27-54 (P3): a `.git` an earlier rollback could not put back is named in
+    // the journal. A node that holds no `.git` now and has such an entry has
+    // pending git work, not no git work: it is put back after the project step
+    // (a node that holds a repository again takes the ordinary path, and its
+    // entry is carried and kept).
+    let pending: Vec<PendingSave> = set
+        .journal
+        .as_ref()
+        .map(|journal| journal.git_pending.clone())
+        .unwrap_or_default();
+    let pending_master = pending
+        .iter()
+        .find(|entry| entry.node == git::MASTER && !master_git_present);
+    let pending_backup = pending
+        .iter()
+        .find(|entry| entry.node == git::BACKUP && backup_host.is_some() && !backup_git_present);
+    git_report = git::with_pending(
+        git_report.take(),
+        &[pending_master, pending_backup]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>(),
+        backup_host.is_some(),
+    );
+    let pending_master_saved =
+        pending_master.map(|entry| pending_report(&loaded.target.gateway, project, entry));
+    let pending_backup_saved =
+        pending_backup.map(|entry| pending_report(&loaded.target.gateway, project, entry));
     // 27-53 (Q2): the pre-image says `import` from the moment it is written,
     // so a run refused before its import is told apart by `import_sent`. Only
     // a run that never sent its import (`Some(false)`) leaves the project
@@ -9626,6 +9825,13 @@ pub async fn deploy_projects_rollback_run(
     }
 
     if check {
+        for entry in &pending {
+            result.warnings.push(format!(
+                "the host journal names a saved .git of {} at {} that an earlier rollback could \
+                 not put back; the undo puts it back unchanged once no Designer is attached",
+                entry.node, entry.path
+            ));
+        }
         result.git = git_report.take().map(Box::new);
         rollback_run_preview(
             gateway,
@@ -9685,7 +9891,7 @@ pub async fn deploy_projects_rollback_run(
     // refuses before anything is written.
     let built_git;
     let git_writer: Option<&dyn GitStateWriter> = match &git_report {
-        Some(_) if master_git_present => match opts.git_writer {
+        Some(_) if master_git_present || pending_master.is_some() => match opts.git_writer {
             Some(writer) => Some(writer),
             None => {
                 built_git = git_state_writer_for_node(
@@ -9700,7 +9906,7 @@ pub async fn deploy_projects_rollback_run(
         _ => None,
     };
     // The backup's writer, built with the others (27-22).
-    let backup_writer = match (&backup_host, backup_git_present) {
+    let backup_writer = match (&backup_host, backup_git_present || pending_backup.is_some()) {
         (Some(_), true) => {
             let node = loaded.target.nodes.backup.as_ref().ok_or_else(|| {
                 CoreError::Internal("the backup node vanished from the target".to_string())
@@ -9735,7 +9941,7 @@ pub async fn deploy_projects_rollback_run(
     // writes and that there is room for it: a missing grant or a full disk
     // refuses here, before the first save, journal write or import, instead
     // of after the `.git` is gone. The undo writes no pack (`prep: None`).
-    if let (Some(writer), Some(read)) = (git_writer, surfaces.host.git()) {
+    if master_git_present && let (Some(writer), Some(read)) = (git_writer, surfaces.host.git()) {
         git::git_preflight(
             writer,
             read,
@@ -9746,7 +9952,8 @@ pub async fn deploy_projects_rollback_run(
         )
         .await?;
     }
-    if let (Some(writer), Some(host)) = (backup_writer.as_deref(), backup_host.as_deref())
+    if backup_git_present
+        && let (Some(writer), Some(host)) = (backup_writer.as_deref(), backup_host.as_deref())
         && let Some(read) = host.git()
     {
         git::git_preflight_on(
@@ -9813,8 +10020,9 @@ pub async fn deploy_projects_rollback_run(
             // Phase 27 (D-08): the gateway `.git` is saved before the journal and
             // before the first gateway write. A save that cannot be taken stops
             // the undo with nothing written to the gateway.
-            if let (Some(report), Some(writer), Some(read)) =
-                (git_report.as_mut(), git_writer, surfaces.host.git())
+            if master_git_present
+                && let (Some(report), Some(writer), Some(read)) =
+                    (git_report.as_mut(), git_writer, surfaces.host.git())
             {
                 let saved = crate::deploy::git_handover::save(
                     read,
@@ -9838,11 +10046,13 @@ pub async fn deploy_projects_rollback_run(
                 events.emit(event)?;
             }
             // 27-22: the backup's `.git` is saved the same way, on its own host.
-            if let (Some(report), Some(writer), Some(host)) = (
-                git_report.as_mut(),
-                backup_writer.as_deref(),
-                backup_host.as_deref(),
-            ) && let Some(read) = host.git()
+            if backup_git_present
+                && let (Some(report), Some(writer), Some(host)) = (
+                    git_report.as_mut(),
+                    backup_writer.as_deref(),
+                    backup_host.as_deref(),
+                )
+                && let Some(read) = host.git()
                 && let Some(node) = loaded.target.nodes.backup.as_ref()
             {
                 let saved = crate::deploy::git_handover::save(
@@ -9876,7 +10086,9 @@ pub async fn deploy_projects_rollback_run(
                 state: JournalState::RollingBack,
                 started_at: rfc3339_now_utc(),
                 providers: set.run.providers.iter().map(|p| p.name.clone()).collect(),
-                git_pending: Vec::new(),
+                // the entries of the journal being retried are carried; the
+                // rollback settles them (27-54)
+                git_pending: pending.clone(),
             };
             run_writer
                 .write_journal(&loaded.target.gateway, project, &journal.to_bytes())
@@ -9891,11 +10103,18 @@ pub async fn deploy_projects_rollback_run(
             Ok(())
         }
         .await;
-        let git_now = match (git_writer, git_saved.as_ref()) {
-            (Some(writer), Some(saved)) => Some(GitUndo { writer, saved }),
+        // The saves this undo took: a stop before the import removes them. A
+        // pending save (27-54) is not among them: it is the only copy of a
+        // repository, and nothing here removes it.
+        let git_fresh = match (git_writer, git_saved.as_ref()) {
+            (Some(writer), Some(saved)) => Some(GitUndo {
+                writer,
+                saved,
+                pending: false,
+            }),
             _ => None,
         };
-        let backup_now = match (
+        let backup_fresh = match (
             backup_writer.as_deref(),
             backup_host.as_deref(),
             backup_saved.as_ref(),
@@ -9904,6 +10123,7 @@ pub async fn deploy_projects_rollback_run(
                 host,
                 writer,
                 saved,
+                pending: false,
             }),
             _ => None,
         };
@@ -9912,12 +10132,36 @@ pub async fn deploy_projects_rollback_run(
                 err,
                 &loaded.target.gateway,
                 project,
-                git_now,
-                backup_now,
+                git_fresh,
+                backup_fresh,
                 &mut events,
             )
             .await);
         }
+        let git_now = match (git_fresh, git_writer, pending_master_saved.as_ref()) {
+            (Some(fresh), _, _) => Some(fresh),
+            (None, Some(writer), Some(saved)) => Some(GitUndo {
+                writer,
+                saved,
+                pending: true,
+            }),
+            _ => None,
+        };
+        let backup_now = match (
+            backup_fresh,
+            backup_writer.as_deref(),
+            backup_host.as_deref(),
+            pending_backup_saved.as_ref(),
+        ) {
+            (Some(fresh), _, _, _) => Some(fresh),
+            (None, Some(writer), Some(host), Some(saved)) => Some(BackupUndo {
+                host,
+                writer,
+                saved,
+                pending: true,
+            }),
+            _ => None,
+        };
         let failure = TagFailure {
             cause: RollbackCause::RollbackRun,
             what: format!("the undo of run {} from the host copy", target.as_str()),

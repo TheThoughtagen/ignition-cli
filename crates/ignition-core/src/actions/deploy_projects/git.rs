@@ -134,6 +134,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
         "backup_project_json_missing",
         "advance_after and settle_backup_git, the backup's project.json check after it converged (27-37)",
     ),
+    (
+        "git_save_missing",
+        "git_after_pending, --rollback-run, a pending save that is gone (27-54)",
+    ),
 ];
 
 /// The words [`REASON_PRODUCERS`] names this module as the producer of.
@@ -143,6 +147,7 @@ pub const PRODUCED_HERE: &[&str] = &[
     "post_status_mismatch",
     "designer_attached",
     "backup_project_json_missing",
+    "git_save_missing",
 ];
 
 /// The restore reason of a restore that was not attempted because a Designer
@@ -174,6 +179,13 @@ pub const REASON_BACKUP_PROJECT_JSON_MISSING: &str = "backup_project_json_missin
 /// nothing was overwritten, so the repository is the other writer's: the
 /// verdict never sends the operator to put the saved copy over it.
 pub const REASON_GIT_CHANGED: &str = "git_changed";
+
+/// The restore reason of a `--rollback-run` retry whose journal names a saved
+/// `.git` (`git_pending`, 27-53, P3) that cannot be found or read on the host
+/// (27-54). The repository was not put back and ign has no copy to put back:
+/// nothing was written, the journal keeps the entry, and the verdict never
+/// sends the operator to restore a copy that does not exist.
+pub const REASON_GIT_SAVE_MISSING: &str = "git_save_missing";
 
 /// The manifest file the finding is about, as a status path.
 const PROJECT_JSON: &str = "project.json";
@@ -1791,7 +1803,9 @@ fn failed_restore(report: &mut GitReport, failure: &GitRestoreFailure) -> GitAft
             .collect();
         line.push_str(&format!(" ({})", shown.join(", ")));
     }
-    if failure.reason == "git_recreated" {
+    // Only a failure that names the `.git` it found: a save that no longer
+    // matches the journal (27-54) names none.
+    if failure.reason == "git_recreated" && !failure.paths.is_empty() {
         // Pitfall 1, D-07, D-09: a repository someone else created (a Designer
         // open runs `setupLocalRepo` while `.git` is absent) is never
         // overwritten; the save is the module's pre-run repository.
@@ -2675,6 +2689,113 @@ pub async fn git_after_rollback(
     RollbackGit { after, left }
 }
 
+/// The pending save of a `--rollback-run` retry (27-54, P3): the journal names
+/// a `.git` save an earlier rollback could not put back (`git_pending`).
+///
+/// The save is looked at first, by what the journal recorded: one that cannot
+/// be found or read ends the node `git_save_missing`, one whose manifest is not
+/// the journal's ends it `git_recreated`, and in both nothing is written and
+/// the save is not touched. Otherwise the step is [`git_after_rollback`]: the
+/// Designer gate, then the save put back unchanged if `.git` is still absent,
+/// never over a repository that is there.
+pub async fn git_after_pending(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+) -> RollbackGit {
+    let refusal = match inputs
+        .read
+        .save_manifest(inputs.gateway, inputs.project, &saved.run_id)
+        .await
+    {
+        Err(_) => Some((
+            REASON_GIT_SAVE_MISSING,
+            "the saved .git the journal names could not be found or read; nothing was restored",
+            false,
+        )),
+        Ok(now) if now != saved.manifest => Some((
+            "git_recreated",
+            "the saved .git is not the copy the journal names (its manifest differs); nothing \
+             was restored",
+            true,
+        )),
+        Ok(_) => None,
+    };
+    let Some((reason, detail, kept)) = refusal else {
+        return git_after_rollback(report, saved, inputs).await;
+    };
+    let after = failed_restore(
+        report,
+        &GitRestoreFailure {
+            reason,
+            restored: false,
+            paths: Vec::new(),
+            detail: detail.to_string(),
+            save_path: saved.path.clone(),
+        },
+    );
+    if !kept && let Some(restore) = report.master_mut().restore.as_mut() {
+        restore.save_kept = false;
+    }
+    let line = if kept {
+        format!(
+            "project {}: the saved .git the journal names ({}) is not the copy it recorded \
+             ({reason}); its repository was not put back",
+            inputs.project, saved.path
+        )
+    } else {
+        format!(
+            "project {}: the saved .git the journal names ({}) could not be found or read \
+             ({reason}); its repository was not put back",
+            inputs.project, saved.path
+        )
+    };
+    RollbackGit {
+        after,
+        left: vec![line],
+    }
+}
+
+/// `data.git` of a `--rollback-run` retry whose journal names pending saves
+/// (27-54): `report` (the repositories the retry found, or none) with each
+/// pending node's entry present and carrying its save, so the pending step has
+/// a node to report on. A node without `.git` is an `absent` entry, as on a
+/// pair everywhere else.
+pub fn with_pending(
+    report: Option<GitReport>,
+    pending: &[crate::deploy::project_run::PendingSave],
+    pair: bool,
+) -> Option<GitReport> {
+    if pending.is_empty() {
+        return report;
+    }
+    let mut report = report.unwrap_or_else(|| GitReport {
+        release_commit: String::new(),
+        nodes: vec![absent_node(MASTER)],
+        expected_drift: None,
+        expected_drift_count: None,
+        expected_drift_complete: false,
+        would_discard: None,
+        discarded: None,
+        hazards_acknowledged: None,
+    });
+    if pair && report.nodes.len() < 2 {
+        report.nodes.push(absent_node(BACKUP));
+    }
+    for entry in pending {
+        if let Some(node) = report.nodes.iter_mut().find(|n| n.node == entry.node)
+            && node.save.is_none()
+        {
+            node.save = Some(SaveInfo {
+                path: entry.path.clone(),
+                files: usize::try_from(entry.manifest.files).unwrap_or(usize::MAX),
+                bytes: entry.manifest.bytes,
+            });
+        }
+    }
+    Some(report)
+}
+
 /// `--rollback-run` over a project whose `.git` exists (D-08): classify it.
 /// An unsupported shape refuses `project_git_managed` with its reason before
 /// anything is written; a managed or adoptable repo is reported (state,
@@ -3206,6 +3327,7 @@ pub async fn git_rollback_backup(
     inputs: &UnverifiedInputs<'_>,
     wait: &BackupWait<'_>,
     want: Option<&str>,
+    pending: bool,
 ) -> RollbackGit {
     let unsynced = match want {
         None => Some("the master's project digest could not be read".to_string()),
@@ -3235,7 +3357,13 @@ pub async fn git_rollback_backup(
             )],
         };
     }
-    let mut step = git_after_rollback(report, saved, inputs).await;
+    // 27-54: a save the journal names (a pending one) is checked against the
+    // journal first.
+    let mut step = if pending {
+        git_after_pending(report, saved, inputs).await
+    } else {
+        git_after_rollback(report, saved, inputs).await
+    };
     // 27-37: the backup converged on the rolled-back project, so its
     // `project.json` is looked at too. Only a warning: these paths already
     // exit 6 and keep their outcome.
@@ -3460,7 +3588,7 @@ mod tests {
             assert!(!producer.is_empty(), "{word}");
             let here = producer.contains("(27-12");
             let known = HOST_REASONS.contains(word) || RESTORE_REASONS.contains(word);
-            let later = ["27-13", "27-17", "27-22", "27-37"]
+            let later = ["27-13", "27-17", "27-22", "27-37", "27-54"]
                 .iter()
                 .any(|plan| producer.contains(plan));
             assert!(

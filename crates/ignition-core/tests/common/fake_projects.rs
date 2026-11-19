@@ -1090,6 +1090,25 @@ impl FakeProjects {
         self
     }
 
+    /// The session `with_designers_after_verify` attached goes: no later
+    /// Designer read sees it (27-54: a retry after the Designer closed).
+    #[allow(dead_code)]
+    pub fn detach_designers(&self) {
+        *self
+            .designers_after_verify
+            .lock()
+            .expect("designers after verify") = 0;
+    }
+
+    /// Replace the Designer script while the fake is in use: `lists[n]` answers
+    /// Designer read `n` counted from the fake's start (the last list answers
+    /// every later read), so a test that has seen `designers_reads()` reads
+    /// pads that many empty lists first (27-54).
+    #[allow(dead_code)]
+    pub fn set_designers_script(&self, lists: Vec<Vec<DesignerSeen>>) {
+        self.designers.lock().expect("designers").lists = lists;
+    }
+
     /// On Designer read `read` (0-based) run `hook` once.
     #[allow(dead_code)]
     pub fn on_designers_read(&self, read: usize, hook: impl Fn() + Send + Sync + 'static) {
