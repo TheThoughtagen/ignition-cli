@@ -826,13 +826,14 @@ pub fn stage_gateway_project(emitted: &Path, to: &Path, url: &str) -> PathBuf {
         "PRODSHAPE_STAGE_TO already exists: remove it or name a new path"
     );
     copy_tree(&source, &to);
-    let config = to.join(".git").join("config");
+    // Relative to `to`, where `git` runs: `to.join(..)` would double a
+    // relative `to` (CodeRabbit #60).
     git(
         &to,
         &[
             "config",
             "--file",
-            to_str(&config),
+            ".git/config",
             &format!("remote.{REMOTE}.url"),
             url,
         ],
