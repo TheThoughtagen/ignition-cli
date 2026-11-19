@@ -28,6 +28,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 mod apply_ops;
+mod git_dir;
 mod project_ops;
 
 use super::{

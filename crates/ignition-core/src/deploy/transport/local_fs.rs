@@ -133,6 +133,17 @@ mod unix {
         }
     }
 
+    /// One entry of [`Dir::list_stat`].
+    #[derive(Debug, Clone)]
+    pub(in crate::deploy::transport) struct RawEntry {
+        pub(in crate::deploy::transport) name: std::ffi::OsString,
+        pub(in crate::deploy::transport) kind: Kind,
+        /// `st_size` (the link's own size for a symlink).
+        pub(in crate::deploy::transport) size: u64,
+        /// `st_mode & 0o777`.
+        pub(in crate::deploy::transport) mode: u32,
+    }
+
     /// An opened directory.
     #[derive(Debug)]
     pub(in crate::deploy::transport) struct Dir {
@@ -209,6 +220,85 @@ mod unix {
                 Err(FdError::Missing) => Ok(None),
                 Err(e) => Err(lift(e)),
             }
+        }
+
+        /// The metadata of this directory itself (its handle, `fstat`).
+        pub(in crate::deploy::transport) fn metadata(&self) -> FsResult<std::fs::Metadata> {
+            self.fd.metadata().map_err(FsError::Io)
+        }
+
+        /// Open the regular file at `parts` for reading, and its metadata
+        /// from the opened handle (27-43). `None` when a level or the file is
+        /// absent. The file is opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`
+        /// from the walked parent and `fstat`ed: a symlink (`ELOOP`) or
+        /// anything that is not a regular file is `Changed`. NONBLOCK keeps a
+        /// FIFO swapped in from blocking the open until a writer appears (the
+        /// `tree::open_beneath` reasoning); a regular file is unaffected.
+        pub(in crate::deploy::transport) fn open_file(
+            &self,
+            parts: &[&str],
+        ) -> FsResult<Option<(File, std::fs::Metadata)>> {
+            let Some((dir, name)) = self.parent(parts)? else {
+                return Ok(None);
+            };
+            match openat(
+                &dir,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    let file = File::from(fd);
+                    let meta = file.metadata().map_err(FsError::Io)?;
+                    if !meta.is_file() {
+                        return Err(FsError::Changed);
+                    }
+                    Ok(Some((file, meta)))
+                }
+                Err(rustix::io::Errno::NOENT) => Ok(None),
+                Err(e) => Err(lift_errno(e)),
+            }
+        }
+
+        /// What every entry of the directory at `parts` is, with its size and
+        /// permission bits, from one `fstatat(AT_SYMLINK_NOFOLLOW)` each
+        /// relative to the opened directory (27-43); sorted by name bytes.
+        /// A name that is not UTF-8 is returned as it is.
+        #[allow(clippy::unnecessary_cast)] // the raw widths differ per platform
+        pub(in crate::deploy::transport) fn list_stat(
+            &self,
+            parts: &[&str],
+        ) -> FsResult<Vec<RawEntry>> {
+            use std::os::unix::ffi::OsStrExt;
+            let dir = dirfd::walk(&self.fd, parts).map_err(lift)?;
+            let mut out = Vec::new();
+            for entry in rustix::fs::Dir::read_from(&dir).map_err(|e| FsError::Io(e.into()))? {
+                let entry = entry.map_err(|e| FsError::Io(e.into()))?;
+                let raw = entry.file_name().to_bytes();
+                if raw == b"." || raw == b".." {
+                    continue;
+                }
+                let stat =
+                    match rustix::fs::statat(&dir, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+                        Ok(stat) => stat,
+                        Err(rustix::io::Errno::NOENT) => return Err(FsError::Missing),
+                        Err(e) => return Err(FsError::Io(e.into())),
+                    };
+                let kind = match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+                    rustix::fs::FileType::Directory => Kind::Dir,
+                    rustix::fs::FileType::RegularFile => Kind::File,
+                    rustix::fs::FileType::Symlink => Kind::Symlink,
+                    _ => Kind::Other,
+                };
+                out.push(RawEntry {
+                    name: std::ffi::OsStr::from_bytes(raw).to_os_string(),
+                    kind,
+                    size: stat.st_size as u64,
+                    mode: (stat.st_mode as u32) & 0o777,
+                });
+            }
+            out.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+            Ok(out)
         }
 
         fn create_in(dir: &File, name: &str, vis: Visibility) -> FsResult<File> {
