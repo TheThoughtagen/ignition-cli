@@ -106,7 +106,7 @@
 use super::{Budget, EntryKind, FoundFile, ReadBase, SftpTransport, windows_native_path};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
-use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, ProjectDisk};
+use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, OldValue, ProjectDisk};
 use crate::deploy::git_state::{
     GIT_LOG_TAIL_MAX, GIT_LOOSE_REFS_MAX, GIT_MARKERS, GIT_PACKED_REFS_MAX, GitFiles,
 };
@@ -129,9 +129,9 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir, ProjectHost,
-    ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_probe_name,
-    project_run_names_problem_on, tag_record_names_problem_on,
+    GIT_CHANGED_OPERATION, GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir,
+    ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write,
+    git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
 use crate::deploy::transport::winps::{LONG_PATH_PREFIX, WinScript, windows_component_problem};
@@ -588,10 +588,14 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
     "printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
-/// 27-31 (WR-B3, WR-B1), step (c) of a POSIX `.git` write. The bytes are
-/// already in the private stage (`<stage>/<index>` for the write at that
-/// position). Arguments: the data dir, the `.git` path below it, the stage
-/// path, then (target, lock, size) triples; every value is data.
+/// 27-31 (WR-B3, WR-B1) and 27-46 (F4), step (c) of a POSIX `.git` write. The
+/// bytes are already in the private stage (`<stage>/<index>` for the write at
+/// that position). Arguments: the data dir, the `.git` path below it, the stage
+/// path, then five fields per write: the target, the lock, the size, the
+/// expected old value of the target and the expected state of `packed-refs`.
+/// The old value is `-` (the target must be absent), `*` (not compared) or 64
+/// lowercase hex (the sha256 the target must have); the `packed-refs` field is
+/// `*` when unused, or `-` or 64 hex. Every value is data.
 ///
 /// No path the gateway account can change is written through. Every walk is
 /// level by level from the data dir: each level is a real directory (`[ -d ]`
@@ -600,10 +604,13 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
 /// refused. Every create, link and move then uses a basename in that checked
 /// current directory.
 ///
-/// 1. check every triple: the stage file is a regular non-symlink file of the
+/// 1. check every write: the stage file is a regular non-symlink file of the
 ///    sent size, the target is absent or a regular file, the lock is absent,
-///    and the final mode is known (the target's permission bits without the
-///    execute bits; `0600` for a new `config`, `0644` otherwise);
+///    the final mode is known (the target's permission bits without the
+///    execute bits; `0600` for a new `config`, `0644` otherwise), and each
+///    expected-value field has its shape (exit 4 otherwise; the hash tool is
+///    looked for here, only when a field is a digest, exit 3 when the host has
+///    neither `sha256sum` nor `shasum`);
 /// 2. when a directory has to be made and the gateway account (owner of
 ///    `projects/<p>`) is neither root nor the deploy account, refuse with exit
 ///    6 unless `setfacl` exists; make each missing directory with its
@@ -615,21 +622,29 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
 /// 4. create each lock by `ln -n` (a hard link: atomic, never follows a
 ///    symlink at the lock path, never replaces anything, whatever the shell);
 ///    a lock that is not the regular file just made is refused;
-/// 5. `mv -f` each lock over its target in plan order;
+/// 5. just before each `mv -f`, in the checked directory of its target,
+///    compare the target with its expected old value (F4): `-` needs it
+///    absent, a digest needs a regular non-link file with that sha256; a
+///    packed-refs field is compared after a verified walk to the `.git` root.
+///    A mismatch is exit 7, after `ab` has removed this script's locks, the
+///    directories it made, its private directory and the stage; the writes
+///    moved before it stay. Then `mv -f` each lock over its target in plan
+///    order;
 /// 6. remove the private directory and the stage.
 ///
 /// The script removes the locks it made, the directories it made (when still
 /// empty), the private directory and the stage on every refusal and failure it
-/// reports itself (exit 3, 4, 5, 6); it never removes a lock it did not
-/// create. Exit 4 is a refusal, 5 a size mismatch, 6 the ACL step, 3 a host
-/// failure.
+/// reports itself (exit 3, 4, 5, 6, 7); it never removes a lock it did not
+/// create. Exit 4 is a refusal, 5 a size mismatch, 6 the ACL step, 7 a target
+/// that changed after the plan (no value is printed, only the file's name),
+/// 3 a host failure.
 pub(super) const GIT_WRITE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
     "for c in ls mkdir rmdir rm mv wc cat ln id; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "[ -d \"$3\" ] && [ ! -L \"$3\" ] || { printf '%s is not a real stage directory\\n' \"$3\" >&2; exit 4; }; ",
-    "umask 077; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; pdn=''; nt=0; dd=$1; rr=$2; stg=$3; shift 3; ",
+    "umask 077; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; pdn=''; nt=0; H=''; dd=$1; rr=$2; stg=$3; shift 3; ",
     "wq() { bc=$dd; bm='cannot enter %s'; cd -- \"$dd\" 2>/dev/null || return 3; we=$(pwd -P) || return 3; IFS=/; ",
     "for w in $1; do ",
     "if [ -L \"$w\" ]; then bc=$w; bm='%s is a symlink'; unset IFS; return 4; ",
@@ -648,8 +663,17 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; case $o in *'No such file or directory') return 1;; esac; ab; printf '%s\\n' \"$o\" >&2; exit 3; }; ",
     "mo() { q=$(stat -c %a -- \"$1\" 2>/dev/null) || q=$(stat -f %Lp -- \"$1\" 2>/dev/null) || q=''; case $q in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) q=${q#${q%???}};; *) return 1;; esac; }; ",
     "gm() { if [ \"$2\" = 1 ]; then mo \"$1\" || fl 3 'the mode of %s cannot be read' \"$t\"; m=$q; else case $t in config) m=600;; *) m=644;; esac; fi; m=$(printf '%03o' \"$((0$m & 0666))\"); }; ",
-    "ws \"$rr\"; gp=$(pwd -P); n=$#; nt=$((n/3)); i=0; nd=0; ms=''; ",
-    "while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
+    "hd() { [ -n \"$H\" ] && return 0; if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; else fl 3 'the host has neither sha256sum nor shasum'; fi; }; ",
+    "ck() { case $1 in -|\\*) ;; *[!0-9a-f]*) fl 4 'the expected value of %s is not a digest, - or *' \"$2\";; ",
+    "*) [ ${#1} = 64 ] || fl 4 'the expected value of %s is not a digest, - or *' \"$2\"; hd;; esac; }; ",
+    "cv() { [ \"$1\" = '*' ] && return 0; if [ \"$1\" = - ]; then ",
+    "if [ -e \"$2\" ] || [ -L \"$2\" ]; then fl 7 '%s changed after the plan; nothing more was moved' \"$3\"; fi; return 0; fi; ",
+    "if [ -f \"$2\" ] && [ ! -L \"$2\" ]; then hv=$($H -- \"$2\") || fl 3 '%s cannot be read' \"$3\"; ",
+    "[ \"${hv%% *}\" = \"$1\" ] || fl 7 '%s changed after the plan; nothing more was moved' \"$3\"; ",
+    "else fl 7 '%s changed after the plan; nothing more was moved' \"$3\"; fi; }; ",
+    "ws \"$rr\"; gp=$(pwd -P); n=$#; nt=$((n/5)); i=0; nd=0; ms=''; ",
+    "while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; s=$stg/$((i/5)); i=$((i+5)); ck \"$ov\" \"$t\"; ck \"$pv\" \"$t\"; ",
     "case $t in */*) par=${t%/*};; *) par='';; esac; tb=${t##*/}; lb=${l##*/}; ",
     "[ -f \"$s\" ] && [ ! -L \"$s\" ] || fl 4 '%s is not a regular file' \"$s\"; ",
     "[ $(( $(wc -c < \"$s\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$s\"; ",
@@ -660,7 +684,7 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
     "fg=0; if [ $nd = 1 ]; then gu=$(ls -ldn -- \"$dd/${rr%/.git}\" 2>/dev/null | { read -r a b c d; printf '%s' \"$c\"; }); me=$(id -u); ",
     "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then fg=1; ",
     "command -v setfacl >/dev/null 2>&1 || fl 6 'the gateway account needs write access to the new directories in .git and the host has no setfacl'; fi; fi; ",
-    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; i=$((i+5)); ",
     "case $t in */*) rest=${t%/*};; *) rest='';; esac; pp=''; ",
     "while [ -n \"$rest\" ]; do cn=${rest%%/*}; case $rest in */*) rest=${rest#*/};; *) rest='';; esac; ws \"$rr${pp:+/$pp}\"; ",
     "if [ -L \"./$cn\" ]; then fl 4 '%s is a symlink' \"$cn\"; elif [ -d \"./$cn\" ]; then :; elif pr \"./$cn\"; then fl 4 '%s is not a directory' \"$cn\"; ",
@@ -670,20 +694,22 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
     "ws \"$rr\"; pdm=.ign-write-${stg##*/git-stage-}; mkdir -m 700 -- \"./$pdm\" 2>/dev/null || fl 4 '%s exists or cannot be created; it is left alone' \"$pdm\"; pdn=$pdm; ",
     "[ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ] || fl 4 '%s is not a real directory' \"$pdn\"; cd -- \"./$pdn\" 2>/dev/null || fl 3 'cannot enter %s' \"$pdn\"; ",
     "[ -O . ] && [ \"$(pwd -P)\" = \"$gp/$pdn\" ] || fl 4 '%s is not the directory that was made' \"$pdn\"; ",
-    "i=0; ml=$ms; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; k=$((i/3)); s=$stg/$k; i=$((i+3)); ",
+    "i=0; ml=$ms; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; k=$((i/5)); s=$stg/$k; i=$((i+5)); ",
     "m=${ml%%\"$NL\"*}; ml=${ml#*\"$NL\"}; u=$(printf '%03o' \"$((0777 ^ 0$m))\"); ",
     "( umask \"$u\"; set -C; cat -- \"$s\" > \"./$k\" ) 2>/dev/null || fl 3 '%s cannot be copied from the stage' \"$s\"; ",
     "[ -f \"./$k\" ] && [ ! -L \"./$k\" ] || fl 4 '%s is not a regular file' \"$k\"; ",
     "[ $(( $(wc -c < \"./$k\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$k\"; done; ",
-    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; k=$((i/3)); i=$((i+3)); ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; k=$((i/5)); i=$((i+5)); ",
     "case $t in */*) par=${t%/*};; *) par='';; esac; lb=${l##*/}; ws \"$rr${par:+/$par}\"; ",
     "ln -n -- \"$gp/$pdn/$k\" \"./$lb\" 2>/dev/null || { if [ -e \"./$lb\" ] || [ -L \"./$lb\" ]; then fl 4 '%s exists or cannot be created; nothing was written' \"$l\"; else fl 3 '%s cannot be created' \"$l\"; fi; }; ",
     "if [ -f \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ \"./$lb\" -ef \"$gp/$pdn/$k\" ]; then made=\"$made$l$NL\"; ",
     "else if [ -d \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ \"./$lb/$k\" -ef \"$gp/$pdn/$k\" ]; then rm -f -- \"./$lb/$k\"; fi; ",
     "fl 4 '%s is not the regular file that was created' \"$l\"; fi; done; ",
-    "i=0; k=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
+    "i=0; k=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; i=$((i+5)); ",
     "case $t in */*) par=${t%/*};; *) par='';; esac; tb=${t##*/}; lb=${l##*/}; ws \"$rr${par:+/$par}\"; ",
     "if [ -d \"./$tb\" ] && [ ! -L \"./$tb\" ]; then fl 3 '%s became a directory; %s targets were moved before it' \"$t\" \"$k\"; fi; ",
+    "cv \"$ov\" \"./$tb\" \"$t\"; ",
+    "if [ \"$pv\" != '*' ]; then ws \"$rr\"; cv \"$pv\" ./packed-refs \"packed-refs (which lists $t)\"; ws \"$rr${par:+/$par}\"; fi; ",
     "mv -f -- \"./$lb\" \"./$tb\" 2>/dev/null || fl 3 '%s cannot be put in place; %s targets were moved before it' \"$t\" \"$k\"; ",
     "made=${made#*\"$NL\"}; k=$((k+1)); done; ",
     "rmpd; rm -rf -- \"$stg\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
@@ -2491,11 +2517,13 @@ impl GitStateWriter for SftpTransport {
         self.git_manifest_of("restore_git", &answer)
     }
 
-    // Not yet compared (27-45): `GitWrite::old` and `packed_refs_old` are not
-    // checked on an ssh node, so a ref that moved between the engine's read
-    // and this write can still be overwritten here. The POSIX arm compares
-    // under its lock in 27-46 and the Windows arm in 27-52; the guarantee is
-    // not claimed for an ssh node before then.
+    // Compared on a POSIX host (27-46): `GitWrite::old` and `packed_refs_old`
+    // travel as the fourth and fifth field of each write, and `GIT_WRITE_SH`
+    // compares the target with its expected value just before it moves the
+    // lock over it; a mismatch is exit 7, mapped here to
+    // `GIT_CHANGED_OPERATION`. A Windows host does not compare yet (27-52): a
+    // ref that moved between the engine's read and this write can still be
+    // overwritten there, and no guarantee is claimed for it before then.
     async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.mirror_fail("write", why));
@@ -2509,6 +2537,8 @@ impl GitStateWriter for SftpTransport {
                 self.mirror_fail("write", format!("a .git write is refused: {why}"))
             })?;
             let rel = write.name.rel();
+            write_old_fields(write)
+                .map_err(|why| self.mirror_fail("write", format!("{rel} is refused: {why}")))?;
             if self.windows {
                 for component in rel.split('/') {
                     if let Some(why) = windows_component_problem(component) {
@@ -2643,22 +2673,63 @@ impl SftpTransport {
     }
 }
 
-/// Whether a failed git script ran to one of its own exits (3 a host failure,
-/// 4 a refusal, 5 a size mismatch, 6 the ACL step): such a script took the
-/// locks it made and the stage away itself. Anything else (a dropped
-/// connection, a timeout, a kill, an answer that cannot be read) says nothing
-/// about how far it got.
-fn git_script_settled(err: &CoreError) -> bool {
+/// The exit code a failed host script reported (`exit code N` in the detail of
+/// a transport failure), when it ran to one.
+fn git_script_exit(err: &CoreError) -> Option<u32> {
     let CoreError::TransportFailed { detail, .. } = err else {
-        return false;
+        return None;
     };
-    detail
-        .split_once("exit code ")
-        .and_then(|(_, rest)| {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse::<u32>().ok()
-        })
-        .is_some_and(|code| (3..=6).contains(&code))
+    git_script_exit_of(detail)
+}
+
+/// [`git_script_exit`] over the detail text itself.
+fn git_script_exit_of(detail: &str) -> Option<u32> {
+    detail.split_once("exit code ").and_then(|(_, rest)| {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u32>().ok()
+    })
+}
+
+/// Whether a failed git script ran to one of its own exits (3 a host failure,
+/// 4 a refusal, 5 a size mismatch, 6 the ACL step, 7 a target that changed
+/// after the plan): such a script took the locks it made and the stage away
+/// itself. Anything else (a dropped connection, a timeout, a kill, an answer
+/// that cannot be read) says nothing about how far it got.
+fn git_script_settled(err: &CoreError) -> bool {
+    git_script_exit(err).is_some_and(|code| (3..=7).contains(&code))
+}
+
+/// The expected-value field of an old value as `GIT_WRITE_SH` takes it: `-`
+/// for absent, `*` for unchecked, or the 64 lowercase hex digits of the
+/// sha256. A digest of any other shape is refused here, before anything is
+/// sent (T-27-165).
+fn old_value_field(old: &OldValue) -> Result<&str, String> {
+    match old {
+        OldValue::Absent => Ok("-"),
+        OldValue::Unchecked => Ok("*"),
+        OldValue::Sha256(digest) => {
+            if digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                Ok(digest)
+            } else {
+                Err("an expected digest is not 64 lowercase hex digits".to_string())
+            }
+        }
+    }
+}
+
+/// The fourth and fifth field of a write for `GIT_WRITE_SH`: its expected old
+/// value and the expected state of `packed-refs` (`*` when unused).
+fn write_old_fields(write: &GitWrite) -> Result<(&str, &str), String> {
+    let old = old_value_field(&write.old)?;
+    let packed = match &write.packed_refs_old {
+        None => "*",
+        Some(old) => old_value_field(old)?,
+    };
+    Ok((old, packed))
 }
 
 /// `err` with `more` appended to the detail of a transport failure.
@@ -2729,19 +2800,35 @@ impl SftpTransport {
         // (c) every lock created and filled, then moved over its target
         let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
         let mut args = vec![self.data_dir.as_str(), rel, stage.as_str()];
-        for (s, size) in staged.1.iter().zip(&sizes) {
+        for ((s, size), (_, _, write)) in staged.1.iter().zip(&sizes).zip(plan) {
             args.push(&s.target);
             args.push(&s.lock);
             args.push(size);
+            let (old, packed) = write_old_fields(write).map_err(|why| {
+                self.mirror_fail("write", format!("{} is refused: {why}", s.target))
+            })?;
+            args.push(old);
+            args.push(packed);
         }
         if let Err(err) = self
             .git_run("write_git_files", GIT_WRITE_SH, &args, limit)
             .await
         {
-            return Err(if git_script_settled(&err) {
-                err
-            } else {
-                self.git_write_leftovers(err, rel, &stage, plan, true).await
+            return Err(match err {
+                // The script compared a target with what the run read and
+                // found it changed (27-46, F4). It removed its own locks and
+                // the stage before it exited, so there is nothing to clean.
+                CoreError::TransportFailed { node, detail, .. }
+                    if git_script_exit_of(&detail) == Some(7) =>
+                {
+                    CoreError::TransportFailed {
+                        operation: GIT_CHANGED_OPERATION.to_string(),
+                        node,
+                        detail,
+                    }
+                }
+                err if git_script_settled(&err) => err,
+                err => self.git_write_leftovers(err, rel, &stage, plan, true).await,
             });
         }
         drop(staged);
@@ -5009,6 +5096,8 @@ mod tests {
                     "config",
                     "config.lock",
                     "99",
+                    "*",
+                    "*",
                 ],
                 &system_path(),
             );
@@ -5020,6 +5109,130 @@ mod tests {
             );
             assert!(!rig.git().join("config.lock").exists(), "no lock is made");
             assert!(!Path::new(&stage).exists(), "the stage is taken away");
+        }
+
+        /// 27-46 (T-27-165): an expected-value field that is not `-`, `*` or 64
+        /// lowercase hex is refused (exit 4) before any lock is made, whatever
+        /// it looks like; it is data, never script text.
+        #[test]
+        fn write_script_refuses_a_malformed_old_field() {
+            let rig = Rig::new();
+            let injected = rig.root.path().join("injected");
+            let command = format!("$(touch {})", injected.display());
+            for (position, bad) in [
+                (0, ""),
+                (0, "abc"),
+                (0, command.as_str()),
+                (0, "A".repeat(64).as_str()),
+                (0, "a".repeat(63).as_str()),
+                (0, "g".repeat(64).as_str()),
+                (1, "a;b"),
+                (1, "--"),
+            ] {
+                let stage = stage_with(&rig, &["12345"]);
+                let (old, packed) = if position == 0 {
+                    (bad, "*")
+                } else {
+                    ("*", bad)
+                };
+                let out = run(
+                    GIT_WRITE_SH,
+                    &[
+                        &rig.data(),
+                        "projects/CapApp/.git",
+                        &stage,
+                        "config",
+                        "config.lock",
+                        "5",
+                        old,
+                        packed,
+                    ],
+                    &system_path(),
+                );
+                assert_eq!(out.code, 4, "{bad:?}: {}", out.stderr);
+                assert!(
+                    out.stderr.contains("not a digest"),
+                    "{bad:?}: {}",
+                    out.stderr
+                );
+                assert!(!rig.git().join("config.lock").exists(), "no lock is made");
+                assert_eq!(
+                    std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                    "[core]\n"
+                );
+                assert!(!injected.exists(), "a field is never run");
+            }
+        }
+
+        /// 27-46: the compare runs in the script itself: a matching digest, an
+        /// absent target and an unchecked field go through; a wrong digest is
+        /// exit 7, which removes the script's own stage and leaves the target.
+        #[test]
+        fn write_script_compares_the_target_before_the_move() {
+            let rig = Rig::new();
+            let bytes = "[core]\n\tnew = 1\n";
+            let digest = |text: &str| crate::deploy::tree::sha256_hex(text.as_bytes());
+            let write = |old: &str, packed: &str| {
+                let stage = stage_with(&rig, &[bytes]);
+                run(
+                    GIT_WRITE_SH,
+                    &[
+                        &rig.data(),
+                        "projects/CapApp/.git",
+                        &stage,
+                        "config",
+                        "config.lock",
+                        &bytes.len().to_string(),
+                        old,
+                        packed,
+                    ],
+                    &system_path(),
+                )
+            };
+            // wrong digest: exit 7, nothing replaced, nothing left
+            let wrong = write(&digest("not what is there\n"), "*");
+            assert_eq!(wrong.code, 7, "{}", wrong.stderr);
+            assert!(wrong.stderr.contains("config changed after the plan"));
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                "[core]\n"
+            );
+            assert!(!rig.git().join("config.lock").exists());
+            assert!(!rig.root.path().join("home/ign-deploy/git-stage-t").exists());
+            // absent expected, but the file is there
+            assert_eq!(write("-", "*").code, 7);
+            // packed-refs expected absent, but it is there
+            std::fs::write(rig.git().join("packed-refs"), "# pack-refs\n").expect("packed");
+            assert_eq!(write("*", "-").code, 7);
+            assert_eq!(write("*", &digest("other\n")).code, 7);
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                "[core]\n"
+            );
+            // the right digests go through
+            let ok = write(&digest("[core]\n"), &digest("# pack-refs\n"));
+            assert_eq!(ok.code, 0, "{}", ok.stderr);
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                bytes
+            );
+        }
+
+        /// 27-46: exit 7 is one of the script's own exits (it cleaned up), the
+        /// same as 3 to 6; a dropped connection or a kill is not.
+        #[test]
+        fn git_script_settled_counts_exit_7() {
+            let exit = |code: &str| CoreError::TransportFailed {
+                operation: "write_git_files".to_string(),
+                node: "n".to_string(),
+                detail: format!("the command failed with exit code {code}: refs changed"),
+            };
+            for code in ["3", "4", "5", "6", "7"] {
+                assert!(git_script_settled(&exit(code)), "exit {code} is settled");
+            }
+            for code in ["1", "2", "8", "255"] {
+                assert!(!git_script_settled(&exit(code)), "exit {code} is not");
+            }
         }
 
         #[test]
@@ -5043,6 +5256,8 @@ mod tests {
                             "config",
                             "config.lock",
                             "1",
+                            "*",
+                            "*",
                         ],
                         &system_path(),
                     );

@@ -3457,8 +3457,8 @@ mod git_rows {
     /// 27-45 (F4): a write whose target is no longer what the run read is
     /// refused with the shared marker; the changed ref keeps its new value,
     /// no lock of ours is left, and the writes before it stay. With the old
-    /// value brought up to date the same write lands. Local host only until
-    /// 27-46 (POSIX) and 27-52 (Windows) make their transports compare.
+    /// value brought up to date the same write lands. Local and sh hosts;
+    /// the pwsh host joins in 27-52, when its transport compares.
     pub async fn git_write_refuses_a_changed_target(c: &GitCtx) {
         let branch = GitWriteName::BranchRef(BRANCH.to_string());
         let rel = branch.rel();
@@ -4056,6 +4056,7 @@ mod git_rows {
         conformance_git_sh_git_objects_fetch_round_trip, GitCtx::posix, git_objects_fetch_round_trip;
         conformance_git_sh_git_objects_refuse_bad_name, GitCtx::posix, git_objects_refuse_bad_name;
         conformance_git_sh_project_file_digests_same, GitCtx::posix, project_file_digests_same;
+        conformance_git_sh_git_write_refuses_a_changed_target, GitCtx::posix, git_write_refuses_a_changed_target;
     }
 
     macro_rules! git_pwsh_row_tests {
@@ -4117,10 +4118,13 @@ mod git_rows {
             assert!(source.contains(&wired), "row {row} is not run on pwsh");
         }
         // Rows whose guarantee a host implements plan by plan: each runs on the
-        // local host now. `git_write_refuses_a_changed_target` joins the list
-        // above when 27-46 (sh) and 27-52 (pwsh) make their transports compare.
+        // local host (27-45) and on the sh host (27-46) now.
+        // `git_write_refuses_a_changed_target` joins the list above when 27-52
+        // makes the pwsh transport compare.
         let row = "git_write_refuses_a_changed_target";
         let wired = format!("conformance_git_local_{row}, GitCtx::local");
         assert!(source.contains(&wired), "row {row} is not run on local");
+        let wired = format!("conformance_git_sh_{row}, GitCtx::posix");
+        assert!(source.contains(&wired), "row {row} is not run on sh");
     }
 }

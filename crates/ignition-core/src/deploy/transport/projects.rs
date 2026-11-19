@@ -460,8 +460,9 @@ pub trait GitHostRead: Send + Sync {
 ///   mismatch on a later ref leaves the release staged on the old commit,
 ///   never a revert). The local host does this
 ///   (`local_git_write_refuses_a_changed_target`, conformance row
-///   `git_write_refuses_a_changed_target`); the ssh host does not compare yet
-///   (27-46 for POSIX, 27-52 for Windows).
+///   `git_write_refuses_a_changed_target`), and so does an ssh POSIX host
+///   (`GIT_WRITE_SH` exit 7, 27-46); an ssh Windows host does not compare yet
+///   (27-52).
 /// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
 ///   of one run and nothing else; no save directory is named `.git`.
 /// - [`probe_write`](Self::probe_write) creates and removes one probe file in

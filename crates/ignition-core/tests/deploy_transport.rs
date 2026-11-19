@@ -4069,10 +4069,10 @@ fn project_run_writer_is_confined() {
 mod sftp_git {
     use super::*;
     use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
-    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName, OldValue};
     use ignition_core::deploy::git_state::GitFiles;
     use ignition_core::deploy::transport::projects::{
-        GitEntry, GitHostRead, GitStateWriter, ProjectHost,
+        GIT_CHANGED_OPERATION, GitEntry, GitHostRead, GitStateWriter, ProjectHost,
     };
     use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
     use ignition_core::deploy::tree::sha256_hex;
@@ -5189,6 +5189,278 @@ mod sftp_git {
         assert_eq!(std::fs::read(git.join("HEAD")).expect("head"), head_before);
         assert!(!git.join("HEAD.lock").exists());
         assert!(stages(&n).is_empty(), "{:?}", stages(&n));
+    }
+
+    /// The sha256 the engine would carry as the old value of `path`.
+    fn digest_of(path: &Path) -> OldValue {
+        OldValue::Sha256(sha256_hex(
+            &std::fs::read(path).expect("read the old value"),
+        ))
+    }
+
+    const MOVED: &[u8] = b"1111111111111111111111111111111111111111\n";
+    const DESIGNER: &[u8] = b"2222222222222222222222222222222222222222\n";
+
+    /// HEAD (rewritten with its own bytes) and the production branch (moved to
+    /// `MOVED`), each carrying the value read now.
+    fn compared_writes(fx: &GitFixture) -> Vec<GitWrite> {
+        let git = fx.git_dir();
+        vec![
+            GitWrite {
+                name: GitWriteName::Head,
+                bytes: std::fs::read(git.join("HEAD")).expect("head"),
+                old: digest_of(&git.join("HEAD")),
+                packed_refs_old: None,
+            },
+            GitWrite {
+                name: GitWriteName::BranchRef("production".to_string()),
+                bytes: MOVED.to_vec(),
+                old: digest_of(&git.join("refs/heads/production")),
+                packed_refs_old: None,
+            },
+        ]
+    }
+
+    /// Nothing of the refused call is left in `.git` or in the account home.
+    fn assert_no_leftovers(n: &Node, fx: &GitFixture, what: &str) {
+        let left: Vec<String> = walk(&fx.git_dir())
+            .into_iter()
+            .filter(|p| p.ends_with(".lock") || p.contains(".ign-write-"))
+            .collect();
+        assert!(left.is_empty(), "{what}: {left:?}");
+        assert!(stages(n).is_empty(), "{what}: {:?}", stages(n));
+    }
+
+    fn assert_changed(err: CoreError, names: &str) {
+        match err {
+            CoreError::TransportFailed {
+                operation, detail, ..
+            } => {
+                assert_eq!(operation, GIT_CHANGED_OPERATION, "{detail}");
+                assert!(detail.contains(names), "names the file: {detail}");
+            }
+            other => panic!("expected the changed-target failure, got {other:?}"),
+        }
+    }
+
+    /// 27-46 (F4, POSIX arm): a ref rewritten after the run read it is never
+    /// overwritten. A `ln` shim changes the ref after the plan and before the
+    /// script compares (the lock of the branch is the call it waits for); the
+    /// write fails as `GIT_CHANGED_OPERATION`, the writer's value stays, this
+    /// script's locks and its stage are gone, and the write before it stays.
+    #[tokio::test]
+    async fn sftp_git_write_refuses_a_changed_target() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        let writes = compared_writes(&fx);
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ln",
+            &format!(
+                "case \"$*\" in *production.lock) printf '2222222222222222222222222222222222222222\\n' > {}/refs/heads/production;; esac\n\
+                 exec \"$(real ln)\" \"$@\"",
+                git.display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let err =
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a changed ref is refused");
+        assert_changed(err, "refs/heads/production");
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/production")).expect("ref"),
+            DESIGNER,
+            "the other writer's value stays"
+        );
+        assert_no_leftovers(&n, &fx, "a refused write");
+    }
+
+    /// 27-46: an old value of absent holds only while the ref is absent; a ref
+    /// that appeared by the move step is refused the same way and kept.
+    #[tokio::test]
+    async fn sftp_git_write_refuses_a_ref_that_appeared() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        let writes = vec![GitWrite {
+            name: GitWriteName::BranchRef("feature/new".to_string()),
+            bytes: MOVED.to_vec(),
+            old: OldValue::Absent,
+            packed_refs_old: None,
+        }];
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ln",
+            &format!(
+                "case \"$*\" in *new.lock) printf 'appeared\\n' > {}/refs/heads/feature/new;; esac\n\
+                 exec \"$(real ln)\" \"$@\"",
+                git.display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let err =
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a ref that appeared is refused");
+        assert_changed(err, "refs/heads/feature/new");
+        assert_eq!(
+            std::fs::read_to_string(git.join("refs/heads/feature/new")).expect("ref"),
+            "appeared\n"
+        );
+        assert_no_leftovers(&n, &fx, "a refused write");
+    }
+
+    /// 27-46: a branch that lives only in `packed-refs` carries the digest of
+    /// `packed-refs`; a `packed-refs` that changed refuses, and nothing is
+    /// moved.
+    #[tokio::test]
+    async fn sftp_git_write_refuses_a_changed_packed_refs() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        assert!(
+            !git.join("refs/remotes/capapp/production").exists(),
+            "the remote branch is packed only"
+        );
+        let writes = vec![GitWrite {
+            name: GitWriteName::RemoteRef {
+                remote: "capapp".to_string(),
+                branch: "production".to_string(),
+            },
+            bytes: MOVED.to_vec(),
+            old: OldValue::Absent,
+            packed_refs_old: Some(digest_of(&git.join("packed-refs"))),
+        }];
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ln",
+            &format!(
+                "case \"$*\" in *production.lock) printf '# gc ran\\n' >> {}/packed-refs;; esac\n\
+                 exec \"$(real ln)\" \"$@\"",
+                git.display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let err =
+            n.t.write_git_files(PROJECT, &writes)
+                .await
+                .expect_err("a changed packed-refs is refused");
+        assert_changed(err, "packed-refs");
+        assert!(
+            !git.join("refs/remotes/capapp/production").exists(),
+            "nothing was moved"
+        );
+        assert_no_leftovers(&n, &fx, "a refused write");
+    }
+
+    /// 27-46: exit 7 of the write script is settled: the script cleaned up
+    /// itself, so no cleanup command is sent after it.
+    #[tokio::test]
+    async fn sftp_git_write_exit_7_is_settled() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let git = fx.git_dir();
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "ln",
+            &format!(
+                "case \"$*\" in *production.lock) printf '2222222222222222222222222222222222222222\\n' > {}/refs/heads/production;; esac\n\
+                 exec \"$(real ln)\" \"$@\"",
+                git.display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        n.t.write_git_files(PROJECT, &compared_writes(&fx))
+            .await
+            .expect_err("a changed ref is refused");
+        let sent = n.count.execs.lock().expect("execs").clone();
+        assert!(
+            sent.iter().any(|c| c.contains("changed after the plan")),
+            "the write script ran: {sent:?}"
+        );
+        assert!(
+            !sent
+                .iter()
+                .any(|c| c.contains("the locks could not be checked")),
+            "no cleanup ran after exit 7: {sent:?}"
+        );
+    }
+
+    /// 27-46: a write with no expectation (a pack) moves without a compare
+    /// and without a hash tool; a write that carries a digest does call one.
+    #[tokio::test]
+    async fn sftp_git_write_unchecked_pack_is_not_hashed() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let log = fx.data_dir.join("hash-calls.log");
+        let shims = common::posix_exec::Shims::new();
+        shims.add(
+            "sha256sum",
+            &format!(
+                "echo sha256sum >> {}\n\
+                 if [ -n \"$(real sha256sum)\" ]; then exec \"$(real sha256sum)\" \"$@\"; fi\n\
+                 exec \"$(real shasum)\" -a 256 \"$@\"",
+                log.display()
+            ),
+        );
+        shims.add(
+            "shasum",
+            &format!(
+                "echo shasum >> {}\nexec \"$(real shasum)\" \"$@\"",
+                log.display()
+            ),
+        );
+        n.count.use_shims(&shims);
+        let pack = GitWrite {
+            name: GitWriteName::PackFile("ab".repeat(20)),
+            bytes: vec![7u8; 4000],
+            old: OldValue::Unchecked,
+            packed_refs_old: None,
+        };
+        n.t.write_git_files(PROJECT, std::slice::from_ref(&pack))
+            .await
+            .expect("an unchecked pack moves");
+        assert!(
+            fx.git_dir().join(pack.name.rel()).is_file(),
+            "the pack is in place"
+        );
+        assert!(!log.exists(), "no hash tool ran for an unchecked write");
+        // a write that carries a digest does hash: the shim is wired
+        n.t.write_git_files(PROJECT, &compared_writes(&fx))
+            .await
+            .expect("an unchanged repo is written");
+        assert!(log.exists(), "a compared write hashes");
+        assert_no_leftovers(&n, &fx, "the writes");
+    }
+
+    /// 27-46 (T-27-165): a malformed old-value field never reaches the host:
+    /// the transport refuses a digest that is not 64 lowercase hex before the
+    /// first remote call.
+    #[tokio::test]
+    async fn sftp_git_write_refuses_a_malformed_old_digest() {
+        let fx = GitFixture::new();
+        let n = node(&fx.data_dir);
+        let calls = n.count.execs();
+        for bad in [
+            "",
+            "AB",
+            &"A".repeat(64),
+            &"g".repeat(64),
+            "$(touch x)",
+            &"a".repeat(63),
+        ] {
+            let write = GitWrite {
+                name: GitWriteName::Head,
+                bytes: b"ref: refs/heads/production\n".to_vec(),
+                old: OldValue::Sha256(bad.to_string()),
+                packed_refs_old: None,
+            };
+            let why = detail(n.t.write_git_files(PROJECT, &[write]).await.expect_err(bad));
+            assert!(why.contains("digest"), "{bad:?}: {why}");
+        }
+        assert_eq!(n.count.execs(), calls, "nothing reached the host");
     }
 
     fn mode_of(path: &Path) -> u32 {
