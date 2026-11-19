@@ -354,7 +354,7 @@ advanced, the run is a finished run with a verdict, and it ends **exit 6**:
 - `restore.reason` is one of the words of the table in
   [Projects the git module manages](#projects-the-git-module-manages)
   (`restore_failed`, `advance_failed`, `status_unexpected`, `git_recreated`,
-  `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`).
+  `git_changed`, `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`).
 - `backup_project_json_missing` (on `nodes.backup` only) is not a `.git`
   failure: after the backup's project converged, its
   `data/projects/<project>/project.json` is absent or not a regular file, and the
@@ -6197,6 +6197,7 @@ word is a change to the repository, the checkout or the target file:
 | `advance_failed` | the advance could not be built or written | the run's warning names the cause; fix it and deploy again (the saved copy is kept) |
 | `status_unexpected` | the status over the work tree rebuilt from the read-back export and the node's disk digests differs from the prediction, or a project file on disk matches neither the release nor the export; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
 | `git_recreated` | the `.git` after the import is not the one prepared against | check the repository, then deploy again; it was left as it is |
+| `git_changed` | a ref, `HEAD`, `config` or `index` changed after the run read the repository and before its write (a Designer or the module wrote meanwhile); the writes before it, the index first, are in place and nothing was overwritten (a `local` node checks this; an `ssh` node does not yet) | check the repository's state on the gateway, then deploy again; the saved copy is kept (do not put it over the repository without checking) |
 | `backup_unsynced` | the backup's project did not equal the release within `--backup-timeout`, so its `.git` was not touched | wait for the pair to converge; the saved copy is `data.git.nodes[1].save.path` on the backup host |
 | `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |
 | `designer_attached` | a Designer session was attached at the check before a `.git` write | close the Designer session, deploy again |

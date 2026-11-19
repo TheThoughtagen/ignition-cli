@@ -17,7 +17,9 @@
 use ignition_core::actions::apicall::ApiCallOutcome;
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
-use ignition_core::actions::deploy_projects::git::REASON_BACKUP_PROJECT_JSON_MISSING;
+use ignition_core::actions::deploy_projects::git::{
+    REASON_BACKUP_PROJECT_JSON_MISSING, REASON_GIT_CHANGED,
+};
 use ignition_core::actions::diagnostics::{BundleDownloadResult, BundleStatusWire};
 use ignition_core::actions::eam::{
     EamDeleteResult, EamHistoryResult, EamLifecycleResult, EamModifyResult, EamTaskCreateResult,
@@ -1724,7 +1726,7 @@ fn deploy_projects_human_lines(
         // and recorded; only the gateway repository was not handed over.
         let git_failed = result.outcome == ProjectOutcome::GitRestoreFailed;
         if let Some(slug) = result.slug.as_ref().filter(|_| git_failed) {
-            let (manifest, repository) = git_failure_kinds(result);
+            let (manifest, repository, changed) = git_failure_kinds(result);
             if manifest {
                 // 27-37: the repository is not the problem. The backup lost
                 // the project's manifest file, so no `.git` instruction.
@@ -1736,16 +1738,30 @@ fn deploy_projects_human_lines(
                     escape_control(slug)
                 ));
             }
+            if changed {
+                // 27-45: a file of `.git` changed while the run wrote it. The
+                // repository is the other writer's, with the writes before it
+                // in place; the saved copy must not be put over it unchecked.
+                lines.push(format!(
+                    "verdict: {}: the project was deployed, read back equal and recorded; a file \
+                     of the gateway's .git changed while ign was writing it (git_changed), so the \
+                     writes before it, the index first, are in place and nothing was overwritten; \
+                     check the repository's state on the gateway, do not put the saved copy over \
+                     it without checking, then deploy again",
+                    escape_control(slug)
+                ));
+            }
             // Any other reason (or none named) keeps the 27-36 verdict, also
             // beside the finding when both kinds are present.
-            if (repository || !manifest) && git_failed_node_kept_save(result) {
+            let repository = repository || !(manifest || changed);
+            if repository && git_failed_node_kept_save(result) {
                 lines.push(format!(
                     "verdict: {}: the project was deployed, read back equal and recorded; its \
                      git repository was not handed over and nothing was rolled back; restore \
                      the .git by hand from the copy named in the outcome line",
                     escape_control(slug)
                 ));
-            } else if repository || !manifest {
+            } else if repository {
                 // CodeRabbit #57: no copy was kept (the save itself failed),
                 // and the `.git` was never written.
                 lines.push(format!(
@@ -1926,11 +1942,12 @@ fn git_restore_failed_line(
     )
 }
 
-/// Which kinds of failed node a `git_restore_failed` run holds (27-37): one
-/// with the backup's `project.json` finding, and one with any other reason.
+/// Which kinds of failed node a `git_restore_failed` run holds: one with the
+/// backup's `project.json` finding (27-37), one whose advance found a file
+/// changed under its lock (27-45), and one with any other reason.
 fn git_failure_kinds(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     let reasons: Vec<&str> = result.git.as_deref().map_or_else(Vec::new, |g| {
         g.nodes
             .iter()
@@ -1941,7 +1958,8 @@ fn git_failure_kinds(
         reasons.contains(&REASON_BACKUP_PROJECT_JSON_MISSING),
         reasons
             .iter()
-            .any(|r| *r != REASON_BACKUP_PROJECT_JSON_MISSING),
+            .any(|r| *r != REASON_BACKUP_PROJECT_JSON_MISSING && *r != REASON_GIT_CHANGED),
+        reasons.contains(&REASON_GIT_CHANGED),
     )
 }
 
@@ -2028,6 +2046,12 @@ fn git_lines(
         }
         if let Some(restore) = &node.restore {
             match restore.reason.as_deref() {
+                // 27-45: the writes before the changed file are in place.
+                Some(reason) if reason == REASON_GIT_CHANGED => lines.push(format!(
+                    "  restore: failed ({}); the repository was partly advanced (the writes \
+                     before the changed file are in place)",
+                    escape_control(reason)
+                )),
                 Some(reason) => lines.push(format!(
                     "  restore: failed ({}){}",
                     escape_control(reason),
@@ -5700,6 +5724,65 @@ mod tests {
         // Another reason keeps the 27-36 verdict.
         let other = deploy_projects_human_lines(&failed_pair_result("backup_unsynced")).join("\n");
         assert!(other.contains("restore the .git by hand"), "{other}");
+    }
+
+    /// 27-45 (F4): a ref, HEAD, config or index changed while the run wrote
+    /// it. The repository is the other writer's, with the writes before it in
+    /// place, so the verdict never sends the operator to put the saved copy
+    /// over it; it says what happened and to check the repository first. The
+    /// restore line does not say "not advanced".
+    #[test]
+    fn git_verdict_for_git_changed() {
+        let mut result = failed_pair_result("git_changed");
+        // The save was restored and the index written before the change.
+        let backup = result.git.as_mut().expect("git").nodes[1]
+            .restore
+            .as_mut()
+            .expect("restore");
+        backup.restored = true;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        let verdict = text
+            .lines()
+            .find(|l| l.starts_with("verdict:"))
+            .expect("a verdict line");
+        for needle in [
+            "verdict: deploy_git_restore_failed",
+            "the project was deployed, read back equal and recorded",
+            "changed while ign was writing it (git_changed)",
+            "the writes before it, the index first, are in place",
+            "check the repository's state on the gateway",
+            "do not put the saved copy over it without checking",
+            "then deploy again",
+        ] {
+            assert!(verdict.contains(needle), "{needle:?} is missing: {verdict}");
+        }
+        assert!(
+            !verdict.contains("restore the .git by hand"),
+            "no restore-from-copy instruction: {verdict}"
+        );
+        let outcome = text
+            .lines()
+            .find(|l| l.starts_with("outcome:"))
+            .expect("an outcome line");
+        assert!(outcome.contains("nodes.backup: git_changed"), "{outcome}");
+        assert!(
+            text.contains(
+                "restore: failed (git_changed); the repository was partly advanced (the writes \
+                 before the changed file are in place)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("restore: failed (git_changed); the repository was not advanced"),
+            "{text}"
+        );
+        // Another reason keeps the 27-36 verdict and its restore instruction.
+        let other = deploy_projects_human_lines(&failed_pair_result("backup_unsynced")).join("\n");
+        assert!(other.contains("restore the .git by hand"), "{other}");
+        assert!(
+            !other.contains("changed while ign was writing it"),
+            "{other}"
+        );
     }
 
     /// CodeRabbit #57: a `.git` that could not be saved was never touched and

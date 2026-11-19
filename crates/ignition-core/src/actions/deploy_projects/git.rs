@@ -167,6 +167,14 @@ pub const REASON_BACKUP_UNSYNCED: &str = "backup_unsynced";
 /// from the index it writes.
 pub const REASON_BACKUP_PROJECT_JSON_MISSING: &str = "backup_project_json_missing";
 
+/// The restore reason of an advance whose write found its target changed under
+/// the lock (27-45, CodeRabbit #55 F4; checkpoint option-a): a Designer or the
+/// module moved a ref, `HEAD`, `config` or `index` after the run read the
+/// repository. The writes before it, the index first, are in place and
+/// nothing was overwritten, so the repository is the other writer's: the
+/// verdict never sends the operator to put the saved copy over it.
+pub const REASON_GIT_CHANGED: &str = "git_changed";
+
 /// The manifest file the finding is about, as a status path.
 const PROJECT_JSON: &str = "project.json";
 
