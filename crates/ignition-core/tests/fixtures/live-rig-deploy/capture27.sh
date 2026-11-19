@@ -457,11 +457,24 @@ place_prodshape27() {
   [ -f "$stage/$APP/.git/refs/heads/production" ] && [ -f "$stage/$APP/project.json" ] \
     || die "place_prodshape27: the stage holds no project with a .git"
   docker stop "$c" > /dev/null
+  # CodeRabbit #60 (Y2): from here the gateway is stopped. A failed copy (a
+  # full disk, say) starts it again before the error is returned, with the
+  # copy's own message and exit status, so seedprod27 can be rerun (reset27
+  # needs a running gateway and replaces the partial copy).
+  local rc=0
   docker run --rm --platform linux/amd64 --entrypoint sh -u root \
     -v "$DATA/projects:/p" -v "$stage/$APP:/src:ro" "$img" \
-    -c "rm -rf /p/$APP && mkdir /p/$APP && cp -a /src/. /p/$APP/ && chown -R $own /p/$APP" > /dev/null
+    -c "rm -rf /p/$APP && mkdir /p/$APP && cp -a /src/. /p/$APP/ && chown -R $own /p/$APP" > /dev/null || rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -f "$PDIR/.git/refs/heads/production" ]; then
+    echo "place_prodshape27: $APP has no .git on the host after the copy" >&2
+    rc=64
+  fi
+  if [ "$rc" -ne 0 ]; then
+    docker start "$c" > /dev/null || echo "place_prodshape27: starting the gateway again failed as well" >&2
+    echo "place_prodshape27: placing the emitted project failed (exit $rc); the gateway was started again, so seedprod27 can be rerun once the cause is fixed" >&2
+    exit "$rc"
+  fi
   /bin/rm -rf "$stage"
-  [ -f "$PDIR/.git/refs/heads/production" ] || die "place_prodshape27: $APP has no .git on the host after the copy"
   docker start "$c" > /dev/null
   echo "place_prodshape27: the emitted gateway project is in place as $APP (its .git as generated, remote at the module's URL); no shape value is shown"
 }
