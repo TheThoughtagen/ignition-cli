@@ -2452,6 +2452,11 @@ impl GitStateWriter for SftpTransport {
         self.git_manifest_of("restore_git", &answer)
     }
 
+    // Not yet compared (27-45): `GitWrite::old` and `packed_refs_old` are not
+    // checked on an ssh node, so a ref that moved between the engine's read
+    // and this write can still be overwritten here. The POSIX arm compares
+    // under its lock in 27-46 and the Windows arm in 27-52; the guarantee is
+    // not claimed for an ssh node before then.
     async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.mirror_fail("write", why));
@@ -3679,6 +3684,8 @@ mod tests {
     #[tokio::test]
     async fn sftp_git_windows_answers_are_checked_strictly() {
         let write = [GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::Head,
             bytes: vec![1],
         }];
@@ -3937,6 +3944,8 @@ mod tests {
         for hostile in ["CON", "a:b", "trail.", "a<b", "a/b", ".."] {
             let (runner, t) = win_host(Vec::new());
             let write = [GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: vec![1],
             }];
@@ -3973,6 +3982,8 @@ mod tests {
         // a ref name Windows cannot hold is refused before any lock is made
         let (runner, t) = win_host(Vec::new());
         let write = [GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::BranchRef("con".to_string()),
             bytes: vec![1],
         }];
@@ -4024,6 +4035,8 @@ mod tests {
         WIN_WRITE
             .iter()
             .map(|(branch, bytes)| GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef((*branch).to_string()),
                 bytes: bytes.to_vec(),
             })

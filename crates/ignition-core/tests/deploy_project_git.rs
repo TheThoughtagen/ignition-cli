@@ -514,6 +514,8 @@ async fn write_refuses_existing_lock() {
     // The remote-tracking write comes first and would succeed alone.
     let writes = [
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::RemoteRef {
                 remote: REMOTE.to_string(),
                 branch: BRANCH.to_string(),
@@ -521,6 +523,8 @@ async fn write_refuses_existing_lock() {
             bytes: new.clone(),
         },
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::BranchRef(BRANCH.to_string()),
             bytes: new,
         },
@@ -557,6 +561,8 @@ async fn write_refuses_unsafe_names() {
             .write_git_files(
                 PROJECT,
                 &[GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: bad.clone(),
                     bytes: b"x".to_vec(),
                 }],
@@ -1633,7 +1639,9 @@ mod published {
     use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
     use ignition_core::deploy::git_remote::HostGit as Git;
     use ignition_core::deploy::transport::local::LocalFsTransport;
-    use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
+    use ignition_core::deploy::transport::projects::{
+        GIT_CHANGED_OPERATION, GitEntry, ProjectHost,
+    };
     use ignition_core::error::CoreError;
 
     const PROVIDER: &str = "PlantA";
@@ -2775,6 +2783,100 @@ mod published {
         assert_eq!(restore.reason.as_deref(), Some("advance_failed"));
         assert!(restore.restored && !restore.advanced && restore.save_kept);
         assert!(!rig.save_trees().is_empty(), "the save is kept");
+    }
+
+    /// A git writer that lets the restore through, makes the first write of
+    /// the advance (the index) and then answers that the second target is no
+    /// longer what the run read: what a host's compare-under-lock answers
+    /// (27-45, F4).
+    struct ChangedAfterIndex(LocalFsTransport);
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for ChangedAfterIndex {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(
+            &self,
+            project: &str,
+            writes: &[GitWrite],
+        ) -> Result<(), CoreError> {
+            let index = writes
+                .iter()
+                .position(|w| matches!(w.name, GitWriteName::Index))
+                .expect("the index is written");
+            self.0.write_git_files(project, &writes[..=index]).await?;
+            let next = writes.get(index + 1).expect("a write follows the index");
+            Err(CoreError::TransportFailed {
+                operation: GIT_CHANGED_OPERATION.to_string(),
+                node: "nodes.master".to_string(),
+                detail: format!("{} changed after it was read", next.name.rel()),
+            })
+        }
+        async fn remove_git_save(&self, g: &str, p: &str, r: &str) -> Result<(), CoreError> {
+            self.0.remove_git_save(g, p, r).await
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.0.probe_write(project, run_id).await
+        }
+    }
+
+    /// 27-45 (F4): a target that changed under the lock ends the node with the
+    /// restore reason `git_changed` under `git_restore_failed` (exit 6, the
+    /// existing slug). The save is kept and named, the run's warning names the
+    /// changed file and says the index write before it stays, and the event
+    /// carries the same word. It is not `advance_failed`.
+    #[tokio::test]
+    async fn restore_and_advance_maps_a_changed_target_to_the_checkpoint_word() {
+        let rig = Rig::new();
+        let host = rig.host();
+        let writer = ChangedAfterIndex(rig.f.node());
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert!(!result.ok && result.record_written);
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore");
+        assert_eq!(restore.reason.as_deref(), Some("git_changed"));
+        assert!(restore.restored && !restore.advanced && restore.save_kept);
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(rig.f.data_dir.join(&save.path).is_dir(), "the save is kept");
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("git_changed"))
+            .unwrap_or_else(|| panic!("no git_changed warning: {:?}", result.warnings));
+        assert!(warning.contains("changed after it was read"), "{warning}");
+        assert!(
+            warning.contains("index") && warning.contains("in place"),
+            "the earlier index write is reported: {warning}"
+        );
+        assert!(warning.contains(&save.path), "{warning}");
+        let events = rig.events(&result);
+        let failed = events
+            .iter()
+            .find(|e| e["event"] == "git_restore_failed")
+            .expect("logged");
+        assert_eq!(failed["reason"], "git_changed");
     }
 
     #[tokio::test]

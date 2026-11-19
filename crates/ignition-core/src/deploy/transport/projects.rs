@@ -446,6 +446,22 @@ pub trait GitHostRead: Send + Sync {
 ///   `local_git_write_refuses_a_git_swapped_after_the_open`). A failed write
 ///   removes only the lock this call created, by identity
 ///   (`local_git_write_failure_keeps_a_foreign_lock_at_the_same_name`).
+///   Each write also carries what it expects to replace
+///   ([`OldValue`](crate::deploy::git_advance::OldValue), 27-45, CodeRabbit #55
+///   F4): the sha256 of the loose file the run read, or absent, and for a
+///   branch that lives only in `packed-refs` also the state of `packed-refs`.
+///   An implementation compares each value that is not `Unchecked` while it
+///   holds the target's lock, just before the publish, reopening the target
+///   relative to the handle its write goes through. A target that is no
+///   longer what was read removes only the lock this call made and fails with
+///   a [`CoreError::TransportFailed`] whose `operation` is
+///   [`GIT_CHANGED_OPERATION`] and whose detail names the file and no value;
+///   writes made before it stay in place (the index is written first, so a
+///   mismatch on a later ref leaves the release staged on the old commit,
+///   never a revert). The local host does this
+///   (`local_git_write_refuses_a_changed_target`, conformance row
+///   `git_write_refuses_a_changed_target`); the ssh host does not compare yet
+///   (27-46 for POSIX, 27-52 for Windows).
 /// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
 ///   of one run and nothing else; no save directory is named `.git`.
 /// - [`probe_write`](Self::probe_write) creates and removes one probe file in
@@ -492,6 +508,13 @@ pub trait GitStateWriter: Send + Sync {
     /// refused and left alone.
     async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError>;
 }
+
+/// The `operation` of the [`CoreError::TransportFailed`] a host answers when a
+/// [`GitWrite`](crate::deploy::git_advance::GitWrite)'s target is no longer
+/// what the engine read (27-45, CodeRabbit #55 F4). The engine maps exactly
+/// this operation to the restore reason `git_changed`; every other failure of
+/// a write stays `advance_failed`.
+pub const GIT_CHANGED_OPERATION: &str = "write_git_changed";
 
 /// The name of the probe file [`GitStateWriter::probe_write`] creates.
 pub fn git_probe_name(run_id: &str) -> String {

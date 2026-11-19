@@ -3106,11 +3106,11 @@ fn every_row_runs_against_the_local_host() {
 #[cfg(unix)]
 mod git_rows {
     use super::*;
-    use common::git_fixture::{GATEWAY, GitFixture, PROJECT};
-    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName};
+    use common::git_fixture::{BRANCH, GATEWAY, GitFixture, PROJECT};
+    use ignition_core::deploy::git_advance::{GitWrite, GitWriteName, OldValue};
     use ignition_core::deploy::git_state::GitFiles;
     use ignition_core::deploy::transport::projects::{
-        GitEntry, GitHostRead, GitStateWriter, ImportDir,
+        GIT_CHANGED_OPERATION, GitEntry, GitHostRead, GitStateWriter, ImportDir,
     };
     use ignition_core::error::CoreError;
 
@@ -3370,10 +3370,14 @@ mod git_rows {
         std::fs::write(&foreign, &bytes).expect("foreign lock");
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Config,
                 bytes: b"[core]\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: bytes.clone(),
             },
@@ -3405,10 +3409,14 @@ mod git_rows {
         std::fs::write(c.fx.git_dir().join("config.lock"), "held").expect("lock");
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/other\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Config,
                 bytes: b"[core]\n".to_vec(),
             },
@@ -3444,6 +3452,70 @@ mod git_rows {
                 .expect("digest");
             assert_eq!(digest, Some(sha256_hex(&write.bytes)));
         }
+    }
+
+    /// 27-45 (F4): a write whose target is no longer what the run read is
+    /// refused with the shared marker; the changed ref keeps its new value,
+    /// no lock of ours is left, and the writes before it stay. With the old
+    /// value brought up to date the same write lands. Local host only until
+    /// 27-46 (POSIX) and 27-52 (Windows) make their transports compare.
+    pub async fn git_write_refuses_a_changed_target(c: &GitCtx) {
+        let branch = GitWriteName::BranchRef(BRANCH.to_string());
+        let rel = branch.rel();
+        let read_at_plan = std::fs::read(c.fx.git_dir().join(&rel)).expect("branch ref");
+        let head = std::fs::read(c.fx.git_dir().join("HEAD")).expect("head");
+        let writes_for = |branch_old: &[u8]| {
+            vec![
+                GitWrite {
+                    name: GitWriteName::Head,
+                    bytes: head.clone(),
+                    old: OldValue::Sha256(sha256_hex(&head)),
+                    packed_refs_old: None,
+                },
+                GitWrite {
+                    name: branch.clone(),
+                    bytes: b"1111111111111111111111111111111111111111\n".to_vec(),
+                    old: OldValue::Sha256(sha256_hex(branch_old)),
+                    packed_refs_old: None,
+                },
+            ]
+        };
+        // the Designer commits after the run read the repository
+        let designer = b"2222222222222222222222222222222222222222\n".to_vec();
+        std::fs::write(c.fx.git_dir().join(&rel), &designer).expect("designer commit");
+        let err = c
+            .write
+            .write_git_files(PROJECT, &writes_for(&read_at_plan))
+            .await
+            .expect_err("a changed ref is refused");
+        match &err {
+            CoreError::TransportFailed {
+                operation, detail, ..
+            } => {
+                assert_eq!(operation, GIT_CHANGED_OPERATION, "{err:?}");
+                assert!(detail.contains(&rel), "names the file: {detail}");
+            }
+            other => panic!("not a transport failure: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(c.fx.git_dir().join(&rel)).expect("ref"),
+            designer,
+            "the Designer's value stays"
+        );
+        assert!(
+            !c.fx.git_dir().join(format!("{rel}.lock")).exists(),
+            "no lock of ours is left"
+        );
+        assert_no_git_stage(c, "a refused write");
+        // brought up to date, the same write lands
+        c.write
+            .write_git_files(PROJECT, &writes_for(&designer))
+            .await
+            .expect("an unchanged target is written");
+        assert_eq!(
+            std::fs::read(c.fx.git_dir().join(&rel)).expect("ref"),
+            b"1111111111111111111111111111111111111111\n"
+        );
     }
 
     pub async fn git_probe_denied_names_path(c: &GitCtx) {
@@ -3967,6 +4039,7 @@ mod git_rows {
         conformance_git_local_git_objects_fetch_round_trip, GitCtx::local, git_objects_fetch_round_trip;
         conformance_git_local_git_objects_refuse_bad_name, GitCtx::local, git_objects_refuse_bad_name;
         conformance_git_local_project_file_digests_same, GitCtx::local, project_file_digests_same;
+        conformance_git_local_git_write_refuses_a_changed_target, GitCtx::local, git_write_refuses_a_changed_target;
     }
 
     git_row_tests! {
@@ -4043,5 +4116,11 @@ mod git_rows {
             let wired = format!("conformance_git_pwsh_{row}, {row};");
             assert!(source.contains(&wired), "row {row} is not run on pwsh");
         }
+        // Rows whose guarantee a host implements plan by plan: each runs on the
+        // local host now. `git_write_refuses_a_changed_target` joins the list
+        // above when 27-46 (sh) and 27-52 (pwsh) make their transports compare.
+        let row = "git_write_refuses_a_changed_target";
+        let wired = format!("conformance_git_local_{row}, GitCtx::local");
+        assert!(source.contains(&wired), "row {row} is not run on local");
     }
 }

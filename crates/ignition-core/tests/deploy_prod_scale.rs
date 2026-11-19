@@ -3280,14 +3280,20 @@ fn git_prodshape_pack() {
             PROJECT,
             &[
                 GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: GitWriteName::PackFile(pack.name.clone()),
                     bytes: pack.pack.clone(),
                 },
                 GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: GitWriteName::PackIndex(pack.name.clone()),
                     bytes: pack.idx.clone(),
                 },
                 GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: GitWriteName::BranchRef(BRANCH.to_string()),
                     bytes: format!("{}\n", f.release_head).into_bytes(),
                 },

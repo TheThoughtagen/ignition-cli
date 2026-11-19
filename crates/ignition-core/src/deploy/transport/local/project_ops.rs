@@ -40,7 +40,7 @@ use super::LocalFsTransport;
 use super::git_dir::{GitDir, GitDirError, LockId, Open};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
-use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, ProjectDisk};
+use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, OldValue, ProjectDisk};
 use crate::deploy::git_objects::{
     GIT_OBJECTS_LIST_MAX_ENTRIES, GitObjectEntry, GitObjectEntryKind, GitObjectFile, GitObjectList,
     check_object_rel,
@@ -61,8 +61,8 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::local_fs::{Dir, FsError, Kind};
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir, ProjectHost,
-    ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write,
+    GIT_CHANGED_OPERATION, GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir,
+    ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write,
     git_entry_location, git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::yamlio::YAML_MAX_BYTES;
@@ -1578,6 +1578,16 @@ impl LocalFsTransport {
                     }
                 };
                 super::git_dir::fire(|| format!("locked:{}", item.rel));
+                // 27-45 (F4): under the lock, the target must still be what
+                // the run read. A mismatch removes only this call's lock
+                // (the file is closed first) and keeps every earlier write.
+                if let Err(changed) =
+                    self.git_old_holds(&git, parent, &item.name, &item.rel, item.write)
+                {
+                    drop(file);
+                    let _ = parent.remove_own_lock(&item.temp, id);
+                    return Err(changed);
+                }
                 let result = (|| -> std::io::Result<()> {
                     // the umask may have narrowed the create; the file gets
                     // exactly the mode it replaces (an fchmod on the open file)
@@ -1602,6 +1612,70 @@ impl LocalFsTransport {
             }
         }
         outcome
+    }
+
+    /// The sha256 of the regular file opened at `rel` below `dir`, streamed
+    /// from the handle the open returned; `None` when it is absent.
+    fn git_open_digest(&self, dir: &GitDir, rel: &str) -> Result<Option<String>, CoreError> {
+        let Some((mut file, _)) = dir.open_file(rel).map_err(self.gd("write"))? else {
+            return Ok(None);
+        };
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 65_536];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .map_err(|e| self.fail(format!("{rel} cannot be read ({})", e.kind())))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        Ok(Some(format!("{:x}", hasher.finalize())))
+    }
+
+    /// Whether `expected` holds for `found`, the digest of what is there now.
+    fn old_holds(expected: &OldValue, found: Option<&str>) -> bool {
+        match expected {
+            OldValue::Unchecked => true,
+            OldValue::Absent => found.is_none(),
+            OldValue::Sha256(want) => found == Some(want.as_str()),
+        }
+    }
+
+    /// The compare of 27-45 (F4), made while this call holds the target's
+    /// lock: the target is reopened `O_NOFOLLOW` relative to `parent`, the
+    /// handle its write goes through, and hashed; a branch that lived only in
+    /// `packed-refs` also has `packed-refs` reopened relative to the held
+    /// `.git`. A target that is no longer what the run read is a
+    /// [`GIT_CHANGED_OPERATION`] failure naming the file and no value.
+    fn git_old_holds(
+        &self,
+        git: &GitDir,
+        parent: &GitDir,
+        name: &str,
+        rel: &str,
+        write: &GitWrite,
+    ) -> Result<(), CoreError> {
+        let changed = |file: &str, extra: &str| {
+            self.git_fail(
+                GIT_CHANGED_OPERATION,
+                format!("{file} changed after the run read it{extra}; it is left as it is"),
+            )
+        };
+        if write.old != OldValue::Unchecked {
+            let found = self.git_open_digest(parent, name)?;
+            if !Self::old_holds(&write.old, found.as_deref()) {
+                return Err(changed(rel, ""));
+            }
+        }
+        if let Some(packed) = &write.packed_refs_old {
+            let found = self.git_open_digest(git, "packed-refs")?;
+            if !Self::old_holds(packed, found.as_deref()) {
+                return Err(changed("packed-refs", &format!(" (it listed {rel})")));
+            }
+        }
+        Ok(())
     }
 
     /// Every loose ref below `dir` (named `prefix`), at most one past the
@@ -2562,22 +2636,32 @@ mod tests {
         let hash = "a".repeat(40);
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/other\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Config,
                 bytes: b"[core]\n[remote \"origin\"]\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("production".to_string()),
                 bytes: b"1111\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("feature/x".to_string()),
                 bytes: b"2222\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::PackFile(hash),
                 bytes: vec![7u8; 16],
             },
@@ -2611,6 +2695,8 @@ mod tests {
         t.write_git_files_blocking(
             "CapApp",
             &[GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Config,
                 bytes: b"[core]\n".to_vec(),
             }],
@@ -2737,10 +2823,14 @@ mod tests {
         let t = host(dir.path());
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Index,
                 bytes: vec![1u8; 64 * 1024 * 1024],
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/other\n".to_vec(),
             },
@@ -3808,6 +3898,8 @@ mod tests {
         let result = host(dir.path()).write_git_files_blocking(
             "CapApp",
             &[GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("sub/x".to_string()),
                 bytes: b"1111\n".to_vec(),
             }],
@@ -3847,6 +3939,8 @@ mod tests {
         let result = host(dir.path()).write_git_files_blocking(
             "CapApp",
             &[GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/other\n".to_vec(),
             }],
@@ -4021,6 +4115,8 @@ mod tests {
         let result = host(dir.path()).write_git_files_blocking(
             "CapApp",
             &[GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/other\n".to_vec(),
             }],
@@ -4059,6 +4155,8 @@ mod tests {
         let result = host(dir.path()).write_git_files_blocking(
             "CapApp",
             &[GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("new/deep/x".to_string()),
                 bytes: b"1111\n".to_vec(),
             }],
@@ -4070,6 +4168,225 @@ mod tests {
             "the level this pass made is removed again"
         );
         assert!(git.join("refs/heads").is_dir(), "an existing level stays");
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// A write of `name` that expects `old` (and, for a packed branch,
+    /// `packed`) to be what it replaces.
+    fn guarded(
+        name: GitWriteName,
+        bytes: &[u8],
+        old: OldValue,
+        packed: Option<OldValue>,
+    ) -> GitWrite {
+        GitWrite {
+            name,
+            bytes: bytes.to_vec(),
+            old,
+            packed_refs_old: packed,
+        }
+    }
+
+    /// Assert that `err` is the answer for a target that changed.
+    fn assert_changed(err: &CoreError, what: &str) {
+        match err {
+            CoreError::TransportFailed {
+                operation, detail, ..
+            } => {
+                assert_eq!(operation, GIT_CHANGED_OPERATION, "{err}");
+                assert!(detail.contains(what), "names the file: {detail}");
+            }
+            other => panic!("not a transport failure: {other}"),
+        }
+    }
+
+    /// 27-45 (F4): the writes of an unchanged repo go through when every old
+    /// value holds: a digest that matches, an absent loose ref, and a packed
+    /// ref whose `packed-refs` is as it was read.
+    #[test]
+    fn local_git_write_accepts_an_unchanged_target() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::write(git.join("packed-refs"), "p\n").expect("packed-refs");
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[
+                guarded(
+                    GitWriteName::Head,
+                    b"ref: refs/heads/other\n",
+                    OldValue::Sha256(sha(b"ref: refs/heads/main\n")),
+                    None,
+                ),
+                guarded(
+                    GitWriteName::BranchRef("main".to_string()),
+                    b"bbbb\n",
+                    OldValue::Sha256(sha(b"aaaa\n")),
+                    None,
+                ),
+                guarded(
+                    GitWriteName::BranchRef("fresh".to_string()),
+                    b"cccc\n",
+                    OldValue::Absent,
+                    Some(OldValue::Sha256(sha(b"p\n"))),
+                ),
+            ],
+        );
+        result.expect("every expectation holds");
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/main")).expect("main"),
+            b"bbbb\n"
+        );
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/fresh")).expect("fresh"),
+            b"cccc\n"
+        );
+    }
+
+    /// 27-45 (F4): a ref rewritten after the engine read it is never
+    /// overwritten. The refusal is the shared marker, the new value stays,
+    /// this call's lock is gone, and a write that came before it in the pass
+    /// stays published.
+    #[test]
+    fn local_git_write_refuses_a_changed_target() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        // the Designer commits after the engine read the repository
+        std::fs::write(git.join("refs/heads/main"), "dddd\n").expect("designer commit");
+        let err = host(dir.path())
+            .write_git_files_blocking(
+                "CapApp",
+                &[
+                    guarded(
+                        GitWriteName::Head,
+                        b"ref: refs/heads/other\n",
+                        OldValue::Sha256(sha(b"ref: refs/heads/main\n")),
+                        None,
+                    ),
+                    guarded(
+                        GitWriteName::BranchRef("main".to_string()),
+                        b"bbbb\n",
+                        OldValue::Sha256(sha(b"aaaa\n")),
+                        None,
+                    ),
+                ],
+            )
+            .expect_err("a changed ref is refused");
+        assert_changed(&err, "refs/heads/main");
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/main")).expect("main"),
+            b"dddd\n",
+            "the Designer's value stays"
+        );
+        assert!(
+            std::fs::symlink_metadata(git.join("refs/heads/main.lock")).is_err(),
+            "this call's lock is removed"
+        );
+        assert_eq!(
+            std::fs::read(git.join("HEAD")).expect("HEAD"),
+            b"ref: refs/heads/other\n",
+            "the write before it stays"
+        );
+    }
+
+    /// 27-45 (F4): the comparison is made under the lock. A lock another
+    /// writer holds at the name after this call's create (the call's own is
+    /// gone) is not removed by the refusal.
+    #[test]
+    fn local_git_write_mismatch_keeps_a_foreign_lock() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        let g = git.clone();
+        at_point("locked:refs/heads/main", move || {
+            std::fs::remove_file(g.join("refs/heads/main.lock")).expect("drop this call's lock");
+            std::fs::write(g.join("refs/heads/main.lock"), b"foreign").expect("foreign lock");
+            std::fs::write(g.join("refs/heads/main"), "dddd\n").expect("designer commit");
+        });
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[guarded(
+                GitWriteName::BranchRef("main".to_string()),
+                b"bbbb\n",
+                OldValue::Sha256(sha(b"aaaa\n")),
+                None,
+            )],
+        );
+        no_point();
+        assert_changed(&result.expect_err("refused"), "refs/heads/main");
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/main.lock")).expect("the foreign lock stays"),
+            b"foreign"
+        );
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/main")).expect("main"),
+            b"dddd\n"
+        );
+    }
+
+    /// 27-45 (F4): an expected-absent loose ref that was created meanwhile is
+    /// refused the same way.
+    #[test]
+    fn local_git_write_refuses_a_ref_that_appeared() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::write(git.join("refs/heads/fresh"), "eeee\n").expect("appeared");
+        let err = host(dir.path())
+            .write_git_files_blocking(
+                "CapApp",
+                &[guarded(
+                    GitWriteName::BranchRef("fresh".to_string()),
+                    b"cccc\n",
+                    OldValue::Absent,
+                    None,
+                )],
+            )
+            .expect_err("a ref that appeared is refused");
+        assert_changed(&err, "refs/heads/fresh");
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/fresh")).expect("fresh"),
+            b"eeee\n"
+        );
+        assert!(std::fs::symlink_metadata(git.join("refs/heads/fresh.lock")).is_err());
+    }
+
+    /// 27-45 (F4): a branch that lived only in `packed-refs` is refused when
+    /// `packed-refs` changed meanwhile (a `pack-refs`, a deleted branch), and
+    /// when it appeared after the engine saw none.
+    #[test]
+    fn local_git_write_refuses_a_changed_packed_refs() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        std::fs::write(git.join("packed-refs"), "rewritten\n").expect("packed-refs");
+        let err = host(dir.path())
+            .write_git_files_blocking(
+                "CapApp",
+                &[guarded(
+                    GitWriteName::BranchRef("packed".to_string()),
+                    b"cccc\n",
+                    OldValue::Absent,
+                    Some(OldValue::Sha256(sha(b"as read\n"))),
+                )],
+            )
+            .expect_err("a changed packed-refs is refused");
+        assert_changed(&err, "packed-refs");
+        assert!(std::fs::symlink_metadata(git.join("refs/heads/packed")).is_err());
+        assert!(std::fs::symlink_metadata(git.join("refs/heads/packed.lock")).is_err());
+
+        // `packed-refs` was absent when read and exists now
+        let err = host(dir.path())
+            .write_git_files_blocking(
+                "CapApp",
+                &[guarded(
+                    GitWriteName::BranchRef("packed".to_string()),
+                    b"cccc\n",
+                    OldValue::Absent,
+                    Some(OldValue::Absent),
+                )],
+            )
+            .expect_err("a packed-refs that appeared is refused");
+        assert_changed(&err, "packed-refs");
     }
 
     /// 27-44: a level of the save's directory chain swapped for a symlink

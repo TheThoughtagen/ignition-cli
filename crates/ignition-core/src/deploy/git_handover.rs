@@ -19,6 +19,11 @@
 //! Nothing here replaces, deletes or renames an existing `.git`: a `.git`
 //! that is not the one the advance was prepared against stops the handover
 //! with reason `git_recreated` and is left as it is. A failure keeps the save.
+//!
+//! Each write of the advance also carries what it expects to replace
+//! ([`OldValue`], filled from the `.git` the pre-advance check read), and a
+//! host that compares under the file's lock refuses a target that changed
+//! meanwhile: reason `git_changed` (27-45).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -27,12 +32,14 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 
 use super::git_advance::{
-    AdvanceFailure, AdvancePrep, GitWriteName, config_digest, finish_advance,
+    AdvanceFailure, AdvancePrep, GitWrite, GitWriteName, OldValue, config_digest, finish_advance,
 };
 use super::git_remote::HostGit;
-use super::git_state::{GitRefs, GitState, GitStateKind, classify, redact_text};
+use super::git_state::{GitFiles, GitRefs, GitState, GitStateKind, classify, redact_text};
 use super::ledger::{LedgerRoot, git_save_location};
-use super::transport::projects::{GitEntry, GitHostRead, GitManifest, GitStateWriter};
+use super::transport::projects::{
+    GIT_CHANGED_OPERATION, GitEntry, GitHostRead, GitManifest, GitStateWriter,
+};
 use crate::error::CoreError;
 
 /// The reason words a failed handover carries. Every word has a producer in
@@ -42,6 +49,7 @@ pub const RESTORE_REASONS: &[&str] = &[
     "advance_failed",
     "status_unexpected",
     "git_recreated",
+    "git_changed",
 ];
 
 /// A finished [`save`].
@@ -146,12 +154,13 @@ pub async fn save(
 }
 
 /// What `.git` is now, classified the way the prepare classified it, with the
-/// refs it was classified from.
+/// refs it was classified from and the files the answer was read from: the
+/// advance's expected old values come from these, not from a second read.
 async fn classify_live(
     read: &dyn GitHostRead,
     git: &HostGit,
     project: &str,
-) -> Result<(GitState, Option<GitRefs>), CoreError> {
+) -> Result<(GitState, Option<GitRefs>, GitFiles), CoreError> {
     let files = read.read_git_state(project).await?;
     files.check_caps()?;
     let config = match (&files.kind, &files.config) {
@@ -163,7 +172,61 @@ async fn classify_live(
     } else {
         None
     };
-    Ok((classify(&files, config.as_ref(), refs.as_ref()), refs))
+    let state = classify(&files, config.as_ref(), refs.as_ref());
+    Ok((state, refs, files))
+}
+
+/// The old value of a file read as `bytes`: its digest, or absent.
+fn old_of(bytes: Option<&[u8]>) -> OldValue {
+    match bytes {
+        Some(bytes) => OldValue::Sha256(format!("{:x}", Sha256::digest(bytes))),
+        None => OldValue::Absent,
+    }
+}
+
+/// The ref names a `packed-refs` file lists (`<id> <name>` lines; comment and
+/// peeled lines carry no name).
+fn packed_ref_names(packed_refs: &[u8]) -> BTreeSet<&str> {
+    std::str::from_utf8(packed_refs)
+        .unwrap_or("")
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with('^'))
+        .filter_map(|line| line.split_once(' ').map(|(_, name)| name.trim_end()))
+        .collect()
+}
+
+/// Give every write the value it expects to replace (27-45, F4), taken from
+/// `files`, the `.git` the pre-advance check read, and `index`, the digest of
+/// the index read right after it. HEAD, config and a loose ref carry the
+/// digest of their file or `Absent`; a ref that is not loose is `Absent`, and
+/// when `packed-refs` lists it the write also names the state of
+/// `packed-refs`; the discard ref is `Absent` (its name is the run's own);
+/// only the content-addressed pack and idx stay [`OldValue::Unchecked`].
+fn fill_old_values(writes: &mut [GitWrite], files: &GitFiles, index: &OldValue) {
+    let packed = files.packed_refs.as_deref();
+    let listed = packed.map(packed_ref_names).unwrap_or_default();
+    for write in writes {
+        write.packed_refs_old = None;
+        write.old = match &write.name {
+            GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => OldValue::Unchecked,
+            GitWriteName::Index => index.clone(),
+            GitWriteName::Head => old_of(files.head.as_deref()),
+            GitWriteName::Config => old_of(files.config.as_deref()),
+            GitWriteName::DiscardRef(_) => OldValue::Absent,
+            GitWriteName::BranchRef(_) | GitWriteName::RemoteRef { .. } => {
+                let rel = write.name.rel();
+                let loose = files
+                    .loose_refs
+                    .iter()
+                    .find(|(name, _)| *name == rel)
+                    .map(|(_, bytes)| bytes.as_slice());
+                if loose.is_none() && listed.contains(rel.as_str()) {
+                    write.packed_refs_old = Some(old_of(packed));
+                }
+                old_of(loose)
+            }
+        };
+    }
 }
 
 /// The pack bases of `prep` that no ref of the live repo names, byte-sorted.
@@ -205,11 +268,15 @@ fn unnamed_bases(prep: &AdvancePrep, refs: Option<&GitRefs>) -> Vec<String> {
 /// same repo, else `git_recreated` and it is left alone; anything else at
 /// `.git` is `git_recreated` too. Either way, some ref of the repo must still
 /// name every commit the pack was built against ([`AdvancePrep::pack_bases`]),
-/// or the pack may leave objects missing. (c) the writes, lock-and-rename, through
+/// or the pack may leave objects missing. Every write then gets the value it
+/// expects to replace, from the state that check read ([`OldValue`], 27-45).
+/// (c) the writes, lock-and-rename, through
 /// `write`, in the plan's order: the index before every ref, config and HEAD
 /// write, so a write that fails part way leaves HEAD and the branch at the old
-/// commit over an index that holds the release (27-26, WR-A1). (d) each
-/// written file's sha256 read back.
+/// commit over an index that holds the release (27-26, WR-A1). A write whose
+/// target is no longer what was read is refused by the host under the file's
+/// lock and ends the handover `git_changed`; the writes before it stay and
+/// nothing is overwritten. (d) each written file's sha256 read back.
 ///
 /// With `discard` the writes of (c) include `refs/ign-discarded/<run id>`
 /// naming the abandoned HEAD (27-15, D-05), and the report says `keep_save`:
@@ -248,7 +315,7 @@ pub async fn restore_and_advance(
         .project_file_digests(project)
         .await
         .map_err(|e| core("advance_failed", "the project's files could not be read", e))?;
-    let plan = match finish_advance(git, checkout, prep, export_zip, &disk).await {
+    let mut plan = match finish_advance(git, checkout, prep, export_zip, &disk).await {
         Ok(mut plan) => {
             // The abandoned HEAD stays reachable through a ref the advance
             // writes right before the branch ref moves (27-15, 27-26). The ref
@@ -282,6 +349,8 @@ pub async fn restore_and_advance(
         .await
         .map_err(|e| core("restore_failed", "the .git probe failed", e))?;
     let mut restored = false;
+    // The `.git` the checks below classify: the writes' old values come from it.
+    let live_files: GitFiles;
     match files.kind {
         GitEntry::Absent => {
             let still = read
@@ -308,9 +377,10 @@ pub async fn restore_and_advance(
             }
             restored = true;
             restored_now.store(true, std::sync::atomic::Ordering::Relaxed);
-            let (now, refs) = classify_live(read, git, project)
+            let (now, refs, read_files) = classify_live(read, git, project)
                 .await
                 .map_err(|e| core("restore_failed", "the restored .git cannot be read", e))?;
+            live_files = read_files;
             let unnamed = unnamed_bases(prep, refs.as_ref());
             if !unnamed.is_empty() {
                 return Err(fail(
@@ -349,9 +419,10 @@ pub async fn restore_and_advance(
             }
         }
         GitEntry::Directory => {
-            let (now, refs) = classify_live(read, git, project)
+            let (now, refs, read_files) = classify_live(read, git, project)
                 .await
                 .map_err(|e| core("restore_failed", "the .git probe failed", e))?;
+            live_files = read_files;
             // A managed repo is advanced and an adoptable one is adopted; the
             // prepare's classification must be exactly what is there now.
             if !matches!(now.kind, GitStateKind::Managed | GitStateKind::Adoptable) || &now != state
@@ -401,11 +472,43 @@ pub async fn restore_and_advance(
         }
     }
 
+    // Every write carries what it expects to replace (27-45, F4), from the
+    // `.git` the checks above classified. The index is hashed once, right
+    // after them; no other file is read again.
+    let index_old = if live_files.index_present {
+        let digest = read
+            .git_file_digest(project, &GitWriteName::Index)
+            .await
+            .map_err(|e| core("advance_failed", "the .git index cannot be read", e))?;
+        match digest {
+            Some(digest) => OldValue::Sha256(digest),
+            None => OldValue::Absent,
+        }
+    } else {
+        OldValue::Absent
+    };
+    fill_old_values(&mut plan.writes, &live_files, &index_old);
+
     // (c) The advance.
     write
         .write_git_files(project, &plan.writes)
         .await
-        .map_err(|e| core("advance_failed", "the advance could not be written", e))?;
+        .map_err(|e| match &e {
+            // A target moved between the read and its lock: the writes before
+            // it are in place and nothing was overwritten (27-45, F4).
+            CoreError::TransportFailed {
+                operation, detail, ..
+            } if operation == GIT_CHANGED_OPERATION => fail(
+                "git_changed",
+                Vec::new(),
+                format!(
+                    "a file of .git changed after the run read it, and the advance stopped \
+                     there ({detail}); the writes before it, the index first, are in place \
+                     and nothing was overwritten"
+                ),
+            ),
+            _ => core("advance_failed", "the advance could not be written", e),
+        })?;
 
     // (d) Read every written file back.
     for planned in &plan.writes {
@@ -564,7 +667,7 @@ fn describe(name: &GitWriteName) -> String {
 mod tests {
     use super::*;
     use crate::deploy::git_advance::tests::{CODE, Fixture, git, put, read_git_files};
-    use crate::deploy::git_advance::{GitWrite, prepare_advance};
+    use crate::deploy::git_advance::{GitWrite, OldValue, prepare_advance};
     use crate::deploy::git_objects::{GitObjectFile, GitObjectList};
     use crate::deploy::transport::projects::{GitSize, ImportDir};
     use std::path::PathBuf;
@@ -573,6 +676,8 @@ mod tests {
     /// is never read back here, so it answers one fixed manifest.
     struct DirHost {
         git_dir: PathBuf,
+        /// Every write the advance handed to `write_git_files`, in order.
+        seen: std::sync::Mutex<Vec<GitWrite>>,
     }
 
     fn manifest() -> GitManifest {
@@ -674,6 +779,10 @@ mod tests {
             _project: &str,
             writes: &[GitWrite],
         ) -> Result<(), CoreError> {
+            self.seen
+                .lock()
+                .expect("seen")
+                .extend(writes.iter().cloned());
             for write in writes {
                 let path = self.git_dir.join(write.name.rel());
                 std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -700,6 +809,7 @@ mod tests {
     async fn save_path_follows_the_ledger_root() {
         let host = DirHost {
             git_dir: PathBuf::from("unused"),
+            seen: Default::default(),
         };
         let home = save(
             &host,
@@ -722,6 +832,135 @@ mod tests {
             data.path,
             "ign-deploy/gw-a/projects/CapApp/git-save/r1/repo"
         );
+    }
+
+    /// What `old` the engine must give a write of `rel`: the digest of the
+    /// loose file on disk, or `Absent` when there is none.
+    fn disk_old(git_dir: &Path, rel: &str) -> OldValue {
+        match std::fs::read(git_dir.join(rel)) {
+            Ok(bytes) => OldValue::Sha256(format!("{:x}", Sha256::digest(bytes))),
+            Err(_) => OldValue::Absent,
+        }
+    }
+
+    /// Run a green advance of the fixture's managed repo against a recording
+    /// host and return the writes it made, with the `.git` as it was before.
+    async fn advance_writes_of(f: &Fixture) -> Vec<GitWrite> {
+        let git_host = HostGit::new();
+        let (state, refs) = f.gateway_state(&git_host).await;
+        let members = f.members(&git_host, &[]).await;
+        let prep = prepare_advance(&git_host, &f.seed, &state, &refs, &f.c2, &members)
+            .await
+            .expect("prepare");
+        let export = f.import(&git_host, &[], &[], None).await;
+        let host = DirHost {
+            git_dir: f.git_dir(),
+            seen: Default::default(),
+        };
+        let saved = save(&host, &host, LedgerRoot::DataDir, "gw", "CapApp", "r1")
+            .await
+            .expect("save");
+        // The index the gateway holds before the advance.
+        std::fs::write(f.git_dir().join("index"), b"the gateway's index").expect("index");
+        restore_and_advance(
+            &host, &host, &git_host, &f.seed, &state, &saved, &prep, &export, None,
+        )
+        .await
+        .expect("a managed repo advances");
+        host.seen.lock().expect("seen").clone()
+    }
+
+    /// 27-45 (F4): every write of the advance carries what it expects to
+    /// replace, taken from the state the pre-advance check read. HEAD, config
+    /// and the refs carry the digest of their loose file (or `Absent`), the
+    /// index the digest of the index, and only the pack and its idx are
+    /// unchecked.
+    #[tokio::test]
+    async fn advance_writes_carry_their_old_values() {
+        let f = Fixture::new();
+        let before = std::fs::read(f.git_dir().join("refs/heads/production")).expect("loose");
+        assert!(!before.is_empty(), "the fixture's branch ref is loose");
+        let (head, index) = (
+            disk_old(&f.git_dir(), "HEAD"),
+            OldValue::Sha256(format!("{:x}", Sha256::digest(b"the gateway's index"))),
+        );
+        let want_branch = disk_old(&f.git_dir(), "refs/heads/production");
+        let want_remote = disk_old(&f.git_dir(), "refs/remotes/origin/production");
+        let writes = advance_writes_of(&f).await;
+        assert!(!writes.is_empty());
+        let mut seen_pack = false;
+        let mut seen_index = false;
+        for write in &writes {
+            match &write.name {
+                GitWriteName::PackFile(_) | GitWriteName::PackIndex(_) => {
+                    seen_pack = true;
+                    assert_eq!(write.old, OldValue::Unchecked, "{:?}", write.name);
+                    assert_eq!(write.packed_refs_old, None);
+                }
+                GitWriteName::Index => {
+                    seen_index = true;
+                    assert_eq!(write.old, index, "the index carries its digest");
+                    assert_eq!(write.packed_refs_old, None);
+                }
+                GitWriteName::Head => assert_eq!(write.old, head),
+                GitWriteName::BranchRef(_) => {
+                    assert_eq!(write.old, want_branch, "a loose branch ref");
+                    assert_eq!(
+                        write.packed_refs_old, None,
+                        "a loose ref names no packed-refs"
+                    );
+                }
+                GitWriteName::RemoteRef { .. } => assert_eq!(write.old, want_remote),
+                GitWriteName::Config => unreachable!("a managed repo's config is not written"),
+                GitWriteName::DiscardRef(_) => unreachable!("no discard here"),
+            }
+            if !matches!(
+                write.name,
+                GitWriteName::PackFile(_) | GitWriteName::PackIndex(_)
+            ) {
+                assert_ne!(
+                    write.old,
+                    OldValue::Unchecked,
+                    "{:?} is compared",
+                    write.name
+                );
+            }
+        }
+        assert!(seen_pack && seen_index);
+    }
+
+    /// 27-45: a branch that lives only in `packed-refs` has no loose file, so
+    /// its old value is `Absent` and it also names the digest of
+    /// `packed-refs`, the file a Designer's or the module's `pack-refs` would
+    /// rewrite.
+    #[tokio::test]
+    async fn advance_old_value_of_a_packed_branch_names_packed_refs() {
+        let f = Fixture::new();
+        git(&f.gw, &["pack-refs", "--all", "--prune"]);
+        assert!(
+            !f.git_dir().join("refs/heads/production").exists(),
+            "the branch is packed"
+        );
+        let packed = std::fs::read(f.git_dir().join("packed-refs")).expect("packed-refs");
+        let want = OldValue::Sha256(format!("{:x}", Sha256::digest(&packed)));
+        let writes = advance_writes_of(&f).await;
+        let branch = writes
+            .iter()
+            .find(|w| matches!(w.name, GitWriteName::BranchRef(_)))
+            .expect("a branch write");
+        assert_eq!(branch.old, OldValue::Absent);
+        assert_eq!(branch.packed_refs_old, Some(want.clone()));
+        let remote = writes
+            .iter()
+            .find(|w| matches!(w.name, GitWriteName::RemoteRef { .. }))
+            .expect("a remote ref write");
+        assert_eq!(remote.old, OldValue::Absent);
+        assert_eq!(remote.packed_refs_old, Some(want));
+        let head = writes
+            .iter()
+            .find(|w| matches!(w.name, GitWriteName::Head))
+            .expect("HEAD");
+        assert_eq!(head.packed_refs_old, None, "HEAD is never in packed-refs");
     }
 
     /// The surviving `.git` has the prepared HEAD, upstream and remote refs,
@@ -759,6 +998,7 @@ mod tests {
         let export = f.import(&git_host, &[], &[], None).await;
         let host = DirHost {
             git_dir: f.git_dir(),
+            seen: Default::default(),
         };
         let saved = save(&host, &host, LedgerRoot::DataDir, "gw", "CapApp", "r1")
             .await

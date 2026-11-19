@@ -7471,18 +7471,26 @@ async fn wincap_git_scripts() {
     let hash = "ab".repeat(20);
     let writes = vec![
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::PackFile(hash.clone()),
             bytes: vec![b'P'; 70_000],
         },
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::PackIndex(hash),
             bytes: vec![b'I'; 1_200],
         },
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::BranchRef("production".to_string()),
             bytes: b"0123456789abcdef0123456789abcdef01234567\n".to_vec(),
         },
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::Head,
             bytes: b"ref: refs/heads/production\n".to_vec(),
         },
@@ -7532,6 +7540,8 @@ async fn wincap_git_scripts() {
         .await
         .expect("plant a lock");
     let again = vec![GitWrite {
+        old: Default::default(),
+        packed_refs_old: None,
         name: GitWriteName::BranchRef("production".to_string()),
         bytes: b"fedcba9876543210fedcba9876543210fedcba98\n".to_vec(),
     }];
@@ -7585,6 +7595,8 @@ async fn wincap_git_scripts() {
             .await
             .expect("plant a junction");
         let attempt = vec![GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: name.clone(),
             bytes: b"fedcba9876543210fedcba9876543210fedcba98\n".to_vec(),
         }];

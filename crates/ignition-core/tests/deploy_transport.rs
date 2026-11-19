@@ -4651,14 +4651,20 @@ mod sftp_git {
         let pack = "ab".repeat(20);
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("feature/new".to_string()),
                 bytes: format!("{}\n", fx.c2).into_bytes(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::PackFile(pack.clone()),
                 bytes: vec![7u8; 5000],
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/feature/new\n".to_vec(),
             },
@@ -4699,10 +4705,14 @@ mod sftp_git {
         std::fs::write(fx.git_dir().join("config.lock"), "held").expect("lock");
         let again = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/other\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Config,
                 bytes: b"[core]\n".to_vec(),
             },
@@ -4734,6 +4744,8 @@ mod sftp_git {
         // a pack name that is not a hex digest never reaches the host
         let calls = n.count.execs();
         let bad = vec![GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::PackFile("../x".to_string()),
             bytes: vec![1],
         }];
@@ -4757,10 +4769,14 @@ mod sftp_git {
     fn two_writes(fx: &GitFixture) -> Vec<GitWrite> {
         vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/feature/new\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("feature/new".to_string()),
                 bytes: format!("{}\n", fx.c2).into_bytes(),
             },
@@ -4974,10 +4990,14 @@ mod sftp_git {
         let fx = GitFixture::new();
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/feature/new\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Index,
                 bytes: vec![9u8; 64],
             },
@@ -5136,10 +5156,14 @@ mod sftp_git {
         n.count.use_shims(&shims);
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/sub/x\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("sub/x".to_string()),
                 bytes: format!("{}\n", fx.c2).into_bytes(),
             },
@@ -5204,18 +5228,26 @@ mod sftp_git {
         n.count.use_shims(&shims);
         let writes = vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: Head,
                 bytes: b"ref: refs/heads/production\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: BranchRef("production".to_string()),
                 bytes: format!("{}\n", fx.c2).into_bytes(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: Config,
                 bytes: b"[core]\n\trepositoryformatversion = 0\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: RemoteRef {
                     remote: "origin".to_string(),
                     branch: "feature".to_string(),
@@ -5307,10 +5339,14 @@ mod sftp_git {
     fn in_place(fx: &GitFixture) -> Vec<GitWrite> {
         vec![
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: b"ref: refs/heads/production\n".to_vec(),
             },
             GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("production".to_string()),
                 bytes: format!("{}\n", fx.c2).into_bytes(),
             },
@@ -5319,6 +5355,8 @@ mod sftp_git {
 
     fn discard(run: &str) -> Vec<GitWrite> {
         vec![GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::DiscardRef(run.to_string()),
             bytes: b"0123456789012345678901234567890123456789\n".to_vec(),
         }]
@@ -5366,6 +5404,8 @@ mod sftp_git {
         n.t.write_git_files(
             PROJECT,
             &[GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef("deep/er/x".to_string()),
                 bytes: format!("{}\n", fx.c2).into_bytes(),
             }],
@@ -5621,6 +5661,8 @@ mod sftp_git {
         ];
         for name in hostile {
             let write = vec![GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: vec![1],
             }];

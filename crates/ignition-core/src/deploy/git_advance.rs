@@ -140,6 +140,25 @@ impl GitWriteName {
     }
 }
 
+/// What a write expects to replace (27-45, CodeRabbit #55 F4): the state of the
+/// target file when the engine read the repository. A host that can compare
+/// does so under the file's own lock, just before the publish, and refuses the
+/// write when the file is no longer what was read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum OldValue {
+    /// The target must not exist.
+    Absent,
+    /// The target must exist and its bytes must hash to this lowercase hex
+    /// sha256.
+    Sha256(String),
+    /// No comparison. Only the pack and idx files carry this: their names are
+    /// their content, so replacing one with the same name replaces nothing.
+    /// It is also what a write has before `restore_and_advance` fills it, so a
+    /// hand-built write in a test compares nothing.
+    #[default]
+    Unchecked,
+}
+
 /// One file to write below the gateway repo's `.git`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitWrite {
@@ -147,6 +166,12 @@ pub struct GitWrite {
     pub name: GitWriteName,
     /// Its bytes.
     pub bytes: Vec<u8>,
+    /// What the file holds now, as the engine read it before this advance.
+    pub old: OldValue,
+    /// For a ref write whose branch lives only in `packed-refs` (the loose
+    /// file is [`OldValue::Absent`]): the state of `packed-refs` as read. A
+    /// loose ref, and every non-ref write, carries `None`.
+    pub packed_refs_old: Option<OldValue>,
 }
 
 /// The commit ids the pack is built against: the gateway's HEAD, its
@@ -626,6 +651,8 @@ impl AdvancePlan {
         self.writes.insert(
             at,
             GitWrite {
+                old: OldValue::Unchecked,
+                packed_refs_old: None,
                 name,
                 bytes: format!("{abandoned_head}\n").into_bytes(),
             },
@@ -697,10 +724,14 @@ pub async fn finish_advance(
     let mut writes = Vec::new();
     if let Some(pack) = &prep.pack {
         writes.push(GitWrite {
+            old: OldValue::Unchecked,
+            packed_refs_old: None,
             name: GitWriteName::PackFile(pack.name.clone()),
             bytes: pack.pack.clone(),
         });
         writes.push(GitWrite {
+            old: OldValue::Unchecked,
+            packed_refs_old: None,
             name: GitWriteName::PackIndex(pack.name.clone()),
             bytes: pack.idx.clone(),
         });
@@ -714,6 +745,8 @@ pub async fn finish_advance(
     // on a branch with no index, which a Designer commit or discard turns into
     // a revert of the deploy.
     writes.push(GitWrite {
+        old: OldValue::Unchecked,
+        packed_refs_old: None,
         name: GitWriteName::Index,
         bytes: index,
     });
@@ -722,11 +755,15 @@ pub async fn finish_advance(
     // HEAD, so a reader that sees HEAD on the branch sees the section.
     if let Some(config) = &prep.config {
         writes.push(GitWrite {
+            old: OldValue::Unchecked,
+            packed_refs_old: None,
             name: GitWriteName::Config,
             bytes: config.clone(),
         });
     }
     writes.push(GitWrite {
+        old: OldValue::Unchecked,
+        packed_refs_old: None,
         name: GitWriteName::RemoteRef {
             remote: prep.remote.clone(),
             branch: prep.branch.clone(),
@@ -735,10 +772,14 @@ pub async fn finish_advance(
     });
     // `keep_discarded` puts the discard ref of an override right before this.
     writes.push(GitWrite {
+        old: OldValue::Unchecked,
+        packed_refs_old: None,
         name: GitWriteName::BranchRef(prep.branch.clone()),
         bytes: commit_line,
     });
     writes.push(GitWrite {
+        old: OldValue::Unchecked,
+        packed_refs_old: None,
         name: GitWriteName::Head,
         bytes: format!("ref: refs/heads/{}\n", prep.branch).into_bytes(),
     });
@@ -1683,6 +1724,8 @@ pub(crate) mod tests {
     fn keep_discarded_adds_the_ref_before_the_branch() {
         let head = "a".repeat(40);
         let write = |name: GitWriteName| GitWrite {
+            old: OldValue::Unchecked,
+            packed_refs_old: None,
             name,
             bytes: Vec::new(),
         };

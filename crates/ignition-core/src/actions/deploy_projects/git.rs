@@ -115,6 +115,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
     ),
     ("git_recreated", "git_handover::restore_and_advance (27-02)"),
     (
+        "git_changed",
+        "git_handover::restore_and_advance, write under lock (27-45)",
+    ),
+    (
         "backup_unsynced",
         "git_after_backup, the wait for the backup's project (27-22)",
     ),
