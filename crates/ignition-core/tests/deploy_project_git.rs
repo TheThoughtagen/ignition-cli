@@ -1382,6 +1382,34 @@ mod gateway_objects {
         assert_only_object_rels(&rec);
     }
 
+    /// 27-47 (C3): a pack is checked against its index (the index records the
+    /// pack's trailer), so a round fetches every pack together with its own
+    /// index: the `.idx` is the file right after its `.pack`. The indexes are
+    /// also read once on their own to choose the packs.
+    #[tokio::test]
+    async fn gateway_objects_fetches_each_pack_with_its_index() {
+        let f = GitFixture::new();
+        let mut names = None;
+        let (gate, live, _d) =
+            unpushed_scene_with(&f, |f| names = Some(f.gateway_split_packs())).await;
+        let (_history, unpushed) = names.expect("split");
+        let rec = Recording::new(f.node());
+        let (nodes, result) = run(&f, &gate, &live, &rec).await;
+        result.expect("dirty");
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        let fetched = rec.fetched();
+        let pack = format!("objects/pack/pack-{unpushed}.pack");
+        let at = fetched
+            .iter()
+            .position(|rel| *rel == pack)
+            .expect("the pack was fetched");
+        assert_eq!(
+            fetched.get(at + 1).map(String::as_str),
+            Some(format!("objects/pack/pack-{unpushed}.idx").as_str()),
+            "the pack's own index comes with it: {fetched:?}"
+        );
+    }
+
     #[tokio::test]
     async fn gateway_objects_rounds_with_an_empty_ign_store() {
         let f = GitFixture::new();

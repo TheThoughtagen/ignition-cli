@@ -120,7 +120,7 @@ use std::path::Path;
 use crate::deploy::git_objects::{
     GIT_OBJECTS_FETCH_MAX_BYTES, GIT_OBJECTS_LIST_MAX_ENTRIES, GIT_OBJECTS_LOOSE_MAX,
     GIT_OBJECTS_PACKS_MAX, GitObjectEntry, GitObjectEntryKind, GitObjectFile, GitObjectList,
-    check_object_rel,
+    check_object_rel, verify_fetched_objects,
 };
 use crate::deploy::project_run::{
     PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
@@ -2268,11 +2268,18 @@ impl GitHostRead for SftpTransport {
         } else {
             self.fetch_files(&base, &refs, tmp.path()).await?;
         }
+        // Every file is checked against its own name and its partner before
+        // anything is installed (27-47, C3): the `get` follows a link planted
+        // after the listing, and the protocol has no no-follow open. The local
+        // transport's fetch is not changed: its reads are handle-anchored
+        // since 27-43, so the asymmetry is deliberate.
         let (from, to, listed) = (tmp.path().to_path_buf(), dest.to_path_buf(), files.to_vec());
-        let installed =
-            tokio::task::spawn_blocking(move || install_object_files(&from, &to, &listed))
-                .await
-                .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?;
+        let installed = tokio::task::spawn_blocking(move || {
+            verify_fetched_objects(&from, &listed)?;
+            install_object_files(&from, &to, &listed)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?;
         drop(tmp);
         installed.map_err(|why| self.mirror_fail(OP, why))
     }

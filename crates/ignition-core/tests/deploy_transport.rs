@@ -6052,12 +6052,13 @@ mod sftp_git {
         }
 
         // the number of sessions does not depend on the object count
+        // (27-47: real loose objects, made by git, since a fetch now checks
+        // every object against its own name)
+        let blobs = tempfile::tempdir().expect("blobs");
         for i in 0..120u32 {
-            let fan = format!("{:02x}", i % 7);
-            let dir = fx.git_dir().join("objects").join(&fan);
-            std::fs::create_dir_all(&dir).expect("fan");
-            std::fs::write(dir.join(format!("{i:038x}")), vec![b'o'; 50 + i as usize])
-                .expect("object");
+            let body = blobs.path().join(format!("o{i}"));
+            std::fs::write(&body, vec![b'o'; 50 + i as usize]).expect("body");
+            fx.git_in_project(&["hash-object", "-w", body.to_str().expect("utf8")]);
         }
         let n = node(&fx.data_dir);
         let big = n.t.list_git_objects(PROJECT).await.expect("list");
@@ -6157,6 +6158,132 @@ mod sftp_git {
                 .is_err()
         );
         assert!(files_below(fresh.path()).is_empty());
+    }
+
+    /// 27-47 (C3): the `get` that follows a listing opens each path by name and
+    /// the sftp protocol offers no no-follow open, so a loose object whose path
+    /// is made a link after the listing is followed. The two objects here have
+    /// the same stored size (a real attacker picks a target of the listed
+    /// size), so the size check passes and only the check of the bytes against
+    /// the object's own name can refuse.
+    #[tokio::test]
+    async fn sftp_git_objects_fetch_refuses_a_link_swapped_after_the_listing() {
+        let fx = GitFixture::new();
+        // blobs of one length whose stored sizes agree
+        let mut by_size: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
+        for i in 0..24 {
+            let scratch = fx.data_dir.join(format!("blob-{i}"));
+            std::fs::write(&scratch, format!("swap candidate {i:04}\n")).expect("blob");
+            let id = fx.git_in_project(&["hash-object", "-w", scratch.to_str().expect("utf8")]);
+            let rel = format!("objects/{}/{}", &id[..2], &id[2..]);
+            let size = std::fs::metadata(fx.git_dir().join(&rel))
+                .expect("meta")
+                .len();
+            by_size.entry(size).or_default().push(rel);
+        }
+        let pair = by_size
+            .values()
+            .find(|rels| rels.len() >= 2)
+            .expect("two blobs of one stored size");
+        let (honest, other) = (pair[0].clone(), pair[1].clone());
+
+        let n = node(&fx.data_dir);
+        let list = n.t.list_git_objects(PROJECT).await.expect("list");
+        let file = list
+            .loose
+            .iter()
+            .find(|f| f.rel == honest)
+            .expect("listed")
+            .clone();
+        let swapped = fx.git_dir().join(&honest);
+        std::fs::remove_file(&swapped).expect("rm");
+        std::os::unix::fs::symlink(fx.git_dir().join(&other), &swapped).expect("link");
+
+        let dest = tempfile::tempdir().expect("dest");
+        let err =
+            n.t.fetch_git_objects(PROJECT, std::slice::from_ref(&file), dest.path())
+                .await
+                .expect_err("a link swapped after the listing");
+        assert!(
+            matches!(err, CoreError::TransportFailed { .. }),
+            "transport_failed: {err:?}"
+        );
+        let why = detail(err);
+        assert!(why.contains(&file.rel), "names the object file: {why}");
+        assert!(
+            files_below(dest.path()).is_empty(),
+            "nothing installed: {:?}",
+            files_below(dest.path())
+        );
+
+        // the same object, not swapped, still fetches
+        std::fs::remove_file(&swapped).expect("rm link");
+        std::fs::copy(fx.git_dir().join(&other), &swapped).expect("copy back");
+        let fresh = tempfile::tempdir().expect("dest");
+        let ok = list
+            .loose
+            .iter()
+            .find(|f| f.rel == other)
+            .expect("listed")
+            .clone();
+        n.t.fetch_git_objects(PROJECT, std::slice::from_ref(&ok), fresh.path())
+            .await
+            .expect("an honest object");
+    }
+
+    /// 27-47 (C3): the same for a pack. The link target is another pack (its
+    /// idx is not in the fetch); the listing's size for it is the target's, as
+    /// a same-size target would be. The idx of the pack asked for records the
+    /// trailer of the pack it was written with, not the target's.
+    #[tokio::test]
+    async fn sftp_git_objects_fetch_refuses_a_pack_swapped_after_the_listing() {
+        use ignition_core::deploy::git_objects::GitObjectFile;
+        let fx = GitFixture::new();
+        fx.designer_commit(false);
+        let (history, unpushed) = fx.gateway_split_packs();
+        let n = node(&fx.data_dir);
+        let list = n.t.list_git_objects(PROJECT).await.expect("list");
+        assert_eq!(list.packs.len(), 2, "{:?}", list.packs);
+        let asked = list
+            .packs
+            .iter()
+            .find(|p| p.name == history)
+            .expect("history pack");
+        let target = list
+            .packs
+            .iter()
+            .find(|p| p.name == unpushed)
+            .expect("unpushed pack");
+        let pack = fx.git_dir().join(asked.pack_rel());
+        std::fs::remove_file(&pack).expect("rm");
+        std::os::unix::fs::symlink(fx.git_dir().join(target.pack_rel()), &pack).expect("link");
+        let files = vec![
+            GitObjectFile {
+                rel: asked.idx_rel(),
+                size: asked.idx_size,
+            },
+            GitObjectFile {
+                rel: asked.pack_rel(),
+                size: target.pack_size,
+            },
+        ];
+
+        let dest = tempfile::tempdir().expect("dest");
+        let err =
+            n.t.fetch_git_objects(PROJECT, &files, dest.path())
+                .await
+                .expect_err("a pack swapped after the listing");
+        assert!(
+            matches!(err, CoreError::TransportFailed { .. }),
+            "transport_failed: {err:?}"
+        );
+        let why = detail(err);
+        assert!(why.contains(&asked.pack_rel()), "names the pack: {why}");
+        assert!(
+            files_below(dest.path()).is_empty(),
+            "nothing installed: {:?}",
+            files_below(dest.path())
+        );
     }
 
     /// 27-11: the listing refuses a symlink and a repo whose `objects` is

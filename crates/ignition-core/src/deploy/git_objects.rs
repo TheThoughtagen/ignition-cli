@@ -440,8 +440,9 @@ async fn fetch_packs(
     }
     let host =
         |what: &str, err: crate::error::CoreError| gateway(format!("{what}: {}", detail_of(&err)));
-    // The indexes go to a staging dir beside the scratch git dir; a pack's
-    // index moves into the git dir with its pack.
+    // The indexes go to a staging dir beside the scratch git dir. They are
+    // read for the ids they hold; each chosen pack's own index arrives with
+    // it in its round and is the one installed.
     let stage = scratch.root().join("idx-stage");
     std::fs::create_dir(&stage)
         .map_err(|e| gateway(format!("a staging dir could not be made: {}", e.kind())))?;
@@ -483,21 +484,28 @@ async fn fetch_packs(
         // One fetch for every pack of the round, so the number of host
         // connections follows the rounds and not the packs (27-11, D-24: a
         // production gateway holds dozens of packs, and a Windows host costs
-        // a connection or more per fetch).
-        let mut round: Vec<GitObjectFile> = Vec::with_capacity(chosen.len());
+        // a connection or more per fetch). Each pack comes with its own
+        // index in the same fetch (27-47, C3): a pack is checked against the
+        // pack checksum its index records, so the two must arrive together.
+        // The pack comes first, as git uses a pack only once its index
+        // exists. The staged index only chose the packs.
+        let mut round: Vec<GitObjectFile> = Vec::with_capacity(chosen.len() * 2);
         for &i in &chosen {
             let pack = &list.packs[i];
-            reserve(stats, pack.pack_size)?;
+            reserve(stats, pack.pack_size.saturating_add(pack.idx_size))?;
             round.push(GitObjectFile {
                 rel: pack.pack_rel(),
                 size: pack.pack_size,
+            });
+            round.push(GitObjectFile {
+                rel: pack.idx_rel(),
+                size: pack.idx_size,
             });
         }
         read.fetch_git_objects(project, &round, scratch.git_dir())
             .await
             .map_err(|e| host("a gateway pack cannot be read", e))?;
         for i in chosen {
-            install_index(&stage, scratch.git_dir(), &list.packs[i])?;
             fetched[i] = true;
             stats.packs += 1;
         }
@@ -505,32 +513,6 @@ async fn fetch_packs(
             .missing_objects(scratch, head)
             .await
             .map_err(|e| host("the gateway HEAD's objects cannot be checked", e))?;
-    }
-    Ok(())
-}
-
-/// Move a pack's staged index next to its pack, after the pack (git uses a
-/// pack only once its index exists). The copy is exclusive and its size is
-/// the listed size.
-fn install_index(stage: &Path, git_dir: &Path, pack: &GitPackFiles) -> Result<(), GitGateFailure> {
-    let rel = pack.idx_rel();
-    let from = rel
-        .split('/')
-        .fold(stage.to_path_buf(), |p, part| p.join(part));
-    let to = rel
-        .split('/')
-        .fold(git_dir.to_path_buf(), |p, part| p.join(part));
-    let failed =
-        |e: std::io::Error| gateway(format!("a pack index could not be installed: {}", e.kind()));
-    let mut source = std::fs::File::open(&from).map_err(failed)?;
-    let mut target = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&to)
-        .map_err(failed)?;
-    let copied = std::io::copy(&mut source, &mut target).map_err(failed)?;
-    if copied != pack.idx_size {
-        return Err(gateway("a pack index changed size while it was copied"));
     }
     Ok(())
 }
