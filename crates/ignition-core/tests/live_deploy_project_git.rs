@@ -73,7 +73,9 @@ use ignition_core::error::CoreError;
 use ignition_core::poll::PollConfig;
 
 mod common;
-use common::prod_shape_git::{HOST_LINUX_RESTORE_VERIFY, HOST_LINUX_SAVE, HOST_LINUX_UPLOAD};
+use common::prod_shape_git::{
+    self as prod_shape_git, HOST_LINUX_RESTORE_VERIFY, HOST_LINUX_SAVE, HOST_LINUX_UPLOAD,
+};
 
 /// The only gateway this gate may talk to.
 const RIG_GATEWAY_NAME: &str = "ign-git27-rig";
@@ -2975,7 +2977,10 @@ async fn git_restart_pull_e2e() {
 const PRODSHAPE_DESCRIPTOR_SUBJECT: &str = "release deploy descriptor";
 
 /// 27-24 Task 1 (D-18): the rig remote was seeded by the production-shape
-/// generator (`capture27.sh seedprod27`) and the module cloned it. The deploy
+/// generator (`capture27.sh seedprod27`) and the emitted gateway project, its
+/// padded `.git` as generated, was put in place (a module clone of the remote
+/// would carry none of the padding); the live `.git` is checked against the
+/// configured shape (`IGN_PROD_SHAPE_FILE`, `PRODSHAPE_GIT_OUT`). The deploy
 /// runs on that project and the handover's save, restore plus verify, and
 /// advance upload each finish inside the 27-06 Linux host budgets. No shape
 /// value is printed: only times, budgets, event names and difference counts.
@@ -3000,6 +3005,30 @@ async fn git_prodscale_rig() {
         PRODSHAPE_DESCRIPTOR_SUBJECT,
         "the rig remote is not the production-shape seed (run seedprod27 first)"
     );
+    // CodeRabbit #58 follow-up (X3): the live .git must have the configured
+    // shape before anything is applied. A module clone of the remote holds one
+    // pack and none of the generator's padding, so seedprod27 places the
+    // emitted gateway project; this checks that it is what the gateway holds.
+    // Only the names of the counts that differ are printed, never a value.
+    assert!(
+        std::env::var_os("IGN_PROD_SHAPE_FILE").is_some_and(|v| !v.is_empty()),
+        "IGN_PROD_SHAPE_FILE is not set: the gate compares the live .git with the configured shape"
+    );
+    let shape = prod_shape_git::GitShape::from_env();
+    let emitted = PathBuf::from(require_env("PRODSHAPE_GIT_OUT"));
+    let emitted_git = prod_shape_git::measure_git_dir(
+        &emitted.join("data").join("projects").join(APP).join(".git"),
+    );
+    let live_git = prod_shape_git::measure_git_dir(&rig.project_dir().join(".git"));
+    let off = prod_shape_git::placed_mismatches(&live_git, &emitted_git, &shape);
+    eprintln!(
+        "LIVE-SCALE shape: live .git matches the configured shape={} differing={off:?}",
+        off.is_empty()
+    );
+    assert!(
+        off.is_empty(),
+        "REFUSING: the live .git does not have the configured shape (differing: {off:?}); run seedprod27 again"
+    );
     let (_work, config) = script_config(&api, &rig.url).await;
 
     let first = DeployFlags {
@@ -3023,6 +3052,31 @@ async fn git_prodscale_rig() {
         first_change: true,
         ..DeployFlags::default()
     };
+    // CodeRabbit #60 (Y3): the module's start sync can still write after the
+    // check above (wait_clone only proves an index and a ref), and the timed
+    // save reads the .git as it is now. So it is measured again right before
+    // the timed apply, after every write this gate makes: it must still have
+    // the configured shape, and its packs, loose objects and tag refs must
+    // equal the first measurement. Names only, never a value.
+    let before_apply = prod_shape_git::measure_git_dir(&rig.project_dir().join(".git"));
+    let mut changed_since = prod_shape_git::placed_mismatches(&before_apply, &emitted_git, &shape);
+    for (name, now, first) in [
+        ("packs_changed", before_apply.packs, live_git.packs),
+        ("loose_objects_changed", before_apply.loose, live_git.loose),
+        ("tag_refs_changed", before_apply.tag_refs, live_git.tag_refs),
+    ] {
+        if now != first {
+            changed_since.push(name);
+        }
+    }
+    eprintln!(
+        "LIVE-SCALE shape before the timed apply: unchanged and configured={} differing={changed_since:?}",
+        changed_since.is_empty()
+    );
+    assert!(
+        changed_since.is_empty(),
+        "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
+    );
     let timed = TimedWriter::new(rig.node());
     let timeline = Timeline::new();
     let extras = Extras {

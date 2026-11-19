@@ -477,8 +477,11 @@ backup_git() { if [ -d "$(pdir b)/.git" ]; then echo present; else echo absent; 
 # backup's .git presence, the backup's code.py value and util2 presence, and the
 # master's .git presence. Converged means code.py reads CODE and util2 reads
 # UTIL2. BEFORE is the backup's .git presence taken before the import (a
-# deletion during the import is a deletion too: POLL_GIT_GONE is then 0). Sets
-# POLL_GIT_GONE (seconds, or `none`) and POLL_CONVERGED.
+# deletion during the import is a deletion too: POLL_GIT_GONE is then 0). The
+# first sample is t=0 whatever the clock says. Sets POLL_GIT_GONE (seconds;
+# `none` when a .git present before the import is still there at the end;
+# `absent_before` when the backup had no .git before the import, so nothing
+# could disappear) and POLL_CONVERGED (seconds or `none`).
 POLL_GIT_GONE=none
 POLL_CONVERGED=none
 poll_backup() {
@@ -487,9 +490,17 @@ poll_backup() {
   t0=$(date +%s)
   POLL_GIT_GONE=none
   POLL_CONVERGED=none
+  if [ "$bg" = absent ]; then
+    POLL_GIT_GONE=absent_before
+    echo "   [$label] the backup had no .git before the import: there is no disappearance to time"
+  fi
   while :; do
-    now=$(date +%s)
-    el=$((now - t0))
+    if [ "$first" = yes ]; then
+      el=0
+    else
+      now=$(date +%s)
+      el=$((now - t0))
+    fi
     ba=$([ -d "$(pdir b)/.git" ] && echo present || echo absent)
     cb=$(codepy b)
     ub=$(util2 b)
@@ -508,6 +519,16 @@ poll_backup() {
     [ "$el" -lt "$secs" ] || break
     sleep 2
   done
+}
+
+# gone_text NONE-MEANS: POLL_GIT_GONE as result text. Initial absence is its
+# own result, never read as a .git that survived (CodeRabbit #58 follow-up X1).
+gone_text() {
+  case "$POLL_GIT_GONE" in
+    none) echo "none ($1)" ;;
+    absent_before) echo "not applicable (the backup had no .git before the import)" ;;
+    *) echo "$POLL_GIT_GONE s" ;;
+  esac
 }
 
 logs_b() { # SINCE
@@ -550,7 +571,7 @@ g5_steps() {
   master_import "$zip"
   echo "   import answered after $(( $(date +%s) - t_import )) s; master .git present=$([ -d "$(pdir a)/.git" ] && echo yes || echo no)"
   poll_backup b 120 'return 2' yes "$before"
-  echo "RESULT (b) backup .git disappeared after: $POLL_GIT_GONE s (none = still there at 120 s); backup content converged after: $POLL_CONVERGED s (none = not within 120 s)"
+  echo "RESULT (b) backup .git disappeared after: $(gone_text 'still there at 120 s'); backup content converged after: $POLL_CONVERGED s (none = not within 120 s)"
   echo "   backup .git at 120 s: present=$([ -d "$(pdir b)/.git" ] && echo yes || echo no)"
   echo "   backup module log lines since the import:"
   logs_b "$ts" | sed 's/^/     /'
@@ -570,7 +591,7 @@ g5_steps() {
   master_import "$zip"
   echo "   import answered after $(( $(date +%s) - t_import )) s"
   poll_backup c 120 'return 2' yes "$before"
-  echo "RESULT (c) restored backup .git disappeared after: $POLL_GIT_GONE s (none = survived 120 s)"
+  echo "RESULT (c) restored backup .git disappeared after: $(gone_text 'survived 120 s')"
   echo "   backup .git at 120 s: present=$([ -d "$(pdir b)/.git" ] && echo yes || echo no)"
   shape "$(pdir b)" "backup after (c)"
   echo "   backup module log lines since the second import:"
@@ -586,7 +607,7 @@ g5_steps() {
   master_import "$zip100"
   echo "   import answered after $(( $(date +%s) - t_import )) s"
   poll_backup c2 120 'return 1' no "$before"
-  echo "RESULT (c2) backup .git disappeared after: $POLL_GIT_GONE s (none = survived 120 s); backup content converged after: $POLL_CONVERGED s"
+  echo "RESULT (c2) backup .git disappeared after: $(gone_text 'survived 120 s'); backup content converged after: $POLL_CONVERGED s"
   echo "   backup .git at 120 s: present=$([ -d "$(pdir b)/.git" ] && echo yes || echo no)"
   echo "   backup module log lines since the third import:"
   logs_b "$ts" | sed 's/^/     /'

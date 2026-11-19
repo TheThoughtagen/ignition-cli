@@ -61,7 +61,9 @@
 #                    git_prodshape_emit test when absent) and IGN_PROD_SHAPE_FILE
 #                    the private shape file; production sits at the gateway's
 #                    head, the release tag v1.1.0 one advance ahead, and the
-#                    module clones it. No shape value is printed.
+#                    emitted gateway project (its padded .git as generated) is
+#                    put in place of a module clone (place_prodshape27). No
+#                    shape value is printed.
 #   seedtags27       (27-24) push release v1.3.0 to the remote's production: its
 #                    deploy/project.yaml owns the tag provider CapTags and
 #                    tags/CapTags/ holds two neutral tags (Phase 26 layout)
@@ -419,7 +421,62 @@ seed_prodshape27() {
   seedgit -C "$bare" update-ref refs/tags/v1.1.0 "$commit"
   /bin/rm -f "$idx"
   chmod -R a+rX "$bare"
+  PRODSHAPE_OUT_REAL=$out
   echo "seed_prodshape27: $BARE seeded from the generator output (production at the gateway head, tag v1.1.0 ahead); no shape value is shown"
+}
+
+# place_prodshape27 (CodeRabbit #58 follow-up X3): the generator pads the
+# gateway's .git (one pack per history run, unreferenced loose objects, loose
+# tag refs) after it made the remote, so the module's clone of the remote holds
+# one pack and none of the padding: it never has the configured shape. Like the
+# VM gates' `upload`, the rig therefore gets the emitted gateway project itself:
+# the deploy_prod_scale git_prodshape_stage test copies it (in-scope files and
+# .git as the generator left them) into a stage below the state directory with
+# the remote URL set to the module's repo_uri; the gateway is stopped, the stage
+# is put in place as the gateway's user (a throwaway root container of the
+# gateway image) and the gateway is started. The module's start sync then finds
+# an existing repository, as on a production gateway. git_prodscale_rig
+# compares the live .git with the configured shape before it applies.
+place_prodshape27() {
+  local c img own stage=$STATE/prodshape-stage
+  [ -n "${PRODSHAPE_OUT_REAL:-}" ] || die "place_prodshape27: run seed_prodshape27 first"
+  c=$(cid)
+  [ -n "$c" ] || die "place_prodshape27: no running gw container"
+  img=$(docker inspect -f '{{.Config.Image}}' "$c")
+  [ -n "$img" ] || die "place_prodshape27: the gw container has no image"
+  own=$(docker exec "$c" sh -c 'echo "$(id -u):$(id -g)"')
+  [[ $own =~ ^[0-9]+:[0-9]+$ ]] || die "place_prodshape27: the gateway user's ids are not numeric"
+  /bin/rm -rf "$stage"
+  mkdir -p "$stage" "$STATE/evidence"
+  (
+    cd "$REPO"
+    PRODSHAPE_GIT_OUT=$PRODSHAPE_OUT_REAL PRODSHAPE_STAGE_TO=$stage/$APP \
+      cargo test -p ignition-core --test deploy_prod_scale git_prodshape_stage -- --nocapture
+  ) > "$STATE/evidence/seedprod27-stage.log" 2>&1 \
+    || die "place_prodshape27: staging the emitted project failed; see $STATE/evidence/seedprod27-stage.log"
+  [ -f "$stage/$APP/.git/refs/heads/production" ] && [ -f "$stage/$APP/project.json" ] \
+    || die "place_prodshape27: the stage holds no project with a .git"
+  docker stop "$c" > /dev/null
+  # CodeRabbit #60 (Y2): from here the gateway is stopped. A failed copy (a
+  # full disk, say) starts it again before the error is returned, with the
+  # copy's own message and exit status, so seedprod27 can be rerun (reset27
+  # needs a running gateway and replaces the partial copy).
+  local rc=0
+  docker run --rm --platform linux/amd64 --entrypoint sh -u root \
+    -v "$DATA/projects:/p" -v "$stage/$APP:/src:ro" "$img" \
+    -c "rm -rf /p/$APP && mkdir /p/$APP && cp -a /src/. /p/$APP/ && chown -R $own /p/$APP" > /dev/null || rc=$?
+  if [ "$rc" -eq 0 ] && [ ! -f "$PDIR/.git/refs/heads/production" ]; then
+    echo "place_prodshape27: $APP has no .git on the host after the copy" >&2
+    rc=64
+  fi
+  if [ "$rc" -ne 0 ]; then
+    docker start "$c" > /dev/null || echo "place_prodshape27: starting the gateway again failed as well" >&2
+    echo "place_prodshape27: placing the emitted project failed (exit $rc); the gateway was started again, so seedprod27 can be rerun once the cause is fixed" >&2
+    exit "$rc"
+  fi
+  /bin/rm -rf "$stage"
+  docker start "$c" > /dev/null
+  echo "place_prodshape27: the emitted gateway project is in place as $APP (its .git as generated, remote at the module's URL); no shape value is shown"
 }
 
 # seedtags27 (27-24, checker W12): release v1.3.0 on the remote's production, a
@@ -666,7 +723,11 @@ reset27() {
     [ "$tries" -lt 20 ] || die "reset27: the git server does not answer the smart-HTTP advertisement"
     sleep 3
   done
-  docker restart "$(cid)" > /dev/null
+  if [ "${GIT27_SEED:-synthetic}" = prodshape ]; then
+    place_prodshape27
+  else
+    docker restart "$(cid)" > /dev/null
+  fi
   wait_running 600 || die "reset27: the gateway is not RUNNING within 600 s"
   wait_app 600 || die "reset27: $APP did not answer find within 600 s"
   wait_clone 600 || die "reset27: the module's clone of $APP did not finish within 600 s (no refs/heads/production and index)"
