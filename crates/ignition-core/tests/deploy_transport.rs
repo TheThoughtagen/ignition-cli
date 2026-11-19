@@ -6926,6 +6926,24 @@ mod winps_git_native {
                 "OpenForDelete",
             ]
         );
+        // the access, sharing, disposition and flags of each open, as reviewed
+        // (27-48 review: `OpenFile` takes no `write` and reads only, and the
+        // new lock's handle can read its own attributes for `FileId`)
+        for call in [
+            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
+            "public static SafeFileHandle OpenFile(string p){return O(p,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+            "public static SafeFileHandle CreateNew(string p){return O(p,GENERIC_WRITE|FILE_READ_ATTRIBUTES,0,CREATE_NEW,0,0);}",
+            "public static SafeFileHandle OpenForDelete(string p){return O(p,DELETE|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+        ] {
+            assert_eq!(block.matches(call).count(), 1, "{call}");
+        }
+        // nothing opens a file for writing but the one new file
+        assert_eq!(
+            block.matches("GENERIC_WRITE").count(),
+            2,
+            "const + CreateNew"
+        );
+        assert!(!block.contains("bool write"), "OpenFile has no write mode");
     }
 
     /// The loader is fixed text with the fail-closed shape of the record

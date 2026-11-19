@@ -356,9 +356,10 @@ macro_rules! git_native_cs {
             "return h;}catch{h.Dispose();throw;}}",
             // No FILE_SHARE_DELETE: while held, the directory cannot be renamed or replaced.
             "public static SafeFileHandle OpenDir(string p){return O(p,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
-            "public static SafeFileHandle OpenFile(string p,bool write){return O(p,GENERIC_READ|(write?GENERIC_WRITE:0),FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+            "public static SafeFileHandle OpenFile(string p){return O(p,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
             // No sharing at all: nobody else can open, delete or replace the new file while it is held.
-            "public static SafeFileHandle CreateNew(string p){return O(p,GENERIC_WRITE,0,CREATE_NEW,0,0);}",
+            // It can read its own attributes, so FileId can be taken from the handle that created it.
+            "public static SafeFileHandle CreateNew(string p){return O(p,GENERIC_WRITE|FILE_READ_ATTRIBUTES,0,CREATE_NEW,0,0);}",
             "public static SafeFileHandle OpenForDelete(string p){return O(p,DELETE|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
             // Volume serial number (8 bytes) and 128-bit file id, as 48 hex digits.
             "public static string FileId(SafeFileHandle h){byte[] b=new byte[24];",
@@ -387,10 +388,10 @@ macro_rules! git_native_cs {
 ///   for delete, so a directory that is held cannot be renamed or replaced (the
 ///   Windows anchor, there being no `openat`); must be a directory and not a
 ///   reparse point, read from the attribute tag of the handle that is returned.
-/// - `OpenFile(path, write)`: `GENERIC_READ` (and `GENERIC_WRITE` when `write`),
-///   shared for read, write and delete; must be a regular file, not a reparse
-///   point.
-/// - `CreateNew(path)`: `GENERIC_WRITE`, no sharing, `CREATE_NEW`.
+/// - `OpenFile(path)`: `GENERIC_READ` only, shared for read, write and delete;
+///   must be a regular file, not a reparse point.
+/// - `CreateNew(path)`: `GENERIC_WRITE | FILE_READ_ATTRIBUTES` (so `FileId` can
+///   be read from the handle that created the file), no sharing, `CREATE_NEW`.
 /// - `OpenForDelete(path)`: `DELETE | FILE_READ_ATTRIBUTES`, shared for read,
 ///   write and delete; a regular file, not a reparse point.
 /// - `FileId(handle)`: `GetFileInformationByHandleEx(FileIdInfo)` as hex.
@@ -409,7 +410,7 @@ pub const GIT_NATIVE_CS: &str = git_native_cs!();
 /// block, so an edit of the block fails until this changes in the same diff,
 /// after the block has been reviewed again.
 pub const GIT_NATIVE_SHA256: &str =
-    "d8dfa7a5f714044f3f31994c53c314fd5318d57ef454eada773f3cb7a360c773";
+    "d7e591c96cb694c2688198b0d72987cd8adb9bbca361d6afb6632cf44be9c145";
 
 /// The loader a Windows git script puts at the start of its body to use
 /// [`GIT_NATIVE_CS`] (the inline layout): the RECORD_REPLACE form. It fails
