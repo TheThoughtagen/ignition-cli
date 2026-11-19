@@ -60,6 +60,12 @@ base64 = "0.22"
 # artifact fetch's streaming sha256 verification — still not a new
 # dependency, just a second, production-side consumer of the same pin.
 sha2 = "0.10"
+# Phase 27 (27-47): flate2 is promoted from the graph (it comes in through zip's
+# `deflate`) for the post-download check of gateway git objects: a loose object
+# is inflated in process, then hashed by host git. Same feature set as zip
+# resolves (zlib-rs, no default backend), so Cargo.lock does not change: NOT a
+# new package. No SHA-1 crate (host git stays the only git engine, 27-47 Task 1).
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 # Phase 6 (TUI): ratatui floor-pinned at 0.30.2 — 0.30.1 bumped MSRV 1.86→1.88
 # in a PATCH release, so patch drift can move MSRV; the floor rides the
 # 1.88-MSRV release and CI (stable) catches future bumps. crossterm takes the

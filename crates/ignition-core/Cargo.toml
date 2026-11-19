@@ -31,6 +31,7 @@ quick-xml = { workspace = true } # 11-03 TAGS-12: Event-loop loss scan (no serde
 csv = { workspace = true } # 11-03 TAGS-12: legacy CSV loss scan + 11-04 generator
 base64 = { workspace = true } # 11-04: byte-faithful envelope carrier (payload_b64 decode / file_b64 encode — the ONLY transfer transformation)
 sha2 = { workspace = true } # promoted from ignition-cli's dev-dependencies (15-01): the module artifact fetch's streaming sha256 verification — already workspace-pinned at 0.10, NOT a new dependency
+flate2 = { workspace = true } # 27-47: inflate a fetched loose git object before host git hashes it — already in the graph via zip (same zlib-rs feature set), NOT a new crate; no sha1 crate (host git hashes)
 similar = "3" # 22-04: unified text diff for `deploy plan --diff` only; already in Cargo.lock at 3.2.0 (through snapbox), NOT a new package
 
 [target.'cfg(unix)'.dependencies]

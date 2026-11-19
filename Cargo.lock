@@ -1488,6 +1488,7 @@ dependencies = [
  "base64",
  "csv",
  "directories",
+ "flate2",
  "futures-util",
  "getrandom 0.2.17",
  "keyring",
