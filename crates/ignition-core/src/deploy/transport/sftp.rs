@@ -1460,7 +1460,21 @@ impl SftpTransport {
         script: &winps::WinScript,
     ) -> Result<serde_json::Value, CoreError> {
         self.sessions.fetch_add(1, Ordering::Relaxed);
-        self.shell.exec_powershell(script).await
+        let first = self.shell.exec_powershell(script).await;
+        // A staged git script (27-50) is run first, and staged only when the host
+        // says its file is not there with its pin: the file stays in the account
+        // home between runs, so the steady state costs no connection for it. The
+        // refusal comes from the stub, or from the loader reading the block's
+        // source, before the script did anything.
+        if let (Some(staged), Err(err)) = (script.staged(), &first)
+            && project_ops::staging_refused(err)
+        {
+            self.stage_git_files("git_native_stage", Some(staged))
+                .await?;
+            self.sessions.fetch_add(1, Ordering::Relaxed);
+            return self.shell.exec_powershell(script).await;
+        }
+        first
     }
 
     /// Windows only: the PowerShell walk of each native root in `roots`, in
@@ -2032,15 +2046,15 @@ impl SftpTransport {
 
         let limit = bundle::archive_limit(listed);
         let need = limit.saturating_add(bundle::STAGING_FREE_MARGIN);
-        let script = winps::WinScript::bundle_level(
-            LONG_PATH_PREFIX,
-            &windows_native_path(&base.remote_root(&self.data_dir)),
-            &windows_native_path(&remote_list),
-            &windows_native_path(&remote_zip),
-            &list_sha,
-            need,
-            base.bundle_level(),
-        );
+        let script = self
+            .bundle_script(
+                base,
+                &windows_native_path(&remote_list),
+                &windows_native_path(&remote_zip),
+                &list_sha,
+                need,
+            )
+            .await?;
         let value = self.read_powershell(&script).await.map_err(|e| match e {
             CoreError::TransportFailed { detail, .. } => self.fail(format!(
                 "cannot bundle the listed files on the host: {detail}"
@@ -2204,15 +2218,15 @@ impl SftpTransport {
             }
             limit.saturating_add(bundle::STAGING_FREE_MARGIN)
         };
-        let script = winps::WinScript::bundle_level(
-            LONG_PATH_PREFIX,
-            &windows_native_path(&base.remote_root(&self.data_dir)),
-            &windows_native_path(&remote_list),
-            &windows_native_path(&remote_zip),
-            list_sha,
-            need,
-            base.bundle_level(),
-        );
+        let script = self
+            .bundle_script(
+                base,
+                &windows_native_path(&remote_list),
+                &windows_native_path(&remote_zip),
+                list_sha,
+                need,
+            )
+            .await?;
         let value = self.read_powershell(&script).await;
         if let Some(opened) = opened {
             let ok = value
@@ -2265,6 +2279,43 @@ impl SftpTransport {
         .map_err(|why| self.fail(base.rename_extract_error(&why)))?;
         drop(archive_dir);
         Ok(())
+    }
+
+    /// The archive script of a read: [`winps::BUNDLE`] for a resource read, and
+    /// for a read of the gateway's `.git` the staged [`winps::BUNDLE_GIT`] (27-50),
+    /// whose files are in place on the host before it is returned. The native
+    /// `list` and `archive` paths and the list's `list_sha` are the read's.
+    async fn bundle_script(
+        &self,
+        base: &ReadBase,
+        list: &str,
+        archive: &str,
+        list_sha: &str,
+        need: u64,
+    ) -> Result<winps::WinScript, CoreError> {
+        let root = windows_native_path(&base.remote_root(&self.data_dir));
+        if matches!(base, ReadBase::ProjectGit(_)) {
+            let script = winps::WinScript::bundle_git(
+                LONG_PATH_PREFIX,
+                &root,
+                list,
+                archive,
+                list_sha,
+                need,
+                base.bundle_level(),
+                &self.win_home().await?,
+            );
+            return Ok(script);
+        }
+        Ok(winps::WinScript::bundle_level(
+            LONG_PATH_PREFIX,
+            &root,
+            list,
+            archive,
+            list_sha,
+            need,
+            base.bundle_level(),
+        ))
     }
 
     /// The archive size of a BUNDLE result for `listed`, or the read's
@@ -4686,6 +4737,14 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 if params.get("l").is_some() && params.get("z").is_some() {
                     return self.bundle_host(&params);
                 }
+                if params.get("n").is_some()
+                    && params.get("s").is_some()
+                    && params.get("x").is_none()
+                {
+                    // the check that the staged files of the git scripts are
+                    // on the host (27-49, 27-50): they are
+                    return ign_line(&serde_json::json!({ "ok": 1, "present": 1 }));
+                }
                 if params.get("d").is_some() && params.get("f").is_some() {
                     return self.clean_host(&params);
                 }
@@ -4872,7 +4931,13 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 self.fs.lock().expect("fs").remove(&list_path);
                 ign_line(&value)
             };
-            if sha256_hex(&list) != text("h") {
+            // the git-object archive script (27-50) sends the list's hash as `s`
+            // (its `h` is the account home); `BUNDLE` sends it as `h`
+            let want_sha = params
+                .get("s")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| text("h"), str::to_string);
+            if sha256_hex(&list) != want_sha {
                 return refuse(serde_json::json!({ "ok": 0, "err": "list" }));
             }
             let free = self.knobs().bundle_free.unwrap_or(u64::MAX);

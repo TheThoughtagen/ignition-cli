@@ -1604,14 +1604,43 @@ impl SftpTransport {
         script: WinScript,
         limit: std::time::Duration,
     ) -> Result<serde_json::Value, CoreError> {
-        if script.loads_native() {
-            self.git_native_staged().await?;
-        }
-        let answer = self.shell.exec_powershell_within(&script, limit).await?;
+        let answer = self.git_win_raw(script, limit).await?;
         if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
             return Err(self.git_unusable(op, "ok is not 1"));
         }
         Ok(answer)
+    }
+
+    /// Run one git WinScript (everything it needs staged first) and answer
+    /// whatever it answered, `ok` or not.
+    async fn git_win_raw(
+        &self,
+        script: WinScript,
+        limit: std::time::Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.ensure_staged(&script).await?;
+        let first = self.shell.exec_powershell_within(&script, limit).await;
+        // A staged script is run first and staged only when the host says its
+        // file is not there with its pin (see `read_powershell`).
+        if let (Some(staged), Err(err)) = (script.staged(), &first)
+            && staging_refused(err)
+        {
+            self.stage_git_files("git_native_stage", Some(staged))
+                .await?;
+            return self.shell.exec_powershell_within(&script, limit).await;
+        }
+        first
+    }
+
+    /// What `script` needs on the host is in place, when it can be checked
+    /// before it runs: the staged source of the reviewed C# block, for a script
+    /// that loads it. The stub of a staged script (27-50) is not checked first:
+    /// it is run, and staged when the host refuses it (`git_win_raw`).
+    pub(super) async fn ensure_staged(&self, script: &WinScript) -> Result<(), CoreError> {
+        if script.staged().is_none() && script.loads_native() {
+            self.git_native_staged().await?;
+        }
+        Ok(())
     }
 
     /// The staged source of the reviewed C# block is in place on this host: at
@@ -1619,7 +1648,7 @@ impl SftpTransport {
     /// the user chose in 27-48). A failed attempt is not remembered.
     async fn git_native_staged(&self) -> Result<(), CoreError> {
         self.native_staged
-            .get_or_try_init(|| self.stage_git_native())
+            .get_or_try_init(|| self.stage_git_files("git_native_stage", None))
             .await
             .map(|_| ())
     }
@@ -1634,44 +1663,67 @@ impl SftpTransport {
     /// by a concurrent run or not the pinned text is a refusal, never code. A
     /// run never removes the file, and a release with another pin names another
     /// file.
-    async fn stage_git_native(&self) -> Result<(), CoreError> {
-        const OP: &str = "git_native_stage";
+    pub(super) async fn stage_git_files(
+        &self,
+        op: &str,
+        script: Option<&'static winps::StagedScript>,
+    ) -> Result<(), CoreError> {
         let home = self.win_home().await?;
         let home_sftp = self.account_home().await?;
-        let remote = format!("{home_sftp}/{GIT_NATIVE_STAGED_DIR}/{GIT_NATIVE_STAGED_FILE}");
-        safe_remote_path(&remote).map_err(|why| {
+        // the block's source first, then the script's text when there is one
+        let mut files: Vec<(&str, &str, &str)> = vec![(
+            GIT_NATIVE_STAGED_FILE,
+            GIT_NATIVE_CS,
+            winps::GIT_NATIVE_SHA256,
+        )];
+        if let Some(staged) = script {
+            files.push((staged.file, staged.text, staged.sha256));
+        }
+        let mut ops = Vec::new();
+        let dir = tempfile::tempdir().map_err(|e| {
             self.mirror_fail(
-                OP,
-                format!("the staged source path cannot ride an sftp batch line ({why})"),
+                op,
+                format!("a local copy of the source cannot be made: {e}"),
             )
         })?;
+        for (name, text, _) in &files {
+            let remote = format!("{home_sftp}/{GIT_NATIVE_STAGED_DIR}/{name}");
+            safe_remote_path(&remote).map_err(|why| {
+                self.mirror_fail(
+                    op,
+                    format!("the staged source path cannot ride an sftp batch line ({why})"),
+                )
+            })?;
+            let local = dir.path().join(name);
+            std::fs::write(&local, text.as_bytes()).map_err(|e| {
+                self.mirror_fail(
+                    op,
+                    format!("a local copy of the source cannot be made: {e}"),
+                )
+            })?;
+            ops.push(SftpOp::Put { local, remote });
+        }
+        let pairs: Vec<(&str, &str)> = files.iter().map(|(n, _, pin)| (*n, *pin)).collect();
+        let check = if script.is_some() {
+            WinScript::git_stage_files(&home, &pairs)
+        } else {
+            WinScript::git_native_stage(&home)
+        };
+        self.sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let answer = self
             .shell
-            .exec_powershell_within(&WinScript::git_native_stage(&home), self.shell.op_timeout())
+            .exec_powershell_within(&check, self.shell.op_timeout())
             .await?;
         if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
-            return Err(self.git_unusable(OP, "ok is not 1"));
+            return Err(self.git_unusable(op, "ok is not 1"));
         }
         match answer.get("present").and_then(serde_json::Value::as_i64) {
             Some(1) => return Ok(()),
             Some(0) => {}
-            _ => return Err(self.git_unusable(OP, "present is missing")),
+            _ => return Err(self.git_unusable(op, "present is missing")),
         }
-        let dir = tempfile::tempdir().map_err(|e| {
-            self.mirror_fail(
-                OP,
-                format!("a local copy of the source cannot be made: {e}"),
-            )
-        })?;
-        let local = dir.path().join(GIT_NATIVE_STAGED_FILE);
-        std::fs::write(&local, GIT_NATIVE_CS.as_bytes()).map_err(|e| {
-            self.mirror_fail(
-                OP,
-                format!("a local copy of the source cannot be made: {e}"),
-            )
-        })?;
-        self.run_batch(OP, vec![SftpOp::Put { local, remote }])
-            .await
+        self.run_batch(op, ops).await
     }
 
     /// The native spelling of the data directory of a Windows node.
@@ -1685,7 +1737,7 @@ impl SftpTransport {
     }
 
     /// The native account home of a Windows node.
-    async fn win_home(&self) -> Result<String, CoreError> {
+    pub(super) async fn win_home(&self) -> Result<String, CoreError> {
         Ok(windows_native_path(&self.account_home().await?))
     }
 
@@ -1776,7 +1828,7 @@ impl SftpTransport {
         }
         .await;
         let drop = compared.is_err();
-        let mv = WinScript::git_restore_move(LONG_PATH_PREFIX, &data, project, run_id, drop);
+        let mv = WinScript::git_restore_move(LONG_PATH_PREFIX, &data, project, &home, run_id, drop);
         let moved = self.git_win(OP, mv, GIT_HEAVY_LIMIT).await;
         compared?;
         moved?;
@@ -2686,9 +2738,9 @@ impl GitStateWriter for SftpTransport {
     // travel as the fourth and fifth field of each write, and `GIT_WRITE_SH`
     // compares the target with its expected value just before it moves the
     // lock over it; a mismatch is exit 7, mapped here to
-    // `GIT_CHANGED_OPERATION`. A Windows host does not compare yet (27-52): a
-    // ref that moved between the engine's read and this write can still be
-    // overwritten there, and no guarantee is claimed for it before then.
+    // `GIT_CHANGED_OPERATION`. A Windows host compares the same way (27-52,
+    // `winps::GIT_REPLACE`, answer `err: changed`) under the held parent just
+    // before the move.
     async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.mirror_fail("write", why));
@@ -3158,24 +3210,62 @@ impl SftpTransport {
                 return Err(self.git_win_leftovers(err, &ctx, named, owned).await);
             }
         }
-        // (d) each lock over its file, after a size check; the last chunk
-        //     removes the stage
+        // (d) each lock over its file after a size check and the compare of
+        //     the target with the value the run read (27-52, F4); the last
+        //     chunk removes the stage
         let chunks = sized.chunks(GIT_WIN_CHUNK).count();
-        for (n, chunk) in sized.chunks(GIT_WIN_CHUNK).enumerate() {
+        let mut expected: Vec<(String, u64, String, String)> = Vec::with_capacity(sized.len());
+        for ((target, size), (_, _, write)) in sized.iter().zip(plan) {
+            let (old, packed) = write_old_fields(write)
+                .map_err(|why| self.mirror_fail("write", format!("{target} is refused: {why}")))?;
+            expected.push((target.clone(), *size, old.to_string(), packed.to_string()));
+        }
+        for (n, chunk) in expected.chunks(GIT_WIN_CHUNK).enumerate() {
             let script = WinScript::git_replace(
                 &data,
                 project,
                 &home,
                 &stage,
+                n * GIT_WIN_CHUNK,
                 chunk,
                 RENAME_RETRIES,
                 n + 1 == chunks,
             );
-            if let Err(err) = self.git_win("write_git_files", script, limit).await {
-                // the chunks before this one were moved over their targets: a
-                // lock there now is not ours
-                let named = !git_win_script_settled(&err);
-                return Err(self.git_win_leftovers(err, &ctx, named, n..chunks).await);
+            let answer = match self.git_win_raw(script, limit).await {
+                Ok(answer) => answer,
+                Err(err) => {
+                    // the chunks before this one were moved over their targets: a
+                    // lock there now is not ours
+                    let named = !git_win_script_settled(&err);
+                    return Err(self.git_win_leftovers(err, &ctx, named, n..chunks).await);
+                }
+            };
+            let say = |key: &str| answer.get(key).and_then(serde_json::Value::as_i64);
+            match (
+                say("ok"),
+                answer.get("err").and_then(serde_json::Value::as_str),
+            ) {
+                (Some(1), _) => {}
+                (Some(0), Some("changed")) => {
+                    // The script compared a target with what the run read and
+                    // found it changed. It moved nothing from that entry on and
+                    // removed nothing: the unmoved entries' locks and the stage
+                    // go through the unlock by file id, and the new value stays.
+                    let file = match (say("p"), say("i").and_then(|i| usize::try_from(i).ok())) {
+                        (Some(1), _) => "packed-refs".to_string(),
+                        (_, Some(i)) if i < plan.len() => plan[i].0.clone(),
+                        _ => "a .git file".to_string(),
+                    };
+                    let err = self.mirror_fail(
+                        GIT_CHANGED_OPERATION,
+                        format!("{file} changed after the run read it; it is left as it is"),
+                    );
+                    return Err(self.git_win_leftovers(err, &ctx, false, n..chunks).await);
+                }
+                _ => {
+                    let err = self.git_unusable("write_git_files", "ok is not 1");
+                    return Err(self.git_win_leftovers(err, &ctx, true, n..chunks).await);
+                }
             }
         }
         drop(staged);
@@ -3278,6 +3368,18 @@ struct WinWrite<'a> {
     stage: &'a str,
     plan: &'a [(String, String, &'a GitWrite)],
     sized: &'a [(String, u64)],
+}
+
+/// Whether the host refused a staged git script (27-50) before it did anything:
+/// the stub's fixed sentence (its file is missing or is not the pinned text), or
+/// the loader's (the block's source is missing or is not the pinned text). The
+/// transport then stages both files and runs the script once more.
+pub(super) fn staging_refused(err: &CoreError) -> bool {
+    let CoreError::TransportFailed { detail, .. } = err else {
+        return false;
+    };
+    detail.contains("the staged git script is missing or is not the pinned text")
+        || detail.contains("the .git reader cannot declare its native calls")
 }
 
 /// Whether a failed Windows git script ran to its own failure (a terminating
@@ -4557,7 +4659,10 @@ mod tests {
     /// `objects/pack/` prefix on both sides.
     #[test]
     fn git_lock_suffix_matches_the_script_rule() {
-        use crate::deploy::transport::winps::{GIT_LOCK, GIT_REPLACE};
+        use crate::deploy::transport::winps::{
+            GIT_LOCK_STAGED as GIT_LOCK, GIT_REPLACE_STAGED as GIT_REPLACE,
+            GIT_UNLOCK_STAGED as GIT_UNLOCK,
+        };
         let hash = "a".repeat(40);
         let packs = [
             GitWriteName::PackFile(hash.clone()),
@@ -4581,7 +4686,7 @@ mod tests {
             assert_eq!(git_lock_suffix(name), ".lock");
             assert!(!name.rel().starts_with("objects/pack/"));
         }
-        for script in [GIT_LOCK, GIT_REPLACE] {
+        for script in [GIT_LOCK, GIT_UNLOCK, GIT_REPLACE] {
             assert!(
                 script.contains("if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'}"),
                 "the script derives the lock name by the same rule"
@@ -4657,7 +4762,10 @@ mod tests {
         assert_eq!(lock["o"], 0);
         assert_eq!(lock["w"][0], "refs/heads/production:5");
         let replace = win_params(&argv[3]);
-        assert_eq!(replace["w"][0], "refs/heads/production:5");
+        // the expected old values travel with each write (27-52, F4): unchecked
+        // for a write with the default old value
+        assert_eq!(replace["w"][0], "refs/heads/production:5:*:*");
+        assert_eq!(replace["o"], 0);
         assert_eq!(replace["q"], RENAME_RETRIES);
         assert_eq!(replace["r"], true, "the replace removes the stage");
         assert_eq!(replace["s"], name.as_str());
@@ -4727,6 +4835,129 @@ mod tests {
         let why = detail(t.write_git_files("CapApp", &write).await.expect_err("dead"));
         assert!(why.contains("the cleanup also failed"), "{why}");
         assert!(why.contains("production.lock"), "{why}");
+    }
+
+    /// 27-52 (F4): a replace that answers `err: changed` is a
+    /// `GIT_CHANGED_OPERATION` failure naming the file, followed by the unlock
+    /// over the unmoved entries (which removes the stage), and nothing else.
+    #[tokio::test]
+    async fn sftp_git_windows_changed_target_is_a_changed_operation() {
+        let write = win_write();
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
+        let (runner, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            ok_answer(),
+            ok("IGN-RESULT:{\"ok\":0,\"err\":\"changed\",\"i\":0,\"p\":0}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":1,\"kept\":0}\n"),
+        ]);
+        let err = t
+            .write_git_files("CapApp", &write)
+            .await
+            .expect_err("a changed target");
+        let CoreError::TransportFailed {
+            operation, detail, ..
+        } = &err
+        else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert_eq!(operation, GIT_CHANGED_OPERATION);
+        assert!(
+            detail.contains("refs/heads/production changed after the run read it"),
+            "{detail}"
+        );
+        assert!(!detail.contains("0123"), "no value in the error: {detail}");
+        let argv = runner.argv.lock().expect("argv").clone();
+        assert_eq!(argv.len(), 5, "stage, put, lock, replace, unlock");
+        let unlock = win_params(&argv[4]);
+        assert_eq!(unlock["r"], true, "the unlock removes the stage");
+        // packed-refs is named when it is what changed
+        let (_, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            ok_answer(),
+            ok("IGN-RESULT:{\"ok\":0,\"err\":\"changed\",\"i\":0,\"p\":1}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":1,\"kept\":0}\n"),
+        ]);
+        let err = t
+            .write_git_files("CapApp", &write)
+            .await
+            .expect_err("packed");
+        assert!(format!("{err:?}").contains("packed-refs changed after the run read it"));
+    }
+
+    /// 27-50: a staged script is run first and staged only when the host
+    /// refuses it (its file is missing or is not the pinned text): the check of
+    /// the staged files, one upload of the block's source and the script's text,
+    /// then the script again. The file stays between runs, so the next script
+    /// needs no check.
+    #[tokio::test]
+    async fn sftp_git_staged_script_is_staged_only_when_the_host_refuses_it() {
+        let write = win_write();
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
+        let refused = fail(
+            1,
+            "Exception: the staged git script is missing or is not the pinned text",
+        );
+        let (runner, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            refused,
+            stage_answer(0),
+            ok(""),
+            ok_answer(),
+            ok_answer(),
+        ]);
+        t.write_git_files("CapApp", &write).await.expect("write");
+        let argv = runner.argv.lock().expect("argv").clone();
+        let stdins = runner.stdins.lock().expect("stdins").clone();
+        assert_eq!(
+            argv.len(),
+            7,
+            "stage, put, lock (refused), check, upload, lock, replace"
+        );
+        let check = win_params(&argv[3]);
+        let lock_file = winps::STAGED_SCRIPTS
+            .iter()
+            .find(|st| st.name == "lock")
+            .expect("lock")
+            .file;
+        assert_eq!(
+            check["n"],
+            serde_json::json!([GIT_NATIVE_STAGED_FILE, lock_file])
+        );
+        let puts: Vec<&str> = stdins[4]
+            .lines()
+            .filter(|l| l.starts_with("put "))
+            .collect();
+        assert_eq!(
+            puts.len(),
+            2,
+            "the block's source and the script: {}",
+            stdins[4]
+        );
+        assert!(puts[1].contains(lock_file), "{}", puts[1]);
+        // a script refused once more after it was staged is the error
+        let (_, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            fail(
+                1,
+                "Exception: the staged git script is missing or is not the pinned text",
+            ),
+            stage_answer(1),
+            fail(
+                1,
+                "Exception: the staged git script is missing or is not the pinned text",
+            ),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":0,\"kept\":0}\n"),
+        ]);
+        let why = detail(
+            t.write_git_files("CapApp", &write)
+                .await
+                .expect_err("refused twice"),
+        );
+        assert!(why.contains("not the pinned text"), "{why}");
     }
 
     /// 27-33: a stage that exists is refused by the stage script and left

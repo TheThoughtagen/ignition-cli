@@ -18,7 +18,9 @@
 //!   unix machine has not. A script whose body starts with the block's loader
 //!   (`GIT_NATIVE_LOAD`) is run with a stand-in for `IgnGit.N` defined in the
 //!   same `pwsh` process before the exact encoded text: the same type, the same
-//!   seven methods and signatures, and managed semantics (the attributes of the
+//!   seven methods and signatures, and managed semantics (`FileId` is the file's
+//!   `stat` device and inode, `DeleteOnClose` deletes the file at once: a harness
+//!   difference, the handle is not what carries either on Windows; the attributes of the
 //!   path are read and a `ReparsePoint` is refused with the block's own text,
 //!   then the file is opened as a `SafeFileHandle`). The loader's type guard
 //!   sees the type and skips its own `Add-Type`, so the staged source is not
@@ -69,14 +71,22 @@ static void C(string p,int k){
 FileAttributes t=A(p);
 if((t&FileAttributes.ReparsePoint)!=0)throw new IOException("the path is a reparse point");
 if(((t&FileAttributes.Directory)!=0)!=(k==1))throw new IOException(k==1?"the path is not a directory":"the path is not a regular file");}
-public static SafeFileHandle OpenDir(string p){L("D",p);C(p,1);return new SafeFileHandle(IntPtr.Zero,false);}
-public static SafeFileHandle OpenFile(string p){L("F",p);C(p,2);return File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);}
+static System.Runtime.CompilerServices.ConditionalWeakTable<SafeFileHandle,string> M=new System.Runtime.CompilerServices.ConditionalWeakTable<SafeFileHandle,string>();
+static SafeFileHandle R(SafeFileHandle h,string p){M.Add(h,p);return h;}
+public static SafeFileHandle OpenDir(string p){L("D",p);C(p,1);return R(new SafeFileHandle(IntPtr.Zero,false),p);}
+public static SafeFileHandle OpenFile(string p){L("F",p);C(p,2);return R(File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete),p);}
 public static SafeFileHandle CreateNew(string p){
-L("N",p);try{return File.OpenHandle(p,FileMode.CreateNew,FileAccess.Write,FileShare.None);}
+L("N",p);try{return R(File.OpenHandle(p,FileMode.CreateNew,FileAccess.Write,FileShare.None),p);}
 catch(IOException){throw X("cannot open the path",80);}}
-public static SafeFileHandle OpenForDelete(string p){L("X",p);C(p,2);return File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete);}
-public static string FileId(SafeFileHandle h){return BitConverter.ToString(BitConverter.GetBytes(h.DangerousGetHandle().ToInt64())).Replace("-","").PadRight(48,(char)48);}
-public static void DeleteOnClose(SafeFileHandle h){throw new IOException("DeleteOnClose has no stand-in");}
+public static SafeFileHandle OpenForDelete(string p){L("X",p);C(p,2);return R(File.OpenHandle(p,FileMode.Open,FileAccess.Read,FileShare.ReadWrite|FileShare.Delete),p);}
+static string S(string p,string f){
+var i=new System.Diagnostics.ProcessStartInfo("stat"){RedirectStandardOutput=true,RedirectStandardError=true,UseShellExecute=false};
+i.ArgumentList.Add(f);i.ArgumentList.Add("%d:%i");i.ArgumentList.Add(p);
+using(var q=System.Diagnostics.Process.Start(i)){string o=q.StandardOutput.ReadToEnd().Trim();q.WaitForExit();return q.ExitCode==0?o:null;}}
+public static string FileId(SafeFileHandle h){string p;if(!M.TryGetValue(h,out p))throw new IOException("the handle has no path in the stand-in");
+string t=S(p,"-c")??S(p,"-f");if(t==null)throw new IOException("stat failed in the stand-in");
+return BitConverter.ToString(System.Text.Encoding.ASCII.GetBytes(t)).Replace("-","");}
+public static void DeleteOnClose(SafeFileHandle h){string p;if(!M.TryGetValue(h,out p))throw new IOException("the handle has no path in the stand-in");File.Delete(p);}
 public static void Move(string a,string b,bool replace){
 if(!replace&&File.Exists(b))throw X("cannot move the file",183);
 File.Move(a,b,replace);}
@@ -174,7 +184,8 @@ fn with_standin(encoded: &str) -> String {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let text = String::from_utf16(&units).expect("utf16");
-    if !text.contains(GIT_NATIVE_LOAD) {
+    // a staged script's stub does not carry the loader: the staged file does
+    if !text.contains(GIT_NATIVE_LOAD) && !text.contains("IgnGitScript-") {
         return encoded.to_string();
     }
     let prefixed = format!("Add-Type -Path '{}';{text}", standin_assembly().display());
@@ -207,8 +218,51 @@ fn output_logged(
     standin: bool,
     log: Option<&std::path::Path>,
 ) -> Result<ProcessOutput, String> {
+    output_budgeted(script, standin, log, COMMAND_BUDGET, true)
+}
+
+/// The staged file of `script` (when it is the stub of one) where the stub
+/// reads it, below the account home of its parameters, as the transport's
+/// upload leaves it.
+fn stage_script(script: &WinScript) -> Result<(), String> {
+    let Some(staged) = script.staged() else {
+        return Ok(());
+    };
+    let home = script.params["h"]
+        .as_str()
+        .ok_or_else(|| "a staged script needs the account home in `h`".to_string())?;
+    let dir = std::path::Path::new(home).join(GIT_NATIVE_STAGED_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("staged dir: {e}"))?;
+    std::fs::write(dir.join(staged.file), staged.text).map_err(|e| format!("staged file: {e}"))
+}
+
+/// [`run`] with a command budget of `usize::MAX`: only for a test-only variant
+/// of a staged body (its text with one step changed), which is the file on a
+/// host and so never a command.
+pub fn run_unbudgeted(script: &WinScript) -> Result<serde_json::Value, String> {
+    let out = output_budgeted(script, true, None, usize::MAX, true)?;
+    interpret_output(&out, 600, None)
+}
+
+/// [`run`] without putting the staged file in place first: the stub meets the
+/// file (or the lack of one) a test left, as on a host where it was changed.
+pub fn run_as_staged(script: &WinScript) -> Result<serde_json::Value, String> {
+    let out = output_budgeted(script, true, None, COMMAND_BUDGET, false)?;
+    interpret_output(&out, 600, None)
+}
+
+fn output_budgeted(
+    script: &WinScript,
+    standin: bool,
+    log: Option<&std::path::Path>,
+    budget: usize,
+    stage: bool,
+) -> Result<ProcessOutput, String> {
     let pwsh = pwsh().ok_or_else(|| "no pwsh".to_string())?;
-    let command = encoded_command(script, COMMAND_BUDGET)?;
+    if stage {
+        stage_script(script)?;
+    }
+    let command = encoded_command(script, budget)?;
     let encoded = command
         .as_str()
         .strip_prefix("powershell -NoProfile -NonInteractive -EncodedCommand ")
@@ -350,7 +404,7 @@ pub fn run_restore(
     let staged = saved.as_ref().ok().map(|_| manifest_of(&stage, home));
     let equal = matches!((&saved, &staged), (Ok(a), Some(Ok(b))) if a == b);
     let moved = run(&WinScript::git_restore_move(
-        "", data, project, run_id, !equal,
+        "", data, project, home, run_id, !equal,
     ));
     if !equal {
         return Err(match (saved, staged) {
