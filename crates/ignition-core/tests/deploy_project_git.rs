@@ -2789,6 +2789,114 @@ mod published {
         assert!(!rig.save_trees().is_empty(), "the save is kept");
     }
 
+    const VIEW_RES: &str = "com.inductiveautomation.perspective/views/V/resource.json";
+    const UTIL2_RES: &str = "ignition/script-python/cap/util2/resource.json";
+
+    /// The live over-count of 2026-11-18 (27-LIVE-CAPTURES.md, `git_prodscale_rig`
+    /// after X3). The disk holds release-form bytes for the resources the
+    /// release leaves alone, the import rewrites only the resources whose
+    /// content changed, and every export renders the gateway's form. The run
+    /// predicted every `resource.json` and `project.json` while the disk status
+    /// listed only the rewritten ones.
+    #[tokio::test]
+    async fn unchanged_resources_keep_release_bytes_on_disk() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_rewrites_changed_only()
+                .with_disk_mirror_gateway_form(&[VIEW_RES, UTIL_RES, UTIL2_RES])
+        });
+        let project = rig.f.project_dir();
+        let view_before = std::fs::read(project.join(VIEW_RES)).expect("V descriptor");
+        let project_json_before = std::fs::read(project.join("project.json")).expect("manifest");
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?} {:?} {:?}",
+            restore.reason,
+            restore.post_status,
+            restore.post_status_note
+        );
+        assert!(result.ok && result.slug.is_none());
+        assert!(restore.advanced && restore.verified, "{restore:?}");
+        assert_eq!(restore.post_status, Some("matched"));
+        // The disk of the unchanged resource and of the manifest is untouched.
+        assert_eq!(
+            std::fs::read(project.join(VIEW_RES)).expect("V descriptor"),
+            view_before,
+            "the import left V alone"
+        );
+        assert_eq!(
+            std::fs::read(project.join("project.json")).expect("manifest"),
+            project_json_before,
+            "the import left project.json alone"
+        );
+        // What JGit lists is what the run predicted: the changed resource and
+        // the new one, never the unchanged ones.
+        let drift = git_of(&result)
+            .expected_drift
+            .clone()
+            .expect("drift known after advance");
+        assert_eq!(drift, vec![UTIL_RES.to_string(), UTIL2_RES.to_string()]);
+        assert!(!drift.iter().any(|p| p == VIEW_RES || p == "project.json"));
+        assert_eq!(rig.f.status_paths(), drift);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+    }
+
+    /// The case 27-24 measured: every descriptor and the manifest on disk are
+    /// already in the gateway's form (the module's clone wrote them so). The
+    /// unchanged resource is not rewritten and still differs from the release,
+    /// so it is drift, and the run is green. A regression guard: green before and
+    /// after the 27-40 fix.
+    #[tokio::test]
+    async fn gateway_form_disk_predicts_every_rewritten_form() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_rewrites_changed_only()
+                .with_disk_mirror_gateway_form(&[VIEW_RES, UTIL_RES, UTIL2_RES])
+        });
+        let project = rig.f.project_dir();
+        for rel in [VIEW_RES, UTIL_RES] {
+            let text = std::fs::read(project.join(rel)).expect("descriptor");
+            let value: serde_json::Value = serde_json::from_slice(&text).expect("json");
+            let mut pretty = serde_json::to_vec_pretty(&value).expect("pretty");
+            pretty.push(b'\n');
+            assert_ne!(pretty, text, "{rel} must change when re-serialised");
+            std::fs::write(project.join(rel), pretty).expect("the gateway form");
+        }
+        // The manifest in the form an export carries it (`description` and
+        // `parent` added, C8b/C8c), so the unchanged manifest is gateway form.
+        std::fs::write(
+            project.join("project.json"),
+            br#"{"description":"","parent":"","title":"CapApp"}"#,
+        )
+        .expect("the gateway form of the manifest");
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?} {:?} {:?}",
+            restore.reason,
+            restore.post_status,
+            restore.post_status_note
+        );
+        assert_eq!(restore.post_status, Some("matched"));
+        let drift = git_of(&result)
+            .expected_drift
+            .clone()
+            .expect("drift known after advance");
+        assert_eq!(
+            drift,
+            vec![
+                VIEW_RES.to_string(),
+                UTIL_RES.to_string(),
+                UTIL2_RES.to_string(),
+                "project.json".to_string(),
+            ]
+        );
+        assert_eq!(rig.f.status_paths(), drift);
+    }
+
     #[test]
     fn post_advance_status_not_checked_on_ssh() {
         use ignition_core::actions::deploy_projects::git::{PostStatusMode, RestoreInfo};
@@ -7540,6 +7648,25 @@ mod published {
             true,
             Some(common::fake_projects::ProjectJsonFate::Absent),
         );
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_backup_project_json_failure(&rig, &result);
+        assert_project_json_warning(&result, "is absent after the deploy");
+        assert!(!backup_project_json(&rig).exists());
+    }
+
+    /// The 27-37 detection under the 27-40 knob: the backup's import rewrites
+    /// only the changed resources and the redundancy sync still deletes its
+    /// `project.json`. The run fails loudly with the same decided outcome.
+    #[tokio::test]
+    async fn backup_project_json_absent_still_fails_loudly() {
+        let rig = pair();
+        let mut backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let gw = std::mem::take(&mut backup.gw);
+        backup.gw = gw.with_disk_mirror_rewrites_changed_only();
         let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
         assert_backup_project_json_failure(&rig, &result);
         assert_project_json_warning(&result, "is absent after the deploy");

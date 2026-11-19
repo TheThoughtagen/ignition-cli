@@ -121,7 +121,8 @@
 //! first), R-6 (a project that is not registered keeps its `.git` and
 //! the files outside the artifact's roots), and G2 (the bytes on disk equal
 //! the bytes of the next export, so the mirror writes what an export
-//! carries). `with_disk_mirror_gateway_form(paths)` keeps those
+//! carries; that holds only for the resources the import rewrites, see
+//! `with_disk_mirror_rewrites_changed_only`). `with_disk_mirror_gateway_form(paths)` keeps those
 //! `resource.json` members pretty-printed in the store, so the disk and
 //! every later export carry the gateway's own serialisation (R-1).
 //! `with_disk_mirror_readonly_after_import()` makes the project directory
@@ -131,6 +132,16 @@
 //! redundancy project sync on a backup (27-37): the import's `project.json`
 //! is deleted from disk or replaced by a directory, while the export still
 //! carries it.
+//!
+//! `with_disk_mirror_rewrites_changed_only()` models the finding of the live
+//! re-run of 2026-11-18 (27-LIVE-CAPTURES.md, `git_prodscale_rig` after X3,
+//! Diagnosis): the gateway's overwrite import rewrites only the resources
+//! whose content changed, and every other resource keeps the bytes it had on
+//! disk, while every export still renders the gateway's own form. A resource
+//! is a folder with a `resource.json` (with its members) or a lone member
+//! (`project.json`); it is unchanged when the import holds the same member
+//! paths with the same content (JSON members compare as values, not as
+//! bytes). G2 therefore holds only for the resources an import rewrites.
 //!
 //! The one write is `project_import` (25-11). Nothing ever adds a delete,
 //! rename, copy, modify or reparent method, so the engine suite can never pass
@@ -305,6 +316,10 @@ struct DiskMirror {
     /// What the redundancy project sync does to the backup's `project.json`
     /// after the import wrote it (27-37, debug backup-project-json-absent).
     project_json: Option<ProjectJsonFate>,
+    /// An import rewrites only the resources whose content changed; the
+    /// files of every other resource keep the bytes they have on disk
+    /// (27-40, the live finding of 2026-11-18).
+    rewrites_changed_only: bool,
 }
 
 /// What happens to `<project>/project.json` on a mirrored node right after
@@ -457,7 +472,22 @@ impl FakeProjects {
             extra_on_disk: Vec::new(),
             recreates_git: false,
             project_json: None,
+            rewrites_changed_only: false,
         });
+        self
+    }
+
+    /// An import rewrites only the resources whose content changed, as the
+    /// live gateway did on 2026-11-18 (module doc); the files of the others
+    /// keep the bytes they have on disk. Needs [`Self::with_disk_mirror`].
+    #[allow(dead_code)]
+    pub fn with_disk_mirror_rewrites_changed_only(self) -> Self {
+        self.mirror
+            .lock()
+            .expect("mirror")
+            .as_mut()
+            .expect("with_disk_mirror first")
+            .rewrites_changed_only = true;
         self
     }
 
@@ -531,12 +561,29 @@ impl FakeProjects {
     }
 
     /// Write the stored project below the mirror's data directory.
-    fn mirror_write(&self, name: &str, stored: &StoredProject) {
+    /// `unchanged` are the members of resources this import leaves alone
+    /// (empty unless the mirror rewrites changed resources only).
+    fn mirror_write(
+        &self,
+        name: &str,
+        stored: &StoredProject,
+        unchanged: &std::collections::BTreeSet<String>,
+    ) {
         let guard = self.mirror.lock().expect("mirror");
         let Some(mirror) = guard.as_ref() else {
             return;
         };
         let dir = mirror.data_dir.join("projects").join(name);
+        // What an unchanged member holds on disk now, taken before the
+        // directory is emptied and put back after.
+        let kept: BTreeMap<String, Vec<u8>> = unchanged
+            .iter()
+            .filter_map(|path| {
+                std::fs::read(dir.join(path))
+                    .ok()
+                    .map(|bytes| (path.clone(), bytes))
+            })
+            .collect();
         let artifact_root = |entry: &str| {
             entry == "project.json"
                 || entry == "ignition"
@@ -568,7 +615,12 @@ impl FakeProjects {
         for (path, bytes) in &stored.members {
             let target = dir.join(path);
             std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
-            std::fs::write(target, self.exported_bytes(stored, path, bytes)).expect("write");
+            match kept.get(path) {
+                Some(held) => std::fs::write(target, held).expect("write"),
+                None => {
+                    std::fs::write(target, self.exported_bytes(stored, path, bytes)).expect("write")
+                }
+            }
         }
         for path in &mirror.extra_on_disk {
             let target = dir.join(path);
@@ -1836,9 +1888,15 @@ impl ProjectGateway for FakeProjects {
                 .filter(|p| !p.is_empty())
                 .map(str::to_string);
         }
+        let unchanged = match self.mirror.lock().expect("mirror").as_ref() {
+            Some(mirror) if mirror.rewrites_changed_only => {
+                unchanged_members(projects.get(name).map(|p| &p.members), &members)
+            }
+            _ => std::collections::BTreeSet::new(),
+        };
         projects.insert(name.to_string(), StoredProject { record, members });
         if let Some(stored) = projects.get(name) {
-            self.mirror_write(name, stored);
+            self.mirror_write(name, stored, &unchanged);
         }
         let changes = if self.empty_changes.load(Ordering::SeqCst) {
             serde_json::json!([])
@@ -2166,6 +2224,79 @@ fn adopt(zip: &[u8]) -> BTreeMap<String, Vec<u8>> {
         );
     }
     kept
+}
+
+/// The members of the resources an import leaves alone (27-40): a resource is
+/// a folder holding a `resource.json` (the longest such ancestor of a member)
+/// or a lone member, and it is unchanged when `new` holds the same member paths
+/// as `old` with the same content. JSON members compare as values, so the
+/// gateway's own serialisation of an unchanged descriptor does not read as a
+/// change.
+fn unchanged_members(
+    old: Option<&BTreeMap<String, Vec<u8>>>,
+    new: &BTreeMap<String, Vec<u8>>,
+) -> std::collections::BTreeSet<String> {
+    let Some(old) = old else {
+        return std::collections::BTreeSet::new();
+    };
+    let roots: Vec<String> = old
+        .keys()
+        .chain(new.keys())
+        .filter_map(|p| p.strip_suffix("/resource.json"))
+        .map(str::to_string)
+        .collect();
+    let group_of = |path: &str| -> String {
+        roots
+            .iter()
+            .filter(|r| path.starts_with(&format!("{r}/")))
+            .max_by_key(|r| r.len())
+            .cloned()
+            .unwrap_or_else(|| path.to_string())
+    };
+    let same = |path: &str, a: &[u8], b: &[u8]| -> bool {
+        if a == b {
+            return true;
+        }
+        if !path.ends_with(".json") {
+            return false;
+        }
+        match (
+            serde_json::from_slice::<serde_json::Value>(a),
+            serde_json::from_slice::<serde_json::Value>(b),
+        ) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => false,
+        }
+    };
+    type Side<'a> = BTreeMap<&'a str, &'a [u8]>;
+    let mut groups: BTreeMap<String, (Side<'_>, Side<'_>)> = BTreeMap::new();
+    for (path, bytes) in old {
+        groups
+            .entry(group_of(path))
+            .or_default()
+            .0
+            .insert(path, bytes);
+    }
+    for (path, bytes) in new {
+        groups
+            .entry(group_of(path))
+            .or_default()
+            .1
+            .insert(path, bytes);
+    }
+    let mut unchanged = std::collections::BTreeSet::new();
+    for (before, after) in groups.values() {
+        let alike = before.len() == after.len()
+            && before.iter().all(|(path, bytes)| {
+                after
+                    .get(path)
+                    .is_some_and(|other| same(path, bytes, other))
+            });
+        if alike {
+            unchanged.extend(after.keys().map(|p| (*p).to_string()));
+        }
+    }
+    unchanged
 }
 
 /// An import of `nodes` into `level` under `policy`, as 26-LIVE-CAPTURES.md
