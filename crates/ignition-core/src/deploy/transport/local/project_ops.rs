@@ -2081,7 +2081,10 @@ fn free_space_command(path: &Path) -> std::process::Command {
             "-Command",
             FREE_SPACE_SCRIPT,
         ])
-        .env(FREE_PATH_ENV, path);
+        .env(FREE_PATH_ENV, path)
+        // The git read token belongs to the two remote git reads only
+        // (T-27-41 scope, 27-SECURITY.md auditor note 2).
+        .env_remove(crate::deploy::git_remote::GIT_TOKEN_ENV);
     command
 }
 
@@ -3117,13 +3120,30 @@ mod tests {
                     )
                 })
                 .collect();
-            assert_eq!(
-                env,
-                vec![(FREE_PATH_ENV.to_string(), Some(hostile.to_string()))]
-            );
+            // The path is the one value set; the git read token is the one
+            // variable removed (27-56, T-27-197).
+            let mut want = vec![
+                (FREE_PATH_ENV.to_string(), Some(hostile.to_string())),
+                (crate::deploy::git_remote::GIT_TOKEN_ENV.to_string(), None),
+            ];
+            want.sort();
+            let mut env = env;
+            env.sort();
+            assert_eq!(env, want);
         }
         assert!(FREE_SPACE_SCRIPT.contains("$env:IGN_FREE_PATH"));
         assert!(!FREE_SPACE_SCRIPT.contains("$args"));
+    }
+
+    /// 27-56 (T-27-197): the PowerShell free-space child does not inherit the
+    /// git read token either.
+    #[test]
+    fn free_space_command_removes_the_git_token() {
+        let command = free_space_command(Path::new("C:\\data"));
+        let removed = command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(crate::deploy::git_remote::GIT_TOKEN_ENV) && value.is_none()
+        });
+        assert!(removed, "free_space_command must env_remove the git token");
     }
 
     #[tokio::test]
