@@ -6088,7 +6088,13 @@ branch and remote-tracking ref move to the release, and the index marks the
 paths the import removed as assume-unchanged. Every written file is read back.
 On success the save is removed. The advance writes only files below `.git`,
 lock-and-rename, and a `.git` that is not the one the advance was prepared
-against stops the run with `git_recreated` and is left as it is.
+against stops the run with `git_recreated` and is left as it is. On a node the
+deploy account reaches as a local directory, the saved copy is put in place
+with a rename that cannot replace anything, an empty directory included, so a
+`.git` that appears while the copy is staged is kept and the run reports it; a
+host whose file system cannot refuse to replace fails the restore with `the
+host cannot publish without replacing` (`git_restore_failed`, the save kept and
+named) and never falls back to a plain rename.
 
 A **`record`** advances the repository in place the same way (the `.git` was
 never removed, so there is no restore) and removes the save.

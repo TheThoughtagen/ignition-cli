@@ -300,6 +300,14 @@ pub struct GitSize {
 ///
 /// Every answer is fail-closed: a `.git` that cannot be read is
 /// [`CoreError::TransportFailed`], never an absent one.
+///
+/// On a local node every read is relative to directory handles opened level by
+/// level without following a link (unix: `openat(O_NOFOLLOW)`; Windows: levels
+/// held without delete sharing and a reparse point refused on the handle), so
+/// a level or file swapped for a symlink after the walk fails the read naming
+/// it (tests `local_git_state_refuses_a_level_swapped_after_the_open`,
+/// `local_git_state_refuses_a_file_swapped_after_the_open`,
+/// `local_git_manifest_refuses_a_directory_swapped_during_the_walk`).
 #[async_trait::async_trait]
 pub trait GitHostRead: Send + Sync {
     /// The fixed files of `<data_dir>/projects/<project>/.git`, under the
@@ -415,11 +423,29 @@ pub trait GitHostRead: Send + Sync {
 ///   leaving no save behind. The save is private (0700 directories on Unix).
 /// - [`restore_git`](Self::restore_git) creates `.git` from that save only when
 ///   `.git` is absent; it never replaces, deletes or renames an existing one.
+///   On a local node the staged copy is published with a rename that cannot
+///   replace (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)`
+///   on macOS), so a `.git` that appears meanwhile, an empty directory
+///   included, is kept (test
+///   `local_git_restore_keeps_an_empty_git_planted_before_the_publish`); a host
+///   whose file system does not know the flag fails closed with "the host
+///   cannot publish without replacing" and there is no plain-rename fallback
+///   (`local_noreplace_unsupported_fails_closed`). On Windows std's rename
+///   refuses a directory target (`local_git_restore_refuses_an_existing_git_on_windows`).
 /// - [`write_git_files`](Self::write_git_files) writes the fixed
 ///   [`GitWriteName`](crate::deploy::git_advance::GitWriteName) files inside an
 ///   existing `.git`, each through `<name>.lock` created exclusively and then
 ///   renamed over the file (packs through a private sibling). An existing lock
-///   refuses the write and nothing is written.
+///   refuses the write and nothing is written. On a local node every write is
+///   made through handles opened from the held `.git`: each parent is opened or
+///   made one level at a time without following a link, the lock is created
+///   with `O_CREAT | O_EXCL | O_NOFOLLOW` in the parent's handle, and the
+///   publish is a `renameat` inside that handle, so a parent swapped for a
+///   symlink after the preflight is refused and nothing is created behind it
+///   (`local_git_write_refuses_a_parent_swapped_after_the_preflight`,
+///   `local_git_write_refuses_a_git_swapped_after_the_open`). A failed write
+///   removes only the lock this call created, by identity
+///   (`local_git_write_failure_keeps_a_foreign_lock_at_the_same_name`).
 /// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
 ///   of one run and nothing else; no save directory is named `.git`.
 /// - [`probe_write`](Self::probe_write) creates and removes one probe file in
