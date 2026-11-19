@@ -6949,7 +6949,13 @@ mod winps_git_native {
     /// The loader is fixed text with the fail-closed shape of the record
     /// replace's (25-20, G-25-5): FullLanguage first, the type guard, one
     /// `Add-Type` inside a try whose catch throws a fixed prefix plus the
-    /// bounded cause. It embeds the pinned block, once, and nothing else.
+    /// bounded cause. Since 27-49 it is the staged loader (the layout 27-48
+    /// chose): it carries the pin, not the block, reads the staged source once
+    /// as bytes, compares their SHA-256 with the pin and compiles those same
+    /// bytes. Each assertion the inline loader had has its staged form here
+    /// (the block is no longer in the loader, so "the block is in it once"
+    /// became "the pin is in it once", and "no parameter is read" became "the
+    /// only parameter is the account home").
     #[test]
     fn git_native_load_is_fixed_fail_closed_text() {
         let load = winps::GIT_NATIVE_LOAD;
@@ -6973,16 +6979,48 @@ mod winps_git_native {
             load.ends_with(tail),
             "the catch throws the fixed prefix and IgnCause"
         );
-        // outside the C# (which has a catch of its own): IgnCause's catch and the loader's
-        let powershell = load.replace(winps::GIT_NATIVE_CS, "");
-        assert_eq!(powershell.matches("catch{").count(), 2);
-        // the block is compiled from exactly the pinned text, once
-        let literal = format!("Add-Type -TypeDefinition '{}'", winps::GIT_NATIVE_CS);
-        assert_eq!(load.matches(&literal).count(), 1);
-        assert_eq!(
-            load.matches(winps::GIT_NATIVE_CS).count(),
-            1,
-            "the pinned text is in the loader once"
+        // outside the helpers' own catch and the loader's: two
+        assert_eq!(load.matches("catch{").count(), 2);
+
+        // the source is the staged file, read once as bytes; the bytes
+        // hashed are the bytes compiled
+        assert_eq!(load.matches("ReadAllBytes(").count(), 1, "one read");
+        assert_eq!(load.matches("$ib=").count(), 1, "one buffer");
+        assert_eq!(load.matches("ComputeHash($ib)").count(), 1, "hashed once");
+        assert_eq!(load.matches("GetString($ib)").count(), 1, "compiled once");
+        let read = load.find("ReadAllBytes(").expect("read");
+        let hash = load.find("ComputeHash($ib)").expect("hash");
+        let compare = load
+            .find(&format!(" -ne '{}'", winps::GIT_NATIVE_SHA256))
+            .expect("compare with the pin");
+        let refuse = load
+            .find("throw 'the staged source is not the pinned text'")
+            .expect("refusal");
+        let compile = load
+            .find("Add-Type -TypeDefinition ([Text.Encoding]::ASCII.GetString($ib))")
+            .expect("compile the bytes read");
+        assert!(
+            read < hash && hash < compare && compare < refuse && refuse < compile,
+            "read, hash, compare, refuse, and only then compile"
+        );
+        // the pin is written in this text, once (the loader does not read it
+        // from the file or from a parameter), and so is the file's name
+        assert_eq!(load.matches(winps::GIT_NATIVE_SHA256).count(), 1);
+        assert!(load.contains(&format!(" -ne '{}')", winps::GIT_NATIVE_SHA256)));
+        let pin12 = &winps::GIT_NATIVE_SHA256[..12];
+        assert_eq!(load.matches(pin12).count(), 2, "name and pin");
+        assert!(load.contains(&format!(
+            "[IO.Path]::Combine($p.h,'ign-deploy','git-native','IgnGitNative-{pin12}.cs')"
+        )));
+        // the home is the only parameter it reads
+        assert_eq!(load.matches("$p.").count(), 1);
+        assert_eq!(load.matches("$p.h").count(), 1);
+        // the loader does not carry the source it compiles
+        assert!(!load.contains(winps::GIT_NATIVE_CS));
+        assert!(!load.contains("DllImport"));
+        assert!(
+            load.chars().count() <= 1200,
+            "the staged loader stays short"
         );
         // the bounded-cause helpers are the record replace's, character for
         // character (the loader is not a second implementation of them)
@@ -6993,10 +7031,35 @@ mod winps_git_native {
             load.contains(&record[from..to]),
             "IgnLine and IgnCause match the record replace's"
         );
-        // no parameter is read and nothing is evaluated here
-        assert!(!load.contains("$p."));
+        // nothing is evaluated here
         for forbidden in ["Invoke-Expression", "iex ", "Start-Process", "-Command"] {
             assert!(!load.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    /// The names the loader, the staging script and the upload share are one:
+    /// the file `IgnGitNative-<first 12 digits of the pin>.cs` in
+    /// `ign-deploy/git-native`, and a first 12 digits that really are the
+    /// pin's.
+    #[test]
+    fn git_native_staged_names_agree_with_the_pin() {
+        let pin12 = &winps::GIT_NATIVE_SHA256[..12];
+        assert_eq!(
+            winps::GIT_NATIVE_STAGED_FILE,
+            format!("IgnGitNative-{pin12}.cs")
+        );
+        assert_eq!(winps::GIT_NATIVE_STAGED_DIR, "ign-deploy/git-native");
+        let script = winps::WinScript::git_native_stage("C:\\Users\\svc");
+        assert_eq!(script.params["n"], winps::GIT_NATIVE_STAGED_FILE);
+        assert_eq!(script.params["s"], winps::GIT_NATIVE_SHA256);
+        assert_eq!(script.params["h"], "C:\\Users\\svc");
+        assert!(
+            !script.loads_native(),
+            "the staging script compiles nothing"
+        );
+        for part in winps::WinScript::git_state("C:\\gw\\.git", &["shallow"], "C:\\Users\\svc") {
+            assert!(part.loads_native(), "{} loads the block", part.name);
+            assert_eq!(part.params["h"], "C:\\Users\\svc", "{}", part.name);
         }
     }
 }
@@ -7043,8 +7106,9 @@ mod winps_git {
         let chunk: Vec<(String, u64)> =
             sized[..ignition_core::deploy::transport::sftp::GIT_WIN_CHUNK].to_vec();
         let stage = format!("git-stage-{}", "R".repeat(64));
-        vec![
-            WinScript::git_state(&git, GIT_MARKERS),
+        let mut all = WinScript::git_state(&git, GIT_MARKERS, home);
+        all.push(WinScript::git_native_stage(home));
+        all.extend(vec![
             WinScript::git_save(prefix, data, &project, home, &gateway, &run),
             WinScript::git_restore(prefix, data, &project, home, &gateway, &run),
             WinScript::git_manifest(prefix, &git),
@@ -7068,13 +7132,16 @@ mod winps_git {
             WinScript::git_free(home, &save_rel),
             WinScript::git_yaml(data, 1_048_576),
             WinScript::project_digests(prefix, data, &project, 100_000),
-        ]
+        ]);
+        all
     }
 
     #[test]
     fn winps_git_scripts_fit_budget() {
         let scripts = maximal();
-        assert_eq!(scripts.len(), 16);
+        // sixteen constructors, of which the state read is three scripts
+        // (27-49), and the staging script of the reviewed block's source
+        assert_eq!(scripts.len(), 16 - 1 + 3 + 1);
         for script in &scripts {
             let command = winps::encoded_command(script, COMMAND_BUDGET)
                 .unwrap_or_else(|why| panic!("{}: {why}", script.name));
@@ -7084,8 +7151,11 @@ mod winps_git {
                 script.name
             );
             assert!(used <= COMMAND_BUDGET, "{}", script.name);
-            if script.name == "project_digests" {
-                // 27-41: room for a longer script or parameter later
+            if script.name == "project_digests" || script.loads_native() {
+                // 27-41: room for a longer script or parameter later; 27-49:
+                // the same for every script that carries the reviewed block's
+                // loader (a script that does not fit is split at a step
+                // boundary, never truncated)
                 assert!(used + 200 <= COMMAND_BUDGET, "{}", script.name);
             }
         }
@@ -7294,6 +7364,9 @@ mod winps_git {
     fn winps_git_params_only() {
         let bodies = [
             ("GIT_STATE", winps::GIT_STATE),
+            ("GIT_STATE_MARKS", winps::GIT_STATE_MARKS),
+            ("GIT_STATE_REFS", winps::GIT_STATE_REFS),
+            ("GIT_NATIVE_STAGE", winps::GIT_NATIVE_STAGE),
             ("GIT_SAVE", winps::GIT_SAVE),
             ("GIT_RESTORE", winps::GIT_RESTORE),
             ("GIT_MANIFEST", winps::GIT_MANIFEST),
@@ -7336,8 +7409,14 @@ mod winps_git {
         assert_eq!(params_only_problem(&good), Ok(()));
         assert_eq!(params_only_problem(script), Ok(()), "and one without it");
 
-        let altered_block = load.replacen("IsInvalid", "IsInvalid ", 1);
+        // the staged loader carries the pin, not the block (27-49): an edit of
+        // the pin (the hash the staged bytes are compared with) is the edit
+        // the reviewed text must not admit
+        let compare = format!(" -ne '{}'", winps::GIT_NATIVE_SHA256);
+        let altered_block = load.replacen(&compare, &format!(" -ne '{}'", "0".repeat(64)), 1);
         assert_ne!(altered_block, load, "the alteration took");
+        let altered_file = load.replacen("IgnGitNative-", "IgnGitNative2-", 1);
+        assert_ne!(altered_file, load, "the alteration took");
         let broken: Vec<(&str, String)> = vec![
             (
                 "an Add-Type that is not the loader",
@@ -7354,8 +7433,12 @@ mod winps_git {
                 format!("add-type -TypeDefinition 'class A{{}}';{script}"),
             ),
             (
-                "a loader whose block was edited",
+                "a loader whose pin was edited",
                 format!("{altered_block}{script}"),
+            ),
+            (
+                "a loader that reads another file",
+                format!("{altered_file}{script}"),
             ),
             (
                 "a second declaration by another road",
@@ -7393,31 +7476,38 @@ mod winps_git {
         }
     }
 
-    /// The staged loader of the budget table (27-48, layout B): the same head as
-    /// the inline loader (FullLanguage check and the bounded-cause helpers),
-    /// then it reads the source file the run uploaded to
-    /// `<home>\ign-deploy\git-native\IgnGitNative-<pin12>.cs`, compares the
-    /// SHA-256 of the bytes it read with the pin written in its own text, and
-    /// compiles those same bytes, decoded. The bytes hashed are the bytes
-    /// compiled. This is a measuring draft: no script carries it.
-    fn staged_loader() -> String {
-        let load = winps::GIT_NATIVE_LOAD;
-        let head = load
-            .split_once("if(-not ('IgnGit.N' -as [type])){try{Add-Type")
-            .expect("the inline loader's guard")
+    /// The inline loader of the budget table (27-48, layout A): the staged
+    /// loader's head (FullLanguage check and the bounded-cause helpers), then
+    /// the whole block as the `Add-Type` source. A measuring text only: no
+    /// script carries it, and since 27-49 `GIT_NATIVE_LOAD` is the staged loader
+    /// (the layout the user chose), so this one is built from it and the block.
+    fn inline_loader() -> String {
+        let head = winps::GIT_NATIVE_LOAD
+            .split_once("if(-not ('IgnGit.N' -as [type])){try{")
+            .expect("the staged loader's guard")
             .0;
-        let pin = winps::GIT_NATIVE_SHA256;
-        let pin12 = &pin[..12];
         format!(
-            "{head}if(-not ('IgnGit.N' -as [type])){{try{{$ib=[IO.File]::ReadAllBytes([IO.Path]::Combine($p.h,'ign-deploy','git-native','IgnGitNative-{pin12}.cs'));if([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($ib)).Replace('-','').ToLower() -ne '{pin}'){{throw 'the staged source is not the pinned text'}};Add-Type -TypeDefinition ([Text.Encoding]::ASCII.GetString($ib))}}catch{{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}}}};"
+            "{head}if(-not ('IgnGit.N' -as [type])){{try{{Add-Type -TypeDefinition '{}'}}catch{{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}}}};",
+            winps::GIT_NATIVE_CS
         )
     }
 
-    /// The encoded length of `script` with `prefix` in front of its body. The
-    /// staged layout needs the account home in `$p.h`; a script that does not
-    /// carry one gets it for the measurement (it is part of the staged cost).
+    /// The body of `script` without the reviewed block's loader, when it has
+    /// one: the text the table puts each loader in front of.
+    fn bare_body(script: &WinScript) -> &'static str {
+        script
+            .body
+            .strip_prefix(winps::GIT_NATIVE_LOAD)
+            .unwrap_or(script.body)
+    }
+
+    /// The encoded length of `script` with `prefix` in front of its bare body.
+    /// The staged layout needs the account home in `$p.h`; a script that does
+    /// not carry one gets it for the measurement (it is part of the staged
+    /// cost).
     fn encoded_with(script: &WinScript, prefix: &str, staged_home: Option<&str>) -> usize {
-        let body: &'static str = Box::leak(format!("{prefix}{}", script.body).into_boxed_str());
+        let body: &'static str =
+            Box::leak(format!("{prefix}{}", bare_body(script)).into_boxed_str());
         let mut params = script.params.clone();
         if let (Some(home), Some(map)) = (staged_home, params.as_object_mut()) {
             map.entry("h")
@@ -7436,18 +7526,21 @@ mod winps_git {
     }
 
     /// 27-48, the input of the review (Task 2): the encoded length of every
-    /// Windows git script (a) as it is today, (b) with the loader and the block
-    /// inline, (c) with the staged loader, against the budget of 8000 with a
-    /// 200-character margin. It asserts nothing about (b) and (c) beyond that
-    /// they can be built; it prints the table and the scripts that would need a
-    /// split. Three rows are the largest chunk of a write plan with the longest
-    /// names, for the three scripts that take a chunk.
+    /// Windows git script (a) bare, without any loader, (b) with the loader and
+    /// the block inline, (c) with the staged loader, against the budget of 8000
+    /// with a 200-character margin. It asserts nothing about (b) and (c) beyond
+    /// that they can be built; it prints the table and the scripts that would
+    /// need a split. Three rows are the largest chunk of a write plan with the
+    /// longest names, for the three scripts that take a chunk. Since 27-49 the
+    /// state read is three scripts that already carry the staged loader, so
+    /// their (c) is what is sent; the shipped scripts are held to the budget
+    /// and the margin by `winps_git_scripts_fit_budget`.
     #[test]
     fn winps_git_native_budget_table() {
         const MARGIN: usize = 200;
         let home = "C:\\Users\\svc-ignition-deploy";
-        let inline = winps::GIT_NATIVE_LOAD.to_string();
-        let staged = staged_loader();
+        let inline = inline_loader();
+        let staged = winps::GIT_NATIVE_LOAD.to_string();
         println!(
             "winps_git_native_budget_table: block {} chars, inline loader {} chars, staged loader {} chars",
             winps::GIT_NATIVE_CS.chars().count(),
@@ -7496,14 +7589,14 @@ mod winps_git {
         }
 
         println!(
-            "| script | today | inline | staged | inline vs {} | staged vs {} |",
+            "| script | bare | inline | staged | inline vs {} | staged vs {} |",
             COMMAND_BUDGET - MARGIN,
             COMMAND_BUDGET - MARGIN
         );
         println!("|---|---|---|---|---|---|");
         let (mut split_inline, mut split_staged) = (Vec::new(), Vec::new());
         for (name, script) in &rows {
-            let today = encoded_with(script, "", None);
+            let bare = encoded_with(script, "", None);
             let inline_len = encoded_with(script, &inline, None);
             let staged_len = encoded_with(script, &staged, Some(home));
             let limit = COMMAND_BUDGET - MARGIN;
@@ -7515,7 +7608,7 @@ mod winps_git {
                 }
             };
             println!(
-                "| {name} | {today} | {inline_len} | {staged_len} | {} | {} |",
+                "| {name} | {bare} | {inline_len} | {staged_len} | {} | {} |",
                 verdict(inline_len),
                 verdict(staged_len)
             );
@@ -7536,7 +7629,11 @@ mod winps_git {
             split_staged.len(),
             rows.len()
         );
-        assert_eq!(rows.len(), 16 + 3, "sixteen scripts and three chunk rows");
+        assert_eq!(
+            rows.len(),
+            (16 - 1 + 3 + 1) + 3,
+            "nineteen scripts (the state read is three, and the staging script) and three chunk rows"
+        );
     }
 
     /// 27-11: the object listing fits the command budget with the longest
@@ -7681,12 +7778,21 @@ mod winps_git {
         }
     }
 
+    /// A throw-away account home for the scripts that load the reviewed block
+    /// (the loader's `$p.h`). Under the stand-in the staged source is never
+    /// read, so the directory stays empty.
+    fn account_home() -> tempfile::TempDir {
+        tempfile::tempdir().expect("account home")
+    }
+
     #[tokio::test]
     async fn pwsh_git_state() {
         if !pwsh_exec::gate("pwsh_git_state") {
             return;
         }
         let fx = GitFixture::new();
+        let home = account_home();
+        let home = s(home.path());
         std::fs::write(fx.git_dir().join("index.lock"), "").expect("lock");
         std::fs::write(fx.git_dir().join("MERGE_HEAD"), "x\n").expect("merge");
         fx.git_in_project(&["branch", "feature/x"]);
@@ -7695,8 +7801,8 @@ mod winps_git {
         fx.git_in_project(&["branch", "late"]);
         let local: GitFiles = fx.node().read_git_state(PROJECT).await.expect("local");
         let markers: Vec<&str> = GIT_MARKERS.to_vec();
-        let answer = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
-            .expect("the state script");
+        let answer =
+            pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect("the state scripts");
         assert_eq!(answer["ok"], 1);
         assert_eq!(file_of(&answer["head"]), local.head);
         assert_eq!(file_of(&answer["config"]), local.config);
@@ -7732,38 +7838,400 @@ mod winps_git {
             refs.iter().any(|(name, _)| name == "refs/heads/late"),
             "a loose ref after the pack: {refs:?}"
         );
+        // the merged answer is the old single script's: exactly its fields
+        let mut keys: Vec<&String> = answer.as_object().expect("object").keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "config", "head", "index", "log", "markers", "ok", "packed", "refs"
+            ]
+        );
         // a missing file is null, never an empty string
         std::fs::remove_file(fx.git_dir().join("packed-refs")).expect("rm");
-        let again =
-            pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers)).expect("run");
+        let again = pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect("run");
         assert!(again["packed"].is_null());
-        // a link in the way is a refusal, not an absent file
+        // a missing `logs` is an absent `logs/HEAD`, not a failure
+        let logs = fx.git_dir().join("logs");
+        std::fs::rename(&logs, fx.git_dir().join("logs.aside")).expect("aside");
+        let none = pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect("no logs");
+        assert!(none["log"].is_null());
+        std::fs::rename(fx.git_dir().join("logs.aside"), &logs).expect("back");
+        // a link in the way is a refusal, not an absent file (the block refuses a
+        // reparse point on the handle it opened, and the script names the path)
         let head = fx.git_dir().join("HEAD");
         std::fs::rename(&head, fx.git_dir().join("HEAD.real")).expect("rename");
         std::os::unix::fs::symlink("HEAD.real", &head).expect("symlink");
-        let why = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
-            .expect_err("a linked HEAD");
-        assert!(why.contains("not a regular file"), "{why}");
+        let why =
+            pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect_err("a linked HEAD");
+        assert!(why.contains("reparse point"), "{why}");
+        assert!(why.contains("HEAD"), "names the file: {why}");
         std::fs::remove_file(&head).expect("rm link");
+        // a directory where a file belongs is a refusal too
+        std::fs::create_dir(&head).expect("HEAD as a directory");
+        let why = pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home)
+            .expect_err("a directory as HEAD");
+        assert!(why.contains("not a regular file"), "{why}");
+        std::fs::remove_dir(&head).expect("rm dir");
         std::fs::rename(fx.git_dir().join("HEAD.real"), &head).expect("restore HEAD");
         // CodeRabbit #56: a linked directory above a file or a ref root is a
         // refusal too, never read through (`logs` above `logs/HEAD`, `refs`
-        // above `refs/heads` and `refs/remotes`)
+        // above `refs/heads` and `refs/remotes`, and, since 27-49, `objects`
+        // above the `objects/info/alternates` marker)
         let outside = tempfile::tempdir().expect("outside");
         std::fs::create_dir_all(outside.path().join("heads")).expect("heads");
         std::fs::write(outside.path().join("heads/stolen"), "1\n").expect("ref");
         std::fs::write(outside.path().join("HEAD"), "0 1 x\n").expect("log");
-        for level in ["logs", "refs"] {
+        for level in ["logs", "refs", "objects"] {
             let at = fx.git_dir().join(level);
             let aside = fx.git_dir().join(format!("{level}.real"));
             std::fs::rename(&at, &aside).expect("aside");
             std::os::unix::fs::symlink(outside.path(), &at).expect("link");
-            let why = pwsh_exec::run(&WinScript::git_state(&s(&fx.git_dir()), &markers))
-                .expect_err(level);
-            assert!(why.contains("not a real directory"), "{level}: {why}");
+            let why = pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect_err(level);
+            assert!(why.contains("reparse point"), "{level}: {why}");
+            assert!(why.contains(level), "names the level: {why}");
+            assert!(!why.contains("stolen"), "nothing was read: {why}");
             std::fs::remove_file(&at).expect("rm link");
             std::fs::rename(&aside, &at).expect("back");
         }
+    }
+
+    /// 27-49: the state read is several connections, and a level can be
+    /// swapped for a link between them. Each script opens every level it reads
+    /// again through the block and refuses a reparse point on the handle it
+    /// opened, so a level swapped after an earlier script of the same read is a
+    /// refusal naming the level, and nothing below it is in any answer. (Under
+    /// the unix stand-in a symlink is the reparse point: this tests that the
+    /// scripts ask the block and refuse; that a held level cannot be swapped
+    /// while it is held is the windows-latest module's.)
+    #[tokio::test]
+    async fn pwsh_git_state_refuses_a_level_swapped_between_calls() {
+        if !pwsh_exec::gate("pwsh_git_state_refuses_a_level_swapped_between_calls") {
+            return;
+        }
+        let fx = GitFixture::new();
+        let home = account_home();
+        let home = s(home.path());
+        fx.git_in_project(&["branch", "feature/x"]);
+        let markers: Vec<&str> = GIT_MARKERS.to_vec();
+        let parts = WinScript::git_state(&s(&fx.git_dir()), &markers, &home);
+        assert_eq!(parts.len(), 3);
+        // the first script reads the honest tree
+        let files = pwsh_exec::run(&parts[0]).expect("the files before the swap");
+        assert!(!files["head"].is_null());
+        // then `refs` is replaced by a link to a directory outside `.git`
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("heads")).expect("heads");
+        std::fs::write(outside.path().join("heads/stolen"), "1\n").expect("ref");
+        let at = fx.git_dir().join("refs");
+        std::fs::rename(&at, fx.git_dir().join("refs.real")).expect("aside");
+        std::os::unix::fs::symlink(outside.path(), &at).expect("link");
+        let why = pwsh_exec::run(&parts[2]).expect_err("the loose refs after the swap");
+        assert!(why.contains("refs"), "names the level: {why}");
+        assert!(why.contains("reparse point"), "{why}");
+        assert!(
+            !why.contains("stolen"),
+            "nothing below the link was read: {why}"
+        );
+        // the merged read is refused as a whole
+        let all =
+            pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect_err("the state read");
+        assert!(all.contains("refs"), "{all}");
+        assert!(!all.contains("stolen"), "{all}");
+        // a link planted one level further down, below an honest `refs`, is
+        // refused the same way
+        std::fs::remove_file(&at).expect("rm link");
+        std::fs::rename(fx.git_dir().join("refs.real"), &at).expect("back");
+        let heads = fx.git_dir().join("refs/heads");
+        std::fs::rename(&heads, fx.git_dir().join("refs/heads.real")).expect("aside");
+        std::os::unix::fs::symlink(outside.path().join("heads"), &heads).expect("link");
+        let why = pwsh_exec::run(&parts[2]).expect_err("a linked refs/heads");
+        assert!(why.contains("refs/heads"), "names the level: {why}");
+        assert!(!why.contains("stolen"), "{why}");
+        std::fs::remove_file(&heads).expect("rm link");
+        std::fs::rename(fx.git_dir().join("refs/heads.real"), &heads).expect("back");
+        // a link planted as a loose ref file, below honest levels, is refused too
+        let loose = fx.git_dir().join("refs/heads/planted");
+        std::os::unix::fs::symlink(outside.path().join("heads/stolen"), &loose).expect("link");
+        let why = pwsh_exec::run(&parts[2]).expect_err("a linked loose ref");
+        assert!(why.contains("refs/heads/planted"), "names the file: {why}");
+        assert!(why.contains("reparse point"), "{why}");
+        std::fs::remove_file(&loose).expect("rm link");
+        // and an honest tree reads again
+        pwsh_exec::run_state(&s(&fx.git_dir()), &markers, &home).expect("honest again");
+    }
+
+    /// 27-49: the loader alone, with no stand-in (the exact encoded command of
+    /// a host): it reads the staged source below `$p.h`, compiles it only when
+    /// its SHA-256 is the pin, and refuses everything else with the fixed
+    /// prefix and the bounded cause. The block is compiled here by the local
+    /// `pwsh` (Roslyn), which proves the staged-file path of the loader and
+    /// the pin check; that the block compiles under Windows PowerShell 5.1's
+    /// `csc` is `win_git_native_block_compiles_under_5_1` (windows-latest).
+    #[tokio::test]
+    async fn pwsh_git_native_loader_compiles_only_the_pinned_staged_bytes() {
+        if !pwsh_exec::gate("pwsh_git_native_loader_compiles_only_the_pinned_staged_bytes") {
+            return;
+        }
+        let body: &'static str = Box::leak(
+            format!(
+                "{}E @{{ok=1;loaded=[bool]('IgnGit.N' -as [type]);methods=@([IgnGit.N].GetMethods()|?{{$_.DeclaringType.Name -eq 'N' -and $_.IsPublic -and $_.IsStatic}}|%{{$_.Name}}|sort)}}",
+                winps::GIT_NATIVE_LOAD
+            )
+            .into_boxed_str(),
+        );
+        let run = |home: &Path| {
+            pwsh_exec::run_without_standin(&WinScript {
+                name: "loader",
+                body,
+                params: serde_json::json!({ "h": s(home) }),
+            })
+        };
+        let home = account_home();
+        // the pinned text loads, and the type has the seven methods of the block
+        let staged = pwsh_exec::stage_native(home.path());
+        let answer = run(home.path()).expect("the pinned staged text loads");
+        assert_eq!(answer["loaded"], true);
+        let methods: Vec<&str> = answer["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .map(|m| m.as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "CreateNew",
+                "DeleteOnClose",
+                "FileId",
+                "Move",
+                "OpenDir",
+                "OpenFile",
+                "OpenForDelete"
+            ]
+        );
+        // one byte different: refused with the fixed prefix, and the cause is
+        // the pin check, not a compile error
+        let prefix = "the .git reader cannot declare its native calls";
+        for (what, bytes) in [
+            (
+                "a changed byte",
+                winps::GIT_NATIVE_CS.replacen("IsInvalid", "IsInvalid ", 1),
+            ),
+            ("a trailing newline", format!("{}\n", winps::GIT_NATIVE_CS)),
+            ("an empty file", String::new()),
+            (
+                "valid C# that is not the block",
+                "namespace IgnGit{public static class N{public static void Evil(){}}}".to_string(),
+            ),
+        ] {
+            std::fs::write(&staged, bytes).expect("overwrite");
+            let why = run(home.path()).expect_err(what);
+            assert!(why.contains(prefix), "{what}: {why}");
+            assert!(
+                why.contains("the staged source is not the pinned text"),
+                "{what}: {why}"
+            );
+        }
+        // no file at all: refused, never a fallback
+        std::fs::remove_file(&staged).expect("rm");
+        let why = run(home.path()).expect_err("no staged source");
+        assert!(why.contains(prefix), "{why}");
+        // a file too that the loader cannot read as a file
+        std::fs::create_dir(&staged).expect("a directory in the file's place");
+        let why = run(home.path()).expect_err("a directory");
+        assert!(why.contains(prefix), "{why}");
+    }
+
+    /// 27-49: the script that makes `ign-deploy\git-native` and says whether the
+    /// pinned source is already there. It compiles nothing and runs without the
+    /// stand-in.
+    #[tokio::test]
+    async fn pwsh_git_native_stage_makes_the_directory_and_checks_the_pin() {
+        if !pwsh_exec::gate("pwsh_git_native_stage_makes_the_directory_and_checks_the_pin") {
+            return;
+        }
+        let home = account_home();
+        let run = || pwsh_exec::run(&WinScript::git_native_stage(&s(home.path())));
+        let dir = home.path().join("ign-deploy/git-native");
+        // an empty home: both levels are made, nothing is there
+        let answer = run().expect("fresh home");
+        assert_eq!(
+            (answer["ok"].as_i64(), answer["present"].as_i64()),
+            (Some(1), Some(0))
+        );
+        assert!(dir.is_dir(), "the directory was made");
+        // the pinned text: present
+        let staged = pwsh_exec::stage_native(home.path());
+        assert_eq!(run().expect("pinned")["present"], 1);
+        // anything else is not present (the upload overwrites it)
+        for bytes in [
+            winps::GIT_NATIVE_CS.replacen("IsInvalid", "IsInvalid ", 1),
+            String::new(),
+            "x".repeat(70_000),
+        ] {
+            std::fs::write(&staged, bytes).expect("overwrite");
+            assert_eq!(run().expect("changed")["present"], 0);
+        }
+        // a link as the staged file, a directory in its place, a link as
+        // `git-native` or as `ign-deploy`: refused, never followed
+        std::fs::remove_file(&staged).expect("rm");
+        std::os::unix::fs::symlink("elsewhere", &staged).expect("link");
+        let why = run().expect_err("a linked file");
+        assert!(why.contains("not a regular file"), "{why}");
+        std::fs::remove_file(&staged).expect("rm link");
+        std::fs::create_dir(&staged).expect("dir");
+        let why = run().expect_err("a directory");
+        assert!(why.contains("not a regular file"), "{why}");
+        std::fs::remove_dir(&staged).expect("rm dir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::remove_dir(&dir).expect("rm git-native");
+        std::os::unix::fs::symlink(outside.path(), &dir).expect("link");
+        let why = run().expect_err("a linked git-native");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was made through the link"
+        );
+        std::fs::remove_file(&dir).expect("rm link");
+        std::fs::remove_dir(home.path().join("ign-deploy")).expect("rm ign-deploy");
+        std::os::unix::fs::symlink(outside.path(), home.path().join("ign-deploy")).expect("link");
+        let why = run().expect_err("a linked ign-deploy");
+        assert!(why.contains("not a real directory"), "{why}");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing was made through the link"
+        );
+    }
+
+    /// Passes every process to the `pwsh` runner of the account-home seam and
+    /// records each sftp batch line that puts the staged source of the
+    /// reviewed block.
+    struct PutCounter {
+        inner: pwsh_exec::PwshHomeRunner,
+        puts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for PutCounter {
+        async fn run(
+            &self,
+            program: &OsStr,
+            args: &[OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: Duration,
+        ) -> ProcessOutput {
+            if let Some(bytes) = &stdin {
+                for line in String::from_utf8_lossy(bytes).lines() {
+                    if line.starts_with("put ") && line.contains(winps::GIT_NATIVE_STAGED_FILE) {
+                        self.puts.lock().expect("puts").push(line.to_string());
+                    }
+                }
+            }
+            self.inner.run(program, args, stdin, timeout).await
+        }
+    }
+
+    /// 27-49, the staged layout end to end: a Windows node (the local
+    /// sftp-server and `pwsh` below the account-home seam) uploads the pinned
+    /// text to `<home>/ign-deploy/git-native/IgnGitNative-<pin12>.cs` in the
+    /// first state read of a run, makes no second upload for a second state
+    /// read of the same run, finds the file in place for a later run, and
+    /// replaces a damaged file in the run that finds it. Every state read gives
+    /// the answer of the local reference.
+    #[tokio::test]
+    async fn sftp_git_native_stage_uploads_the_pinned_text_once_per_run() {
+        if !pwsh_exec::gate("sftp_git_native_stage_uploads_the_pinned_text_once_per_run") {
+            return;
+        }
+        use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+        let fx = GitFixture::new();
+        let home = tempfile::tempdir().expect("home");
+        let puts = Arc::new(Mutex::new(Vec::new()));
+        // a new transport is a new run
+        let node = || {
+            let runner = PutCounter {
+                inner: pwsh_exec::PwshHomeRunner {
+                    home: home.path().to_path_buf(),
+                },
+                puts: puts.clone(),
+            };
+            let shell = RemoteShell::local_sftp_server(
+                &common::sftp_server::sftp_server_path(),
+                Arc::new(runner),
+                Duration::from_secs(120),
+            )
+            .local_exec();
+            let data = posix_root(&fx.data_dir.display().to_string()).expect("posix root");
+            SftpTransport::new_windows(shell, data, "nodes.pwsh").with_home(pwsh_exec::SEAM_HOME)
+        };
+        let count = || puts.lock().expect("puts").len();
+        let want: GitFiles = fx.node().read_git_state(PROJECT).await.expect("reference");
+        let staged = home
+            .path()
+            .join(winps::GIT_NATIVE_STAGED_DIR)
+            .join(winps::GIT_NATIVE_STAGED_FILE);
+        assert!(!staged.exists(), "an empty account home");
+
+        // the first state read of a run uploads once
+        let first = node();
+        assert_eq!(
+            first.read_git_state(PROJECT).await.expect("first read"),
+            want
+        );
+        assert_eq!(count(), 1, "one upload: {:?}", puts.lock().expect("puts"));
+        assert_eq!(
+            std::fs::read(&staged).expect("the staged file"),
+            winps::GIT_NATIVE_CS.as_bytes(),
+            "the pinned text, byte for byte"
+        );
+        assert!(
+            puts.lock().expect("puts")[0].contains(&format!(
+                "{}/{}/{}",
+                pwsh_exec::SEAM_HOME,
+                winps::GIT_NATIVE_STAGED_DIR,
+                winps::GIT_NATIVE_STAGED_FILE
+            )),
+            "{:?}",
+            puts.lock().expect("puts")
+        );
+        // a second state read of the same run makes no second upload
+        assert_eq!(first.read_git_state(PROJECT).await.expect("again"), want);
+        assert_eq!(count(), 1, "no second upload in the same run");
+
+        // a later run finds the pinned text in place
+        let second = node();
+        assert_eq!(
+            second.read_git_state(PROJECT).await.expect("second run"),
+            want
+        );
+        assert_eq!(
+            count(),
+            1,
+            "the file was already there with the pinned hash"
+        );
+
+        // a damaged file is replaced in the run that finds it, and the run is
+        // not refused (the staging check hashed it and found it wrong)
+        std::fs::write(&staged, "damaged").expect("damage");
+        let third = node();
+        assert_eq!(
+            third.read_git_state(PROJECT).await.expect("third run"),
+            want
+        );
+        assert_eq!(count(), 2, "one more upload, for the damaged file");
+        assert_eq!(
+            std::fs::read(&staged).expect("the staged file"),
+            winps::GIT_NATIVE_CS.as_bytes()
+        );
+        // the file is never removed by a run, and nothing else is left there
+        let left: Vec<String> = std::fs::read_dir(staged.parent().expect("dir"))
+            .expect("the staged directory")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, [winps::GIT_NATIVE_STAGED_FILE]);
     }
 
     #[tokio::test]

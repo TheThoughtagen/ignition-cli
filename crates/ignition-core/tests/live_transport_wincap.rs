@@ -7356,7 +7356,9 @@ async fn wincap_git_scripts() {
         .await
         .expect("hide");
 
-    // 1. read_git_state: the entry probe and one GIT_STATE call
+    // 1. read_git_state: the entry probe, the staged source of the reviewed
+    //    block (a check, and one upload on the first run, 27-49) and the three
+    //    state scripts
     let started = Instant::now();
     let state = node.read_git_state(GIT_PROJECT).await.expect("state");
     git_step("read_git_state", started.elapsed(), None);

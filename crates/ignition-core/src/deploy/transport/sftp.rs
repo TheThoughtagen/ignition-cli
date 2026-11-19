@@ -844,6 +844,10 @@ pub struct SftpTransport {
     bundle_reads: bool,
     /// Listed bytes per archive part of a split read ([`PART_TARGET_BYTES`]).
     part_target_bytes: u64,
+    /// The staged source of the reviewed C# block is in place on this Windows
+    /// host (27-49): set once per transport, i.e. once per run, by the first
+    /// script that loads the block. A failed attempt leaves it unset.
+    native_staged: tokio::sync::OnceCell<()>,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -873,6 +877,7 @@ impl SftpTransport {
             ctl_seq: AtomicUsize::new(0),
             bundle_reads: false,
             part_target_bytes: PART_TARGET_BYTES,
+            native_staged: tokio::sync::OnceCell::new(),
         }
     }
 

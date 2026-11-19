@@ -33,7 +33,10 @@
 //!   `Get-Item -Force` per level, so a Hidden entry is seen and a denied one is
 //!   an error rather than "absent".
 //! - The git host channel (Phase 27, 27-09), one script per operation, every
-//!   path and name in `$p`: [`GIT_STATE`] (the fixed files in one pass),
+//!   path and name in `$p`: [`GIT_STATE`], [`GIT_STATE_MARKS`] and
+//!   [`GIT_STATE_REFS`] (the state read, three scripts since the reviewed C#
+//!   block of 27-49 took the budget; [`GIT_NATIVE_STAGE`] puts that block's
+//!   source in place),
 //!   [`GIT_SAVE`] and [`GIT_RESTORE`] (one host-local `robocopy` each, with the
 //!   manifest compare inside the script), [`GIT_MANIFEST`], [`GIT_SIZE`] (one
 //!   enumeration, no file read), [`GIT_DIGEST`], [`GIT_OBJECTS`] (the object files of a gateway `.git`, 27-11), [`GIT_LOCK`] and
@@ -406,31 +409,74 @@ macro_rules! git_native_cs {
 /// compile is the Windows test VM and the windows-latest leg of 27-49.
 pub const GIT_NATIVE_CS: &str = git_native_cs!();
 
+// The SHA-256 pin of `GIT_NATIVE_CS` and its first twelve digits (the staged
+// file's name), as literals so `concat!` can build the loader from them. A test
+// pins the text of the block to the first, and checks the second is its prefix.
+macro_rules! git_native_pin {
+    () => {
+        "d7e591c96cb694c2688198b0d72987cd8adb9bbca361d6afb6632cf44be9c145"
+    };
+}
+macro_rules! git_native_pin12 {
+    () => {
+        "d7e591c96cb6"
+    };
+}
+
 /// The SHA-256 of [`GIT_NATIVE_CS`], lowercase hex. A test compares it with the
 /// block, so an edit of the block fails until this changes in the same diff,
 /// after the block has been reviewed again.
-pub const GIT_NATIVE_SHA256: &str =
-    "d7e591c96cb694c2688198b0d72987cd8adb9bbca361d6afb6632cf44be9c145";
+pub const GIT_NATIVE_SHA256: &str = git_native_pin!();
+
+/// Where the staged layout (27-48, the user's choice) puts the block's source
+/// below the deploy account's ledger root (its home): this directory, relative
+/// to the home and `/`-separated. A run uploads [`GIT_NATIVE_CS`] there once
+/// ([`WinScript::git_native_stage`] decides whether it must).
+pub const GIT_NATIVE_STAGED_DIR: &str = "ign-deploy/git-native";
+
+/// The staged file's name: `IgnGitNative-<first 12 digits of the pin>.cs`. A
+/// release whose block has another pin writes another name and never touches
+/// this one.
+pub const GIT_NATIVE_STAGED_FILE: &str = concat!("IgnGitNative-", git_native_pin12!(), ".cs");
+
+// The loader (27-49, the staged layout): the RECORD_REPLACE fail-closed head
+// (FullLanguage first, the bounded-cause helpers character for character), then
+// one guarded `Add-Type` whose source is the staged file, read once as bytes;
+// the SHA-256 of those bytes is compared with the pin written in this text, and
+// the same bytes, decoded, are what is compiled. A changed file only refuses.
+macro_rules! git_native_load {
+    () => {
+        concat!(
+            r#"if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw ('the .git reader needs a FullLanguage PowerShell session, not '+$ExecutionContext.SessionState.LanguageMode)};"#,
+            r#"function IgnLine($t){$s=[regex]::Replace([string]$t,'[\x00-\x1f]+',' ');$s=[regex]::Replace($s,'(?:[A-Za-z]:[\\/]|\\\\)[^''"]*','<path>');$s=[regex]::Replace($s,'[^\x20-\x7e]','?').Trim();if($s.Length -gt 200){$s=$s.Substring(0,200)+'...'};$s};"#,
+            r#"function IgnCause($x){try{while($x.InnerException){$x=$x.InnerException};$m=[string]$x.Message;$k=$x.GetType().FullName+' '+('0x{0:X8}' -f $x.HResult);if($m){$k+=': '+$m};IgnLine $k}catch{'the cause could not be read'}};"#,
+            "if(-not ('IgnGit.N' -as [type])){try{$ib=[IO.File]::ReadAllBytes([IO.Path]::Combine($p.h,'ign-deploy','git-native','IgnGitNative-",
+            git_native_pin12!(),
+            ".cs'));if([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($ib)).Replace('-','').ToLower() -ne '",
+            git_native_pin!(),
+            "'){throw 'the staged source is not the pinned text'};Add-Type -TypeDefinition ([Text.Encoding]::ASCII.GetString($ib))",
+            r#"}catch{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}};"#,
+        )
+    };
+}
 
 /// The loader a Windows git script puts at the start of its body to use
-/// [`GIT_NATIVE_CS`] (the inline layout): the RECORD_REPLACE form. It fails
+/// [`GIT_NATIVE_CS`] (the staged layout): the RECORD_REPLACE form. It fails
 /// closed. Unless the session is `FullLanguage` it throws naming the language
-/// mode; the type is compiled only when `IgnGit.N` is not loaded yet; a failing
+/// mode; the type is compiled only when `IgnGit.N` is not loaded yet; it reads
+/// `<$p.h>\ign-deploy\git-native\IgnGitNative-<pin12>.cs` as bytes, throws
+/// `the staged source is not the pinned text` unless their SHA-256 is
+/// [`GIT_NATIVE_SHA256`] (written in this text), and compiles those same bytes,
+/// so the bytes hashed are the bytes compiled. A failing read, hash or
 /// `Add-Type` throws "the .git reader cannot declare its native calls: " plus
 /// the bounded cause (`IgnLine`, `IgnCause`: one line of printable ASCII, at
 /// most 200 characters, every drive-letter or UNC path replaced by `<path>`),
-/// so no script falls back to a path-based read. No script carries it yet.
+/// so no script falls back to a path-based read.
 ///
-/// This is the only text in which `Add-Type` is allowed in a GIT_* body
-/// (`winps_git_params_only`).
-pub const GIT_NATIVE_LOAD: &str = concat!(
-    r#"if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw ('the .git reader needs a FullLanguage PowerShell session, not '+$ExecutionContext.SessionState.LanguageMode)};"#,
-    r#"function IgnLine($t){$s=[regex]::Replace([string]$t,'[\x00-\x1f]+',' ');$s=[regex]::Replace($s,'(?:[A-Za-z]:[\\/]|\\\\)[^''"]*','<path>');$s=[regex]::Replace($s,'[^\x20-\x7e]','?').Trim();if($s.Length -gt 200){$s=$s.Substring(0,200)+'...'};$s};"#,
-    r#"function IgnCause($x){try{while($x.InnerException){$x=$x.InnerException};$m=[string]$x.Message;$k=$x.GetType().FullName+' '+('0x{0:X8}' -f $x.HResult);if($m){$k+=': '+$m};IgnLine $k}catch{'the cause could not be read'}};"#,
-    "if(-not ('IgnGit.N' -as [type])){try{Add-Type -TypeDefinition '",
-    git_native_cs!(),
-    r#"'}catch{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}};"#,
-);
+/// The only parameter it reads is `$p.h`, the native account home, so every
+/// script that carries the loader carries `h`. This is the only text in which
+/// `Add-Type` is allowed in a GIT_* body (`winps_git_params_only`).
+pub const GIT_NATIVE_LOAD: &str = git_native_load!();
 
 // Phase 27 (27-09): the Windows half of the git host channel. Each script is
 // one `const` built from shared pieces so the text a test runs is the text a
@@ -484,27 +530,94 @@ macro_rules! git_ps_sx {
     };
 }
 
-/// The fixed files of a gateway's `.git` in one pass (Phase 27, 27-09), the
-/// Windows half of the POSIX `GIT_STATE_SH`: `HEAD`, `config`, `packed-refs`,
-/// the tail of `logs/HEAD`, whether `index` exists, the markers of
-/// [`GIT_MARKERS`](crate::deploy::git_state::GIT_MARKERS) that are present and
-/// every loose ref below `refs/heads` and `refs/remotes`.
+// The `.git` state reader on the reviewed block (27-49). Every script below
+// starts with the loader and then holds each level it reads with
+// `[IgnGit.N]::OpenDir` (a handle without delete sharing, a reparse point
+// refused on the handle itself), so a level swapped for a junction or renamed
+// after the check cannot send a read elsewhere. The staged loader leaves a body
+// about 1,000 characters at the command budget, so the old one-pass script is
+// three scripts, run in order and merged (`merge_git_state`): the fixed files,
+// the markers with the index, and the loose refs.
+//
+// `Q` opens one path below `$p.a` through a block method and answers `$null`
+// when the path is absent (Win32 error 2 or 3 on the open itself); any other
+// failure is rethrown naming the path relative to `.git` (the block's own text
+// holds none). `D` holds a directory in `$o`, which a `finally` disposes. The
+// paths below `.git` use `/` throughout: Win32 takes `/` in a path that is not
+// `\\?\`-prefixed, which `.git` paths here never are.
+macro_rules! git_ps_nq {
+    () => {
+        r##"$o=[Collections.ArrayList]@();$g=$p.a;function Q($f,$x){try{[IgnGit.N]::$f($g+'/'+$x)}catch{if($_.Exception.Message -notmatch 'error [23]\)'){throw ($x+': '+$_.Exception.Message)}}};function D($x){$h=Q OpenDir $x;if($h){[void]$o.Add($h)};!!$h};"##
+    };
+}
+
+/// The fixed files of a gateway's `.git` (Phase 27, 27-09; on the block in
+/// 27-49): `HEAD`, `config`, `packed-refs` and the tail of `logs/HEAD`, the
+/// first of the three scripts of the state read (the Windows half of the POSIX
+/// `GIT_STATE_SH`).
 ///
-/// Parameters (`$p`): `a` the native `.git` path, `m` the marker names. Each
-/// file is read with `FileShare.ReadWrite|Delete` (a running gateway is not
-/// blocked) and answered as `{n:size,b:base64}` or `null` when absent; a file
-/// is read up to one byte past its cap, so the caller's cap check names an
-/// oversized one. A reparse point, a directory where a file belongs or a name
-/// with a control character is a terminating error, never an absent file:
-/// presence is decided by `Get-Item -Force`, which throws unless the error is
-/// `ObjectNotFound` (the 25-03 captures). Every directory above a file and
-/// above each loose-ref root (`logs`, `refs`) must be a real directory too,
-/// checked before anything below it is touched (CodeRabbit #56: `Get-Item` on
-/// the final path does not see a junction above it); an absent one is an
-/// absent file. Loose refs stop at 4097 entries.
+/// Parameters (`$p`): `a` the native `.git` path, `h` the native account home
+/// (the loader's). `.git` and `logs` are held (`OpenDir`); each file is opened
+/// with `OpenFile` (a regular file, never a reparse point, shared for read,
+/// write and delete so a running gateway is not blocked) and read through a
+/// `FileStream` over that handle, answered as `{n:size,b:base64}` or `null`
+/// when absent; a file is read up to one byte past its cap, so the caller's
+/// cap check names an oversized one. A reparse point or a directory where a
+/// file belongs is a terminating error naming the path, never an absent file:
+/// absence is only a failed open with Win32 error 2 or 3 (the 25-03 captures).
+/// An absent `logs` makes `logs/HEAD` absent too.
 pub const GIT_STATE: &str = concat!(
+    git_native_load!(),
+    git_ps_nq!(),
+    r##"function F($x,$k,$t){$h=Q OpenFile $x;if($h){$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;$e=[Math]::Min($n,$k);if($t){[void]$s.Seek($n-$e,0)};@{n=$n;b=[Convert]::ToBase64String([IO.BinaryReader]::new($s).ReadBytes($e))}}finally{$s.Dispose()}}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));[void](D logs);E @{ok=1;head=(F HEAD 65537 $false);config=(F config 65537 $false);packed=(F packed-refs 8388609 $false);log=(F logs/HEAD 65536 $true)}}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// The index and the markers of a gateway's `.git`, the second script of the
+/// state read. Parameters: `a` the native `.git`, `h` the native account home,
+/// `m` the marker names (`/`-separated below `.git`). Answers `index` (whether
+/// an entry named `index` exists) and `markers` (the names of `m` that exist, as
+/// an entry of any kind: a file, a directory or a link, none of which is
+/// opened). Presence is `Get-Item -Force`, which throws unless the error is
+/// `ObjectNotFound` (the 25-03 captures). Every directory above a marker is
+/// held first (`objects` and `objects/info` for `objects/info/alternates`), so a
+/// marker below a swapped level is never looked up; an absent level is an
+/// absent marker.
+pub const GIT_STATE_MARKS: &str = concat!(
+    git_native_load!(),
+    git_ps_nq!(),
+    r##"function Z($x){try{Get-Item -LiteralPath ($g+'/'+$x) -Force}catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){throw}}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));$k=@();foreach($m in @($p.m)){$q='';$y=$true;$a=$m.Split('/');for($i=0;$i -lt $a.Length-1;$i++){$q+=$a[$i];if(!(D $q)){$y=$false;break};$q+='/'};if($y -and (Z $m)){$k+=$m}};E @{ok=1;index=[bool](Z index);markers=$k}}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// Every loose ref below `refs/heads` and `refs/remotes`, the third script of
+/// the state read. Parameters: `a` the native `.git`, `h` the native account
+/// home. `refs` is held, then each root, then each directory below it before its
+/// entries are listed (`EnumerateFileSystemInfos` runs only on a held
+/// directory), and every listed entry is opened through the block before it is
+/// used (a directory with `OpenDir`, a file with `OpenFile`): a reparse point
+/// anywhere is a terminating error naming the path, as is a name with a control
+/// character. An absent root lists nothing. Answers `refs`, one `{p,n,b}` per
+/// file: `p` the base64 of the UTF-8 path below `.git`, `n` the size and `b` the
+/// base64 of at most 65,537 bytes. The walk stops at 4097 files.
+pub const GIT_STATE_REFS: &str = concat!(
+    git_native_load!(),
+    git_ps_nq!(),
+    r##"$u=[Collections.ArrayList]@();function F($x){$h=Q OpenFile $x;$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;@{p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($x));n=$n;b=[Convert]::ToBase64String([IO.BinaryReader]::new($s).ReadBytes([Math]::Min($n,65537)))}}finally{$s.Dispose()}};function W($r){foreach($f in ([IO.DirectoryInfo]($g+'/'+$r)).EnumerateFileSystemInfos()){if($u.Count -ge 4097){return};if($f.Name -match '[\x00-\x1f]'){throw 'a ref name holds a control character'};$n=$r+'/'+$f.Name;if($f.Attributes -band 16){if(D $n){W $n}}else{[void]$u.Add((F $n))}}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));if(D refs){foreach($y in 'refs/heads','refs/remotes'){if(D $y){W $y}}};E @{ok=1;refs=$u}}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// Put the staged source of the block in place (Phase 27, 27-49, the staged
+/// layout): `ign-deploy\git-native` below the deploy account's home, and whether
+/// `IgnGitNative-<pin12>.cs` is already there with the pinned hash. Parameters:
+/// `h` the native account home, `n` the file name, `s` the pin. `ign-deploy` and
+/// `git-native` are made when absent and refused when they are links; a file
+/// that is not a regular file is refused. Answers `present` 1 only when the
+/// file is there, no larger than 64 KiB and hashes to `s`; otherwise 0, and the
+/// transport uploads the pinned text over sftp. The script compiles nothing and
+/// trusts nothing it reads: the loader hashes the file again on every use, so a
+/// file changed after this check, or not changed by the upload, only refuses.
+pub const GIT_NATIVE_STAGE: &str = concat!(
     git_ps_base!(),
-    r##"$g=$p.a;K (Z $g)|Out-Null;function P($f){$x=$f.Split('/');$h=$g;for($i=0;$i -lt $x.Length-1;$i++){$h+=$c+$x[$i];$j=Z $h;if(!$j){return $false};$null=K $j};$true};function F($f,$k,$t){if(!(P $f)){return $null};$q=$g+$c+$f.Replace('/',$c);$y=Z $q;if(!$y){return $null};if($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$f is not a regular file"};$n=$y.Length;$e=[int][Math]::Min([long]$n,[long]$k);$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{if($t -and $n -gt $e){[void]$s.Seek($n-$e,0)};$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};@{n=$n;b=[Convert]::ToBase64String($u,0,$o)}};$k=@();foreach($m in @($p.m)){if(Z ($g+$c+$m.Replace('/',$c))){$k+=$m}};$u=@();$z=0;foreach($d in 'refs/heads','refs/remotes'){$y=$null;if(P $d){$y=Z ($g+$c+$d.Replace('/',$c))};if($y){K $y|Out-Null;$s=New-Object Collections.Stack;$s.Push(@($y,$d));while($s.Count -and $z -le 4097){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'refs holds a link or a name with a control character'};$r=$q[1]+'/'+$f.Name;if($a -band 16){$s.Push(@($f,$r))}else{$z++;if($z -le 4097){$v=F $r 65537 $false;$v.p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r));$u+=,$v}}}}}};E @{ok=1;head=(F 'HEAD' 65537 $false);config=(F 'config' 65537 $false);packed=(F 'packed-refs' 8388609 $false);log=(F 'logs/HEAD' 65536 $true);index=[bool](Z ($g+$c+'index'));markers=$k;refs=$u}"##,
+    git_ps_x!(),
+    r##"if($p.n -notmatch '^IgnGitNative-[0-9a-f]{12}\.cs$'){throw 'refusing the staged name'};$u=$p.h+$c+'ign-deploy';$d=$u+$c+'git-native';foreach($q in $u,$d){$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$f=$d+$c+$p.n;$y=Z $f;$k=0;if($y){if($y.PSIsContainer -or ([int]$y.Attributes -band 1024)){throw 'the staged source is not a regular file'};if($y.Length -le 65536){$m=[IO.File]::Open($f,'Open','Read','ReadWrite,Delete');try{$k=[int]((X ([Security.Cryptography.SHA256]::Create().ComputeHash($m))) -eq $p.s)}finally{$m.Dispose()}}};E @{ok=1;present=$k}"##,
 );
 
 /// `<data>\git.yaml` read into the answer (CodeRabbit #56): the Windows half of
@@ -858,6 +971,13 @@ pub struct WinScript {
 }
 
 impl WinScript {
+    /// Whether the body starts with the loader of the reviewed block
+    /// ([`GIT_NATIVE_LOAD`]), so a host must have the staged source in place
+    /// before it runs.
+    pub fn loads_native(&self) -> bool {
+        self.body.starts_with(GIT_NATIVE_LOAD)
+    }
+
     /// The script that replaces `dst` with `src` ([`MOVE_REPLACE`]).
     pub fn move_replace(src: &str, dst: &str) -> WinScript {
         WinScript {
@@ -967,13 +1087,44 @@ impl WinScript {
         }
     }
 
-    /// The script that reads the fixed files of the `.git` at `git` (native),
-    /// asking for the presence of `markers` ([`GIT_STATE`]).
-    pub fn git_state(git: &str, markers: &[&str]) -> WinScript {
+    /// The scripts that read the state of the `.git` at `git` (native), in the
+    /// order they run: [`GIT_STATE`] (the fixed files), [`GIT_STATE_MARKS`]
+    /// (the index and the presence of `markers`) and [`GIT_STATE_REFS`] (the
+    /// loose refs). `home` is the native account home, where the loader reads
+    /// the staged source. Each answers `ok: 1` and its own fields;
+    /// [`merge_git_state`] makes the one answer of the old single script.
+    pub fn git_state(git: &str, markers: &[&str], home: &str) -> Vec<WinScript> {
+        vec![
+            WinScript {
+                name: "git_state",
+                body: GIT_STATE,
+                params: serde_json::json!({ "a": git, "h": home }),
+            },
+            WinScript {
+                name: "git_state_marks",
+                body: GIT_STATE_MARKS,
+                params: serde_json::json!({ "a": git, "h": home, "m": markers }),
+            },
+            WinScript {
+                name: "git_state_refs",
+                body: GIT_STATE_REFS,
+                params: serde_json::json!({ "a": git, "h": home }),
+            },
+        ]
+    }
+
+    /// The script that makes `ign-deploy\git-native` in the native account
+    /// `home` and says whether the staged source is there with the pinned hash
+    /// ([`GIT_NATIVE_STAGE`]).
+    pub fn git_native_stage(home: &str) -> WinScript {
         WinScript {
-            name: "git_state",
-            body: GIT_STATE,
-            params: serde_json::json!({ "a": git, "m": markers }),
+            name: "git_native_stage",
+            body: GIT_NATIVE_STAGE,
+            params: serde_json::json!({
+                "h": home,
+                "n": GIT_NATIVE_STAGED_FILE,
+                "s": GIT_NATIVE_SHA256,
+            }),
         }
     }
 
@@ -1199,6 +1350,37 @@ fn git_run_params(
     serde_json::json!({
         "x": prefix, "d": data, "j": project, "h": home, "g": gateway, "i": run_id,
     })
+}
+
+/// The one answer of the old single state script, from the answers of the
+/// three scripts of [`WinScript::git_state`] in their order: `head`, `config`,
+/// `packed` and `log` from the first, `index` and `markers` from the second,
+/// `refs` from the third. A field a script did not answer is left out, so the
+/// caller's own check names it; a field a script should not answer is dropped.
+/// Anything but three answers is refused.
+pub fn merge_git_state(answers: &[Value]) -> Result<Value, String> {
+    const FIELDS: [&[&str]; 3] = [
+        &["head", "config", "packed", "log"],
+        &["index", "markers"],
+        &["refs"],
+    ];
+    if answers.len() != FIELDS.len() {
+        return Err(format!(
+            "the state read has {} scripts, not {}",
+            answers.len(),
+            FIELDS.len()
+        ));
+    }
+    let mut merged = serde_json::Map::new();
+    merged.insert("ok".to_string(), Value::from(1));
+    for (answer, fields) in answers.iter().zip(FIELDS) {
+        for field in fields {
+            if let Some(value) = answer.get(*field) {
+                merged.insert((*field).to_string(), value.clone());
+            }
+        }
+    }
+    Ok(Value::Object(merged))
 }
 
 /// The remote command for `script`, or why it cannot be sent: the parameters

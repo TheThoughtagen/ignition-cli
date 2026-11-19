@@ -134,7 +134,10 @@ use crate::deploy::transport::projects::{
     git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
-use crate::deploy::transport::winps::{LONG_PATH_PREFIX, WinScript, windows_component_problem};
+use crate::deploy::transport::winps::{
+    self, GIT_NATIVE_CS, GIT_NATIVE_STAGED_DIR, GIT_NATIVE_STAGED_FILE, LONG_PATH_PREFIX,
+    WinScript, windows_component_problem,
+};
 use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
 
@@ -1590,18 +1593,84 @@ const GIT_HEAVY_LIMIT: std::time::Duration = std::time::Duration::from_secs(900)
 const STATE_SMALL_READ: usize = crate::deploy::git_state::GIT_SMALL_FILE_MAX + 1;
 
 impl SftpTransport {
-    /// Run one git WinScript and require `ok == 1` in its answer.
+    /// Run one git WinScript and require `ok == 1` in its answer. A script
+    /// that loads the reviewed C# block (`WinScript::loads_native`) runs only
+    /// after the staged source is in place on the host
+    /// ([`git_native_staged`](Self::git_native_staged)).
     async fn git_win(
         &self,
         op: &str,
         script: WinScript,
         limit: std::time::Duration,
     ) -> Result<serde_json::Value, CoreError> {
+        if script.loads_native() {
+            self.git_native_staged().await?;
+        }
         let answer = self.shell.exec_powershell_within(&script, limit).await?;
         if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
             return Err(self.git_unusable(op, "ok is not 1"));
         }
         Ok(answer)
+    }
+
+    /// The staged source of the reviewed C# block is in place on this host: at
+    /// most once per transport, which is once per run (27-49, the staged layout
+    /// the user chose in 27-48). A failed attempt is not remembered.
+    async fn git_native_staged(&self) -> Result<(), CoreError> {
+        self.native_staged
+            .get_or_try_init(|| self.stage_git_native())
+            .await
+            .map(|_| ())
+    }
+
+    /// Make `ign-deploy\git-native` in the account home and, unless the file
+    /// there already hashes to the pin, upload [`GIT_NATIVE_CS`] to
+    /// `<home>/ign-deploy/git-native/IgnGitNative-<pin12>.cs` in one sftp
+    /// batch. The check is a read-only hash by a script
+    /// (`WinScript::git_native_stage`); the upload is one `put`. Neither is
+    /// trusted later: every script that loads the block hashes the file again
+    /// and compiles only those bytes, so a file that is changed, half written
+    /// by a concurrent run or not the pinned text is a refusal, never code. A
+    /// run never removes the file, and a release with another pin names another
+    /// file.
+    async fn stage_git_native(&self) -> Result<(), CoreError> {
+        const OP: &str = "git_native_stage";
+        let home = self.win_home().await?;
+        let home_sftp = self.account_home().await?;
+        let remote = format!("{home_sftp}/{GIT_NATIVE_STAGED_DIR}/{GIT_NATIVE_STAGED_FILE}");
+        safe_remote_path(&remote).map_err(|why| {
+            self.mirror_fail(
+                OP,
+                format!("the staged source path cannot ride an sftp batch line ({why})"),
+            )
+        })?;
+        let answer = self
+            .shell
+            .exec_powershell_within(&WinScript::git_native_stage(&home), self.shell.op_timeout())
+            .await?;
+        if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
+            return Err(self.git_unusable(OP, "ok is not 1"));
+        }
+        match answer.get("present").and_then(serde_json::Value::as_i64) {
+            Some(1) => return Ok(()),
+            Some(0) => {}
+            _ => return Err(self.git_unusable(OP, "present is missing")),
+        }
+        let dir = tempfile::tempdir().map_err(|e| {
+            self.mirror_fail(
+                OP,
+                format!("a local copy of the source cannot be made: {e}"),
+            )
+        })?;
+        let local = dir.path().join(GIT_NATIVE_STAGED_FILE);
+        std::fs::write(&local, GIT_NATIVE_CS.as_bytes()).map_err(|e| {
+            self.mirror_fail(
+                OP,
+                format!("a local copy of the source cannot be made: {e}"),
+            )
+        })?;
+        self.run_batch(OP, vec![SftpOp::Put { local, remote }])
+            .await
     }
 
     /// The native spelling of the data directory of a Windows node.
@@ -1982,11 +2051,20 @@ impl GitHostRead for SftpTransport {
             if kind != GitEntry::Directory {
                 return Ok(GitFiles::without_contents(kind));
             }
-            let script = WinScript::git_state(&self.win_git(project), GIT_MARKERS);
-            let answer = self
-                .git_win("read_git_state", script, self.shell.op_timeout())
-                .await?;
-            return self.git_files_of("read_git_state", &answer);
+            // three scripts, in order, merged into the one answer the old single
+            // script gave (27-49: the staged loader leaves a body of about 1,000
+            // characters at the command budget)
+            let home = self.win_home().await?;
+            let mut answers = Vec::new();
+            for script in WinScript::git_state(&self.win_git(project), GIT_MARKERS, &home) {
+                answers.push(
+                    self.git_win("read_git_state", script, self.shell.op_timeout())
+                        .await?,
+                );
+            }
+            let merged = winps::merge_git_state(&answers)
+                .map_err(|why| self.git_unusable("read_git_state", &why))?;
+            return self.git_files_of("read_git_state", &merged);
         }
         let kind = self.git_entry_posix(project).await?;
         if kind != GitEntry::Directory {
@@ -3354,6 +3432,53 @@ mod tests {
         )
     }
 
+    /// The staging script's answer (27-49): `present` is 1 when the pinned
+    /// source is already on the host with the pinned hash.
+    fn stage_answer(present: i32) -> ProcessOutput {
+        ok(&format!("IGN-RESULT:{{\"ok\":1,\"present\":{present}}}\n"))
+    }
+
+    /// The three answers of a Windows state read (27-49), made from the one
+    /// merged answer the old single script gave: `ok` and the fields of each
+    /// script (`winps::merge_git_state` puts them back together).
+    fn state_answers(merged: &str) -> Vec<ProcessOutput> {
+        let line = merged
+            .trim_end()
+            .strip_prefix("IGN-RESULT:")
+            .expect("the sentinel");
+        let all: serde_json::Value = serde_json::from_str(line).expect("json");
+        let fields: [&[&str]; 3] = [
+            &["head", "config", "packed", "log"],
+            &["index", "markers"],
+            &["refs"],
+        ];
+        fields
+            .iter()
+            .map(|names| {
+                let mut part = serde_json::Map::new();
+                part.insert("ok".to_string(), 1.into());
+                for name in *names {
+                    if let Some(value) = all.get(*name) {
+                        part.insert((*name).to_string(), value.clone());
+                    }
+                }
+                ok(&format!("IGN-RESULT:{}\n", serde_json::Value::Object(part)))
+            })
+            .collect()
+    }
+
+    /// The parameters of every PowerShell script a recorded run sent, in
+    /// order (the sftp sessions between them are skipped).
+    fn script_params(argv: &[Vec<String>]) -> Vec<serde_json::Value> {
+        argv.iter()
+            .filter(|args| {
+                args.last()
+                    .is_some_and(|c| c.starts_with("powershell -NoProfile -NonInteractive "))
+            })
+            .map(|args| win_params(args))
+            .collect()
+    }
+
     #[tokio::test]
     async fn win_git_entry_parse() {
         // (kind, hidden, reparse) of the `.git` entry
@@ -3827,15 +3952,32 @@ mod tests {
         assert_eq!(p["j"], "CapApp");
         assert_eq!(p["n"], ".ign-probe-r1");
 
-        // state: the probe, then one script, with the marker names as data
+        // state (27-49): the probe, the check of the staged source of the
+        // reviewed block (it is there), then three scripts, the marker names
+        // as data and the account home in every script that loads the block
         let state = "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":3,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[\"shallow\"],\"refs\":[]}\n";
-        let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), ok(state)]);
+        let mut outs = vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), stage_answer(1)];
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
         let files = t.read_git_state("CapApp").await.expect("state");
         assert!(files.index_present);
         assert_eq!(files.markers, ["shallow"]);
-        assert_eq!(runner.argv.lock().expect("argv").len(), 2);
-        let p = win_params(&runner.argv.lock().expect("argv")[1]);
-        assert_eq!(p["m"].as_array().map(Vec::len), Some(GIT_MARKERS.len()));
+        assert_eq!(runner.argv.lock().expect("argv").len(), 5);
+        let sent = script_params(&runner.argv.lock().expect("argv"));
+        assert_eq!(sent.len(), 5);
+        assert_eq!(sent[1]["n"], GIT_NATIVE_STAGED_FILE);
+        assert_eq!(sent[1]["s"], winps::GIT_NATIVE_SHA256);
+        assert_eq!(sent[1]["h"], "C:\\Users\\svc");
+        for script in &sent[2..] {
+            assert_eq!(script["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
+            assert_eq!(script["h"], "C:\\Users\\svc");
+        }
+        assert_eq!(
+            sent[3]["m"].as_array().map(Vec::len),
+            Some(GIT_MARKERS.len()),
+            "the markers go to the second script only"
+        );
+        assert!(sent[2].get("m").is_none() && sent[4].get("m").is_none());
         // a `.git` that is not a directory is answered by kind, never read
         let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "file", 0, 0))]);
         let files = t.read_git_state("CapApp").await.expect("file");
@@ -3911,8 +4053,20 @@ mod tests {
             "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":9,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[],\"refs\":[]}\n",
         ];
         for answer in bad_state {
-            let (_, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), ok(answer)]);
+            let mut outs = vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), stage_answer(1)];
+            outs.extend(state_answers(answer));
+            let (_, t) = win_host(outs);
             assert!(t.read_git_state("CapApp").await.is_err(), "state {answer}");
+        }
+        // a script of the state read that does not say ok, or a staging check
+        // that does not say whether the source is there, is unusable too
+        for stage in [
+            ok("IGN-RESULT:{\"ok\":0,\"present\":1}\n"),
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"present\":2}\n"),
+        ] {
+            let (_, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), stage]);
+            assert!(t.read_git_state("CapApp").await.is_err(), "stage answer");
         }
         // a script that died is transport_failed
         let died = ProcessOutput {
@@ -3924,6 +4078,107 @@ mod tests {
         let (_, t) = win_host(vec![died]);
         let err = t.restore_git("gw", "CapApp", "r1").await.expect_err("died");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    /// 27-49: the staged source of the reviewed block is checked and, when it
+    /// is not there with the pinned hash, uploaded once per run, before the
+    /// first script that loads the block. A second state read of the same
+    /// run runs no staging check and makes no upload; a failed upload is not
+    /// remembered, so the next read tries again.
+    #[tokio::test]
+    async fn sftp_git_native_stage_runs_once_per_run_and_uploads_only_when_missing() {
+        let probe = || ok(&win_answer("dir", "dir", "dir", 1, 0));
+        let state = "IGN-RESULT:{\"ok\":1,\"head\":null,\"config\":null,\"packed\":null,\"log\":null,\"index\":false,\"markers\":[],\"refs\":[]}\n";
+        // an empty host: probe, check (absent), the upload, three scripts; then
+        // the second read of the run: probe and three scripts, nothing else
+        let mut outs = vec![probe(), stage_answer(0), ok("")];
+        outs.extend(state_answers(state));
+        outs.push(probe());
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
+        t.read_git_state("CapApp").await.expect("first read");
+        t.read_git_state("CapApp").await.expect("second read");
+        let argv = runner.argv.lock().expect("argv").clone();
+        let stdins = runner.stdins.lock().expect("stdins").clone();
+        assert_eq!(argv.len(), 3 + 3 + 1 + 3, "{argv:?}");
+        let puts: Vec<&String> = stdins.iter().filter(|text| text.contains("put ")).collect();
+        assert_eq!(puts.len(), 1, "one upload in the run: {stdins:?}");
+        assert!(
+            puts[0].contains(&format!(
+                "\"/C:/Users/svc/{GIT_NATIVE_STAGED_DIR}/{GIT_NATIVE_STAGED_FILE}\""
+            )),
+            "{}",
+            puts[0]
+        );
+        assert!(
+            puts[0].contains("IgnGitNative-d7e591c96cb6.cs"),
+            "named by the first 12 digits of the pin: {}",
+            puts[0]
+        );
+        let checks = script_params(&argv)
+            .iter()
+            .filter(|params| params.get("n").is_some())
+            .count();
+        assert_eq!(checks, 1, "one staging check in the run");
+        // the upload is before the first script that loads the block
+        let order: Vec<&str> = argv
+            .iter()
+            .map(|args| {
+                let command = args.last().map(String::as_str).unwrap_or_default();
+                if command.starts_with("powershell ") {
+                    "script"
+                } else {
+                    "sftp"
+                }
+            })
+            .collect();
+        assert_eq!(order[..4], ["script", "script", "sftp", "script"]);
+
+        // the pinned source is already there: no upload at all
+        let mut outs = vec![probe(), stage_answer(1)];
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
+        t.read_git_state("CapApp").await.expect("present");
+        assert!(
+            runner
+                .stdins
+                .lock()
+                .expect("stdins")
+                .iter()
+                .all(|text| !text.contains("put ")),
+            "nothing to upload"
+        );
+
+        // an upload that fails fails the read and is tried again by the next
+        let failed = ProcessOutput {
+            stdout: Vec::new(),
+            stderr: b"Couldn't create file: Permission denied\n".to_vec(),
+            code: 1,
+            timed_out: false,
+        };
+        let mut outs = vec![
+            probe(),
+            stage_answer(0),
+            failed,
+            probe(),
+            stage_answer(0),
+            ok(""),
+        ];
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
+        assert!(
+            t.read_git_state("CapApp").await.is_err(),
+            "the upload failed"
+        );
+        t.read_git_state("CapApp").await.expect("the retry");
+        let puts = runner
+            .stdins
+            .lock()
+            .expect("stdins")
+            .iter()
+            .filter(|text| text.contains("put "))
+            .count();
+        assert_eq!(puts, 2, "the failed upload is not remembered");
     }
 
     fn objects_answer(lines: &[&str], n: usize, more: i32) -> ProcessOutput {
