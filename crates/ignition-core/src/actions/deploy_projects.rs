@@ -9514,12 +9514,15 @@ fn rollback_run_result(
 /// same rules as the undo itself ([`rollback_plan`] per provider, the project
 /// against its pre-image, the settings, the provider deletes and the
 /// groups), into `data.tags.rollback`; a node the undo cannot remove is a
-/// warning that it would end `rollback_failed`.
+/// warning that it would end `rollback_failed`. `project_pre` is the
+/// pre-image the undo would import (the apply's `project_undo`), so a run that
+/// never sent its import previews no project reimport (CodeRabbit #61).
 #[allow(clippy::too_many_arguments)]
 async fn rollback_run_preview(
     gateway: &dyn ProjectGateway,
     loaded: &LoadedProject,
     set: &HostSet,
+    project_pre: Option<&[u8]>,
     writes: &TagWrites,
     groups: Option<&GroupsDone>,
     target: &RunId,
@@ -9533,7 +9536,7 @@ async fn rollback_run_preview(
     let mut undeletable = Vec::new();
     let mut deleted = Vec::new();
     let mut project_reimported = false;
-    if let Some(zip) = &set.project_zip
+    if let Some(zip) = project_pre
         && let Ok(pre) = live_digest(project, zip)
     {
         project_reimported = result.live_sha256.as_deref() != Some(pre.sha256.as_str());
@@ -9873,6 +9876,7 @@ pub async fn deploy_projects_rollback_run(
             gateway,
             loaded,
             &set,
+            project_undo.as_ref().and_then(|undo| undo.pre.as_deref()),
             &writes,
             writes.groups.as_ref(),
             &target,

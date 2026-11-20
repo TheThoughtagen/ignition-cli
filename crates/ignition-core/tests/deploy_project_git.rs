@@ -8635,6 +8635,26 @@ mod published {
         assert_eq!(host_run_json(&rig)["import_sent"], false);
         assert_eq!(rig.git_manifest().await, before, ".git is untouched");
 
+        // CodeRabbit #61: the check makes the apply's project decision. The
+        // live project is the Designer's save, not the pre-image, and the run
+        // never sent its import, so the undo imports nothing and the check
+        // says so.
+        let check = rig.rollback_run(&run_id, true).await.expect("a check");
+        let rollback = check
+            .tags
+            .as_ref()
+            .and_then(|t| t.rollback.as_ref())
+            .expect("data.tags.rollback");
+        assert!(
+            !rollback.project_reimported,
+            "no project reimport is previewed: {:?}",
+            check.warnings
+        );
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "a check imports nothing"
+        );
+
         let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
         assert!(
             rig.gateway.import_calls().is_empty(),
