@@ -2,12 +2,14 @@
 # capture27.sh SUBCOMMAND [ARG ...]
 #
 # Phase 27 (27-03) rig driver: a disposable Ignition 8.3.6 gateway with the
-# signed git module 2.3.4 and a git server whose remote has the branches `main`
-# and `production` and no `master` (D-17), so the keep-and-advance handover of
-# the 27-01/27-02 engine can be proven against JGit inside the module.
+# signed git module named by GIT27_MODULE_VERSION (default 2.3.5) and a git
+# server whose remote has the branches `main` and `production` and no `master`
+# (D-17), so the keep-and-advance handover of the 27-01/27-02 engine can be
+# proven against JGit inside the module.
 #
 #   up27             write the rig files, build the git server, start the rig
-#                    with the module (`ign rig up --with-module git@2.3.4`)
+#                    with the module (`ign rig up --with-module git@<version>`,
+#                    the version from GIT27_MODULE_VERSION, default 2.3.5)
 #   seed27           (re)build the synthetic repository `capapp.git`: project
 #                    CapApp, branches main + production (at v1.0.0), tags
 #                    v1.0.0 and v1.1.0 (v1.1.0 is a child commit no branch
@@ -92,7 +94,7 @@ set -euo pipefail
 PORT=18292
 PROJ=ign-git27-rig
 GW_NAME=ign-git27-rig
-MODULE_VER=${GIT27_MODULE_VERSION:-2.3.4}
+MODULE_VER=${GIT27_MODULE_VERSION:-2.3.5}
 BASE=${IGN_GIT27_RIG_URL:-http://127.0.0.1:$PORT}
 # The module's server-side repository name and the project it clones into.
 APP=CapApp
