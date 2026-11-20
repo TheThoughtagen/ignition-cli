@@ -61,7 +61,9 @@ use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::git_advance::{AdvancePrep, GitWrite, prepare_advance};
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
-use ignition_core::deploy::git_state::{GitHead, GitRefs, GitState, GitStateKind, classify};
+use ignition_core::deploy::git_state::{
+    GitHead, GitRefs, GitRemote, GitState, GitStateKind, classify,
+};
 use ignition_core::deploy::ledger::{LedgerRoot, git_save_rel};
 use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact, canonical_digest};
@@ -663,6 +665,10 @@ async fn git_advance_status() {
         before.branch
     );
 
+    // version-matched restore expectation: begin
+    let (restore_expect, identity_before) =
+        restore_expect_before(&rig, &api, &HostGit::new(), true).await;
+    // version-matched restore expectation: end
     let advanced = run_handover(&rig, &api).await;
     let report = &advanced.report;
     eprintln!(
@@ -673,10 +679,28 @@ async fn git_advance_status() {
         report.expected_drift.len(),
         report.dropped.len()
     );
-    assert!(
-        report.restored && report.advanced && report.verified,
-        "{report:?}"
-    );
+    // version-matched restore expectation: begin
+    if restore_expect == RestoreExpect::Restored {
+        assert!(
+            report.restored && report.advanced && report.verified,
+            "{report:?}"
+        );
+    } else {
+        assert!(
+            !report.restored && report.advanced && report.verified,
+            "{report:?}"
+        );
+        let before = identity_before
+            .as_ref()
+            .expect("the identity is captured before the handover");
+        let after = repo_identity(&rig, &HostGit::new()).await;
+        let problems = in_place_problems(before, &after, &advanced.c2);
+        assert!(
+            problems.is_empty(),
+            "the repository after the handover is not the one before, advanced to the release: {problems:?}"
+        );
+    }
+    // version-matched restore expectation: end
 
     // JGit's status equals the prediction (as sets: none extra, none missing).
     let after = jgit(&api, &config).await;
@@ -1252,12 +1276,34 @@ async fn git_pull_push_roundtrip() {
     let (_work, config) = script_config(&api, &rig.url).await;
 
     // 1. ign's advance to v1.1.0 (as git_advance_status does).
+    // version-matched restore expectation: begin
+    let (restore_expect, identity_before) = restore_expect_before(&rig, &api, &host, true).await;
+    // version-matched restore expectation: end
     let advanced = run_handover(&rig, &api).await;
-    assert!(
-        advanced.report.restored && advanced.report.advanced && advanced.report.verified,
-        "{:?}",
-        advanced.report
-    );
+    // version-matched restore expectation: begin
+    if restore_expect == RestoreExpect::Restored {
+        assert!(
+            advanced.report.restored && advanced.report.advanced && advanced.report.verified,
+            "{:?}",
+            advanced.report
+        );
+    } else {
+        assert!(
+            !advanced.report.restored && advanced.report.advanced && advanced.report.verified,
+            "{:?}",
+            advanced.report
+        );
+        let before = identity_before
+            .as_ref()
+            .expect("the identity is captured before the handover");
+        let after = repo_identity(&rig, &host).await;
+        let problems = in_place_problems(before, &after, &advanced.c2);
+        assert!(
+            problems.is_empty(),
+            "the repository after the handover is not the one before, advanced to the release: {problems:?}"
+        );
+    }
+    // version-matched restore expectation: end
     let drift = jgit(&api, &config).await;
     eprintln!(
         "LIVE-JGIT after advance: uncommitted={} unpushed={} branch={}",
@@ -2103,6 +2149,13 @@ async fn managed_deploy(
         allow_manual_undo: expect.tags,
         ..DeployFlags::default()
     };
+    // version-matched restore expectation: begin
+    // 27-61: the module version decides what the handover must show. An
+    // adoptable repo is not a managed one and keeps its expression on every
+    // version, so its identity is not captured.
+    let (restore_expect, identity_before) =
+        restore_expect_before(rig, api, &HostGit::new(), expect.state != "adoptable").await;
+    // version-matched restore expectation: end
     let started = Instant::now();
     let applied = deploy_in_process(rig, false, ENV, release, &flags, label)
         .await
@@ -2139,15 +2192,43 @@ async fn managed_deploy(
         restore["dropped"],
         restore["reason"]
     );
-    // The import left the partial repo in place (observed live in 27-24), so
-    // there was nothing to put back and `restored` is false for an adoption;
-    // the advance and its read-back are what the adoption must show.
-    assert!(
-        (restore["restored"] == true || expect.state == "adoptable")
-            && restore["advanced"] == true
-            && restore["verified"] == true,
-        "{label}: the handover did not complete: {restore}"
-    );
+    // version-matched restore expectation: begin
+    if restore_expect == RestoreExpect::Restored || expect.state == "adoptable" {
+        // The import left the partial repo in place (observed live in 27-24), so
+        // there was nothing to put back and `restored` is false for an adoption;
+        // the advance and its read-back are what the adoption must show.
+        assert!(
+            (restore["restored"] == true || expect.state == "adoptable")
+                && restore["advanced"] == true
+                && restore["verified"] == true,
+            "{label}: the handover did not complete: {restore}"
+        );
+    } else {
+        // 27-61: the module kept `.git` through the import, so nothing is
+        // restored and the same repository is advanced to the release.
+        assert!(
+            restore["restored"] == false
+                && restore["advanced"] == true
+                && restore["verified"] == true,
+            "{label}: the handover did not advance in place: {restore}"
+        );
+        let (_keep, _tree, release_commit) = release_checkout(rig, release);
+        let before = identity_before
+            .as_ref()
+            .expect("the identity is captured before the apply");
+        let after = repo_identity(rig, &HostGit::new()).await;
+        let problems = in_place_problems(before, &after, &release_commit);
+        assert!(
+            problems.is_empty(),
+            "{label}: the repository after the deploy is not the one before, advanced to the release: {problems:?}"
+        );
+        eprintln!(
+            "LIVE-RESTORE-INPLACE {label} same repository at the release objects_before={} objects_after={}",
+            before.objects.len(),
+            after.objects.len()
+        );
+    }
+    // version-matched restore expectation: end
     assert_eq!(
         restore["post_status"], "matched",
         "{label}: the master is a local node, so the run's own post-advance disk status ran (D-25): {restore}"
@@ -3254,6 +3335,9 @@ async fn git_prodscale_rig() {
         changed_since.is_empty(),
         "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
     );
+    // version-matched restore expectation: begin
+    let (restore_expect, identity_before) = restore_expect_before(&rig, &api, &host, true).await;
+    // version-matched restore expectation: end
     let timed = TimedWriter::new(rig.node(), rig.data.clone());
     let timeline = Timeline::new();
     let extras = Extras {
@@ -3296,13 +3380,39 @@ async fn git_prodscale_rig() {
             ),
         );
     }
-    if !(restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true)
-    {
-        find(
-            &mut findings,
-            format!("the handover did not complete: {restore}"),
-        );
+    // version-matched restore expectation: begin
+    match restore_expect {
+        RestoreExpect::Restored => {
+            if !(restore["restored"] == true
+                && restore["advanced"] == true
+                && restore["verified"] == true)
+            {
+                find(
+                    &mut findings,
+                    format!("the handover did not complete: {restore}"),
+                );
+            }
+        }
+        RestoreExpect::InPlace => {
+            if !(restore["restored"] == false
+                && restore["advanced"] == true
+                && restore["verified"] == true)
+            {
+                find(
+                    &mut findings,
+                    format!("the handover did not advance in place: {restore}"),
+                );
+            }
+            let before = identity_before
+                .as_ref()
+                .expect("the identity is captured before the timed apply");
+            let after = repo_identity(&rig, &host).await;
+            for problem in in_place_problems(before, &after, &release) {
+                find(&mut findings, problem);
+            }
+        }
     }
+    // version-matched restore expectation: end
     if restore["post_status"] != "matched" {
         find(
             &mut findings,
@@ -3312,19 +3422,37 @@ async fn git_prodscale_rig() {
 
     // The budgets (D-18): none is scaled and none is skipped, and each row is
     // printed whatever the outcome.
-    for (row, span, budget) in [
-        ("save", timed.span("save"), HOST_LINUX_SAVE),
-        (
-            "restore_verify",
-            timed.span("restore"),
-            HOST_LINUX_RESTORE_VERIFY,
-        ),
-        ("upload", timed.span("upload"), HOST_LINUX_UPLOAD),
-    ] {
-        if let Some(finding) = within(row, span, budget) {
-            find(&mut findings, finding);
+    // version-matched restore expectation: begin
+    match restore_expect {
+        RestoreExpect::Restored => {
+            for (row, span, budget) in [
+                ("save", timed.span("save"), HOST_LINUX_SAVE),
+                (
+                    "restore_verify",
+                    timed.span("restore"),
+                    HOST_LINUX_RESTORE_VERIFY,
+                ),
+                ("upload", timed.span("upload"), HOST_LINUX_UPLOAD),
+            ] {
+                if let Some(finding) = within(row, span, budget) {
+                    find(&mut findings, finding);
+                }
+            }
+        }
+        RestoreExpect::InPlace => {
+            if let Some(finding) = within("save", timed.span("save"), HOST_LINUX_SAVE) {
+                find(&mut findings, finding);
+            }
+            eprintln!("LIVE-SCALE restore_verify: not applicable: advanced in place");
+            if let Some(finding) = restore_row_in_place(timed.span("restore")) {
+                find(&mut findings, finding);
+            }
+            if let Some(finding) = within("upload", timed.span("upload"), HOST_LINUX_UPLOAD) {
+                find(&mut findings, finding);
+            }
         }
     }
+    // version-matched restore expectation: end
 
     // Y3 follow-up (27-42): the save's `.git`, measured right after the timed
     // save and outside its span, has the configured shape and the counts
@@ -5124,4 +5252,334 @@ async fn git_module_version(api: &dyn GatewayApi, node: &str) -> String {
                 GIT_MODULE.gateway_module_id
             )
         })
+}
+
+/// 27-61: the restore expectation follows the module version; any version it
+/// does not know fails rather than being guessed.
+#[test]
+fn restore_expectation_follows_the_module_version() {
+    for restored in ["2.3.4 (b0)", "2.3.4"] {
+        assert_eq!(restore_expectation(restored), Ok(RestoreExpect::Restored));
+    }
+    for in_place in ["2.3.5 (b0)", "2.3.5", "2.3.10", "2.4.0 (b2)", "3.0.0"] {
+        assert_eq!(
+            restore_expectation(in_place),
+            Ok(RestoreExpect::InPlace),
+            "{in_place:?}"
+        );
+    }
+    for unknown in [
+        "2.3.3",
+        "2.2.9 (b0)",
+        "",
+        "2.3",
+        "2.3.5-rc1",
+        "2.3.x",
+        "abc",
+    ] {
+        let err = restore_expectation(unknown).expect_err(unknown);
+        assert!(err.contains(&format!("{unknown:?}")), "{err}");
+    }
+}
+
+/// A managed [`RepoIdentity`] for the unit cases below.
+fn identity(head: &str, objects: &[&str]) -> RepoIdentity {
+    RepoIdentity {
+        kind: GitStateKind::Managed,
+        remote: Some(GitRemote {
+            name: "origin".to_string(),
+            url_redacted: "http://git.example/capapp.git".to_string(),
+            url_key: "git.example/capapp".to_string(),
+        }),
+        tracked: Some("production".to_string()),
+        head: Some(head.to_string()),
+        objects: objects.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
+/// 27-61: the in-place identity check names every difference, and never the
+/// value of a remote URL.
+#[test]
+fn in_place_problems_names_every_difference() {
+    let (old, release) = ("1".repeat(40), "2".repeat(40));
+    let before = identity(&old, &["pack/pack-a.pack", "ab/cdef"]);
+    let same = identity(&release, &["pack/pack-a.pack", "ab/cdef", "12/3456"]);
+    assert_eq!(
+        in_place_problems(&before, &same, &release),
+        Vec::<String>::new()
+    );
+
+    let mut renamed = same.clone();
+    renamed.remote.as_mut().expect("remote").name = "upstream".to_string();
+    let problems = in_place_problems(&before, &renamed, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("remote name"),
+        "{problems:?}"
+    );
+
+    let mut moved = same.clone();
+    let remote = moved.remote.as_mut().expect("remote");
+    remote.url_redacted = "http://other.example/elsewhere.git".to_string();
+    remote.url_key = "other.example/elsewhere".to_string();
+    let problems = in_place_problems(&before, &moved, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("remote URL"),
+        "{problems:?}"
+    );
+    for value in ["git.example", "other.example", "elsewhere", "capapp"] {
+        assert!(
+            !problems[0].contains(value),
+            "a URL value is printed: {problems:?}"
+        );
+    }
+
+    let mut retracked = same.clone();
+    retracked.tracked = Some("main".to_string());
+    let problems = in_place_problems(&before, &retracked, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("tracked branch"),
+        "{problems:?}"
+    );
+
+    let lost = identity(&release, &["pack/pack-a.pack"]);
+    let problems = in_place_problems(&before, &lost, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("ab/cdef"),
+        "{problems:?}"
+    );
+
+    let behind = identity(&old, &["pack/pack-a.pack", "ab/cdef"]);
+    let problems = in_place_problems(&before, &behind, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("HEAD"),
+        "{problems:?}"
+    );
+
+    let mut gone = same.clone();
+    gone.kind = GitStateKind::Unsupported;
+    let problems = in_place_problems(&before, &gone, &release);
+    assert!(
+        problems.iter().any(|p| p.contains("unsupported")),
+        "{problems:?}"
+    );
+}
+
+/// 27-61: on an advance-in-place module the `restore_verify` row does not
+/// apply, and only a restore that ran anyway is a finding.
+#[test]
+fn restore_row_in_place_fails_only_on_a_restore_span() {
+    assert_eq!(restore_row_in_place(None), None);
+    let finding =
+        restore_row_in_place(Some(Duration::from_millis(1234))).expect("a restore span fails");
+    assert!(
+        finding.contains("advance-in-place") && finding.contains("1234 ms"),
+        "{finding}"
+    );
+}
+
+/// The first git module release whose start import skips `.git`, so a managed
+/// repo is advanced in place (upstream ignition-git-module #53, 27-60).
+const IN_PLACE_FROM: (u64, u64, u64) = (2, 3, 5);
+
+/// What a managed deploy must show about the restore, by module version
+/// (27-61, user decision 2026-11-20: a version match, not a loosening).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreExpect {
+    /// 2.3.4: the overwrite import deletes `.git`, and ign restores it from
+    /// its save (`restored == true`).
+    Restored,
+    /// 2.3.5 and later: `.git` survives the import, and ign advances the same
+    /// repository in place (`restored == false`).
+    InPlace,
+}
+
+/// The restore expectation for the gateway-reported module `version`. A
+/// version that is neither the defect release nor a plain `X.Y.Z` at or above
+/// [`IN_PLACE_FROM`] is an error: the expectation is never guessed.
+fn restore_expectation(version: &str) -> Result<RestoreExpect, String> {
+    if is_defect_release(version) {
+        return Ok(RestoreExpect::Restored);
+    }
+    let token = version.split_whitespace().next().unwrap_or("");
+    let parts: Vec<&str> = token.split('.').collect();
+    let numbers: Option<Vec<u64>> = (parts.len() == 3)
+        .then(|| {
+            parts
+                .iter()
+                .map(|part| {
+                    if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                        part.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .flatten();
+    match numbers.as_deref() {
+        Some(&[major, minor, patch]) if (major, minor, patch) >= IN_PLACE_FROM => {
+            Ok(RestoreExpect::InPlace)
+        }
+        _ => {
+            let (major, minor, patch) = IN_PLACE_FROM;
+            Err(format!(
+                "git module version {version:?}: the restore expectation is defined for \
+                 {DEFECT_MODULE_RELEASE} and for {major}.{minor}.{patch} or later only"
+            ))
+        }
+    }
+}
+
+/// The repository on the rig node, as far as an advance in place must keep
+/// it: the class, the remote, the tracked branch, HEAD, and every file name
+/// below `.git/objects/` (names only, never bytes; pack and loose object
+/// names are content hashes, and an advance only adds objects).
+#[derive(Debug, Clone)]
+struct RepoIdentity {
+    kind: GitStateKind,
+    remote: Option<GitRemote>,
+    tracked: Option<String>,
+    head: Option<String>,
+    objects: BTreeSet<String>,
+}
+
+/// Read the [`RepoIdentity`] of the rig's project. A missing or unreadable
+/// `.git` is read as what it is (absent, unsupported), not a panic, so a
+/// finding-based gate still prints its later rows.
+async fn repo_identity(rig: &Rig, host: &HostGit) -> RepoIdentity {
+    let files = rig
+        .node()
+        .read_git_state(APP)
+        .await
+        .expect("host read of .git");
+    let config = match files.config.as_deref() {
+        Some(raw) => host.parse_config(raw).await.ok(),
+        None => None,
+    };
+    let refs = host.parse_refs(&files).await.ok().flatten();
+    let state = classify(&files, config.as_ref(), refs.as_ref());
+    let mut objects = BTreeSet::new();
+    let root = rig.project_dir().join(".git").join("objects");
+    let mut pending = vec![root.clone()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.expect("a .git/objects entry");
+            let path = entry.path();
+            let kind = entry.file_type().expect("a .git/objects entry type");
+            if kind.is_dir() {
+                pending.push(path);
+            } else if let Ok(rel) = path.strip_prefix(&root) {
+                objects.insert(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    RepoIdentity {
+        kind: state.kind,
+        head: state
+            .head
+            .as_ref()
+            .and_then(|head| head.commit())
+            .map(str::to_string),
+        remote: state.remote,
+        tracked: state.tracked,
+        objects,
+    }
+}
+
+/// Every way `after` is not `before` advanced in place to `release_commit`.
+/// A remote URL difference is named without either value.
+fn in_place_problems(
+    before: &RepoIdentity,
+    after: &RepoIdentity,
+    release_commit: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (when, identity) in [("before", before), ("after", after)] {
+        if identity.kind != GitStateKind::Managed {
+            problems.push(format!(
+                "the repository {when} the deploy is {}, not managed",
+                identity.kind.as_str()
+            ));
+        }
+    }
+    let name = |identity: &RepoIdentity| identity.remote.as_ref().map(|r| r.name.clone());
+    if name(before) != name(after) {
+        problems.push(format!(
+            "the remote name differs: {:?} before, {:?} after",
+            name(before),
+            name(after)
+        ));
+    }
+    let url = |identity: &RepoIdentity| {
+        identity
+            .remote
+            .as_ref()
+            .map(|r| (r.url_redacted.clone(), r.url_key.clone()))
+    };
+    if url(before) != url(after) {
+        problems.push("the remote URL differs (the values are not printed)".to_string());
+    }
+    if before.tracked != after.tracked {
+        problems.push(format!(
+            "the tracked branch differs: {:?} before, {:?} after",
+            before.tracked, after.tracked
+        ));
+    }
+    let missing: Vec<&String> = before.objects.difference(&after.objects).collect();
+    if !missing.is_empty() {
+        problems.push(format!(
+            "{} object file name(s) from before are missing after: {:?}",
+            missing.len(),
+            missing.iter().take(10).collect::<Vec<_>>()
+        ));
+    }
+    if after.head.as_deref() != Some(release_commit) {
+        problems.push(format!(
+            "HEAD is {:?}, not the release commit {release_commit}",
+            after.head
+        ));
+    }
+    problems
+}
+
+/// The `restore_verify` row on an advance-in-place module: not applicable,
+/// so no span is the expected case; a `restore` span means a restore ran on a
+/// module that keeps `.git`, which is a finding.
+fn restore_row_in_place(span: Option<Duration>) -> Option<String> {
+    span.map(|measured| {
+        format!(
+            "restore_verify: a restore ran on an advance-in-place module ({} ms)",
+            measured.as_millis()
+        )
+    })
+}
+
+/// The master's git module version, the restore expectation it implies, and
+/// (on an advance-in-place module, when `capture` is set) the repository's
+/// identity before the write. An unknown version panics here, before anything
+/// is written. Prints `LIVE-RESTORE-EXPECT module=<version> expect=...`.
+async fn restore_expect_before(
+    rig: &Rig,
+    api: &dyn GatewayApi,
+    host: &HostGit,
+    capture: bool,
+) -> (RestoreExpect, Option<RepoIdentity>) {
+    let version = git_module_version(api, "master").await;
+    let expect = restore_expectation(&version).unwrap_or_else(|err| panic!("{err}"));
+    eprintln!(
+        "LIVE-RESTORE-EXPECT module={version} expect={}",
+        match expect {
+            RestoreExpect::Restored => "restored",
+            RestoreExpect::InPlace => "in_place",
+        }
+    );
+    let before = if capture && expect == RestoreExpect::InPlace {
+        Some(repo_identity(rig, host).await)
+    } else {
+        None
+    };
+    (expect, before)
 }
