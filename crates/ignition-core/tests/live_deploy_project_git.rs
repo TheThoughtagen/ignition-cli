@@ -1,6 +1,7 @@
 //! Phase 27's live gates on a git-module rig (27-03, the phase tracer's last
 //! step): the keep-and-advance handover of 27-01/27-02 runs against JGit inside
-//! the git module 2.3.4 on an Ignition 8.3.6 gateway. Nothing here is mocked.
+//! the git module on an Ignition 8.3.6 gateway. The rigs default to module 2.3.5
+//! (27-61); 2.3.4 is for `git_pair_detect_live` only. Nothing here is mocked.
 //!
 //! ```text
 //! cd crates/ignition-core/tests/fixtures/live-rig-deploy
@@ -52,6 +53,7 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::actions::script::script_run;
 use ignition_core::actions::webdev::webdev_deploy_with;
 use ignition_core::client::deploy_api::scan_and_wait;
+use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::ScanKind;
 use ignition_core::client::{DeployApi, GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{self, Config, Credential, Secret};
@@ -70,6 +72,7 @@ use ignition_core::deploy::transport::projects::{
 };
 use ignition_core::deploy::transport::{self, projects::project_host_for_node};
 use ignition_core::error::CoreError;
+use ignition_core::module::GIT_MODULE;
 use ignition_core::poll::PollConfig;
 
 mod common;
@@ -3702,7 +3705,10 @@ async fn git_designer_evidence() {
     eprintln!("LIVE-RAN git_designer_evidence");
 }
 
-// ---- 27-25 Task 1: the pair rig, git module 2.3.4 on both nodes -----------------
+// ---- 27-25 Task 1: the pair rig, the same git module on both nodes ---------------
+//
+// The pair driver defaults to git module 2.3.5 (27-61); a pair built with
+// `IGN_PAIR_MODULE_VER=2.3.4` is for `git_pair_detect_live` only.
 //
 // `capture27-pair.sh live <log> git_pair_e2e` (it sources `tokens.env` and exports
 // `IGNITION_LIVE_PAIR=1`, `IGN_PAIR_DATA_A`, `IGN_PAIR_DATA_B`,
@@ -4296,23 +4302,41 @@ async fn git_pair_e2e() {
     eprintln!("LIVE-RAN git_pair_e2e");
 }
 
-/// 27-38 (GITDEP-09 detection, never the passing gate): on the rig pair, with
-/// the git module's backup `project.json` deletion present, one apply of v1.1.0
-/// must end `git_restore_failed` (slug `deploy_git_restore_failed`, exit 6) with
-/// `restore.reason` `backup_project_json_missing` on `nodes.backup` and the
-/// backup's save kept, while the master is as strict and green as
-/// `git_pair_e2e` demands. Its last line is `LIVE-DETECT git_pair_detect_live`,
-/// a different line kind from the passing-gate line, so a proof that the guard
-/// fires is never read as a green pair. When the defect does not reproduce (the
-/// module fix is installed) it prints `LIVE-DETECT-NA defect not reproduced`
-/// and fails: retire or rewrite this check when `git_pair_e2e` goes green.
+/// 27-38 (GITDEP-09 detection, never the passing gate): proves ign's
+/// `backup_project_json_missing` guard on a real pair that runs the defective
+/// git module 2.3.4 on both nodes. With the module's backup `project.json`
+/// deletion present, one apply of v1.1.0 must end `git_restore_failed` (slug
+/// `deploy_git_restore_failed`, exit 6) with `restore.reason`
+/// `backup_project_json_missing` on `nodes.backup` and the backup's save kept,
+/// while the master is as strict and green as `git_pair_e2e` demands.
+///
+/// 27-61: on any other release the check skips before any state read or
+/// deploy, because 27-60 showed the fix on 2.3.5 and `git_pair_e2e` asserts it
+/// there. The counted proof is `capture27-pair.sh detect`, which needs the
+/// anchored `LIVE-DETECT git_pair_detect_live` line, a different line kind from
+/// the passing-gate line; a skip prints neither, so it never counts. When the
+/// defect does not reproduce on 2.3.4 the check prints
+/// `LIVE-DETECT-NA defect not reproduced` and fails.
 #[tokio::test]
-#[ignore = "needs the pair rig with the git module on both nodes: IGNITION_LIVE_PAIR=1"]
+#[ignore = "needs the pair rig with git module 2.3.4 on both nodes (IGN_PAIR_MODULE_VER=2.3.4): IGNITION_LIVE_PAIR=1"]
 async fn git_pair_detect_live() {
     let Some(rig) = pair_rig().await else { return };
     let backup = rig.backup.as_ref().expect("pair");
     let api_a = rig.api();
     let api_b = pair_api_b(&rig);
+    // 27-61: the guard's live proof needs the defective release on both nodes.
+    let version_a = git_module_version(&api_a, "master").await;
+    let version_b = git_module_version(&api_b, "backup").await;
+    if !(is_defect_release(&version_a) && is_defect_release(&version_b)) {
+        skip(&format!(
+            "git module {version_a} on the master and {version_b} on the backup: \
+             this check proves ign's backup_project_json_missing guard on \
+             {DEFECT_MODULE_RELEASE} only (build the pair with \
+             IGN_PAIR_MODULE_VER={DEFECT_MODULE_RELEASE}); git_pair_e2e is the gate \
+             on a fixed module"
+        ));
+        return;
+    }
     let host = HostGit::new();
     let node_a = LocalFsTransport::new(rig.data.clone(), "nodes.master");
     let node_b = LocalFsTransport::new(backup.data.clone(), "nodes.backup");
@@ -5054,4 +5078,50 @@ async fn git_g2norm() {
         patch.len()
     );
     println!("LIVE-RAN git_g2norm");
+}
+
+// ---- 27-61: the git module version a gate runs against -------------------------
+
+/// 27-61: the detection predicate matches the defective release only, read the
+/// way the gateway reports it (`2.3.4 (b0)`).
+#[test]
+fn is_defect_release_matches_only_the_2_3_4_release() {
+    assert!(is_defect_release("2.3.4 (b0)"));
+    assert!(is_defect_release("2.3.4"));
+    for other in ["2.3.5 (b0)", "2.3.40", "2.3.4-rc1", ""] {
+        assert!(
+            !is_defect_release(other),
+            "{other:?} is not the defect release"
+        );
+    }
+}
+
+/// The git module release with the backup `project.json` deletion (27-38).
+const DEFECT_MODULE_RELEASE: &str = "2.3.4";
+
+/// Whether the gateway-reported module `version` (`2.3.4 (b0)`) is the
+/// defective release: its first whitespace-separated token is exactly
+/// [`DEFECT_MODULE_RELEASE`].
+fn is_defect_release(version: &str) -> bool {
+    version.split_whitespace().next() == Some(DEFECT_MODULE_RELEASE)
+}
+
+/// The git module's version on one node, as the gateway's module list reports
+/// it. A failed read or a missing module panics, naming the node.
+async fn git_module_version(api: &dyn GatewayApi, node: &str) -> String {
+    let listed = api
+        .modules(false, &ListQuery::default())
+        .await
+        .unwrap_or_else(|err| panic!("{node}: the module list failed: {}", err.code()));
+    listed
+        .items
+        .iter()
+        .find(|module| module.id == GIT_MODULE.gateway_module_id)
+        .map(|module| module.version.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "{node}: the git module {} is not installed",
+                GIT_MODULE.gateway_module_id
+            )
+        })
 }
