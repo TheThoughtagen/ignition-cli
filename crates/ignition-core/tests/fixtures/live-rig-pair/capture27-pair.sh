@@ -3,10 +3,10 @@
 #
 # Phase 27 (27-04) pair rig driver: the disposable two-node 8.3.6 pair of
 # setup-pair.sh (compose project `ign-pair-rig`, gw-a Master on 127.0.0.1:18300,
-# gw-b Backup on 127.0.0.1:18301) with the signed git module 2.3.4 on BOTH nodes,
-# a git server both nodes reach, and the same `CapApp` seed and `git.yaml`
-# (template variant) on both nodes. G5 records what redundancy sync does to the
-# backup's `.git`.
+# gw-b Backup on 127.0.0.1:18301) with the signed git module named by
+# IGN_PAIR_MODULE_VER (default 2.3.5) on BOTH nodes, a git server both nodes
+# reach, and the same `CapApp` seed and `git.yaml` (template variant) on both
+# nodes. G5 records what redundancy sync does to the backup's `.git`.
 #
 #   up       idempotent. A rig that is already up with the module is left as is.
 #            Otherwise: seed the synthetic repository, write a compose override
@@ -40,8 +40,10 @@
 #            named test must end its log with an anchored `LIVE-DETECT <name>`
 #            line (the check proves the backup project.json guard fires on the
 #            rig pair; it is never a passing gate) and the log must not hold a
-#            `LIVE-RAN <name>` line for the same name. `git_pair_e2e` is not run
-#            by it and stays RED until the git-module fix lands
+#            `LIVE-RAN <name>` line for the same name. The check runs only on a
+#            pair built with IGN_PAIR_MODULE_VER=2.3.4; on any other module it
+#            skips, so this runner fails for the missing line. `git_pair_e2e` is
+#            the passing gate on the fixed module (27-60)
 #   down     remove the pair (compose down -v), the git server and the override
 #
 # G5 steps (each timed):
@@ -101,7 +103,10 @@ DEPLOY_FIX=$HERE/../live-rig-deploy
 PROJECT=ign-pair-rig
 APP=CapApp
 BARE=capapp.git
-MODULE_VER=2.3.4
+# IGN_PAIR_MODULE_VER: the git module version both nodes run (default 2.3.5,
+# the release that fixes the backup project.json deletion). Set 2.3.4 to
+# rebuild the defect for git_pair_detect_live.
+MODULE_VER=${IGN_PAIR_MODULE_VER:-2.3.5}
 CDATA=/usr/local/bin/ignition/data
 # IGN_PAIR_WAIT_S: how long up waits for each node (default 600 s; a loaded
 # machine running the amd64 image under emulation needs more).
