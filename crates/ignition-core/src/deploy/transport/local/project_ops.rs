@@ -4202,6 +4202,34 @@ mod tests {
         );
     }
 
+    /// CodeRabbit #61 (CR1): the paths the no-replace move gives Win32. A
+    /// short path is passed as it is; a long one gets the extended-length
+    /// prefix (`\\?\UNC\` for a UNC path); a verbatim one is left alone.
+    #[cfg(windows)]
+    #[test]
+    fn local_noreplace_windows_long_paths_get_the_extended_prefix() {
+        let shown = |p: &str| {
+            let w = super::super::git_dir::wide_path(Path::new(p)).expect("wide path");
+            assert_eq!(w.last(), Some(&0), "NUL-terminated");
+            String::from_utf16(&w[..w.len() - 1]).expect("utf-16")
+        };
+        let long = "d".repeat(250);
+        assert_eq!(shown(r"C:\data\projects\.git"), r"C:\data\projects\.git");
+        assert_eq!(
+            shown(&format!(r"C:\{long}\restoring")),
+            format!(r"\\?\C:\{long}\restoring")
+        );
+        assert_eq!(
+            shown(&format!(r"\\server\share\{long}\restoring")),
+            format!(r"\\?\UNC\server\share\{long}\restoring")
+        );
+        assert_eq!(
+            shown(&format!(r"\\?\C:\{long}\restoring")),
+            format!(r"\\?\C:\{long}\restoring")
+        );
+        assert!(super::super::git_dir::wide_path(Path::new("a\0b")).is_err());
+    }
+
     /// C10/C11 kept (27-44): when a write fails after its lock was created,
     /// the lock is removed only if it is still the file this call created. A
     /// lock another writer put at the name meanwhile, with the same bytes or

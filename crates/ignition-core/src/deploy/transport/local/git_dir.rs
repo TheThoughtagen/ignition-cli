@@ -818,20 +818,13 @@ fn open_held(path: &Path, dir: bool) -> std::io::Result<File> {
 /// `MOVEFILE_REPLACE_EXISTING` any object at `to` (a file or a directory,
 /// empty or not) fails the call with `ERROR_ALREADY_EXISTS` or
 /// `ERROR_FILE_EXISTS`, both `ErrorKind::AlreadyExists`. No flag lets it copy
-/// across volumes either: both names are below one held data directory.
+/// across volumes either: both names are below one held data directory. Both
+/// paths are given in the form [`wide_path`] makes, so a long one moves as it
+/// did through `std::fs::rename`.
 #[cfg(windows)]
 pub(super) fn move_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
-    let wide = |p: &Path| -> std::io::Result<Vec<u16>> {
-        let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
-        if w.contains(&0) {
-            return Err(std::io::ErrorKind::InvalidInput.into());
-        }
-        w.push(0);
-        Ok(w)
-    };
-    let (from, to) = (wide(from)?, wide(to)?);
+    let (from, to) = (wide_path(from)?, wide_path(to)?);
     // SAFETY: both pointers are to NUL-terminated UTF-16 buffers that live
     // until the call returns; the flags are 0 (no replace, no copy).
     let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
@@ -840,6 +833,58 @@ pub(super) fn move_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// `p` as the NUL-terminated wide path `MoveFileExW` is given, converted the
+/// way `std::fs` converts a path (CodeRabbit #61): one of 248 units or more
+/// (the legacy `MAX_PATH` of the directory APIs) is made absolute and given
+/// the extended-length prefix, `\\?\` before a drive and `\\?\UNC\` in
+/// place of the `\\` of a UNC path, so a stage deeper than `MAX_PATH` still
+/// moves on a host without the long-path opt-in. A shorter path, and one that
+/// already is verbatim (`\\?\` or `\??\`), is passed as it is.
+#[cfg(windows)]
+pub(super) fn wide_path(p: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    const LEGACY_MAX_PATH: usize = 248;
+    const SEP: u16 = b'\\' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    const COLON: u16 = b':' as u16;
+    const VERBATIM: [u16; 4] = [SEP, SEP, QUERY, SEP];
+    const NT: [u16; 4] = [SEP, QUERY, QUERY, SEP];
+    const UNC: [u16; 8] = [
+        SEP,
+        SEP,
+        QUERY,
+        SEP,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        SEP,
+    ];
+    let encode = |p: &Path| -> std::io::Result<Vec<u16>> {
+        let w: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if w.contains(&0) {
+            Err(std::io::ErrorKind::InvalidInput.into())
+        } else {
+            Ok(w)
+        }
+    };
+    let mut w = encode(p)?;
+    if !w.starts_with(&VERBATIM) && !w.starts_with(&NT) && w.len() + 1 >= LEGACY_MAX_PATH {
+        // `GetFullPathNameW`, which std's own conversion calls.
+        let full = encode(&std::path::absolute(p)?)?;
+        let (prefix, skip): (&[u16], usize) = match full.as_slice() {
+            [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => (&[], 0),
+            [SEP, SEP, DOT, SEP, ..] => (&VERBATIM, 4),
+            [SEP, SEP, ..] => (&UNC, 2),
+            [_, COLON, SEP, ..] => (&VERBATIM, 0),
+            _ => (&[], 0),
+        };
+        w = [prefix, &full[skip..]].concat();
+    }
+    w.push(0);
+    Ok(w)
 }
 
 /// Whether the handle's metadata says the object is a reparse point of any
