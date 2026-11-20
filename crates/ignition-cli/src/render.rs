@@ -2054,12 +2054,23 @@ fn git_lines(
             ));
         }
         if let Some(save) = &node.save {
-            lines.push(format!(
-                "  saved .git: {} ({} file(s), {} byte(s))",
-                escape_control(&save.path),
-                save.files,
-                save.bytes
-            ));
+            // CodeRabbit #61: a missing save (`git_save_missing`) carries the
+            // journal's entry, not a copy that exists.
+            let missing = node.restore.as_ref().and_then(|r| r.reason.as_deref())
+                == Some(REASON_GIT_SAVE_MISSING);
+            if missing {
+                lines.push(format!(
+                    "  saved .git (as the journal names it; it could not be found or read): {}",
+                    escape_control(&save.path)
+                ));
+            } else {
+                lines.push(format!(
+                    "  saved .git: {} ({} file(s), {} byte(s))",
+                    escape_control(&save.path),
+                    save.files,
+                    save.bytes
+                ));
+            }
         }
         if let Some(restore) = &node.restore {
             match restore.reason.as_deref() {
@@ -5862,6 +5873,39 @@ mod tests {
         assert!(
             outcome.contains("git_save_missing") && !outcome.contains("copy at"),
             "{outcome}"
+        );
+    }
+
+    /// CodeRabbit #61: a node whose save is missing (`git_save_missing`) does
+    /// not show the journal's path, files and bytes as an available save; the
+    /// line says the copy the journal names could not be found or read. An
+    /// available save keeps its line.
+    #[test]
+    fn missing_save_is_not_shown_as_an_available_save() {
+        let mut result = failed_pair_result("git_save_missing");
+        let git = result.git.as_mut().expect("git");
+        git.nodes[1].restore.as_mut().expect("restore").save_kept = false;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            !text.contains(
+                "saved .git: ign-deploy/gw/projects/App/git-save/r1/backup-repo (9 file(s), \
+                 2100 byte(s))"
+            ),
+            "the missing save is not shown as available: {text}"
+        );
+        assert!(
+            text.contains(
+                "saved .git (as the journal names it; it could not be found or read): \
+                 ign-deploy/gw/projects/App/git-save/r1/backup-repo"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "saved .git: ign-deploy/gw/projects/App/git-save/r1/repo (12 file(s), 3400 \
+                 byte(s))"
+            ),
+            "an available save keeps its line: {text}"
         );
     }
 
