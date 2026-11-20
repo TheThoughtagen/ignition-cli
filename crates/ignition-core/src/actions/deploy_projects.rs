@@ -9871,6 +9871,28 @@ pub async fn deploy_projects_rollback_run(
                 entry.node, entry.path
             ));
         }
+        // CodeRabbit #61: a pending save the undo would put back is a planned
+        // change. That is a node with no `.git` now and a git surface, whose
+        // save reads as the journal recorded it: the apply's
+        // `git_after_pending` writes nothing for one that is gone or
+        // recreated, and leaves an entry whose node holds a `.git` again.
+        let mut pending_restore = false;
+        for (saved, read) in [
+            (pending_master_saved.as_ref(), surfaces.host.git()),
+            (
+                pending_backup_saved.as_ref(),
+                backup_host.as_deref().and_then(|host| host.git()),
+            ),
+        ] {
+            if let (Some(saved), Some(read)) = (saved, read)
+                && read
+                    .save_manifest(&saved.gateway, &saved.project, &saved.run_id)
+                    .await
+                    .is_ok_and(|now| now == saved.manifest)
+            {
+                pending_restore = true;
+            }
+        }
         result.git = git_report.take().map(Box::new);
         rollback_run_preview(
             gateway,
@@ -9884,6 +9906,7 @@ pub async fn deploy_projects_rollback_run(
             &mut result,
         )
         .await;
+        result.would_change |= pending_restore;
         return Ok(result);
     }
 

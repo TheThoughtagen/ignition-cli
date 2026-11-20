@@ -8738,6 +8738,47 @@ mod published {
         assert_eq!(pending[0]["manifest"]["digest"], before.digest.as_str());
     }
 
+    /// CodeRabbit #61: with the project and the tags already restored, the
+    /// check of the retry counts the pending save the apply puts back
+    /// (`.git` absent, the save as the journal recorded it) in
+    /// `would_change`, and writes nothing. A pending save that is gone is not
+    /// counted: the apply writes nothing for it.
+    #[tokio::test]
+    async fn rollback_run_check_counts_only_the_pending_save_the_apply_puts_back() {
+        let (rig, _before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+        let journal = host_journal_json(&rig).expect("the journal");
+        let check = rig.rollback_run(&run_id, true).await.expect("a check");
+        let rollback = check
+            .tags
+            .as_ref()
+            .and_then(|t| t.rollback.as_ref())
+            .expect("data.tags.rollback");
+        assert!(
+            !rollback.project_reimported && rollback.reimported_count == 0,
+            "the project and the tags are already restored: {rollback:?}"
+        );
+        assert!(
+            check.would_change,
+            "the pending save is put back by the apply: {:?}",
+            check.warnings
+        );
+        assert!(!rig.f.git_dir().exists(), "a check writes no .git");
+        assert_eq!(host_journal_json(&rig).expect("the journal stays"), journal);
+
+        let (rig, _before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+        let tree = rig.save_trees().remove(0);
+        std::fs::remove_dir_all(tree.parent().expect("the run's save directory"))
+            .expect("the save is deleted");
+        let check = rig.rollback_run(&run_id, true).await.expect("a check");
+        assert!(
+            !check.would_change,
+            "a save that is gone is not put back: {:?}",
+            check.warnings
+        );
+    }
+
     /// P3: `--rollback-run` with the Designer gone finds `.git` absent and a
     /// pending entry, and puts the save back unchanged, removes the entry and
     /// the save, and clears the journal. Before 27-54 the retry saw no git
