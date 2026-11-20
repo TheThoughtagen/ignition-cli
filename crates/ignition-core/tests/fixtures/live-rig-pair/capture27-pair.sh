@@ -101,7 +101,9 @@ DEPLOY_FIX=$HERE/../live-rig-deploy
 PROJECT=ign-pair-rig
 APP=CapApp
 BARE=capapp.git
-MODULE_VER=2.3.4
+# IGN_PAIR_MODULE_VER: the git module version both nodes run (default 2.3.4,
+# the release with the backup project.json defect).
+MODULE_VER=${IGN_PAIR_MODULE_VER:-2.3.4}
 CDATA=/usr/local/bin/ignition/data
 # IGN_PAIR_WAIT_S: how long up waits for each node (default 600 s; a loaded
 # machine running the amd64 image under emulation needs more).
