@@ -65,11 +65,14 @@
 //! system that does not know the flag (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`) fails
 //! closed with "the host cannot publish without replacing"
 //! (`local_noreplace_unsupported_fails_closed`); there is no plain-rename
-//! fallback. On Windows `std::fs::rename` is the publish: the target is
-//! checked on its parent's held handle first, and std refuses a directory
-//! target (`local_git_restore_refuses_an_existing_git_on_windows`,
-//! `local_noreplace_windows_rename_refuses_a_directory_target`). The residual
-//! there is the final component, as for the reads.
+//! fallback. On Windows the publish is `MoveFileExW` without
+//! `MOVEFILE_REPLACE_EXISTING`, after the target is checked on its parent's
+//! held handle; it fails on any existing target, an empty directory included
+//! (`local_git_restore_refuses_an_existing_git_on_windows`,
+//! `local_noreplace_windows_publish_keeps_an_empty_git_planted_at_the_move`).
+//! `std::fs::rename` is never the publish there: it replaces an empty
+//! directory on Windows. The residual is the final component, as for the
+//! reads.
 //!
 //! The error texts are value-free: level names only, never a path outside the
 //! data directory.
@@ -811,6 +814,34 @@ fn open_held(path: &Path, dir: bool) -> std::io::Result<File> {
         .open(path)
 }
 
+/// `MoveFileExW(from, to, 0)`: a move that never replaces. Without
+/// `MOVEFILE_REPLACE_EXISTING` any object at `to` (a file or a directory,
+/// empty or not) fails the call with `ERROR_ALREADY_EXISTS` or
+/// `ERROR_FILE_EXISTS`, both `ErrorKind::AlreadyExists`. No flag lets it copy
+/// across volumes either: both names are below one held data directory.
+#[cfg(windows)]
+pub(super) fn move_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let wide = |p: &Path| -> std::io::Result<Vec<u16>> {
+        let mut w: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if w.contains(&0) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        w.push(0);
+        Ok(w)
+    };
+    let (from, to) = (wide(from)?, wide(to)?);
+    // SAFETY: both pointers are to NUL-terminated UTF-16 buffers that live
+    // until the call returns; the flags are 0 (no replace, no copy).
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Whether the handle's metadata says the object is a reparse point of any
 /// kind (symlink, junction, or another).
 #[cfg(windows)]
@@ -900,6 +931,17 @@ impl GitDir {
         let file = match open_held(&self.path.join(name), false) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // A directory opened without `FILE_FLAG_BACKUP_SEMANTICS` is
+            // "access denied": what is there is looked at without following
+            // it, and anything but a regular file is refused as one, the
+            // answer the unix open's `fstat` gives.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return match self.kind_here(name)? {
+                    Kind::File => Err(io_text(&rel, "cannot be read", &e)),
+                    Kind::Missing => Ok(None),
+                    other => Err(file_error(&rel, other)),
+                };
+            }
             Err(e) => return Err(io_text(&rel, "cannot be read", &e)),
         };
         let meta = file
@@ -996,9 +1038,11 @@ impl GitDir {
     }
 
     /// Move `from` below this directory to `to` below `to_dir`, never over
-    /// anything: the target is looked at on its parent's held handle, and
-    /// `std::fs::rename` refuses a directory target (the Windows tests prove
-    /// it). The residual is the final component.
+    /// anything: the target is looked at on its parent's held handle, then
+    /// the move is `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, which
+    /// fails on any existing target, an empty directory included
+    /// (`std::fs::rename` is not used: it replaces an empty directory on
+    /// Windows). The residual is the final component.
     pub(super) fn publish_noreplace(
         &self,
         from: &str,
@@ -1008,7 +1052,8 @@ impl GitDir {
         if to_dir.kind_here(to)? != Kind::Missing {
             return Err(GitDirError::already("the target already exists"));
         }
-        std::fs::rename(self.path.join(from), to_dir.path.join(to)).map_err(|e| {
+        fire(|| format!("move:{to}"));
+        move_noreplace(&self.path.join(from), &to_dir.path.join(to)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists
                 || e.kind() == std::io::ErrorKind::PermissionDenied
                     && to_dir.kind_here(to).is_ok_and(|k| k != Kind::Missing)

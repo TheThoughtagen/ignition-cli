@@ -1509,6 +1509,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "windows-sys 0.61.2",
  "wiremock",
  "yaml_serde",
  "zip",

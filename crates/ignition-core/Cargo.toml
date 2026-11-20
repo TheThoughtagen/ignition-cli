@@ -37,6 +37,9 @@ similar = "3" # 22-04: unified text diff for `deploy plan --diff` only; already 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true } # 22-01: descriptor-relative openat (deploy/tree.rs open_regular_file) — already in the graph via tempfile, NOT a new crate
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true } # 27-gaps: MoveFileExW (no MOVEFILE_REPLACE_EXISTING) for the Windows restore publish — already in the graph via tempfile at 0.61.2 (same features), NOT a new crate
+
 [dev-dependencies]
 wiremock = { workspace = true }
 tempfile = { workspace = true }

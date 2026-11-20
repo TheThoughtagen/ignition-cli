@@ -90,6 +90,12 @@ crossbeam-channel = "0.5"
 # io::Error conversion) is enabled and the dependency is cfg(unix) in
 # ignition-core.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+# Phase 27 (27-gaps, PR #61 windows-latest): windows-sys is promoted from the
+# graph (tempfile resolves it at 0.61.2 with the same two features) for the
+# Windows restore publish: MoveFileExW without MOVEFILE_REPLACE_EXISTING, the
+# no-replace move std::fs::rename is not (it replaces an empty directory).
+# Cargo.lock does not change: NOT a new package. cfg(windows) in ignition-core.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

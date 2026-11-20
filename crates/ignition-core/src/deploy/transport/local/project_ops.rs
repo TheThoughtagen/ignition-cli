@@ -3983,6 +3983,15 @@ mod tests {
     /// Restore the save of `data_with_save` with `planted` files created in a
     /// `.git` that appears just before the publish; returns the error text.
     fn restore_with_git_planted(planted: &'static [(&'static str, &'static [u8])]) -> String {
+        restore_with_git_planted_at("publish:CapApp", planted)
+    }
+
+    /// [`restore_with_git_planted`] with the `.git` planted at the hook point
+    /// `label`.
+    fn restore_with_git_planted_at(
+        label: &'static str,
+        planted: &'static [(&'static str, &'static [u8])],
+    ) -> String {
         let dir = data_with_save();
         let t = host(dir.path());
         let before = t
@@ -3990,7 +3999,7 @@ mod tests {
             .expect("save manifest");
         let git = dir.path().join("projects/CapApp/.git");
         let g = git.clone();
-        at_point("publish:CapApp", move || {
+        at_point(label, move || {
             std::fs::create_dir(&g).expect("plant .git");
             for (name, bytes) in planted {
                 std::fs::write(g.join(name), bytes).expect("plant file");
@@ -4087,30 +4096,57 @@ mod tests {
     }
 
     /// 27-44 on Windows: an empty `.git` planted before the publish is kept
-    /// and the restore refuses with the same wording (std's rename refuses a
-    /// directory target; the publish also looks at the target on its parent's
-    /// handle). Pending windows-latest CI.
+    /// and the restore refuses with the same wording (the publish looks at the
+    /// target on its parent's handle first).
     #[cfg(windows)]
     #[test]
     fn local_git_restore_refuses_an_existing_git_on_windows() {
         restore_with_git_planted(&[]);
     }
 
-    /// The assumption the Windows publish relies on, proven directly: std's
-    /// rename of a directory onto an existing empty directory fails and both
-    /// survive. Pending windows-latest CI.
+    /// 27-44 on Windows, the move itself: an empty `.git` planted after the
+    /// publish looked at the target, just before the move, is kept and the
+    /// restore refuses "appeared; it is never replaced". The move is
+    /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`; `std::fs::rename`
+    /// would have replaced the empty directory (PR #61 windows-latest).
     #[cfg(windows)]
     #[test]
-    fn local_noreplace_windows_rename_refuses_a_directory_target() {
+    fn local_noreplace_windows_publish_keeps_an_empty_git_planted_at_the_move() {
+        restore_with_git_planted_at("move:.git", &[]);
+    }
+
+    /// The Windows no-replace move, directly: an existing empty directory or
+    /// file at the target fails it as `AlreadyExists`, and the source and the
+    /// target are both left as they were.
+    #[cfg(windows)]
+    #[test]
+    fn local_noreplace_windows_move_refuses_an_existing_target() {
         let dir = tempfile::tempdir().expect("dir");
-        let (from, to) = (dir.path().join("from"), dir.path().join("to"));
+        let from = dir.path().join("from");
         std::fs::create_dir(&from).expect("from");
         std::fs::write(from.join("f"), b"x").expect("f");
-        std::fs::create_dir(&to).expect("to");
-        std::fs::rename(&from, &to).expect_err("a directory target is not replaced");
-        assert!(from.join("f").is_file(), "the source is untouched");
-        assert!(to.is_dir(), "the target is untouched");
-        assert_eq!(std::fs::read_dir(&to).expect("to").count(), 0);
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).expect("empty");
+        let e = super::super::git_dir::move_noreplace(&from, &empty)
+            .expect_err("an empty directory target is not replaced");
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert!(empty.is_dir(), "the target is untouched");
+        assert_eq!(std::fs::read_dir(&empty).expect("empty").count(), 0);
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"keep").expect("file");
+        let e = super::super::git_dir::move_noreplace(&from, &file)
+            .expect_err("a file target is not replaced");
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(std::fs::read(&file).expect("file"), b"keep");
+        assert_eq!(
+            std::fs::read(from.join("f")).expect("f"),
+            b"x",
+            "the source is untouched"
+        );
+        let to = dir.path().join("to");
+        super::super::git_dir::move_noreplace(&from, &to).expect("a free target is moved to");
+        assert_eq!(std::fs::read(to.join("f")).expect("moved"), b"x");
+        assert!(!from.exists());
     }
 
     /// C10/C11 kept (27-44): when a write fails after its lock was created,
@@ -4313,7 +4349,10 @@ mod tests {
 
     /// 27-45 (F4): the comparison is made under the lock. A lock another
     /// writer holds at the name after this call's create (the call's own is
-    /// gone) is not removed by the refusal.
+    /// gone) is not removed by the refusal. Unix only: on Windows the lock is
+    /// held without delete sharing, so no other writer can take the name while
+    /// the compare runs (the Windows test below).
+    #[cfg(unix)]
     #[test]
     fn local_git_write_mismatch_keeps_a_foreign_lock() {
         let dir = data_with_repo();
@@ -4338,6 +4377,58 @@ mod tests {
         assert_eq!(
             std::fs::read(git.join("refs/heads/main.lock")).expect("the foreign lock stays"),
             b"foreign"
+        );
+        assert_eq!(
+            std::fs::read(git.join("refs/heads/main")).expect("main"),
+            b"dddd\n"
+        );
+    }
+
+    /// 27-45 (F4) on Windows: the lock this call created is held without
+    /// delete sharing while the target is compared, so another writer can
+    /// neither remove it nor create its own at the name (the swap the unix
+    /// test makes cannot happen here). The refusal then removes this call's
+    /// lock and keeps the Designer's value.
+    #[cfg(windows)]
+    #[test]
+    fn local_git_write_mismatch_holds_its_lock_on_windows() {
+        let dir = data_with_repo();
+        let git = dir.path().join("projects/CapApp/.git");
+        let g = git.clone();
+        // what the other writer's remove (its raw error) and create got
+        type Seen = Option<(Option<i32>, std::io::ErrorKind)>;
+        let seen: std::rc::Rc<std::cell::RefCell<Seen>> = std::rc::Rc::default();
+        let record = seen.clone();
+        at_point("locked:refs/heads/main", move || {
+            let lock = g.join("refs/heads/main.lock");
+            let removed = std::fs::remove_file(&lock).expect_err("the held lock is not removed");
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+                .expect_err("the name is taken");
+            *record.borrow_mut() = Some((removed.raw_os_error(), created.kind()));
+            std::fs::write(g.join("refs/heads/main"), "dddd\n").expect("designer commit");
+        });
+        let result = host(dir.path()).write_git_files_blocking(
+            "CapApp",
+            &[guarded(
+                GitWriteName::BranchRef("main".to_string()),
+                b"bbbb\n",
+                OldValue::Sha256(sha(b"aaaa\n")),
+                None,
+            )],
+        );
+        no_point();
+        assert_eq!(
+            seen.borrow_mut().take(),
+            Some((Some(32), std::io::ErrorKind::AlreadyExists)),
+            "the remove is a sharing violation (32) and the create finds the name taken"
+        );
+        assert_changed(&result.expect_err("refused"), "refs/heads/main");
+        assert!(
+            std::fs::symlink_metadata(git.join("refs/heads/main.lock")).is_err(),
+            "this call's lock is removed"
         );
         assert_eq!(
             std::fs::read(git.join("refs/heads/main")).expect("main"),

@@ -430,8 +430,9 @@ pub trait GitHostRead: Send + Sync {
 ///   `local_git_restore_keeps_an_empty_git_planted_before_the_publish`); a host
 ///   whose file system does not know the flag fails closed with "the host
 ///   cannot publish without replacing" and there is no plain-rename fallback
-///   (`local_noreplace_unsupported_fails_closed`). On Windows std's rename
-///   refuses a directory target (`local_git_restore_refuses_an_existing_git_on_windows`).
+///   (`local_noreplace_unsupported_fails_closed`). On Windows the publish is
+///   `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, which never replaces
+///   either (`local_noreplace_windows_publish_keeps_an_empty_git_planted_at_the_move`).
 /// - [`write_git_files`](Self::write_git_files) writes the fixed
 ///   [`GitWriteName`](crate::deploy::git_advance::GitWriteName) files inside an
 ///   existing `.git`, each through `<name>.lock` created exclusively and then
