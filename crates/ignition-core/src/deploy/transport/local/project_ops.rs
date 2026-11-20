@@ -2330,9 +2330,14 @@ mod tests {
 
     fn data_with_save() -> tempfile::TempDir {
         let dir = data_with_projects();
-        std::fs::create_dir_all(dir.path().join("projects/CapApp")).expect("project");
-        let repo = dir
-            .path()
+        fill_save(dir.path());
+        dir
+    }
+
+    /// The save of [`data_with_save`] and its project directory, in `data`.
+    fn fill_save(data: &Path) {
+        std::fs::create_dir_all(data.join("projects/CapApp")).expect("project");
+        let repo = data
             .join("ign-deploy/gw/projects/CapApp/git-save")
             .join(SAVE_RUN)
             .join("repo");
@@ -2340,7 +2345,6 @@ mod tests {
         std::fs::write(repo.join("HEAD"), "ref: refs/heads/main\n").expect("head");
         std::fs::write(repo.join("config"), "[core]\n").expect("config");
         std::fs::write(repo.join("objects/o1"), "object").expect("object");
-        dir
     }
 
     /// 27-30 (WR-B6): a symlink at any level of the save path refuses the
@@ -4147,6 +4151,55 @@ mod tests {
         super::super::git_dir::move_noreplace(&from, &to).expect("a free target is moved to");
         assert_eq!(std::fs::read(to.join("f")).expect("moved"), b"x");
         assert!(!from.exists());
+    }
+
+    /// CodeRabbit #61 (CR1): a stage whose path is longer than `MAX_PATH`
+    /// (260), published to a `.git` path that fits, is put in place on a host
+    /// without the long-path opt-in. `std::fs::rename` gave Win32 the
+    /// extended-length form of a long path; the no-replace move has to as
+    /// well, or the publish fails and `.git` stays absent.
+    #[cfg(windows)]
+    #[test]
+    fn local_git_restore_publishes_a_stage_longer_than_max_path_on_windows() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // The data directory is padded to 215 units: the stage,
+        // `<data>\ign-deploy\gw\projects\CapApp\git-save\<run>\restoring`, is
+        // then past 260 and `<data>\projects\CapApp\.git` under 248.
+        let pad = 215usize
+            .saturating_sub(base.path().as_os_str().len() + 1)
+            .max(1);
+        let data = base.path().join("d".repeat(pad));
+        std::fs::create_dir_all(&data).expect("data");
+        fill_save(&data);
+        let stage = data
+            .join("ign-deploy/gw/projects/CapApp/git-save")
+            .join(SAVE_RUN)
+            .join("restoring");
+        let git = data.join("projects/CapApp/.git");
+        let stage_len = std::path::absolute(&stage)
+            .expect("stage")
+            .as_os_str()
+            .len();
+        let git_len = std::path::absolute(&git).expect("git").as_os_str().len();
+        assert!(stage_len > 260, "the stage is past MAX_PATH ({stage_len})");
+        assert!(git_len < 248, "the .git path fits ({git_len})");
+        let t = host(&data);
+        let saved = t
+            .save_manifest_blocking("gw", "CapApp", SAVE_RUN)
+            .expect("save manifest");
+        assert!(!git.exists(), "the destination is absent");
+        let restored = t
+            .restore_git_blocking("gw", "CapApp", SAVE_RUN)
+            .expect("the long stage is published");
+        assert_eq!(restored, saved, "the restored .git is the save");
+        assert_eq!(
+            std::fs::read(git.join("HEAD")).expect("HEAD"),
+            b"ref: refs/heads/main\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&stage).is_err(),
+            "the stage was moved"
+        );
     }
 
     /// C10/C11 kept (27-44): when a write fails after its lock was created,
