@@ -694,7 +694,8 @@ async fn git_advance_status() {
             .as_ref()
             .expect("the identity is captured before the handover");
         let after = repo_identity(&rig, &HostGit::new()).await;
-        let problems = in_place_problems(before, &after, &advanced.c2);
+        let problems =
+            in_place_problems(before, &after, old_head_present(&rig, before), &advanced.c2);
         assert!(
             problems.is_empty(),
             "the repository after the handover is not the one before, advanced to the release: {problems:?}"
@@ -1297,7 +1298,8 @@ async fn git_pull_push_roundtrip() {
             .as_ref()
             .expect("the identity is captured before the handover");
         let after = repo_identity(&rig, &host).await;
-        let problems = in_place_problems(before, &after, &advanced.c2);
+        let problems =
+            in_place_problems(before, &after, old_head_present(&rig, before), &advanced.c2);
         assert!(
             problems.is_empty(),
             "the repository after the handover is not the one before, advanced to the release: {problems:?}"
@@ -2217,15 +2219,18 @@ async fn managed_deploy(
             .as_ref()
             .expect("the identity is captured before the apply");
         let after = repo_identity(rig, &HostGit::new()).await;
-        let problems = in_place_problems(before, &after, &release_commit);
+        let problems = in_place_problems(
+            before,
+            &after,
+            old_head_present(rig, before),
+            &release_commit,
+        );
         assert!(
             problems.is_empty(),
             "{label}: the repository after the deploy is not the one before, advanced to the release: {problems:?}"
         );
         eprintln!(
-            "LIVE-RESTORE-INPLACE {label} same repository at the release objects_before={} objects_after={}",
-            before.objects.len(),
-            after.objects.len()
+            "LIVE-RESTORE-INPLACE {label} same repository at the release, pre-deploy HEAD kept"
         );
     }
     // version-matched restore expectation: end
@@ -3407,7 +3412,9 @@ async fn git_prodscale_rig() {
                 .as_ref()
                 .expect("the identity is captured before the timed apply");
             let after = repo_identity(&rig, &host).await;
-            for problem in in_place_problems(before, &after, &release) {
+            for problem in
+                in_place_problems(before, &after, old_head_present(&rig, before), &release)
+            {
                 find(&mut findings, problem);
             }
         }
@@ -5283,7 +5290,7 @@ fn restore_expectation_follows_the_module_version() {
 }
 
 /// A managed [`RepoIdentity`] for the unit cases below.
-fn identity(head: &str, objects: &[&str]) -> RepoIdentity {
+fn identity(head: &str) -> RepoIdentity {
     RepoIdentity {
         kind: GitStateKind::Managed,
         remote: Some(GitRemote {
@@ -5293,7 +5300,6 @@ fn identity(head: &str, objects: &[&str]) -> RepoIdentity {
         }),
         tracked: Some("production".to_string()),
         head: Some(head.to_string()),
-        objects: objects.iter().map(|name| name.to_string()).collect(),
     }
 }
 
@@ -5302,16 +5308,16 @@ fn identity(head: &str, objects: &[&str]) -> RepoIdentity {
 #[test]
 fn in_place_problems_names_every_difference() {
     let (old, release) = ("1".repeat(40), "2".repeat(40));
-    let before = identity(&old, &["pack/pack-a.pack", "ab/cdef"]);
-    let same = identity(&release, &["pack/pack-a.pack", "ab/cdef", "12/3456"]);
+    let before = identity(&old);
+    let same = identity(&release);
     assert_eq!(
-        in_place_problems(&before, &same, &release),
+        in_place_problems(&before, &same, true, &release),
         Vec::<String>::new()
     );
 
     let mut renamed = same.clone();
     renamed.remote.as_mut().expect("remote").name = "upstream".to_string();
-    let problems = in_place_problems(&before, &renamed, &release);
+    let problems = in_place_problems(&before, &renamed, true, &release);
     assert!(
         problems.len() == 1 && problems[0].contains("remote name"),
         "{problems:?}"
@@ -5321,7 +5327,7 @@ fn in_place_problems_names_every_difference() {
     let remote = moved.remote.as_mut().expect("remote");
     remote.url_redacted = "http://other.example/elsewhere.git".to_string();
     remote.url_key = "other.example/elsewhere".to_string();
-    let problems = in_place_problems(&before, &moved, &release);
+    let problems = in_place_problems(&before, &moved, true, &release);
     assert!(
         problems.len() == 1 && problems[0].contains("remote URL"),
         "{problems:?}"
@@ -5335,29 +5341,30 @@ fn in_place_problems_names_every_difference() {
 
     let mut retracked = same.clone();
     retracked.tracked = Some("main".to_string());
-    let problems = in_place_problems(&before, &retracked, &release);
+    let problems = in_place_problems(&before, &retracked, true, &release);
     assert!(
         problems.len() == 1 && problems[0].contains("tracked branch"),
         "{problems:?}"
     );
 
-    let lost = identity(&release, &["pack/pack-a.pack"]);
-    let problems = in_place_problems(&before, &lost, &release);
+    let problems = in_place_problems(&before, &same, false, &release);
     assert!(
-        problems.len() == 1 && problems[0].contains("ab/cdef"),
+        problems.len() == 1
+            && problems[0].contains("pre-deploy HEAD")
+            && problems[0].contains(&old),
         "{problems:?}"
     );
 
-    let behind = identity(&old, &["pack/pack-a.pack", "ab/cdef"]);
-    let problems = in_place_problems(&before, &behind, &release);
+    let behind = identity(&old);
+    let problems = in_place_problems(&before, &behind, true, &release);
     assert!(
-        problems.len() == 1 && problems[0].contains("HEAD"),
+        problems.len() == 1 && problems[0].contains("not the release commit"),
         "{problems:?}"
     );
 
     let mut gone = same.clone();
     gone.kind = GitStateKind::Unsupported;
-    let problems = in_place_problems(&before, &gone, &release);
+    let problems = in_place_problems(&before, &gone, true, &release);
     assert!(
         problems.iter().any(|p| p.contains("unsupported")),
         "{problems:?}"
@@ -5431,16 +5438,14 @@ fn restore_expectation(version: &str) -> Result<RestoreExpect, String> {
 }
 
 /// The repository on the rig node, as far as an advance in place must keep
-/// it: the class, the remote, the tracked branch, HEAD, and every file name
-/// below `.git/objects/` (names only, never bytes; pack and loose object
-/// names are content hashes, and an advance only adds objects).
+/// it: the class, the remote, the tracked branch and HEAD. That the history
+/// is kept is checked by [`old_head_present`].
 #[derive(Debug, Clone)]
 struct RepoIdentity {
     kind: GitStateKind,
     remote: Option<GitRemote>,
     tracked: Option<String>,
     head: Option<String>,
-    objects: BTreeSet<String>,
 }
 
 /// Read the [`RepoIdentity`] of the rig's project. A missing or unreadable
@@ -5458,24 +5463,6 @@ async fn repo_identity(rig: &Rig, host: &HostGit) -> RepoIdentity {
     };
     let refs = host.parse_refs(&files).await.ok().flatten();
     let state = classify(&files, config.as_ref(), refs.as_ref());
-    let mut objects = BTreeSet::new();
-    let root = rig.project_dir().join(".git").join("objects");
-    let mut pending = vec![root.clone()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries {
-            let entry = entry.expect("a .git/objects entry");
-            let path = entry.path();
-            let kind = entry.file_type().expect("a .git/objects entry type");
-            if kind.is_dir() {
-                pending.push(path);
-            } else if let Ok(rel) = path.strip_prefix(&root) {
-                objects.insert(rel.to_string_lossy().replace('\\', "/"));
-            }
-        }
-    }
     RepoIdentity {
         kind: state.kind,
         head: state
@@ -5485,15 +5472,34 @@ async fn repo_identity(rig: &Rig, host: &HostGit) -> RepoIdentity {
             .map(str::to_string),
         remote: state.remote,
         tracked: state.tracked,
-        objects,
     }
 }
 
-/// Every way `after` is not `before` advanced in place to `release_commit`.
-/// A remote URL difference is named without either value.
+/// Whether the commit HEAD named before the write is still in the rig
+/// repository (`git cat-file -e <commit>^{commit}` in its work tree). No HEAD
+/// before, or any answer but a clean yes, is `false`: the check fails closed.
+fn old_head_present(rig: &Rig, before: &RepoIdentity) -> bool {
+    let Some(commit) = before.head.as_deref() else {
+        return false;
+    };
+    git_command(
+        &rig.project_dir(),
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .output()
+    .expect("git runs")
+    .status
+    .success()
+}
+
+/// Every way `after` is not `before` advanced in place to `release_commit`;
+/// `old_head_present` is whether `before`'s HEAD commit is still in the
+/// repository after the write ([`old_head_present`]). A remote URL difference
+/// is named without either value.
 fn in_place_problems(
     before: &RepoIdentity,
     after: &RepoIdentity,
+    old_head_present: bool,
     release_commit: &str,
 ) -> Vec<String> {
     let mut problems = Vec::new();
@@ -5528,12 +5534,13 @@ fn in_place_problems(
             before.tracked, after.tracked
         ));
     }
-    let missing: Vec<&String> = before.objects.difference(&after.objects).collect();
-    if !missing.is_empty() {
+    if !old_head_present {
         problems.push(format!(
-            "{} object file name(s) from before are missing after: {:?}",
-            missing.len(),
-            missing.iter().take(10).collect::<Vec<_>>()
+            "the pre-deploy HEAD commit {} is missing from the repository after the deploy",
+            before
+                .head
+                .as_deref()
+                .unwrap_or("(none: HEAD named no commit before)")
         ));
     }
     if after.head.as_deref() != Some(release_commit) {
