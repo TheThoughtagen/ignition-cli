@@ -3280,14 +3280,20 @@ fn git_prodshape_pack() {
             PROJECT,
             &[
                 GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: GitWriteName::PackFile(pack.name.clone()),
                     bytes: pack.pack.clone(),
                 },
                 GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: GitWriteName::PackIndex(pack.name.clone()),
                     bytes: pack.idx.clone(),
                 },
                 GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: GitWriteName::BranchRef(BRANCH.to_string()),
                     bytes: format!("{}\n", f.release_head).into_bytes(),
                 },
@@ -3825,6 +3831,114 @@ fn git_prodshape_posix_size() {
     });
 }
 
+/// The post-import project digests through the POSIX host script (27-41, D-25):
+/// one `project_file_digests` call over every file of the production-shape
+/// project, equal to the local reader's answer, in one ssh connection and no
+/// sftp session, within
+/// [`HOST_LINUX_PROJECT_DIGESTS`](shape_git::HOST_LINUX_PROJECT_DIGESTS), which
+/// is the host read budget (the 27-40 rule). Prints `measured <ms> budget <ms>`
+/// and never the shape.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_posix_project_digests() {
+    use prodshape_posix::posix_node;
+    use shape_git::HOST_LINUX_PROJECT_DIGESTS;
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let (node, count) = posix_node(&f.data_dir, home.path());
+        let reference = f
+            .node()
+            .project_file_digests(PROJECT)
+            .await
+            .expect("reference");
+        let started = Instant::now();
+        let disk = node
+            .project_file_digests(PROJECT)
+            .await
+            .expect("project digests");
+        let took = started.elapsed();
+        assert_eq!(disk, reference, "the host reads what the local walk reads");
+        assert_eq!(count.execs(), 1, "one ssh connection");
+        assert_eq!(count.sftp(), 0, "no sftp session");
+        prodshape_within(
+            "git_prodshape_posix_project_digests",
+            took,
+            HOST_LINUX_PROJECT_DIGESTS,
+        );
+    });
+}
+
+/// The native account home of the Windows scripts that load the reviewed block
+/// (the loader's `$p.h`); under the `IgnGit.N` stand-in the staged source is
+/// never read, so any value will do.
+#[cfg(unix)]
+const HOME: &str = "/ign-test-home";
+
+/// The same read through the Windows script under PowerShell 7 (27-41): equal
+/// to the local reader's answer, within
+/// [`HOST_WINDOWS_PROJECT_DIGESTS`](shape_git::HOST_WINDOWS_PROJECT_DIGESTS).
+/// The walk and the hashing are the script's own; the VM run of 27-59
+/// (`wincap_project_digests`) covers Windows PowerShell 5.1 and never is
+/// replaced by this row.
+#[cfg(unix)]
+#[test]
+fn git_prodshape_pwsh_project_digests() {
+    use common::pwsh_exec;
+    use ignition_core::deploy::git_advance::{DiskFile, ProjectDisk};
+    use ignition_core::deploy::transport::winps::WinScript;
+    use shape_git::HOST_WINDOWS_PROJECT_DIGESTS;
+    if !pwsh_exec::gate("git_prodshape_pwsh_project_digests") {
+        return;
+    }
+    let _one = prodshape_serial();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_shape, f) = prodshape_fixture(dir.path());
+    prodshape_block_on(async {
+        let data = f.data_dir.display().to_string();
+        let reference = f
+            .node()
+            .project_file_digests(PROJECT)
+            .await
+            .expect("reference");
+        let started = Instant::now();
+        let answer = pwsh_exec::run(&WinScript::project_digests(
+            "", &data, PROJECT, 100_000, HOME,
+        ))
+        .expect("project digests");
+        let took = started.elapsed();
+        let text = answer["t"].as_str().expect("t");
+        let disk: ProjectDisk = text
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let mut part = line.split('\t');
+                let (rel, size, sha) = (
+                    part.next().expect("name"),
+                    part.next().expect("size"),
+                    part.next().expect("sha"),
+                );
+                (
+                    rel.to_string(),
+                    DiskFile {
+                        size: size.parse().expect("size"),
+                        sha256: sha.to_string(),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(answer["n"].as_u64(), Some(disk.len() as u64));
+        assert_eq!(disk, reference, "Windows reads what the local walk reads");
+        prodshape_within(
+            "git_prodshape_pwsh_project_digests",
+            took,
+            HOST_WINDOWS_PROJECT_DIGESTS,
+        );
+    });
+}
+
 /// The worst case of the gateway-object read through the POSIX host scripts
 /// (27-11): the unpushed commit is packed and ign's store is empty, so every
 /// pack that holds an object of G's tree is read, through the listing script
@@ -3951,6 +4065,13 @@ struct SharedRead(Arc<ignition_core::deploy::transport::sftp::SftpTransport>);
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl ignition_core::deploy::transport::projects::GitHostRead for SharedRead {
+    async fn project_file_digests(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, ignition_core::error::CoreError>
+    {
+        self.0.project_file_digests(project).await
+    }
     async fn read_git_state(
         &self,
         project: &str,
@@ -4068,13 +4189,13 @@ fn git_prodshape_pwsh_save_restore() {
 
         // the preflight: one enumeration, no file read
         let started = Instant::now();
-        let size = pwsh_exec::run(&WinScript::git_size("", &git)).expect("size");
+        let size = pwsh_exec::run(&WinScript::git_size("", &git, HOME)).expect("size");
         let size_took = started.elapsed();
         assert_eq!(size["files"].as_u64(), Some(reference.files as u64));
         assert_eq!(size["bytes"].as_u64(), Some(reference.bytes));
         prodshape_within("git_prodshape_pwsh_size", size_took, HOST_WINDOWS_PREFLIGHT);
 
-        let live = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("live manifest");
+        let live = pwsh_exec::run(&WinScript::git_manifest("", &git, HOME)).expect("live manifest");
         assert_eq!(
             manifest_of(&live),
             want,
@@ -4082,15 +4203,8 @@ fn git_prodshape_pwsh_save_restore() {
         );
 
         let started = Instant::now();
-        let saved = pwsh_exec::run(&WinScript::git_save(
-            "",
-            &data,
-            PROJECT,
-            &home_s,
-            GATEWAY,
-            GIT_PRODSHAPE_RUN,
-        ))
-        .expect("save");
+        let saved =
+            pwsh_exec::run_save(&data, PROJECT, &home_s, GATEWAY, GIT_PRODSHAPE_RUN).expect("save");
         let save_took = started.elapsed();
         assert_eq!(
             manifest_of(&saved),
@@ -4102,16 +4216,10 @@ fn git_prodshape_pwsh_save_restore() {
         // the import deletes `.git`; restore plus the manifest of the result
         std::fs::remove_dir_all(f.git_dir()).expect("rm .git");
         let started = Instant::now();
-        let back = pwsh_exec::run(&WinScript::git_restore(
-            "",
-            &data,
-            PROJECT,
-            &home_s,
-            GATEWAY,
-            GIT_PRODSHAPE_RUN,
-        ))
-        .expect("restore");
-        let after = pwsh_exec::run(&WinScript::git_manifest("", &git)).expect("manifest after");
+        let back = pwsh_exec::run_restore(&data, PROJECT, &home_s, GATEWAY, GIT_PRODSHAPE_RUN)
+            .expect("restore");
+        let after =
+            pwsh_exec::run(&WinScript::git_manifest("", &git, HOME)).expect("manifest after");
         let restore_took = started.elapsed();
         assert_eq!(manifest_of(&back), want);
         assert_eq!(manifest_of(&after), want);

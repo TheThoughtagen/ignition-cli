@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::deploy::git_remote::GIT_TOKEN_ENV;
+
 /// Stdout above this many bytes is a failure (32 MiB). File content never
 /// travels on stdout (it is downloaded to a temp dir), only listings.
 pub const STDOUT_CAP_BYTES: usize = 32 * 1024 * 1024;
@@ -153,6 +155,37 @@ fn failed(code: i32, timed_out: bool, note: String) -> ProcessOutput {
     }
 }
 
+/// The command [`run_capped`] runs: the UTF-8 locale, piped stdio, and the
+/// git read token removed. The token ([`GIT_TOKEN_ENV`]) belongs to the two
+/// remote git reads only (T-27-41 scope, 27-SECURITY.md auditor note 2), so
+/// no ssh, sftp or pwsh child inherits it. Nothing else is removed here:
+/// ssh needs `SSH_AUTH_SOCK`, and the git children have their own scrub list.
+fn capped_command(program: &OsStr, args: &[OsString]) -> tokio::process::Command {
+    capped_command_with(program, args, &[])
+}
+
+/// [`capped_command`] with `extra` environment pairs set before the token is
+/// removed. Only tests pass any: they prove the removal wins.
+fn capped_command_with(
+    program: &OsStr,
+    args: &[OsString],
+    extra: &[(&str, &str)],
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command.args(args);
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command
+        .env("LC_ALL", utf8_locale())
+        .env_remove(GIT_TOKEN_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
 pub(crate) async fn run_capped(
     program: &OsStr,
     args: &[OsString],
@@ -160,14 +193,16 @@ pub(crate) async fn run_capped(
     timeout: Duration,
     stdout_cap: usize,
 ) -> ProcessOutput {
-    let mut command = tokio::process::Command::new(program);
-    command
-        .args(args)
-        .env("LC_ALL", utf8_locale())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    run_command(capped_command(program, args), stdin, timeout, stdout_cap).await
+}
+
+async fn run_command(
+    mut command: tokio::process::Command,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    stdout_cap: usize,
+) -> ProcessOutput {
+    let program = command.as_std().get_program().to_os_string();
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
@@ -389,5 +424,30 @@ mod tests {
             .await;
         assert_eq!(out.code, 3);
         assert_eq!(out.stderr, b"oops\n");
+    }
+
+    /// 27-56 (T-27-197, 27-SECURITY.md auditor note 2): the git read token
+    /// reaches only the two remote git reads, never an ssh or sftp child.
+    #[test]
+    fn run_capped_removes_the_git_token() {
+        let command = capped_command(OsStr::new("ssh"), &[os("-V")]);
+        let removed = command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(GIT_TOKEN_ENV) && value.is_none());
+        assert!(removed, "capped_command must env_remove the git token");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_capped_child_does_not_see_the_git_token() {
+        let command = capped_command_with(
+            OsStr::new("sh"),
+            &[os("-c"), os("printf %s \"${IGNITION_GIT_TOKEN-unset}\"")],
+            &[(GIT_TOKEN_ENV, "sekret")],
+        );
+        let out = run_command(command, None, Duration::from_secs(5), 1024).await;
+        assert_eq!(out.code, 0, "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
     }
 }

@@ -844,6 +844,10 @@ pub struct SftpTransport {
     bundle_reads: bool,
     /// Listed bytes per archive part of a split read ([`PART_TARGET_BYTES`]).
     part_target_bytes: u64,
+    /// The staged source of the reviewed C# block is in place on this Windows
+    /// host (27-49): set once per transport, i.e. once per run, by the first
+    /// script that loads the block. A failed attempt leaves it unset.
+    native_staged: tokio::sync::OnceCell<()>,
 }
 
 fn transport_failed(label: &str, detail: impl std::fmt::Display) -> CoreError {
@@ -873,6 +877,7 @@ impl SftpTransport {
             ctl_seq: AtomicUsize::new(0),
             bundle_reads: false,
             part_target_bytes: PART_TARGET_BYTES,
+            native_staged: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1455,7 +1460,21 @@ impl SftpTransport {
         script: &winps::WinScript,
     ) -> Result<serde_json::Value, CoreError> {
         self.sessions.fetch_add(1, Ordering::Relaxed);
-        self.shell.exec_powershell(script).await
+        let first = self.shell.exec_powershell(script).await;
+        // A staged git script (27-50) is run first, and staged only when the host
+        // says its file is not there with its pin: the file stays in the account
+        // home between runs, so the steady state costs no connection for it. The
+        // refusal comes from the stub, or from the loader reading the block's
+        // source, before the script did anything.
+        if let (Some(staged), Err(err)) = (script.staged(), &first)
+            && project_ops::staging_refused(err)
+        {
+            self.stage_git_files("git_native_stage", Some(staged))
+                .await?;
+            self.sessions.fetch_add(1, Ordering::Relaxed);
+            return self.shell.exec_powershell(script).await;
+        }
+        first
     }
 
     /// Windows only: the PowerShell walk of each native root in `roots`, in
@@ -2027,15 +2046,15 @@ impl SftpTransport {
 
         let limit = bundle::archive_limit(listed);
         let need = limit.saturating_add(bundle::STAGING_FREE_MARGIN);
-        let script = winps::WinScript::bundle_level(
-            LONG_PATH_PREFIX,
-            &windows_native_path(&base.remote_root(&self.data_dir)),
-            &windows_native_path(&remote_list),
-            &windows_native_path(&remote_zip),
-            &list_sha,
-            need,
-            base.bundle_level(),
-        );
+        let script = self
+            .bundle_script(
+                base,
+                &windows_native_path(&remote_list),
+                &windows_native_path(&remote_zip),
+                &list_sha,
+                need,
+            )
+            .await?;
         let value = self.read_powershell(&script).await.map_err(|e| match e {
             CoreError::TransportFailed { detail, .. } => self.fail(format!(
                 "cannot bundle the listed files on the host: {detail}"
@@ -2199,15 +2218,15 @@ impl SftpTransport {
             }
             limit.saturating_add(bundle::STAGING_FREE_MARGIN)
         };
-        let script = winps::WinScript::bundle_level(
-            LONG_PATH_PREFIX,
-            &windows_native_path(&base.remote_root(&self.data_dir)),
-            &windows_native_path(&remote_list),
-            &windows_native_path(&remote_zip),
-            list_sha,
-            need,
-            base.bundle_level(),
-        );
+        let script = self
+            .bundle_script(
+                base,
+                &windows_native_path(&remote_list),
+                &windows_native_path(&remote_zip),
+                list_sha,
+                need,
+            )
+            .await?;
         let value = self.read_powershell(&script).await;
         if let Some(opened) = opened {
             let ok = value
@@ -2260,6 +2279,43 @@ impl SftpTransport {
         .map_err(|why| self.fail(base.rename_extract_error(&why)))?;
         drop(archive_dir);
         Ok(())
+    }
+
+    /// The archive script of a read: [`winps::BUNDLE`] for a resource read, and
+    /// for a read of the gateway's `.git` the staged [`winps::BUNDLE_GIT`] (27-50),
+    /// whose files are in place on the host before it is returned. The native
+    /// `list` and `archive` paths and the list's `list_sha` are the read's.
+    async fn bundle_script(
+        &self,
+        base: &ReadBase,
+        list: &str,
+        archive: &str,
+        list_sha: &str,
+        need: u64,
+    ) -> Result<winps::WinScript, CoreError> {
+        let root = windows_native_path(&base.remote_root(&self.data_dir));
+        if matches!(base, ReadBase::ProjectGit(_)) {
+            let script = winps::WinScript::bundle_git(
+                LONG_PATH_PREFIX,
+                &root,
+                list,
+                archive,
+                list_sha,
+                need,
+                base.bundle_level(),
+                &self.win_home().await?,
+            );
+            return Ok(script);
+        }
+        Ok(winps::WinScript::bundle_level(
+            LONG_PATH_PREFIX,
+            &root,
+            list,
+            archive,
+            list_sha,
+            need,
+            base.bundle_level(),
+        ))
     }
 
     /// The archive size of a BUNDLE result for `listed`, or the read's
@@ -4681,6 +4737,14 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 if params.get("l").is_some() && params.get("z").is_some() {
                     return self.bundle_host(&params);
                 }
+                if params.get("n").is_some()
+                    && params.get("s").is_some()
+                    && params.get("x").is_none()
+                {
+                    // the check that the staged files of the git scripts are
+                    // on the host (27-49, 27-50): they are
+                    return ign_line(&serde_json::json!({ "ok": 1, "present": 1 }));
+                }
                 if params.get("d").is_some() && params.get("f").is_some() {
                     return self.clean_host(&params);
                 }
@@ -4867,7 +4931,13 @@ drwxr-xr-x    ? 501      0             480 Oct 19 04:26 /d/cr/..\n\
                 self.fs.lock().expect("fs").remove(&list_path);
                 ign_line(&value)
             };
-            if sha256_hex(&list) != text("h") {
+            // the git-object archive script (27-50) sends the list's hash as `s`
+            // (its `h` is the account home); `BUNDLE` sends it as `h`
+            let want_sha = params
+                .get("s")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| text("h"), str::to_string);
+            if sha256_hex(&list) != want_sha {
                 return refuse(serde_json::json!({ "ok": 0, "err": "list" }));
             }
             let free = self.knobs().bundle_free.unwrap_or(u64::MAX);
@@ -8375,6 +8445,107 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         assert_eq!(names, ["AppData", "ign-deploy"]);
     }
 
+    /// 27-47: a real loose git object, a blob holding `body`: the rel it is
+    /// named by and the bytes of its file. A fetch checks every object file
+    /// against its own name, so a fixture is made by git (the id) and zlib
+    /// (the file), not by hand.
+    fn loose_blob(body: &[u8]) -> (String, Vec<u8>) {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("git")
+            .args(["hash-object", "-t", "blob", "--stdin"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(body)
+            .expect("body");
+        let out = child.wait_with_output().expect("git ends");
+        assert!(out.status.success(), "git hash-object failed");
+        let id = String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+        let mut raw = format!("blob {}\0", body.len()).into_bytes();
+        raw.extend_from_slice(body);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).expect("deflate");
+        (
+            format!("objects/{}/{}", &id[..2], &id[2..]),
+            encoder.finish().expect("finish"),
+        )
+    }
+
+    /// `len` printable bytes that do not compress to nothing, from `seed`.
+    fn filler(seed: u32, len: usize) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(12345);
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                b'a' + ((state >> 16) % 26) as u8
+            })
+            .collect()
+    }
+
+    /// A real pack of a few blobs and its index, made by git: the name (the
+    /// hex in `pack-<name>.pack`), the pack bytes and the idx bytes.
+    fn real_pack() -> (String, Vec<u8>, Vec<u8>) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .trim()
+                .to_string()
+        };
+        git(&["init", "-q"]);
+        let mut ids = String::new();
+        for i in 0..6u32 {
+            let body = dir.path().join(format!("b{i}"));
+            std::fs::write(&body, filler(i, 400)).expect("body");
+            ids.push_str(&git(&["hash-object", "-w", body.to_str().expect("utf8")]));
+            ids.push('\n');
+        }
+        let mut child = std::process::Command::new("git")
+            .args(["pack-objects", "-q", "packed"])
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("git runs");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(ids.as_bytes())
+            .expect("ids");
+        let out = child.wait_with_output().expect("git ends");
+        assert!(out.status.success(), "git pack-objects failed");
+        let name = String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+        let pack = std::fs::read(dir.path().join(format!("packed-{name}.pack"))).expect("pack");
+        let idx = std::fs::read(dir.path().join(format!("packed-{name}.idx"))).expect("idx");
+        (name, pack, idx)
+    }
+
     fn windows_fake() -> Arc<FakeSftp> {
         let fake = FakeSftp::new();
         fake.knobs().windows = true;
@@ -9767,18 +9938,28 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         for count in [3u32, 60] {
             let fake = windows_fake();
             let mut files = Vec::new();
+            let mut first = Vec::new();
             for i in 0..count {
-                let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
-                let body = format!("object {i}");
-                fake.file(&format!("{git}/{rel}"), &body);
+                let (rel, bytes) = loose_blob(format!("object {i}").as_bytes());
+                fake.put(&format!("{git}/{rel}"), Node::File(bytes.clone()));
+                if i == 0 {
+                    first = bytes.clone();
+                }
                 files.push(GitObjectFile {
                     rel,
-                    size: body.len() as u64,
+                    size: bytes.len() as u64,
                 });
             }
-            let pack = format!("objects/pack/pack-{}.pack", "c".repeat(40));
-            fake.file(&format!("{git}/{pack}"), "PACKDATA");
-            files.push(GitObjectFile { rel: pack, size: 8 });
+            // a pack comes with its own index (27-47)
+            let (name, pack_bytes, idx_bytes) = real_pack();
+            for (suffix, bytes) in [("pack", pack_bytes), ("idx", idx_bytes)] {
+                let rel = format!("objects/pack/pack-{name}.{suffix}");
+                fake.put(&format!("{git}/{rel}"), Node::File(bytes.clone()));
+                files.push(GitObjectFile {
+                    rel,
+                    size: bytes.len() as u64,
+                });
+            }
             let t = windows_transport(&fake);
             let dest = tempfile::tempdir().expect("dest");
             t.fetch_git_objects("CapApp", &files, dest.path())
@@ -9790,7 +9971,7 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
             }
             assert_eq!(
                 std::fs::read(dest.path().join(&files[0].rel)).expect("first"),
-                b"object 0"
+                first
             );
             assert_eq!(
                 get_lines(&fake).len(),
@@ -9922,9 +10103,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let mut files = Vec::new();
         let fake = windows_fake();
         for i in 0..24u32 {
-            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
-            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
-            fake.file(&format!("{git}/{rel}"), &body);
+            // 27-47: a real object, which a fetch now checks against its name
+            let (rel, body) = loose_blob(&filler(i, 60 + i as usize * 7));
+            fake.put(&format!("{git}/{rel}"), Node::File(body.clone()));
             files.push(GitObjectFile {
                 rel,
                 size: body.len() as u64,
@@ -10045,9 +10226,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let mut files = Vec::new();
         let mut listed = Vec::new();
         for i in 0..24u32 {
-            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
-            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
-            fake.file(&format!("{git}/{rel}"), &body);
+            // 27-47: a real object, which a fetch now checks against its name
+            let (rel, body) = loose_blob(&filler(i, 60 + i as usize * 7));
+            fake.put(&format!("{git}/{rel}"), Node::File(body.clone()));
             listed.push(BundleFile {
                 collection: "objects".to_string(),
                 rel: rel.strip_prefix("objects/").expect("objects").to_string(),
@@ -10098,9 +10279,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let mut files = Vec::new();
         let mut listed = Vec::new();
         for i in 0..24u32 {
-            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
-            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
-            fake.file(&format!("{git}/{rel}"), &body);
+            // 27-47: a real object, which a fetch now checks against its name
+            let (rel, body) = loose_blob(&filler(i, 60 + i as usize * 7));
+            fake.put(&format!("{git}/{rel}"), Node::File(body.clone()));
             listed.push(BundleFile {
                 collection: "objects".to_string(),
                 rel: rel.strip_prefix("objects/").expect("objects").to_string(),
@@ -10136,9 +10317,9 @@ drwx******    1 -        -               0 Oct 15 01:54 ign-deploy\n";
         let fake = windows_fake();
         let mut files = Vec::new();
         for i in 0..24u32 {
-            let rel = format!("objects/{:02x}/{:038x}", i % 5, i);
-            let body = format!("object {i} {}", "x".repeat(60 + i as usize * 7));
-            fake.file(&format!("{git}/{rel}"), &body);
+            // 27-47: a real object, which a fetch now checks against its name
+            let (rel, body) = loose_blob(&filler(i, 60 + i as usize * 7));
+            fake.put(&format!("{git}/{rel}"), Node::File(body.clone()));
             files.push(GitObjectFile {
                 rel,
                 size: body.len() as u64,

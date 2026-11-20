@@ -737,20 +737,34 @@ runs:
               // the project on its next restart. ign only detects it; the repository is not
               // the problem, so this reason gets its own headline and no restore-from-copy step.
               const isManifest = (n) => oneLine(n.restore.reason) === 'backup_project_json_missing';
+              // 27-45: a file of the gateway's .git changed while ign wrote it. The repository is
+              // the other writer's, with ign's earlier writes in place; putting the saved copy over
+              // it would destroy that writer's work, so this reason gets its own headline too.
+              const isChanged = (n) => oneLine(n.restore.reason) === 'git_changed';
               const manifestNodes = failed.filter(isManifest);
-              const repoNodes = failed.filter((n) => !isManifest(n));
+              const changedNodes = failed.filter(isChanged);
+              const repoNodes = failed.filter((n) => !isManifest(n) && !isChanged(n));
               const manifestText = 'the backup\'s project.json is missing or not a regular file (backup_project_json_missing) on ' +
                 manifestNodes.map((n) => oneLine(n.node)).join(', ') +
                 ', so the backup will lose the project on its next restart; ign does not repair this (a git module and redundancy defect): ' +
                 'put project.json back on the backup, and do not restart the backup or re-run this workflow until project.json is back';
+              const changedText = 'a file of the gateway\'s .git changed while ign was writing it (git_changed) on ' +
+                changedNodes.map((n) => oneLine(n.node)).join(', ') +
+                '; the writes before it, the index first, are in place and nothing was overwritten; ' +
+                'check the repository\'s state on the gateway, do not put the saved copy over it without checking (the copy is at ' +
+                changedNodes.map((n) => (n.save && n.save.path ? oneLine(n.save.path) : 'an unknown path')).join(', ') +
+                '), then deploy again';
               const repoText = 'the gateway\'s .git was not restored' +
                 (repoNodes.length ? ' (' + repoNodes.map((n) => oneLine(n.restore.reason)).join(', ') + ')' : '') +
                 '; the saved copy is at ' + (repoNodes.length ? repoNodes.map((n) => (n.save && n.save.path ? oneLine(n.save.path) : 'an unknown path')).join(', ') : 'the path the run output names') +
                 '; do not re-run this workflow before the repository is restored from it';
+              const findings = [];
+              if (manifestNodes.length) findings.push(manifestText);
+              if (changedNodes.length) findings.push(changedText);
+              if (repoNodes.length || !findings.length) findings.push(repoText);
               return result(false, 'git_restore_failed',
-                prefix + ' git_restore_failed (' + oneLine(data.slug) + '): the project is deployed and its release is recorded' +
-                  (manifestNodes.length ? ', but ' + manifestText : '') +
-                  (repoNodes.length || !manifestNodes.length ? (manifestNodes.length ? '; also ' : ', but ') + repoText : ''),
+                prefix + ' git_restore_failed (' + oneLine(data.slug) + '): the project is deployed and its release is recorded, but ' +
+                  findings.join('; also '),
                 where);
             }
             // A tag-owning run whose automatic rollback, or a --rollback-run undo, did not

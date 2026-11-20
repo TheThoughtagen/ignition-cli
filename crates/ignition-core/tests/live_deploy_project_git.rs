@@ -60,7 +60,7 @@ use ignition_core::deploy::git_advance::{AdvancePrep, GitWrite, prepare_advance}
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
 use ignition_core::deploy::git_state::{GitHead, GitRefs, GitState, GitStateKind, classify};
-use ignition_core::deploy::ledger::LedgerRoot;
+use ignition_core::deploy::ledger::{LedgerRoot, git_save_rel};
 use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact, canonical_digest};
 use ignition_core::deploy::tag_converge::BackupTags;
@@ -154,15 +154,47 @@ fn local_url_guard_accepts_loopback() {
     }
 }
 
-/// Run host git in `dir` with no user or system config; trimmed stdout.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+/// The variables that choose which repository a git child acts on. A caller's
+/// environment must never steer a test's git commands at another repository
+/// (T-27-199, the W1 pattern of `git_remote::SCRUBBED_ENV`).
+const REPOSITORY_SELECTION_ENV: [&str; 7] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_COMMON_DIR",
+];
+
+/// A host-git command in `dir` with no user or system config and no
+/// repository-selection variable. A caller that needs one of them (an index
+/// file) sets it on the returned command, after this clears them.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    git_command_with(dir, args, &[])
+}
+
+/// [`git_command`] with `injected` variables set before the repository
+/// selection is cleared. Only a test passes any: it proves the clearing wins.
+fn git_command_with(dir: &Path, args: &[&str], injected: &[(&str, &str)]) -> Command {
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git runs");
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for (key, value) in injected {
+        command.env(key, value);
+    }
+    for var in REPOSITORY_SELECTION_ENV {
+        command.env_remove(var);
+    }
+    command
+}
+
+/// Run host git in `dir` with no user or system config; trimmed stdout.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = git_command(dir, args).output().expect("git runs");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -906,12 +938,8 @@ const CODE_PY: &str = "ignition/script-python/cap/util/code.py";
 /// `git` with an explicit environment and optional stdin; trimmed stdout.
 fn git_with(dir: &Path, env: &[(&str, &str)], args: &[&str], stdin: Option<&[u8]>) -> String {
     use std::io::Write;
-    let mut command = Command::new("git");
+    let mut command = git_command(dir, args);
     command
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(if stdin.is_some() {
             std::process::Stdio::piped()
         } else {
@@ -2660,35 +2688,171 @@ fn drift_difference(jg: &Jgit, predicted: &[String]) -> (Vec<String>, Vec<String
     )
 }
 
-/// Print a row's time beside its budget and fail over it.
-fn within(row: &str, measured: Duration, budget: Duration) {
+/// 27-42 (T-27-188): the files whose bytes on the rig's project directory
+/// differ from the release's, which is what JGit lists once its index holds
+/// the release. The export is not read: it renders the gateway's form for
+/// files the import left alone (the premise the 2026-11-18 run falsified).
+///
+/// Paths are relative to the project, `/`-separated, the form of an artifact
+/// member (the caller maps them with [`module_path`] for JGit's list and
+/// counts the files for the run's `expected_drift_count`). Only regular files
+/// are compared; no link is followed; the project's own `.git` is skipped.
+/// A release member that is not a regular file on the disk is a deletion and
+/// is drift, so a deletion still fails the gate.
+fn disk_drift(project_dir: &Path, release: &BTreeMap<String, Vec<u8>>) -> BTreeSet<String> {
+    fn walk(root: &Path, rel: &str, out: &mut BTreeMap<String, PathBuf>) {
+        let here = if rel.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(rel)
+        };
+        for entry in std::fs::read_dir(&here).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().to_string();
+            if rel.is_empty() && name == ".git" {
+                continue;
+            }
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let kind = entry.file_type().expect("file type");
+            if kind.is_dir() {
+                walk(root, &child, out);
+            } else if kind.is_file() {
+                out.insert(child, entry.path());
+            }
+        }
+    }
+    let mut on_disk = BTreeMap::new();
+    walk(project_dir, "", &mut on_disk);
+    release
+        .iter()
+        .filter(|(path, bytes)| match on_disk.get(*path) {
+            Some(file) => std::fs::read(file).expect("a project file reads") != **bytes,
+            None => true,
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// 27-42 (Y3 follow-up): the counts of the saved `.git` that differ from the
+/// ones measured right before the timed apply, by name. Never a value.
+fn saved_count_changes(
+    saved: &prod_shape_git::Measured,
+    before_apply: &prod_shape_git::Measured,
+) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    for (name, now, first) in [
+        ("saved_packs_changed", saved.packs, before_apply.packs),
+        (
+            "saved_loose_objects_changed",
+            saved.loose,
+            before_apply.loose,
+        ),
+        (
+            "saved_tag_refs_changed",
+            saved.tag_refs,
+            before_apply.tag_refs,
+        ),
+    ] {
+        if now != first {
+            changed.push(name);
+        }
+    }
+    changed
+}
+
+/// The whole saved-shape compare: the saved `.git` has the configured shape
+/// (the names `placed_mismatches` gives, prefixed `saved_`), and its packs,
+/// loose objects and tag refs equal the ones measured before the timed apply.
+/// `None` for the save is itself a difference.
+fn saved_shape_differences(
+    saved: Option<&prod_shape_git::Measured>,
+    before_apply: &prod_shape_git::Measured,
+    emitted: &prod_shape_git::Measured,
+    shape: &prod_shape_git::GitShape,
+) -> Vec<String> {
+    let Some(saved) = saved else {
+        return vec!["saved_shape_not_measured".to_string()];
+    };
+    let mut off: Vec<String> = prod_shape_git::placed_mismatches(saved, emitted, shape)
+        .into_iter()
+        .map(|name| format!("saved_{name}"))
+        .collect();
+    off.extend(
+        saved_count_changes(saved, before_apply)
+            .into_iter()
+            .map(str::to_string),
+    );
+    off
+}
+
+/// Record `finding` and print it at once, so a run that dies later still
+/// shows what it had found.
+fn find(findings: &mut Vec<String>, finding: String) {
+    eprintln!("LIVE-SCALE finding: {finding}");
+    findings.push(finding);
+}
+
+/// Print a row's time beside its budget; the finding when it is over the
+/// budget, or when the run left no span for the row (a missing span is a
+/// finding too, and the other rows are still printed).
+fn within(row: &str, measured: Option<Duration>, budget: Duration) -> Option<String> {
+    let Some(measured) = measured else {
+        let finding = format!("{row}: the run left no timed span for this row");
+        eprintln!(
+            "LIVE-SCALE {row}: no span, budget {} ms",
+            budget.as_millis()
+        );
+        return Some(finding);
+    };
     eprintln!(
         "LIVE-SCALE {row}: measured {} ms budget {} ms",
         measured.as_millis(),
         budget.as_millis()
     );
-    assert!(
-        measured <= budget,
-        "{row}: measured {} ms is over the budget of {} ms",
-        measured.as_millis(),
-        budget.as_millis()
-    );
+    (measured > budget).then(|| {
+        format!(
+            "{row}: measured {} ms is over the budget of {} ms",
+            measured.as_millis(),
+            budget.as_millis()
+        )
+    })
 }
 
 /// The run's own git writer calls, timed: the same local transport the run
 /// would build from the master, wrapped so each save, restore and advance
 /// upload leaves its duration (the run's events carry no durations).
+///
+/// 27-42 (Y3 follow-up): right after the save span is recorded, outside it,
+/// the writer measures the save's `repo` directory below `data` and keeps the
+/// result for the gate's saved-shape compare. The measurement lengthens the
+/// time between the save and the import, never a timed span.
 struct TimedWriter {
     inner: LocalFsTransport,
+    /// The rig's data directory (the root of the ledger's save path).
+    data: PathBuf,
     spans: std::sync::Mutex<Vec<(&'static str, Duration)>>,
+    saved: std::sync::Mutex<Option<prod_shape_git::Measured>>,
 }
 
 impl TimedWriter {
-    fn new(inner: LocalFsTransport) -> TimedWriter {
+    fn new(inner: LocalFsTransport, data: PathBuf) -> TimedWriter {
         TimedWriter {
             inner,
+            data,
             spans: std::sync::Mutex::new(Vec::new()),
+            saved: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The save's `repo` directory as measured after the save span, if the
+    /// run saved one.
+    fn saved_shape(&self) -> Option<prod_shape_git::Measured> {
+        self.saved.lock().expect("saved").clone()
     }
 
     fn span(&self, name: &'static str) -> Option<Duration> {
@@ -2717,6 +2881,16 @@ impl GitStateWriter for TimedWriter {
         let started = Instant::now();
         let out = self.inner.save_git(gateway, project, run_id).await;
         self.record("save", started);
+        // Outside the span above.
+        if out.is_ok() {
+            let mut repo = self.data.clone();
+            for part in git_save_rel(gateway, project, run_id).split('/') {
+                repo.push(part);
+            }
+            if repo.is_dir() {
+                *self.saved.lock().expect("saved") = Some(prod_shape_git::measure_git_dir(&repo));
+            }
+        }
         out
     }
 
@@ -3077,7 +3251,7 @@ async fn git_prodscale_rig() {
         changed_since.is_empty(),
         "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
     );
-    let timed = TimedWriter::new(rig.node());
+    let timed = TimedWriter::new(rig.node(), rig.data.clone());
     let timeline = Timeline::new();
     let extras = Extras {
         observer: Some(&timeline),
@@ -3103,49 +3277,96 @@ async fn git_prodscale_rig() {
     for (at, name) in timeline.seen.lock().expect("timeline").iter() {
         eprintln!("LIVE-SCALE event {name} at {at} ms");
     }
-    assert_eq!(
-        applied.outcome.as_str(),
-        "imported",
-        "scale outcome (slug {}): {}",
-        applied_json["slug"],
-        applied_json["git"]
-    );
-    assert!(
-        restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true,
-        "the handover did not complete: {restore}"
-    );
-    assert_eq!(restore["post_status"], "matched", "{restore}");
 
-    // The budgets (D-18): none is scaled and none is skipped.
-    within(
-        "save",
-        timed.span("save").expect("the run saved the repository"),
-        HOST_LINUX_SAVE,
+    // 27-42: every finding is recorded and printed as it is found, and the
+    // gate fails once at its end naming all of them (the 27-25 rule), so a red
+    // run still yields its timings. Nothing below is dropped or loosened.
+    let mut findings: Vec<String> = Vec::new();
+    if applied.outcome.as_str() != "imported" {
+        find(
+            &mut findings,
+            format!(
+                "scale outcome (slug {}): {} is not imported: {}",
+                applied_json["slug"],
+                applied.outcome.as_str(),
+                applied_json["git"]
+            ),
+        );
+    }
+    if !(restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true)
+    {
+        find(
+            &mut findings,
+            format!("the handover did not complete: {restore}"),
+        );
+    }
+    if restore["post_status"] != "matched" {
+        find(
+            &mut findings,
+            format!("post_status is not matched: {restore}"),
+        );
+    }
+
+    // The budgets (D-18): none is scaled and none is skipped, and each row is
+    // printed whatever the outcome.
+    for (row, span, budget) in [
+        ("save", timed.span("save"), HOST_LINUX_SAVE),
+        (
+            "restore_verify",
+            timed.span("restore"),
+            HOST_LINUX_RESTORE_VERIFY,
+        ),
+        ("upload", timed.span("upload"), HOST_LINUX_UPLOAD),
+    ] {
+        if let Some(finding) = within(row, span, budget) {
+            find(&mut findings, finding);
+        }
+    }
+
+    // Y3 follow-up (27-42): the save's `.git`, measured right after the timed
+    // save and outside its span, has the configured shape and the counts
+    // measured right before the timed apply. Names only, never a value.
+    let saved_off = saved_shape_differences(
+        timed.saved_shape().as_ref(),
+        &before_apply,
+        &emitted_git,
+        &shape,
     );
-    within(
-        "restore_verify",
-        timed
-            .span("restore")
-            .expect("the import removed .git and the run restored it"),
-        HOST_LINUX_RESTORE_VERIFY,
+    eprintln!(
+        "LIVE-SCALE saved shape equals the checked shape={} differing={saved_off:?}",
+        saved_off.is_empty()
     );
-    within(
-        "upload",
-        timed.span("upload").expect("the run wrote the advance"),
-        HOST_LINUX_UPLOAD,
-    );
+    if !saved_off.is_empty() {
+        find(
+            &mut findings,
+            format!("the saved .git differs from the checked shape (differing: {saved_off:?})"),
+        );
+    }
 
     // JGit says what the run predicted (D-25): a difference blocks the cut-over.
     // `data.git.expected_drift` is byte-sorted and capped; `expected_drift_count`
     // is the full number (the published contract). So: every listed path is in
     // JGit's list, the run's count equals an independent recomputation (the
-    // read-back export against the release's bytes), and JGit's list equals
-    // that recomputed full set.
-    assert_eq!(applied_json["git"]["expected_drift_complete"], true);
+    // rig's project directory on disk against the release's bytes, 27-42: what
+    // JGit reads, not the read-back export), and JGit's list equals that
+    // recomputed full set.
+    if applied_json["git"]["expected_drift_complete"] != true {
+        find(
+            &mut findings,
+            format!(
+                "expected_drift_complete is not true: {}",
+                applied_json["git"]["expected_drift_complete"]
+            ),
+        );
+    }
     let predicted = strs(&applied_json["git"]["expected_drift"]);
-    let counted = applied_json["git"]["expected_drift_count"]
-        .as_u64()
-        .expect("the run reports the full drift count");
+    let counted = applied_json["git"]["expected_drift_count"].as_u64();
+    if counted.is_none() {
+        find(
+            &mut findings,
+            "the run does not report the full drift count".to_string(),
+        );
+    }
     tokio::time::sleep(Duration::from_secs(10)).await;
     let jg = jgit(&api, &config).await;
     // The listed part is capped, so JGit's list is the longer one: only the
@@ -3153,17 +3374,7 @@ async fn git_prodscale_rig() {
     let (_, missing) = drift_difference(&jg, &predicted);
     let (_keep2, checkout, _c) = release_checkout(&rig, "v1.1.0");
     let release_files = zip_members(&build_artifact(&checkout).expect("artifact builds").zip);
-    let live_files = zip_members(
-        &GatewayProjects(&api)
-            .export_bytes(APP)
-            .await
-            .expect("the project's export"),
-    );
-    let changed: BTreeSet<String> = release_files
-        .iter()
-        .filter(|(path, bytes)| live_files.get(*path).is_some_and(|live| live != *bytes))
-        .map(|(path, _)| path.clone())
-        .collect();
+    let changed = disk_drift(&rig.project_dir(), &release_files);
     let full: BTreeSet<String> = changed.iter().map(|file| module_path(file)).collect();
     let extra: Vec<&String> = jg.paths.difference(&full).collect();
     let absent: Vec<&String> = full.difference(&jg.paths).collect();
@@ -3172,28 +3383,48 @@ async fn git_prodscale_rig() {
         missing.len(),
         extra.len(),
         absent.len(),
-        counted == changed.len() as u64,
+        counted == Some(changed.len() as u64),
         jg.unpushed,
         jg.branch
     );
-    assert!(
-        missing.is_empty(),
-        "CUT-OVER BLOCKER (D-25): {} listed path(s) are not in JGit's status",
-        missing.len()
-    );
-    assert!(
-        extra.is_empty() && absent.is_empty(),
-        "CUT-OVER BLOCKER (D-25): JGit differs from the full prediction: extra={} missing={}",
-        extra.len(),
-        absent.len()
-    );
-    assert_eq!(
-        counted,
-        changed.len() as u64,
-        "the run's drift count differs from the recomputed one"
-    );
-    assert_eq!(jg.unpushed, 0);
-    eprintln!("LIVE-CHECK prodscale_jgit_equals_expected_drift");
+    let jgit_findings = findings.len();
+    if !missing.is_empty() {
+        find(
+            &mut findings,
+            format!(
+                "CUT-OVER BLOCKER (D-25): {} listed path(s) are not in JGit's status",
+                missing.len()
+            ),
+        );
+    }
+    if !(extra.is_empty() && absent.is_empty()) {
+        find(
+            &mut findings,
+            format!(
+                "CUT-OVER BLOCKER (D-25): JGit differs from the full prediction: extra={} missing={}",
+                extra.len(),
+                absent.len()
+            ),
+        );
+    }
+    if counted != Some(changed.len() as u64) {
+        find(
+            &mut findings,
+            format!(
+                "the run's drift count ({counted:?}) differs from the recomputed one ({})",
+                changed.len()
+            ),
+        );
+    }
+    if jg.unpushed != 0 {
+        find(
+            &mut findings,
+            format!("unpushed commits after the deploy: {}", jg.unpushed),
+        );
+    }
+    if findings.len() == jgit_findings {
+        eprintln!("LIVE-CHECK prodscale_jgit_equals_expected_drift");
+    }
     write_evidence(
         &rig,
         "git_prodscale_rig",
@@ -3204,7 +3435,13 @@ async fn git_prodscale_rig() {
             "restore_verify_ms": timed.span("restore").map(|d| d.as_millis()),
             "upload_ms": timed.span("upload").map(|d| d.as_millis()),
             "post_status": restore["post_status"],
+            "saved_shape_differing": saved_off,
+            "findings": findings,
         }),
+    );
+    assert!(
+        findings.is_empty(),
+        "findings of the production-scale run: {findings:#?}"
     );
     eprintln!("LIVE-RAN git_prodscale_rig");
 }
@@ -3611,6 +3848,88 @@ fn head_at_reads_head_not_any_branch() {
         ..refs
     };
     assert!(!head_at(&unborn, &old), "an unborn HEAD names no commit");
+}
+
+/// 27-42 (T-27-188): the gate's independent drift set is what JGit measures,
+/// the rig's project directory against the release's bytes. A file holding
+/// the gateway's form is drift, a file holding the release's bytes is not,
+/// and `.git` is never read.
+#[test]
+fn disk_drift_counts_only_files_that_differ_from_the_release() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let project = dir.path();
+    let kept = "com.inductiveautomation.perspective/views/V/resource.json";
+    let rewritten = "ignition/script-python/cap/util/resource.json";
+    let release = BTreeMap::from([
+        (kept.to_string(), b"{\"a\":1}".to_vec()),
+        (rewritten.to_string(), b"{\"a\":1}".to_vec()),
+    ]);
+    let put = |rel: &str, bytes: &[u8]| {
+        let path = project.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        std::fs::write(path, bytes).expect("write");
+    };
+    put(kept, b"{\"a\":1}");
+    put(rewritten, b"{ \"a\": 1 }\n");
+    // Whatever `.git` holds, even a copy of a release path, is not read.
+    put(".git/HEAD", b"ref: refs/heads/production\n");
+    put(&format!(".git/{kept}"), b"not the release");
+    assert_eq!(
+        disk_drift(project, &release),
+        BTreeSet::from([rewritten.to_string()]),
+        "only the file holding other bytes than the release is drift"
+    );
+    assert_eq!(module_path(rewritten), "ignition/script-python/cap/util");
+}
+
+/// A release member that is not on the disk is a deletion, and a deletion
+/// still fails the gate.
+#[test]
+fn disk_drift_reports_a_release_member_missing_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gone = "project.json";
+    let release = BTreeMap::from([(gone.to_string(), b"{}".to_vec())]);
+    std::fs::create_dir_all(dir.path().join(".git")).expect("git dir");
+    assert_eq!(
+        disk_drift(dir.path(), &release),
+        BTreeSet::from([gone.to_string()])
+    );
+}
+
+/// 27-42 (Y3 follow-up): the saved shape compare names the counts that
+/// changed, never a measured value.
+#[test]
+fn saved_shape_mismatch_names_only_counts() {
+    let checked = prod_shape_git::Measured {
+        bytes: 1_000_000,
+        files: 90,
+        packs: 3,
+        loose: 40,
+        tag_refs: 7,
+    };
+    assert!(saved_count_changes(&checked, &checked).is_empty());
+    let saved = prod_shape_git::Measured {
+        packs: 4,
+        ..checked.clone()
+    };
+    assert_eq!(
+        saved_count_changes(&saved, &checked),
+        vec!["saved_packs_changed"]
+    );
+    let everything = prod_shape_git::Measured {
+        packs: 1,
+        loose: 2,
+        tag_refs: 3,
+        ..checked.clone()
+    };
+    assert_eq!(
+        saved_count_changes(&everything, &checked),
+        vec![
+            "saved_packs_changed",
+            "saved_loose_objects_changed",
+            "saved_tag_refs_changed"
+        ]
+    );
 }
 
 /// Every git event of a pair run with the node it names and the time it was
@@ -4253,6 +4572,380 @@ async fn git_pair_detect_live() {
 // private repository); nothing is committed anywhere. Output here is counts
 // only: no path, no name and no byte of the real repository is printed.
 
+/// The D-20 normalization patch of `gateway` against the release tree: every
+/// member is written as a blob from its raw bytes, so no attribute, filter or
+/// line-ending setting of the repository can hide a change (W16, T-27-198).
+fn normalization_patch(
+    release_checkout: &Path,
+    release_tag: &str,
+    gateway: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<u8>, String> {
+    normalization_patch_with(release_checkout, release_tag, gateway, &|_| {})
+}
+
+/// [`normalization_patch`] with `tamper` run on the patch before it is
+/// verified. Only a test passes one: it proves a bad patch is refused.
+///
+/// The patch is built tree to tree, with no work tree and no conversion:
+/// 1. a temporary index is read from the release tree;
+/// 2. each gateway member is written as a blob (`hash-object -w --no-filters`)
+///    and entered in that index with the mode the release tree gives it;
+/// 3. `write-tree`, then `diff --binary <release tree> <gateway tree>`;
+/// 4. the patch is applied (`apply --cached`) onto a second temporary index
+///    from the release tree, and every member's blob is compared byte for byte
+///    with the gateway bytes. The result tree must be the gateway tree.
+///
+/// Errors name the member that differs; a caller printing counts only must not
+/// print them.
+fn normalization_patch_with(
+    release_checkout: &Path,
+    release_tag: &str,
+    gateway: &BTreeMap<String, Vec<u8>>,
+    tamper: &dyn Fn(&mut Vec<u8>),
+) -> Result<Vec<u8>, String> {
+    if release_tag.is_empty() || release_tag.starts_with('-') {
+        return Err("the release tag is not a revision name".to_string());
+    }
+    let scratch = tempfile::tempdir().map_err(|e| e.kind().to_string())?;
+    let build_index = scratch.path().join("index-gateway");
+    let check_index = scratch.path().join("index-check");
+    let utf8 = |p: &Path| p.to_str().map(str::to_string).ok_or("a non-UTF-8 path");
+
+    let release_tree = String::from_utf8_lossy(&norm_git(
+        release_checkout,
+        None,
+        &["rev-parse", "--verify", &format!("{release_tag}^{{tree}}")],
+        None,
+    )?)
+    .trim()
+    .to_string();
+
+    // The modes the release tree gives its files: a member keeps its own.
+    let listing = norm_git(
+        release_checkout,
+        None,
+        &["ls-tree", "-r", "-z", &release_tree],
+        None,
+    )?;
+    let mut modes: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("an ls-tree entry has no tab")?;
+        let mode =
+            String::from_utf8_lossy(&entry[..entry.iter().position(|b| *b == b' ').unwrap_or(0)])
+                .to_string();
+        modes.insert(entry[tab + 1..].to_vec(), mode);
+    }
+
+    // The gateway tree, from raw bytes.
+    let build = utf8(&build_index)?;
+    norm_git(
+        release_checkout,
+        Some(&build),
+        &["read-tree", &release_tree],
+        None,
+    )?;
+    let mut index_info: Vec<u8> = Vec::new();
+    for (path, bytes) in gateway {
+        let mode = modes
+            .get(path.as_bytes())
+            .filter(|mode| matches!(mode.as_str(), "100644" | "100755"))
+            .ok_or_else(|| format!("{path}: not a regular file of the release tree"))?;
+        let blob = String::from_utf8_lossy(&norm_git(
+            release_checkout,
+            Some(&build),
+            &["hash-object", "-w", "--no-filters", "--stdin"],
+            Some(bytes),
+        )?)
+        .trim()
+        .to_string();
+        index_info.extend_from_slice(format!("{mode} {blob}\t{path}").as_bytes());
+        index_info.push(0);
+    }
+    norm_git(
+        release_checkout,
+        Some(&build),
+        &["update-index", "-z", "--index-info"],
+        Some(&index_info),
+    )?;
+    let gateway_tree = String::from_utf8_lossy(&norm_git(
+        release_checkout,
+        Some(&build),
+        &["write-tree"],
+        None,
+    )?)
+    .trim()
+    .to_string();
+
+    // The patch, tree to tree.
+    let mut patch = norm_git(
+        release_checkout,
+        None,
+        &[
+            "diff",
+            "--binary",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            &release_tree,
+            &gateway_tree,
+        ],
+        None,
+    )?;
+    if patch.is_empty() {
+        // The gateway bytes are the release bytes: nothing to carry.
+        return if gateway_tree == release_tree {
+            Ok(patch)
+        } else {
+            Err("the trees differ but the diff is empty".to_string())
+        };
+    }
+    tamper(&mut patch);
+
+    // The check: apply onto a second index, compare every member's blob.
+    let check = utf8(&check_index)?;
+    norm_git(
+        release_checkout,
+        Some(&check),
+        &["read-tree", &release_tree],
+        None,
+    )?;
+    norm_git(
+        release_checkout,
+        Some(&check),
+        &["apply", "--cached", "--whitespace=nowarn", "-"],
+        Some(&patch),
+    )
+    .map_err(|e| format!("the patch does not apply to the release tree: {e}"))?;
+    let result_tree = String::from_utf8_lossy(&norm_git(
+        release_checkout,
+        Some(&check),
+        &["write-tree"],
+        None,
+    )?)
+    .trim()
+    .to_string();
+    for (path, bytes) in gateway {
+        let blob = norm_git(
+            release_checkout,
+            None,
+            &["cat-file", "blob", &format!("{result_tree}:{path}")],
+            None,
+        )?;
+        if &blob != bytes {
+            return Err(format!(
+                "{path}: the patch does not reproduce the gateway bytes"
+            ));
+        }
+    }
+    if result_tree != gateway_tree {
+        return Err("the patch changes something other than the listed members".to_string());
+    }
+    Ok(patch)
+}
+
+/// Run host git in `dir` for the normalization patch: no conversion setting,
+/// no user or system config, no repository-selection variable (only the index
+/// file this function chose); the stdout bytes, or a redacted error.
+fn norm_git(
+    dir: &Path,
+    index: Option<&str>,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    let mut full = vec!["-c", "core.autocrlf=false", "-c", "core.safecrlf=false"];
+    full.extend_from_slice(args);
+    let mut command = git_command(dir, &full);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.kind().to_string())?;
+    let mut handle = child.stdin.take().ok_or("no stdin")?;
+    if let Some(bytes) = stdin {
+        // A child that exits early closes the pipe; its status says why.
+        let _ = handle.write_all(bytes);
+    }
+    drop(handle);
+    let out = child.wait_with_output().map_err(|e| e.kind().to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            ignition_core::deploy::git_state::redact_text(&String::from_utf8_lossy(&out.stderr))
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// A scratch repository with `files` committed under the tag `rel`.
+#[cfg(test)]
+fn norm_fixture(attributes: Option<&str>, files: &[(&str, &[u8])]) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("release");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    git(&repo, &["init", "-q"]);
+    if let Some(text) = attributes {
+        std::fs::write(repo.join(".gitattributes"), text).expect("attributes");
+    }
+    for (path, bytes) in files {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("dirs");
+        std::fs::write(file, bytes).expect("file");
+    }
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "release",
+        ],
+    );
+    git(&repo, &["tag", "rel"]);
+    (dir, repo)
+}
+
+/// Apply `patch` onto a fresh index read from the tag `rel` and return the
+/// blob it leaves at `path`. The check the function runs, made again here.
+#[cfg(test)]
+fn applied_blob(repo: &Path, patch: &[u8], path: &str) -> Vec<u8> {
+    use std::io::Write;
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let index = scratch.path().join("index");
+    let index = index.to_str().expect("utf8");
+    let run = |args: &[&str], stdin: Option<&[u8]>| -> Vec<u8> {
+        let mut command = git_command(repo, args);
+        command
+            .env("GIT_INDEX_FILE", index)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("git spawns");
+        let mut handle = child.stdin.take().expect("stdin");
+        if let Some(bytes) = stdin {
+            handle.write_all(bytes).expect("stdin write");
+        }
+        drop(handle);
+        let out = child.wait_with_output().expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed");
+        out.stdout
+    };
+    run(&["read-tree", "rel^{tree}"], None);
+    run(
+        &["apply", "--cached", "--whitespace=nowarn", "-"],
+        Some(patch),
+    );
+    let tree = String::from_utf8(run(&["write-tree"], None)).expect("utf8");
+    let spec = format!("{}:{path}", tree.trim());
+    run(&["cat-file", "blob", &spec], None)
+}
+
+#[test]
+fn normalization_patch_carries_a_crlf_only_change() {
+    let (_dir, repo) = norm_fixture(
+        Some("* text eol=crlf\n"),
+        &[("a/resource.json", b"{\"a\":1}\n")],
+    );
+    let gateway = BTreeMap::from([("a/resource.json".to_string(), b"{\"a\":1}\r\n".to_vec())]);
+    let patch = normalization_patch(&repo, "rel", &gateway).expect("the patch is built");
+    assert!(!patch.is_empty(), "a CRLF-only change must not vanish");
+    assert_eq!(
+        applied_blob(&repo, &patch, "a/resource.json"),
+        b"{\"a\":1}\r\n".to_vec(),
+        "the patch must carry the gateway bytes exactly"
+    );
+}
+
+#[test]
+fn normalization_patch_refuses_when_the_check_differs() {
+    let (_dir, repo) = norm_fixture(None, &[("a/resource.json", b"{\"a\":1}\n")]);
+    let gateway = BTreeMap::from([("a/resource.json".to_string(), b"{\"a\":2}\n".to_vec())]);
+    let corrupt = |patch: &mut Vec<u8>| {
+        let at = patch
+            .windows(8)
+            .position(|w| w == b"+{\"a\":2}")
+            .expect("the added line");
+        patch[at + 6] = b'3';
+    };
+    let err = normalization_patch_with(&repo, "rel", &gateway, &corrupt)
+        .expect_err("a patch that does not reproduce the gateway bytes is refused");
+    assert!(err.contains("a/resource.json"), "{err}");
+    assert_eq!(
+        git(&repo, &["status", "--porcelain"]),
+        "",
+        "a refused patch leaves the repository clean"
+    );
+}
+
+#[test]
+fn normalization_patch_is_empty_when_the_gateway_kept_the_release_bytes() {
+    let (_dir, repo) = norm_fixture(None, &[("a/resource.json", b"{\"a\":1}\n")]);
+    let gateway = BTreeMap::from([("a/resource.json".to_string(), b"{\"a\":1}\n".to_vec())]);
+    let patch =
+        normalization_patch(&repo, "rel", &gateway).expect("nothing to carry is not an error");
+    assert!(patch.is_empty());
+}
+
+#[test]
+fn normalization_patch_refuses_a_member_the_release_does_not_hold() {
+    let (_dir, repo) = norm_fixture(None, &[("a/resource.json", b"{\"a\":1}\n")]);
+    let gateway = BTreeMap::from([("a/other.json".to_string(), b"{}\n".to_vec())]);
+    let err =
+        normalization_patch(&repo, "rel", &gateway).expect_err("an unknown member is refused");
+    assert!(err.contains("a/other.json"), "{err}");
+}
+
+#[test]
+fn normalization_patch_carries_binary_bytes_and_keeps_the_mode() {
+    let bytes: Vec<u8> = (0u8..=255).collect();
+    let (_dir, repo) = norm_fixture(
+        Some("*.bin -text\n"),
+        &[("run.bin", &[1, 2, 3, 0, 4]), ("a/resource.json", b"{}\n")],
+    );
+    let gateway = BTreeMap::from([("run.bin".to_string(), bytes.clone())]);
+    let patch = normalization_patch(&repo, "rel", &gateway).expect("the patch is built");
+    assert_eq!(applied_blob(&repo, &patch, "run.bin"), bytes);
+}
+
+#[test]
+fn live_git_helper_clears_repository_selection() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let here = dir.path().join("here");
+    let other = dir.path().join("other");
+    for repo in [&here, &other] {
+        std::fs::create_dir_all(repo).expect("dir");
+        git(repo, &["init", "-q"]);
+    }
+    let foreign_git_dir = other.join(".git");
+    let injected = [
+        ("GIT_DIR", foreign_git_dir.to_str().expect("utf8")),
+        ("GIT_COMMON_DIR", foreign_git_dir.to_str().expect("utf8")),
+    ];
+    let out = git_command_with(&here, &["rev-parse", "--absolute-git-dir"], &injected)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success());
+    let answered = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    assert_eq!(
+        answered.canonicalize().expect("resolves"),
+        here.join(".git").canonicalize().expect("resolves"),
+        "the helper must act on its own directory, not the injected repository"
+    );
+}
+
 const NORM_PROJECT: &str = "G2Norm";
 
 #[tokio::test]
@@ -4335,30 +5028,16 @@ async fn git_g2norm() {
         .filter(|path| !released.contains_key(*path))
         .count();
 
-    // The files and the patch: the release tree with the gateway-form bytes.
-    for (path, bytes) in &drift {
-        let file = work.join(path);
-        assert!(
-            file.is_file(),
-            "a drift member is a file of the release tree"
-        );
-        std::fs::write(&file, bytes).expect("gateway-form bytes");
-    }
-    let patch = Command::new("git")
-        .args([
-            "-c",
-            "core.autocrlf=false",
-            "-c",
-            "core.safecrlf=false",
-            "diff",
-            "--binary",
-        ])
-        .current_dir(&work)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git diff runs");
-    assert!(patch.status.success(), "git diff failed");
+    // The files and the patch: the release tree with the gateway-form bytes,
+    // built from raw bytes tree to tree (W16): no work-tree write, so no
+    // attribute or line-ending setting can hide a change. The error text names
+    // a member, so none of it is printed here (counts only).
+    let gateway: BTreeMap<String, Vec<u8>> = drift
+        .iter()
+        .map(|(path, bytes)| ((*path).clone(), (*bytes).clone()))
+        .collect();
+    let patch = normalization_patch(&work, &tag, &gateway)
+        .unwrap_or_else(|_| panic!("the normalization patch failed its raw-byte verification"));
     let mut names: Vec<&str> = drift.iter().map(|(path, _)| path.as_str()).collect();
     names.sort_unstable();
     let mut listing = names.join("\n");
@@ -4366,13 +5045,13 @@ async fn git_g2norm() {
         listing.push('\n');
     }
     std::fs::write(out.join("drift-files.txt"), listing).expect("the file list");
-    std::fs::write(out.join("normalize.patch"), &patch.stdout).expect("the patch");
+    std::fs::write(out.join("normalize.patch"), &patch).expect("the patch");
     println!(
         "LIVE-G2NORM tracked={tracked} artifact_members={} export_members={} drift={} dropped={dropped} extra={extra} patch_bytes={}",
         released.len(),
         exported.len(),
         drift.len(),
-        patch.stdout.len()
+        patch.len()
     );
     println!("LIVE-RAN git_g2norm");
 }

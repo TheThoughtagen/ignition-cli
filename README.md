@@ -354,7 +354,8 @@ advanced, the run is a finished run with a verdict, and it ends **exit 6**:
 - `restore.reason` is one of the words of the table in
   [Projects the git module manages](#projects-the-git-module-manages)
   (`restore_failed`, `advance_failed`, `status_unexpected`, `git_recreated`,
-  `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`).
+  `git_changed`, `post_status_mismatch`, `designer_attached`, `backup_project_json_missing`,
+  `git_save_missing`).
 - `backup_project_json_missing` (on `nodes.backup` only) is not a `.git`
   failure: after the backup's project converged, its
   `data/projects/<project>/project.json` is absent or not a regular file, and the
@@ -5624,6 +5625,25 @@ the run writes `journal.json`, state `applying`. The host keeps the latest
 run's pre-image only: the next run writes over it. A host that cannot take
 the copy stops the run with nothing written to the gateway.
 
+**The schema of the host copy.** `pre-image/run.json` and `journal.json` are
+written at `schema_version` 2. Version 2 adds one field to each file:
+
+| File | Field | Meaning |
+|------|-------|---------|
+| `pre-image/run.json` | `import_sent` | required; `false` when the pre-image is written, `true` once the run rewrote `run.json` right before it sent the project import. A write that fails there stops the run with nothing imported |
+| `journal.json` | `git_pending` | optional, present only when it names at least one save: the `.git` saves a rollback could not put back, each `{node, run_id, path, manifest: {files, bytes, digest}}` (`node` is `nodes.master` or `nodes.backup`, at most one entry per node, `digest` 64 lowercase hex) |
+
+`--rollback-run` imports the pre-image back only when `import_sent` is `true`,
+so a run that was refused before its import and whose tag rollback failed is
+retried by restoring the tags alone: the retry never imports the project and
+never removes a gateway `.git`. Version 1 files that earlier releases wrote
+are still read, with no `import_sent` and no `git_pending`, and a retry of such
+a run behaves as it did before. A file with another `schema_version` is
+`deploy_run_invalid`, naming the versions this build reads (1 and 2); an
+older ign that meets a version 2 file refuses it with its own
+`schema_version is not 1` message. Both files stay strict: an unknown or
+missing field (other than the optional `git_pending`) is refused.
+
 The journal says `rolling_back` while a rollback runs. It is removed after a
 green run (after the records), after a verified rollback, and after a run
 that stopped before its first gateway write (its error stands). It stays after
@@ -5632,6 +5652,23 @@ long as it is there, a `--check` of the project on that gateway reports it in
 `data.tags.journal` with a warning, and a deploy refuses
 `deploy_journal_present` (exit 6) before any write, naming the run and the
 command that undoes it.
+
+**A `.git` the rollback could not put back.** When a rollback has to leave the
+gateway's `.git` out (the import removed it and a Designer is attached, so
+nothing is written) the saved copy is the only copy of the repository. The host
+journal, still `rolling_back`, then names it in `git_pending`: the node, the run
+that took the save, the save's path and its manifest. `--rollback-run` reads the
+entry: a node with no `.git` and an entry has pending git work, not no git
+work, so after the project step, and once no Designer is attached, it puts the
+saved copy back unchanged and takes the entry out. The journal is cleared only
+when no entry is left; an entry that is still pending is a line in the
+rollback's `left` list, so the undo ends `rollback_failed`, never green. A
+saved copy that is gone, or cannot be read, ends the node `git_save_missing`:
+nothing is written and the entry stays (restore the repository from its remote
+with the module, then clear the journal by hand as for any `rollback_failed`).
+A node that holds a repository again keeps its entry too, and ign never writes
+over a repository that is there. On a redundant pair the same holds for
+`nodes.backup`, through the backup's own host.
 
 **`--rollback-run`.**
 
@@ -6088,7 +6125,13 @@ branch and remote-tracking ref move to the release, and the index marks the
 paths the import removed as assume-unchanged. Every written file is read back.
 On success the save is removed. The advance writes only files below `.git`,
 lock-and-rename, and a `.git` that is not the one the advance was prepared
-against stops the run with `git_recreated` and is left as it is.
+against stops the run with `git_recreated` and is left as it is. On a node the
+deploy account reaches as a local directory, the saved copy is put in place
+with a rename that cannot replace anything, an empty directory included, so a
+`.git` that appears while the copy is staged is kept and the run reports it; a
+host whose file system cannot refuse to replace fails the restore with `the
+host cannot publish without replacing` (`git_restore_failed`, the save kept and
+named) and never falls back to a plain rename.
 
 A **`record`** advances the repository in place the same way (the `.git` was
 never removed, so there is no restore) and removes the save.
@@ -6111,8 +6154,11 @@ run `git_restore_failed` with `restore.reason` `designer_attached` naming the
 open sessions; the deploy and the release record stay and the save is kept.
 
 **`expected_drift`.** The files the module will list as uncommitted after the
-deploy: the import rewrites every artifact member, so the set is known only
-after an import. `data.git.expected_drift` is `null` (with
+deploy: the files whose bytes on disk after the import differ from the
+release's bytes, which is what the module lists as uncommitted once the index
+holds the release. A file whose bytes on disk equal the release's is never in
+it, whatever the export renders for it. The set is known only after an
+import. `data.git.expected_drift` is `null` (with
 `expected_drift_complete: false`) in `--check` and in a run that stopped before
 the repository was advanced; after the advance it is the byte-sorted
 prediction (capped at 200, with `expected_drift_count`) and
@@ -6122,13 +6168,27 @@ committed before a Designer push or pull. In-scope files the gateway did not
 keep are listed under `restore.dropped` and are not drift.
 
 **How the run proves the repository (D-25).** With no git on the gateway
-host, the proof is the status computed over the read-back export before any
-write to `.git` (it must equal the prediction), plus a read-back of every file
-written. On a `local` node the run also runs a status over the project
-directory on disk after the advance (`restore.post_status` `matched`, or
-`mismatch` and the reason `post_status_mismatch`). On an `ssh` node
-(`post_status: not_checked`) the disk status is not run, because the gateway
-host runs no git and the bytes on disk equal the export's.
+host, the run reads the digests (size and sha256, never content) of the
+project's files on the node after the import, `.git` excluded and nothing
+followed. For each member the read-back export holds, a file whose bytes equal
+the release's is clean, a file whose bytes equal the export's is drift, and a
+file that matches neither ends the run `git_restore_failed` with
+`restore.reason` `status_unexpected` before any write to `.git`. The proof is
+the status computed over a work tree rebuilt from those digests (the release's
+bytes or the export's bytes per path), before any write to `.git`: it must
+equal the prediction. A read-back of every file written follows. On a `local`
+node the run also runs a status over the project directory on disk after the
+advance (`restore.post_status` `matched`, or `mismatch` and the reason
+`post_status_mismatch`); it must equal `expected_drift` exactly, with no
+tolerance, so a file that changes between the prediction and that status ends
+the run. On an `ssh` node (`post_status: not_checked`) the disk status is not
+run, because the gateway host runs no git. The prediction there is made from the
+node's own disk all the same: after the import the run reads the size and sha256
+of every file of the project on the node (one host command, on a Linux or a
+Windows host), so `expected_drift` is what the module lists on that disk. The
+read refuses a link, a special file or a name with a control character (on
+Linux, or a backslash) below the project (the `.git` subtree is not looked
+at), and a project of more than 100,000 files.
 
 **Reading the result.** `data.git` is `null` for a project without a `.git`.
 Otherwise it has `release_commit`, `nodes` (one per node, `master` first),
@@ -6172,12 +6232,14 @@ word is a change to the repository, the checkout or the target file:
 | `nodes_disagree` | on a redundant pair, the two nodes' repositories differ in origin, tracked branch or HEAD (the message names both) | bring the backup's repository to the master's state, then check again |
 | `restore_failed` | the saved `.git` could not be put back | restore the copy `data.git.nodes[].save.path` names |
 | `advance_failed` | the advance could not be built or written | the run's warning names the cause; fix it and deploy again (the saved copy is kept) |
-| `status_unexpected` | the status over the read-back export differs from the prediction; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
+| `status_unexpected` | the status over the work tree rebuilt from the read-back export and the node's disk digests differs from the prediction, or a project file on disk matches neither the release nor the export; nothing was written | the paths are listed; deploy again after the gateway's project matches the artifact |
 | `git_recreated` | the `.git` after the import is not the one prepared against | check the repository, then deploy again; it was left as it is |
+| `git_changed` | a ref, `HEAD`, `config` or `index` changed after the run read the repository and before its write (a Designer or the module wrote meanwhile); the writes before it, the index first, are in place and nothing was overwritten (a `local` node and an `ssh` Linux node check this; an `ssh` Windows node does not yet) | check the repository's state on the gateway, then deploy again; the saved copy is kept (do not put it over the repository without checking) |
 | `backup_unsynced` | the backup's project did not equal the release within `--backup-timeout`, so its `.git` was not touched | wait for the pair to converge; the saved copy is `data.git.nodes[1].save.path` on the backup host |
 | `post_status_mismatch` | the status over the project directory differs from `expected_drift` | the listed paths are in `restore.post_status_note`; the saved copy is kept |
 | `designer_attached` | a Designer session was attached at the check before a `.git` write | close the Designer session, deploy again |
 | `backup_project_json_missing` | the backup's `data/projects/<p>/project.json` is absent or not a regular file after the deploy; redundancy project sync removed it (a git module and redundancy defect) | put `project.json` back on the backup before it restarts; ign does not repair it |
+| `git_save_missing` | a `--rollback-run` retry found that the saved `.git` the journal names (`git_pending`) is no longer on the host, or cannot be read; nothing was written to `.git` | the repository cannot be put back from ign's copy; restore it from its remote with the module, then clear the journal as **Undoing a run** says (when the host was only unreachable, run `--rollback-run` again) |
 
 When a restore or the advance fails the run ends `git_restore_failed` (slug
 `deploy_git_restore_failed`, exit 6): see [the verdict

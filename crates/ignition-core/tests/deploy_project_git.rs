@@ -514,6 +514,8 @@ async fn write_refuses_existing_lock() {
     // The remote-tracking write comes first and would succeed alone.
     let writes = [
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::RemoteRef {
                 remote: REMOTE.to_string(),
                 branch: BRANCH.to_string(),
@@ -521,6 +523,8 @@ async fn write_refuses_existing_lock() {
             bytes: new.clone(),
         },
         GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::BranchRef(BRANCH.to_string()),
             bytes: new,
         },
@@ -557,6 +561,8 @@ async fn write_refuses_unsafe_names() {
             .write_git_files(
                 PROJECT,
                 &[GitWrite {
+                    old: Default::default(),
+                    packed_refs_old: None,
                     name: bad.clone(),
                     bytes: b"x".to_vec(),
                 }],
@@ -1065,6 +1071,12 @@ mod gateway_objects {
 
     #[async_trait::async_trait]
     impl GitHostRead for Recording {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
+            self.inner.project_file_digests(project).await
+        }
         async fn read_git_state(
             &self,
             project: &str,
@@ -1370,6 +1382,34 @@ mod gateway_objects {
         assert_only_object_rels(&rec);
     }
 
+    /// 27-47 (C3): a pack is checked against its index (the index records the
+    /// pack's trailer), so a round fetches every pack together with its own
+    /// index: the `.idx` is the file right after its `.pack`. The indexes are
+    /// also read once on their own to choose the packs.
+    #[tokio::test]
+    async fn gateway_objects_fetches_each_pack_with_its_index() {
+        let f = GitFixture::new();
+        let mut names = None;
+        let (gate, live, _d) =
+            unpushed_scene_with(&f, |f| names = Some(f.gateway_split_packs())).await;
+        let (_history, unpushed) = names.expect("split");
+        let rec = Recording::new(f.node());
+        let (nodes, result) = run(&f, &gate, &live, &rec).await;
+        result.expect("dirty");
+        assert_eq!(nodes.dirty, Some(vec![VIEW.to_string()]));
+        let fetched = rec.fetched();
+        let pack = format!("objects/pack/pack-{unpushed}.pack");
+        let at = fetched
+            .iter()
+            .position(|rel| *rel == pack)
+            .expect("the pack was fetched");
+        assert_eq!(
+            fetched.get(at + 1).map(String::as_str),
+            Some(format!("objects/pack/pack-{unpushed}.idx").as_str()),
+            "the pack's own index comes with it: {fetched:?}"
+        );
+    }
+
     #[tokio::test]
     async fn gateway_objects_rounds_with_an_empty_ign_store() {
         let f = GitFixture::new();
@@ -1627,10 +1667,57 @@ mod published {
     use ignition_core::deploy::apply::preflight::{DesignersMode, DesignersPolicy};
     use ignition_core::deploy::git_remote::HostGit as Git;
     use ignition_core::deploy::transport::local::LocalFsTransport;
-    use ignition_core::deploy::transport::projects::{GitEntry, ProjectHost};
+    use ignition_core::deploy::transport::projects::{
+        GIT_CHANGED_OPERATION, GitEntry, ProjectHost, ProjectRunWriter,
+    };
     use ignition_core::error::CoreError;
 
     const PROVIDER: &str = "PlantA";
+
+    /// The master's run writer, which refuses the `run.json` rewrite that
+    /// says the project import was sent (27-53).
+    pub struct FlagRefuser {
+        pub inner: LocalFsTransport,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectRunWriter for FlagRefuser {
+        async fn write_journal(
+            &self,
+            gateway: &str,
+            project: &str,
+            bytes: &[u8],
+        ) -> Result<(), CoreError> {
+            self.inner.write_journal(gateway, project, bytes).await
+        }
+
+        async fn clear_journal(&self, gateway: &str, project: &str) -> Result<(), CoreError> {
+            self.inner.clear_journal(gateway, project).await
+        }
+
+        async fn write_pre_image(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+            name: &str,
+            bytes: &[u8],
+        ) -> Result<(), CoreError> {
+            let sent = serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .and_then(|v| v["import_sent"].as_bool());
+            if name == "run.json" && sent == Some(true) {
+                return Err(CoreError::TransportFailed {
+                    operation: "write".to_string(),
+                    node: "nodes.master".to_string(),
+                    detail: "the host refused the import flag".to_string(),
+                });
+            }
+            self.inner
+                .write_pre_image(gateway, project, run_id, name, bytes)
+                .await
+        }
+    }
 
     /// A host that answers like the local transport and runs `program` as
     /// host git (a stub, to prove git is never run or to make one step fail).
@@ -1710,6 +1797,13 @@ mod published {
         /// The poll interval of the wait for the backup, which is also the
         /// settle the backup's `.git` gets before its save goes (27-35).
         pub backup_interval: std::time::Duration,
+        /// The master's host refuses the `run.json` rewrite that says the
+        /// import was sent (27-53).
+        pub fail_import_flag: bool,
+        /// The `--designers` policy of a `--rollback-run` (`fail` with the
+        /// production wait when `None`): a test that leaves a session
+        /// attached shortens it (27-54).
+        pub rollback_designers: Option<DesignersPolicy>,
     }
 
     pub fn put_file(root: &std::path::Path, rel: &str, body: &str) {
@@ -1842,6 +1936,8 @@ mod published {
                 hazard_ack: None,
                 tree: None,
                 backup_interval: std::time::Duration::from_millis(5),
+                fail_import_flag: false,
+                rollback_designers: None,
             }
         }
 
@@ -1954,7 +2050,7 @@ mod published {
                     tag_record_writer: None,
                     run_writer: None,
                     git_writer,
-                    designers: Default::default(),
+                    designers: self.rollback_designers.unwrap_or_default(),
                     children_settle: std::time::Duration::from_secs(1),
                     children_poll: std::time::Duration::from_millis(5),
                     tag_verify_settle: std::time::Duration::from_secs(1),
@@ -2095,6 +2191,8 @@ mod published {
                 drop_project_json_at_first_read: false,
                 tags_differ: false,
                 backup_git: self.f.backup_git_dir(),
+                on_tag_export: None,
+                tag_exports: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -2111,6 +2209,9 @@ mod published {
             )>,
         ) -> Result<DeployProjectsResult, CoreError> {
             let input = self.input();
+            let refuser = self.fail_import_flag.then(|| FlagRefuser {
+                inner: self.f.node(),
+            });
             deploy_projects_run(
                 prepared,
                 loaded,
@@ -2133,7 +2234,7 @@ mod published {
                     master: loaded.target.nodes.master.clone(),
                     record_writer: None,
                     tag_record_writer: None,
-                    run_writer: None,
+                    run_writer: refuser.as_ref().map(|w| w as &dyn ProjectRunWriter),
                     git_writer,
                     designers,
                     children_settle: std::time::Duration::from_secs(1),
@@ -2771,6 +2872,100 @@ mod published {
         assert!(!rig.save_trees().is_empty(), "the save is kept");
     }
 
+    /// A git writer that lets the restore through, makes the first write of
+    /// the advance (the index) and then answers that the second target is no
+    /// longer what the run read: what a host's compare-under-lock answers
+    /// (27-45, F4).
+    struct ChangedAfterIndex(LocalFsTransport);
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for ChangedAfterIndex {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(
+            &self,
+            project: &str,
+            writes: &[GitWrite],
+        ) -> Result<(), CoreError> {
+            let index = writes
+                .iter()
+                .position(|w| matches!(w.name, GitWriteName::Index))
+                .expect("the index is written");
+            self.0.write_git_files(project, &writes[..=index]).await?;
+            let next = writes.get(index + 1).expect("a write follows the index");
+            Err(CoreError::TransportFailed {
+                operation: GIT_CHANGED_OPERATION.to_string(),
+                node: "nodes.master".to_string(),
+                detail: format!("{} changed after it was read", next.name.rel()),
+            })
+        }
+        async fn remove_git_save(&self, g: &str, p: &str, r: &str) -> Result<(), CoreError> {
+            self.0.remove_git_save(g, p, r).await
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.0.probe_write(project, run_id).await
+        }
+    }
+
+    /// 27-45 (F4): a target that changed under the lock ends the node with the
+    /// restore reason `git_changed` under `git_restore_failed` (exit 6, the
+    /// existing slug). The save is kept and named, the run's warning names the
+    /// changed file and says the index write before it stays, and the event
+    /// carries the same word. It is not `advance_failed`.
+    #[tokio::test]
+    async fn restore_and_advance_maps_a_changed_target_to_the_checkpoint_word() {
+        let rig = Rig::new();
+        let host = rig.host();
+        let writer = ChangedAfterIndex(rig.f.node());
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert!(!result.ok && result.record_written);
+        assert_eq!(result.slug.as_deref(), Some(GIT_RESTORE_FAILED_SLUG));
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let node = git_of(&result).master();
+        let restore = node.restore.as_ref().expect("restore");
+        assert_eq!(restore.reason.as_deref(), Some("git_changed"));
+        assert!(restore.restored && !restore.advanced && restore.save_kept);
+        let save = node.save.as_ref().expect("the save is named");
+        assert!(rig.f.data_dir.join(&save.path).is_dir(), "the save is kept");
+        assert!(!rig.save_trees().is_empty(), "the save is kept");
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("git_changed"))
+            .unwrap_or_else(|| panic!("no git_changed warning: {:?}", result.warnings));
+        assert!(warning.contains("changed after it was read"), "{warning}");
+        assert!(
+            warning.contains("index") && warning.contains("in place"),
+            "the earlier index write is reported: {warning}"
+        );
+        assert!(warning.contains(&save.path), "{warning}");
+        let events = rig.events(&result);
+        let failed = events
+            .iter()
+            .find(|e| e["event"] == "git_restore_failed")
+            .expect("logged");
+        assert_eq!(failed["reason"], "git_changed");
+    }
+
     #[tokio::test]
     async fn post_advance_status_mismatch_fails() {
         let extra = "ignition/script-python/cap/extra.txt";
@@ -2787,6 +2982,182 @@ mod published {
         let note = restore.post_status_note.expect("the paths are named");
         assert!(note.contains(extra) && note.contains("D-25"), "{note}");
         assert!(!rig.save_trees().is_empty(), "the save is kept");
+    }
+
+    const VIEW_RES: &str = "com.inductiveautomation.perspective/views/V/resource.json";
+    const UTIL2_RES: &str = "ignition/script-python/cap/util2/resource.json";
+
+    /// The live over-count of 2026-11-18 (27-LIVE-CAPTURES.md, `git_prodscale_rig`
+    /// after X3). The disk holds release-form bytes for the resources the
+    /// release leaves alone, the import rewrites only the resources whose
+    /// content changed, and every export renders the gateway's form. The run
+    /// predicted every `resource.json` and `project.json` while the disk status
+    /// listed only the rewritten ones.
+    #[tokio::test]
+    async fn unchanged_resources_keep_release_bytes_on_disk() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_rewrites_changed_only()
+                .with_disk_mirror_gateway_form(&[VIEW_RES, UTIL_RES, UTIL2_RES])
+        });
+        let project = rig.f.project_dir();
+        let view_before = std::fs::read(project.join(VIEW_RES)).expect("V descriptor");
+        let project_json_before = std::fs::read(project.join("project.json")).expect("manifest");
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?} {:?} {:?}",
+            restore.reason,
+            restore.post_status,
+            restore.post_status_note
+        );
+        assert!(result.ok && result.slug.is_none());
+        assert!(restore.advanced && restore.verified, "{restore:?}");
+        assert_eq!(restore.post_status, Some("matched"));
+        // The disk of the unchanged resource and of the manifest is untouched.
+        assert_eq!(
+            std::fs::read(project.join(VIEW_RES)).expect("V descriptor"),
+            view_before,
+            "the import left V alone"
+        );
+        assert_eq!(
+            std::fs::read(project.join("project.json")).expect("manifest"),
+            project_json_before,
+            "the import left project.json alone"
+        );
+        // What JGit lists is what the run predicted: the changed resource and
+        // the new one, never the unchanged ones.
+        let drift = git_of(&result)
+            .expected_drift
+            .clone()
+            .expect("drift known after advance");
+        assert_eq!(drift, vec![UTIL_RES.to_string(), UTIL2_RES.to_string()]);
+        assert!(!drift.iter().any(|p| p == VIEW_RES || p == "project.json"));
+        assert_eq!(rig.f.status_paths(), drift);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+    }
+
+    /// The case 27-24 measured: every descriptor and the manifest on disk are
+    /// already in the gateway's form (the module's clone wrote them so). The
+    /// unchanged resource is not rewritten and still differs from the release,
+    /// so it is drift, and the run is green. A regression guard: green before and
+    /// after the 27-40 fix.
+    #[tokio::test]
+    async fn gateway_form_disk_predicts_every_rewritten_form() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_rewrites_changed_only()
+                .with_disk_mirror_gateway_form(&[VIEW_RES, UTIL_RES, UTIL2_RES])
+        });
+        let project = rig.f.project_dir();
+        for rel in [VIEW_RES, UTIL_RES] {
+            let text = std::fs::read(project.join(rel)).expect("descriptor");
+            let value: serde_json::Value = serde_json::from_slice(&text).expect("json");
+            let mut pretty = serde_json::to_vec_pretty(&value).expect("pretty");
+            pretty.push(b'\n');
+            assert_ne!(pretty, text, "{rel} must change when re-serialised");
+            std::fs::write(project.join(rel), pretty).expect("the gateway form");
+        }
+        // The manifest in the form an export carries it (`description` and
+        // `parent` added, C8b/C8c), so the unchanged manifest is gateway form.
+        std::fs::write(
+            project.join("project.json"),
+            br#"{"description":"","parent":"","title":"CapApp"}"#,
+        )
+        .expect("the gateway form of the manifest");
+        let result = rig.apply().await.expect("the run ends with a verdict");
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Imported,
+            "{:?} {:?} {:?}",
+            restore.reason,
+            restore.post_status,
+            restore.post_status_note
+        );
+        assert_eq!(restore.post_status, Some("matched"));
+        let drift = git_of(&result)
+            .expected_drift
+            .clone()
+            .expect("drift known after advance");
+        assert_eq!(
+            drift,
+            vec![
+                VIEW_RES.to_string(),
+                UTIL_RES.to_string(),
+                UTIL2_RES.to_string(),
+                "project.json".to_string(),
+            ]
+        );
+        assert_eq!(rig.f.status_paths(), drift);
+    }
+
+    /// A git writer that does the advance and then edits one file of the work
+    /// tree, as a change between the prediction and the post-advance status.
+    struct EditAfterAdvance(LocalFsTransport, PathBuf);
+
+    #[async_trait::async_trait]
+    impl GitStateWriter for EditAfterAdvance {
+        async fn save_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.save_git(gateway, project, run_id).await
+        }
+        async fn restore_git(
+            &self,
+            gateway: &str,
+            project: &str,
+            run_id: &str,
+        ) -> Result<ignition_core::deploy::transport::projects::GitManifest, CoreError> {
+            self.0.restore_git(gateway, project, run_id).await
+        }
+        async fn write_git_files(
+            &self,
+            project: &str,
+            writes: &[GitWrite],
+        ) -> Result<(), CoreError> {
+            self.0.write_git_files(project, writes).await?;
+            let mut bytes = std::fs::read(&self.1).expect("the file to edit");
+            bytes.extend_from_slice(b" ");
+            std::fs::write(&self.1, bytes).expect("the edit");
+            Ok(())
+        }
+        async fn remove_git_save(&self, g: &str, p: &str, r: &str) -> Result<(), CoreError> {
+            self.0.remove_git_save(g, p, r).await
+        }
+        async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError> {
+            self.0.probe_write(project, run_id).await
+        }
+    }
+
+    /// D-25 is not loosened: a file changed on disk after the prediction (here
+    /// the unchanged resource the import left alone) still ends the run with
+    /// `post_status_mismatch`, one path being enough.
+    #[tokio::test]
+    async fn post_status_mismatch_still_fails_on_one_extra_path() {
+        let rig = Rig::with(|g| {
+            g.with_disk_mirror_rewrites_changed_only()
+                .with_disk_mirror_gateway_form(&[VIEW_RES, UTIL_RES, UTIL2_RES])
+        });
+        let host = rig.host();
+        let writer = EditAfterAdvance(rig.f.node(), rig.f.project_dir().join(VIEW_RES));
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("prepare");
+        let result = rig
+            .run_prepared(&host, &loaded, prepared, Some(&writer))
+            .await
+            .expect("the run ends with a verdict");
+        assert_eq!(result.outcome, ProjectOutcome::GitRestoreFailed);
+        assert_eq!(result.failure_exit_code(), Some(6));
+        let restore = git_of(&result).master().restore.clone().expect("restore");
+        assert!(restore.advanced && restore.verified, "{restore:?}");
+        assert_eq!(restore.post_status, Some("mismatch"));
+        assert_eq!(restore.reason.as_deref(), Some("post_status_mismatch"));
+        assert!(restore.save_kept);
+        let note = restore.post_status_note.expect("the path is named");
+        assert!(note.contains(VIEW_RES) && note.contains("1 path"), "{note}");
     }
 
     #[test]
@@ -2853,6 +3224,12 @@ mod published {
 
     #[async_trait::async_trait]
     impl GitHostRead for FailingFetch {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
+            self.0.project_file_digests(project).await
+        }
         async fn read_git_state(
             &self,
             project: &str,
@@ -3003,6 +3380,12 @@ mod published {
 
     #[async_trait::async_trait]
     impl GitHostRead for Metered {
+        async fn project_file_digests(
+            &self,
+            project: &str,
+        ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
+            self.inner.project_file_digests(project).await
+        }
         async fn read_git_state(
             &self,
             project: &str,
@@ -5347,7 +5730,8 @@ mod published {
             "{config}"
         );
         f.module_import(true, &[], &[], &[]);
-        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip())
+        let disk = f.node().project_file_digests(PROJECT).await.expect("disk");
+        let plan = finish_advance(&host, &f.checkout, &prep, &f.export_zip(), &disk)
             .await
             .expect("the plan");
         let order: Vec<String> = plan.writes.iter().map(|w| write_label(&w.name)).collect();
@@ -5374,7 +5758,8 @@ mod published {
         let (_state, prep) = m.prepare(&host).await;
         assert!(!prep.adopted && prep.config.is_none() && prep.config_base.is_none());
         m.module_import(true, &[], &[], &[]);
-        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip())
+        let disk = m.node().project_file_digests(PROJECT).await.expect("disk");
+        let plan = finish_advance(&host, &m.checkout, &prep, &m.export_zip(), &disk)
             .await
             .expect("the plan");
         assert!(
@@ -5890,6 +6275,12 @@ mod published {
         /// The backup's copy of the owned tags is not the master's: one
         /// documentation value differs (27-34).
         pub tags_differ: bool,
+        /// Run the closure once, on the backup's `n`th (1-based) tag export:
+        /// the redundancy sync reaching the backup late, after the run's wait
+        /// for its project (27-55, Q3). Only the backup's tag check reads tag
+        /// exports, so this fires inside `backup_step`.
+        pub on_tag_export: Option<(usize, Box<dyn Fn() + Send + Sync>)>,
+        pub tag_exports: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeBackupNode<'_> {
@@ -5904,6 +6295,15 @@ mod published {
             // A tag-owning pair run also waits for the owned tags (26-13): the
             // backup answers with the master's export in the backup's shape
             // (no live values, children reversed).
+            let nth = self
+                .tag_exports
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if let Some((at, hook)) = &self.on_tag_export
+                && *at == nth
+            {
+                hook();
+            }
             self.reads
                 .lock()
                 .expect("reads")
@@ -6451,6 +6851,343 @@ mod published {
         // The backup's repository was never written.
         assert!(rig.f.backup_git_dir().exists());
         assert_eq!(rig.f.git_in_backup(&["rev-parse", "HEAD"]), rig.f.c1);
+    }
+
+    // ---- 27-55 (P6): each backup export is bounded by the remaining wait ----
+
+    /// A backup whose project export answers `zip` after `delay` of real time.
+    /// It is the only fake that stalls: the pair rig's fake backup answers
+    /// without yielding, so the bound can never cut it.
+    struct SlowBackup {
+        zip: Vec<u8>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl BackupTags for SlowBackup {
+        async fn tag_export(&self, _provider: &str) -> Result<Vec<u8>, CoreError> {
+            Err(CoreError::Internal("no tags here".to_string()))
+        }
+        async fn status(
+            &self,
+        ) -> Result<ignition_core::client::redundancy::RedundancyStatusWire, CoreError> {
+            Err(CoreError::Internal("no status here".to_string()))
+        }
+        async fn sync_exhausted(&self, _since_ms: i64) -> Result<bool, CoreError> {
+            Ok(false)
+        }
+        async fn project_export(&self, _project: &str) -> Result<Vec<u8>, CoreError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.zip.clone())
+        }
+    }
+
+    /// The export zip and canonical digest of a small project.
+    async fn small_project() -> (Vec<u8>, String) {
+        use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
+        let gateway = FakeProjects::new().with_project(
+            PROJECT,
+            None,
+            false,
+            &[("project.json", br#"{"title":"Cap App"}"#.to_vec())],
+        );
+        let zip = Gw::export_bytes(&gateway, PROJECT).await.expect("export");
+        let digest = canonical_digest(&zip).expect("a project export").sha256;
+        (zip, digest)
+    }
+
+    fn policy(budget_ms: u64, interval_ms: u64) -> ignition_core::deploy::pair::BackupPolicy {
+        ignition_core::deploy::pair::BackupPolicy {
+            budget: std::time::Duration::from_millis(budget_ms),
+            interval: std::time::Duration::from_millis(interval_ms),
+        }
+    }
+
+    /// P6: a backup export that stalls for 10 s ends the wait at the budget
+    /// plus one interval, not at the client's request timeout.
+    #[tokio::test]
+    async fn backup_export_stall_is_bounded() {
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let (zip, want) = small_project().await;
+        let backup = SlowBackup {
+            zip,
+            delay: std::time::Duration::from_secs(10),
+        };
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(300, 50),
+        };
+        let started = std::time::Instant::now();
+        let outcome = wait_for_backup_project(&wait, PROJECT, &want).await;
+        let took = started.elapsed();
+        let detail = outcome.expect_err("a stalled export is unsynced");
+        eprintln!("backup_export_stall_is_bounded: returned after {took:?}");
+        assert!(
+            took < std::time::Duration::from_millis(300 + 50 + 200),
+            "bounded by budget + interval + slack, took {took:?}"
+        );
+        assert!(detail.contains("did not answer"), "{detail}");
+    }
+
+    /// P6: an answer that arrives after the budget ran out but inside the
+    /// grace window (one interval) is taken: a match proves the backup holds
+    /// the release.
+    #[tokio::test]
+    async fn backup_export_matching_answer_in_the_grace_window_is_accepted() {
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let (zip, want) = small_project().await;
+        // 30 ms after the 300 ms budget, inside the 50 ms interval
+        let backup = SlowBackup {
+            zip: zip.clone(),
+            delay: std::time::Duration::from_millis(330),
+        };
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(300, 50),
+        };
+        let got = wait_for_backup_project(&wait, PROJECT, &want)
+            .await
+            .expect("a matching answer inside the grace window is accepted");
+        assert_eq!(got, zip);
+    }
+
+    /// P6: an answer after budget plus interval is `backup_unsynced`, and the
+    /// reason says the export did not answer in time.
+    #[tokio::test]
+    async fn backup_export_matching_answer_after_the_grace_window_is_unsynced() {
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let (zip, want) = small_project().await;
+        let backup = SlowBackup {
+            zip,
+            delay: std::time::Duration::from_millis(600),
+        };
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(300, 50),
+        };
+        let detail = wait_for_backup_project(&wait, PROJECT, &want)
+            .await
+            .expect_err("too late");
+        assert!(
+            detail.contains("did not answer") && detail.contains("wait"),
+            "{detail}"
+        );
+    }
+
+    /// P6 (27-55, option-b): the pair rig's fake backup answers its export in
+    /// one poll, without yielding, and tokio's `timeout` polls the request
+    /// before its clock, so the bound never cuts it, however loaded the box
+    /// is. That is what keeps every pair test on the unchanged 400 ms `WAIT`:
+    /// a zero budget and a zero interval still take the answer.
+    #[tokio::test]
+    async fn backup_export_of_the_pair_fake_is_never_cut_by_the_bound() {
+        use ignition_core::actions::deploy_projects::ProjectGateway as Gw;
+        use ignition_core::actions::deploy_projects::git::{BackupWait, wait_for_backup_project};
+        let rig = Rig::tagged_pair(true);
+        let want = canonical_digest(
+            &Gw::export_bytes(&rig.gateway, PROJECT)
+                .await
+                .expect("export"),
+        )
+        .expect("a project export")
+        .sha256;
+        let backup = rig.backup_node(0);
+        let wait = BackupWait {
+            backup: &backup,
+            policy: policy(0, 0),
+        };
+        wait_for_backup_project(&wait, PROJECT, &want)
+            .await
+            .expect("the fake's answer is taken with nothing left of the wait");
+    }
+
+    // ---- 27-55 (Q3): the backup's save outlives backup_step and its resync ----
+
+    /// The `git_*` and backup events of a pair run, `(name, node)` in order.
+    fn pair_events(rig: &Rig, result: &DeployProjectsResult) -> Vec<(String, Option<String>)> {
+        rig.events(result)
+            .iter()
+            .filter_map(|e| {
+                let name = e["event"].as_str()?;
+                (name.starts_with("git_") || name.starts_with("backup_"))
+                    .then(|| (name.to_string(), e["node"].as_str().map(str::to_string)))
+            })
+            .collect()
+    }
+
+    /// Q3: on a tag-owning pair the redundancy resync that `backup_step` may
+    /// send, or the sync reaching the backup late, deletes the backup's `.git`
+    /// after the settle looked at it. Before 27-55 the settle had already
+    /// removed the save: the backup ended with neither. Now the save stays
+    /// through `backup_step`, the recheck finds `.git` absent, restores it from
+    /// the save, advances it, and only then removes the save.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_pair_backup_git_deleted_by_the_resync_is_restored() {
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node_with(1, false);
+        let git_dir = rig.f.backup_git_dir();
+        backup.on_tag_export = Some((
+            1,
+            Box::new(move || {
+                std::fs::remove_dir_all(&git_dir).expect("the resync deletes the backup's .git");
+            }),
+        ));
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert!(
+            rig.f.backup_git_dir().exists(),
+            "the backup must not end without a .git: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(
+            rig.f.git_in_backup(&["rev-parse", "HEAD"]),
+            rig.f.c2,
+            "the backup's repository is advanced again"
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert!(restore.restored && restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None, "{restore:?}");
+        assert!(!restore.save_kept, "{restore:?}");
+        assert!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).is_empty(),
+            "the save goes only after the restore"
+        );
+    }
+
+    /// Q3: with no late delete the save of a tag-owning pair's backup is
+    /// removed after `backup_step` (after its resync, or after its verdict when
+    /// none was needed), never before.
+    #[tokio::test]
+    async fn tag_pair_backup_save_removed_only_after_the_recheck() {
+        let rig = Rig::tagged_pair(true);
+        let backup = rig.backup_node_with(1, false);
+        let result = rig.apply_pair(&backup, WAIT).await.expect("green");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::Applied,
+            "{:?}",
+            result.warnings
+        );
+        let events = pair_events(&rig, &result);
+        let at = |name: &str, node: Option<&str>| {
+            events
+                .iter()
+                .position(|(n, o)| n == name && (node.is_none() || o.as_deref() == node))
+        };
+        let verdict = at("backup_verdict", None).expect("the backup's tag verdict");
+        let removed = at("git_save_removed", Some("nodes.backup")).expect("the backup's save goes");
+        assert!(
+            removed > verdict,
+            "the save goes after backup_step, not before: {events:?}"
+        );
+        if let Some(resync) = at("backup_resync", None) {
+            assert!(removed > resync, "{events:?}");
+        }
+        assert!(rig.save_trees_in(&rig.f.backup_data_dir()).is_empty());
+    }
+
+    /// Q3: a `.git` changed after the resync is not the repository that was
+    /// advanced: the backup ends `git_recreated`, the repository is left as it
+    /// is and the save is kept and named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_pair_backup_git_changed_after_the_resync_is_git_recreated() {
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node_with(1, false);
+        let work = rig.f.backup_project_dir();
+        backup.on_tag_export = Some((
+            1,
+            Box::new(move || {
+                common::git_fixture::git(
+                    &work,
+                    &["commit", "-q", "--allow-empty", "-m", "late writer"],
+                );
+            }),
+        ));
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert_eq!(
+            restore.reason.as_deref(),
+            Some("git_recreated"),
+            "{restore:?}"
+        );
+        assert!(restore.save_kept, "{restore:?}");
+        assert_eq!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).len(),
+            1,
+            "the save is kept"
+        );
+        assert!(rig.f.backup_git_dir().exists(), ".git is left as it is");
+    }
+
+    /// Q3 with 27-37: the `project.json` check still runs at the save's removal
+    /// point, which is now the recheck: a `project.json` the resync takes after
+    /// the settle fails the node `backup_project_json_missing` and the save is
+    /// kept.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tag_pair_backup_project_json_removed_after_the_resync_is_found() {
+        let rig = Rig::tagged_pair(true);
+        let mut backup = rig.backup_node_with(1, false);
+        let file = backup_project_json(&rig);
+        backup.on_tag_export = Some((
+            1,
+            Box::new(move || {
+                std::fs::remove_file(&file).expect("the resync deletes project.json");
+            }),
+        ));
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_eq!(
+            result.outcome,
+            ProjectOutcome::GitRestoreFailed,
+            "{:?}",
+            result.warnings
+        );
+        let node = node_of(git_of(&result), "nodes.backup");
+        let restore = node.restore.as_ref().expect("the backup restore");
+        assert_eq!(
+            restore.reason.as_deref(),
+            Some("backup_project_json_missing"),
+            "{restore:?}"
+        );
+        assert!(restore.save_kept, "{restore:?}");
+        assert_eq!(rig.save_trees_in(&rig.f.backup_data_dir()).len(), 1);
+    }
+
+    /// Q3: a pair without owned tags keeps the 27-35 settle exactly: the save
+    /// goes at the settle, and nothing reads the backup's tags afterwards (no
+    /// `backup_step`, so no recheck).
+    #[tokio::test]
+    async fn non_tag_pair_settle_is_unchanged() {
+        let rig = pair();
+        let backup = rig.backup_node_with(1, false);
+        let result = rig.apply_pair(&backup, WAIT).await.expect("green");
+        assert!(result.ok, "{:?}", result.warnings);
+        assert!(
+            rig.save_trees_in(&rig.f.backup_data_dir()).is_empty(),
+            "the save went at the settle"
+        );
+        let events = backup_git_events(&rig, &result);
+        assert!(events.iter().any(|e| e == "git_save_removed"), "{events:?}");
+        assert!(
+            !backup.reads().iter().any(|r| r == "GET tag_export"),
+            "no tag check: {:?}",
+            backup.reads()
+        );
     }
 
     // ---- 27-35: the backup's `.git` settles before its save goes (WR-08) ----
@@ -7546,6 +8283,25 @@ mod published {
         assert!(!backup_project_json(&rig).exists());
     }
 
+    /// The 27-37 detection under the 27-40 knob: the backup's import rewrites
+    /// only the changed resources and the redundancy sync still deletes its
+    /// `project.json`. The run fails loudly with the same decided outcome.
+    #[tokio::test]
+    async fn backup_project_json_absent_still_fails_loudly() {
+        let rig = pair();
+        let mut backup = rig.backup_node_losing(
+            1,
+            true,
+            Some(common::fake_projects::ProjectJsonFate::Absent),
+        );
+        let gw = std::mem::take(&mut backup.gw);
+        backup.gw = gw.with_disk_mirror_rewrites_changed_only();
+        let result = rig.apply_pair(&backup, WAIT).await.expect("a verdict");
+        assert_backup_project_json_failure(&rig, &result);
+        assert_project_json_warning(&result, "is absent after the deploy");
+        assert!(!backup_project_json(&rig).exists());
+    }
+
     /// Debug B4: the path is an empty directory on the backup.
     #[tokio::test]
     async fn pair_backup_project_json_directory_fails_loudly() {
@@ -7812,6 +8568,406 @@ mod published {
             assert!(failed.starts_with("could not be checked ("), "{failed}");
         }
     }
+    // ---- 27-53 (Q2): the import flag of the host copy, with a gateway .git ----
+
+    /// The host `run.json` of the rig's project, as JSON.
+    fn host_run_json(rig: &Rig) -> serde_json::Value {
+        let path = rig
+            .f
+            .data_dir
+            .join("ign-deploy/capgw/projects")
+            .join(PROJECT)
+            .join("pre-image/run.json");
+        serde_json::from_slice(&std::fs::read(path).expect("run.json")).expect("json")
+    }
+
+    /// Q2: a host that refuses the flag rewrite stops the run before the
+    /// import: nothing is imported, the tags roll back, the `.git` save goes
+    /// and the repository is as it was.
+    #[tokio::test]
+    async fn import_flag_write_failure_stops_before_the_import() {
+        let mut rig = Rig::tagged(true);
+        rig.fail_import_flag = true;
+        let before = rig.git_manifest().await;
+
+        let result = rig.apply().await.expect("a rolled-back verdict");
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "no import: {:?}",
+            rig.gateway.call_log()
+        );
+        assert!(!result.ok, "{:?}", result.warnings);
+        assert!(
+            format!("{result:?}").contains("the host refused the import flag"),
+            "the host's error is the cause: {result:?}"
+        );
+        assert_eq!(
+            rig.git_events(&result),
+            ["git_state_read", "git_saved", "git_save_removed"],
+            "the save is taken, then discarded"
+        );
+        assert!(rig.save_trees().is_empty(), "no save is left");
+        assert_eq!(rig.git_manifest().await, before, ".git is untouched");
+        assert_eq!(host_run_json(&rig)["import_sent"], false);
+    }
+
+    /// Q2 (CodeRabbit #57 round 2): a tag-owning run on a git-managed project
+    /// is refused before its import (a Designer saved project work at the last
+    /// check) and its tag rollback fails. The retry restores only the tags:
+    /// it never imports the pre-image over the Designer's save, so it never
+    /// removes the gateway `.git`.
+    #[tokio::test]
+    async fn rollback_run_after_a_pre_import_refusal_never_imports_or_strips_git() {
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let rig = Rig::tagged_with(true, |g| {
+            g.with_designers_script(vec![vec![], vec![session], vec![]])
+                .with_project_edited_on_designers_read(1, PROJECT)
+                .with_tag_import_failure(2)
+        });
+        let before = rig.git_manifest().await;
+        let err = rig.apply().await.expect_err("the tag rollback failed");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        assert!(rig.gateway.import_calls().is_empty(), "no import was sent");
+        let run_id = host_run_json(&rig)["run_id"]
+            .as_str()
+            .expect("a run id")
+            .to_string();
+        assert_eq!(host_run_json(&rig)["import_sent"], false);
+        assert_eq!(rig.git_manifest().await, before, ".git is untouched");
+
+        // CodeRabbit #61: the check makes the apply's project decision. The
+        // live project is the Designer's save, not the pre-image, and the run
+        // never sent its import, so the undo imports nothing and the check
+        // says so.
+        let check = rig.rollback_run(&run_id, true).await.expect("a check");
+        let rollback = check
+            .tags
+            .as_ref()
+            .and_then(|t| t.rollback.as_ref())
+            .expect("data.tags.rollback");
+        assert!(
+            !rollback.project_reimported,
+            "no project reimport is previewed: {:?}",
+            check.warnings
+        );
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "a check imports nothing"
+        );
+
+        let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+        assert!(
+            rig.gateway.import_calls().is_empty(),
+            "the retry imports no pre-image: {:?}",
+            rig.gateway.call_log()
+        );
+        assert_eq!(
+            rig.git_manifest().await,
+            before,
+            ".git is untouched: {:?}",
+            undo.warnings
+        );
+        assert!(rig.save_trees().is_empty(), "no save is left");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::TagsRolledBack,
+            "{:?}",
+            undo.warnings
+        );
+    }
+    // ---- 27-54 (P3): a save a rollback could not put back is pending ----
+
+    /// The host journal of the rig's project, as JSON, when there is one.
+    fn host_journal_json(rig: &Rig) -> Option<serde_json::Value> {
+        let path = rig
+            .f
+            .data_dir
+            .join("ign-deploy/capgw/projects")
+            .join(PROJECT)
+            .join("journal.json");
+        let bytes = std::fs::read(path).ok()?;
+        Some(serde_json::from_slice(&bytes).expect("a journal"))
+    }
+
+    /// A tag-owning managed deploy that fails after its import (a child
+    /// changed behind the run) with a Designer attached throughout: the
+    /// automatic rollback re-imports the pre-image, which removes `.git`, and
+    /// cannot put the save back. Returns the rig, the manifest of the `.git`
+    /// before the run and the run's id.
+    async fn rollback_stuck_behind_a_designer() -> (
+        Rig,
+        ignition_core::deploy::transport::projects::GitManifest,
+        String,
+    ) {
+        let rig = Rig::tagged_with(true, |g| g.with_designers_after_exports(3, 100_000));
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before = rig.git_manifest().await;
+        let err = rig
+            .apply_designers(wait_ms(60))
+            .await
+            .expect_err("the rollback ends rollback_failed");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        assert!(!rig.f.git_dir().exists(), ".git is still absent");
+        let journal = host_journal_json(&rig).expect("the journal stays");
+        let run_id = journal["run_id"].as_str().expect("a run id").to_string();
+        (rig, before, run_id)
+    }
+
+    /// P3: the rollback that leaves a save names it in the host journal (state
+    /// `rolling_back`): node, the save's run id, path and manifest.
+    #[tokio::test]
+    async fn rollback_with_a_designer_attached_writes_git_pending() {
+        let (rig, before, run_id) = rollback_stuck_behind_a_designer().await;
+        let journal = host_journal_json(&rig).expect("the journal");
+        assert_eq!(journal["state"], "rolling_back");
+        assert_eq!(journal["schema_version"], 2);
+        let pending = journal["git_pending"].as_array().expect("git_pending");
+        assert_eq!(pending.len(), 1, "{journal}");
+        let trees = rig.save_trees();
+        assert_eq!(trees.len(), 1, "the save is kept");
+        let save = trees[0]
+            .strip_prefix(&rig.f.data_dir)
+            .expect("below the data dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(pending[0]["node"], "nodes.master");
+        assert_eq!(pending[0]["run_id"], run_id.as_str());
+        assert_eq!(pending[0]["path"], save.as_str());
+        assert_eq!(pending[0]["manifest"]["files"], before.files);
+        assert_eq!(pending[0]["manifest"]["bytes"], before.bytes);
+        assert_eq!(pending[0]["manifest"]["digest"], before.digest.as_str());
+    }
+
+    /// CodeRabbit #61: with the project and the tags already restored, the
+    /// check of the retry counts the pending save the apply puts back
+    /// (`.git` absent, the save as the journal recorded it) in
+    /// `would_change`, and writes nothing. A pending save that is gone is not
+    /// counted: the apply writes nothing for it.
+    #[tokio::test]
+    async fn rollback_run_check_counts_only_the_pending_save_the_apply_puts_back() {
+        let (rig, _before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+        let journal = host_journal_json(&rig).expect("the journal");
+        let check = rig.rollback_run(&run_id, true).await.expect("a check");
+        let rollback = check
+            .tags
+            .as_ref()
+            .and_then(|t| t.rollback.as_ref())
+            .expect("data.tags.rollback");
+        assert!(
+            !rollback.project_reimported && rollback.reimported_count == 0,
+            "the project and the tags are already restored: {rollback:?}"
+        );
+        assert!(
+            check.would_change,
+            "the pending save is put back by the apply: {:?}",
+            check.warnings
+        );
+        assert!(!rig.f.git_dir().exists(), "a check writes no .git");
+        assert_eq!(host_journal_json(&rig).expect("the journal stays"), journal);
+
+        let (rig, _before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+        let tree = rig.save_trees().remove(0);
+        std::fs::remove_dir_all(tree.parent().expect("the run's save directory"))
+            .expect("the save is deleted");
+        let check = rig.rollback_run(&run_id, true).await.expect("a check");
+        assert!(
+            !check.would_change,
+            "a save that is gone is not put back: {:?}",
+            check.warnings
+        );
+    }
+
+    /// P3: `--rollback-run` with the Designer gone finds `.git` absent and a
+    /// pending entry, and puts the save back unchanged, removes the entry and
+    /// the save, and clears the journal. Before 27-54 the retry saw no git
+    /// work and `.git` stayed absent.
+    #[tokio::test]
+    async fn rollback_run_retry_restores_the_pending_save() {
+        let (rig, before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+
+        let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+        assert_eq!(
+            undo.outcome,
+            ProjectOutcome::RolledBack,
+            "{:?}",
+            undo.warnings
+        );
+        assert_eq!(rig.git_manifest().await, before, ".git is as it was saved");
+        let restore = git_of(&undo).master().restore.clone().expect("restore");
+        assert!(restore.restored && !restore.advanced, "{restore:?}");
+        assert_eq!(restore.reason, None);
+        assert!(!restore.save_kept);
+        assert!(rig.save_trees().is_empty(), "the save is removed");
+        assert!(host_journal_json(&rig).is_none(), "the journal is cleared");
+        assert_eq!(
+            rig.git_events(&undo),
+            ["git_restored", "git_save_removed"],
+            "the retry puts the save back and removes it"
+        );
+    }
+
+    /// P3: the same retry with the save deleted: the node ends
+    /// `git_save_missing` naming the path, nothing else is changed on `.git`,
+    /// and the journal stays with its entry.
+    #[tokio::test]
+    async fn rollback_run_retry_with_the_save_gone_ends_rollback_failed() {
+        let (rig, _before, run_id) = rollback_stuck_behind_a_designer().await;
+        rig.gateway.detach_designers();
+        let journal = host_journal_json(&rig).expect("the journal");
+        let path = journal["git_pending"][0]["path"]
+            .as_str()
+            .expect("a path")
+            .to_string();
+        let tree = rig.save_trees().remove(0);
+        std::fs::remove_dir_all(tree.parent().expect("the run's save directory"))
+            .expect("the save is deleted");
+
+        let err = rig
+            .rollback_run(&run_id, false)
+            .await
+            .expect_err("the save is gone");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        let text = err.to_string();
+        assert!(text.contains("git_save_missing"), "{text}");
+        assert!(text.contains(&path), "the line names the path: {text}");
+        assert!(!rig.f.git_dir().exists(), "nothing was written to .git");
+        let kept = host_journal_json(&rig).expect("the journal stays");
+        assert_eq!(kept["git_pending"][0]["path"], path.as_str(), "{kept}");
+        // the retry's own run directory records the failed restore
+        let mut runs: Vec<PathBuf> = std::fs::read_dir(rig.repo.join(".ign/deploy/capgw"))
+            .expect("run dirs")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        runs.sort();
+        let events: Vec<String> = runs
+            .iter()
+            .filter_map(|dir| std::fs::read_to_string(dir.join("events.ndjson")).ok())
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|log| log.contains("git_restore_failed") && log.contains("git_save_missing")),
+            "{events:?}"
+        );
+    }
+
+    /// P3: a journal without pending saves, a version 1 one and a version 2 one
+    /// with none listed, drives today's retry (the tags only, the project
+    /// never imported, `.git` untouched).
+    #[tokio::test]
+    async fn rollback_run_of_a_journal_without_git_pending_behaves_as_today() {
+        for version in [2, 1] {
+            let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+            let rig = Rig::tagged_with(true, |g| {
+                g.with_designers_script(vec![vec![], vec![session], vec![]])
+                    .with_project_edited_on_designers_read(1, PROJECT)
+                    .with_tag_import_failure(2)
+            });
+            let before = rig.git_manifest().await;
+            let err = rig.apply().await.expect_err("the tag rollback failed");
+            assert_eq!(err.code(), "rollback_failed", "{err}");
+            let mut journal = host_journal_json(&rig).expect("the journal stays");
+            assert!(journal.get("git_pending").is_none(), "{journal}");
+            let run_id = journal["run_id"].as_str().expect("a run id").to_string();
+            if version == 1 {
+                journal["schema_version"] = serde_json::json!(1);
+                std::fs::write(
+                    rig.f
+                        .data_dir
+                        .join("ign-deploy/capgw/projects")
+                        .join(PROJECT)
+                        .join("journal.json"),
+                    serde_json::to_vec_pretty(&journal).expect("json"),
+                )
+                .expect("the journal is rewritten");
+            }
+            let undo = rig.rollback_run(&run_id, false).await.expect("a verdict");
+            assert_eq!(
+                undo.outcome,
+                ProjectOutcome::TagsRolledBack,
+                "version {version}: {:?}",
+                undo.warnings
+            );
+            assert!(rig.gateway.import_calls().is_empty(), "version {version}");
+            assert_eq!(rig.git_manifest().await, before, "version {version}");
+            assert!(host_journal_json(&rig).is_none(), "version {version}");
+        }
+    }
+    /// P3 on a pair: both nodes end the automatic rollback behind an attached
+    /// Designer, so the journal names both saves. The retry, with the session
+    /// attached again only once the master is done, puts the master's save
+    /// back and removes its entry, keeps the backup's entry, ends
+    /// `rollback_failed` with a line for the backup, and leaves the journal.
+    #[tokio::test]
+    async fn rollback_run_retry_keeps_the_journal_while_one_entry_is_pending() {
+        let mut rig = Rig::tagged_with(true, |g| g.with_designers_after_exports(3, 100_000));
+        rig.tree = Some(rig.f.node());
+        rig.rollback_designers = Some(wait_ms(60));
+        rig.add_backup();
+        rig.gateway.mutate_child_after_import(PROJECT, 1);
+        let before_master = rig.git_manifest().await;
+        let mut backup = rig.backup_node(0);
+        // the sync already removed the backup's `.git` when the content changed
+        backup.drop_git_at_first_read = true;
+        let host = rig.host();
+        let (loaded, prepared) = rig.plan_with(&host).await.expect("the plan");
+        let err = rig
+            .run_prepared_full(
+                &host,
+                &loaded,
+                prepared,
+                None,
+                wait_ms(60),
+                Some((&backup, WAIT)),
+            )
+            .await
+            .expect_err("both repositories stay behind the Designer");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        let journal = host_journal_json(&rig).expect("the journal stays");
+        let run_id = journal["run_id"].as_str().expect("a run id").to_string();
+        let nodes: Vec<&str> = journal["git_pending"]
+            .as_array()
+            .expect("git_pending")
+            .iter()
+            .map(|e| e["node"].as_str().expect("a node"))
+            .collect();
+        assert_eq!(nodes.len(), 2, "{journal}");
+        assert!(nodes.contains(&"nodes.master") && nodes.contains(&"nodes.backup"));
+
+        // The session goes for the project check and the master's restore (two
+        // reads), then is attached again for the backup's.
+        rig.gateway.detach_designers();
+        let session = ("alice".to_string(), PROJECT.to_string(), "ws-1".to_string());
+        let mut script = vec![Vec::new(); rig.gateway.designers_reads() + 2];
+        script.push(vec![session]);
+        rig.gateway.set_designers_script(script);
+        let err = rig
+            .rollback_run_with(&run_id, false, Some((&backup, WAIT)))
+            .await
+            .expect_err("the backup's save is still pending");
+        assert_eq!(err.code(), "rollback_failed", "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("1 item(s) are left") && text.contains("designer_attached"),
+            "one line, for the backup: {text}"
+        );
+        assert_eq!(
+            rig.git_manifest().await,
+            before_master,
+            "the master is back"
+        );
+        let kept = host_journal_json(&rig).expect("the journal stays");
+        let left: Vec<&str> = kept["git_pending"]
+            .as_array()
+            .expect("the backup's entry stays")
+            .iter()
+            .map(|e| e["node"].as_str().expect("a node"))
+            .collect();
+        assert_eq!(left, ["nodes.backup"], "{kept}");
+    }
 }
 
 /// Write the executable script `path`. The file is written by `cp`, not by
@@ -7831,4 +8987,142 @@ fn write_exec(path: &std::path::Path, text: &str) {
         .expect("cp runs");
     assert!(copied.success(), "cp the script");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+/// 27-41: an `ssh` node predicts `expected_drift` from its own disk, as a local
+/// node does since 27-40.
+#[cfg(unix)]
+mod ssh_nodes {
+    use super::common;
+    use super::common::git_fixture::{GATEWAY, GitFixture, PROJECT, UTIL_RES};
+    use super::*;
+    use ignition_core::deploy::transport::process::{
+        ProcessOutput, ProcessRunner, TokioProcessRunner,
+    };
+    use ignition_core::deploy::transport::remote::RemoteShell;
+    use ignition_core::deploy::transport::sftp::{SftpTransport, posix_root};
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    const VIEW_RES: &str = "com.inductiveautomation.perspective/views/V/resource.json";
+
+    /// Runs the real processes, with the `stat` shim for a BSD host.
+    struct ShimRunner;
+
+    #[async_trait::async_trait]
+    impl ProcessRunner for ShimRunner {
+        async fn run(
+            &self,
+            program: &std::ffi::OsStr,
+            args: &[std::ffi::OsString],
+            stdin: Option<Vec<u8>>,
+            timeout: std::time::Duration,
+        ) -> ProcessOutput {
+            let (program, args) = common::posix_exec::shimmed(program, args);
+            TokioProcessRunner
+                .run(&program, &args, stdin, timeout)
+                .await
+        }
+    }
+
+    /// `zip` with the member `name` replaced by `bytes`.
+    fn with_member(zip: &[u8], name: &str, bytes: &[u8]) -> Vec<u8> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).expect("zip");
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut replaced = false;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).expect("entry");
+            if entry.is_dir() {
+                continue;
+            }
+            let mut body = Vec::new();
+            entry.read_to_end(&mut body).expect("member");
+            if entry.name() == name {
+                body = bytes.to_vec();
+                replaced = true;
+            }
+            writer
+                .start_file(entry.name(), zip::write::SimpleFileOptions::default())
+                .expect("start");
+            writer.write_all(&body).expect("write");
+        }
+        assert!(replaced, "{name} is an export member");
+        writer.finish().expect("finish").into_inner()
+    }
+
+    /// The gateway's rendering of a descriptor (pretty-printed).
+    fn pretty(bytes: &[u8]) -> Vec<u8> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).expect("json");
+        let mut out = serde_json::to_vec_pretty(&value).expect("pretty");
+        out.push(b'\n');
+        out
+    }
+
+    /// The over-count of 2026-11-18, on a node reached over ssh. The import
+    /// rewrote one resource (`UTIL_RES`, written in the gateway's form) and left
+    /// the other resource (`V`) alone: its disk bytes are the release's, while
+    /// the export renders it in the gateway's form. The prediction must list
+    /// only the rewritten path, which is what JGit lists on that disk.
+    async fn predicts_from_disk(windows: bool) {
+        let f = GitFixture::new();
+        let host = HostGit::new();
+        let home = tempfile::tempdir().expect("home");
+        let data = posix_root(&f.data_dir.display().to_string()).expect("posix root");
+        let shell = |runner: Arc<dyn ProcessRunner>| {
+            RemoteShell::local_sftp_server(
+                &common::sftp_server::sftp_server_path(),
+                runner,
+                std::time::Duration::from_secs(120),
+            )
+            .local_exec()
+        };
+        let node = if windows {
+            let runner = common::pwsh_exec::PwshHomeRunner {
+                home: home.path().to_path_buf(),
+            };
+            SftpTransport::new_windows(shell(Arc::new(runner)), data, "nodes.pwsh")
+                .with_home(common::pwsh_exec::SEAM_HOME)
+        } else {
+            let home_root = posix_root(&home.path().display().to_string()).expect("home root");
+            SftpTransport::new(shell(Arc::new(ShimRunner)), data, "nodes.sh").with_home(&home_root)
+        };
+
+        let (state, prep) = f.prepare(&host).await;
+        let saved = save(&node, &node, LedgerRoot::AccountHome, GATEWAY, PROJECT, RUN)
+            .await
+            .expect("save");
+        // the import: the release's bytes everywhere, `UTIL_RES` rewritten
+        f.module_import(true, &[UTIL_RES], &[], &[]);
+        // the export renders `V`'s descriptor in the gateway's form as well
+        let view = std::fs::read(f.project_dir().join(VIEW_RES)).expect("V descriptor");
+        let export = with_member(&f.export_zip(), VIEW_RES, &pretty(&view));
+        let report = restore_and_advance(
+            &node,
+            &node,
+            &host,
+            &f.checkout,
+            &state,
+            &saved,
+            &prep,
+            &export,
+            None,
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("the handover: {failure:?}"));
+        assert!(report.advanced && report.verified, "{report:?}");
+        assert_eq!(
+            report.expected_drift,
+            vec![UTIL_RES.to_string()],
+            "only the rewritten resource is drift"
+        );
+        assert_eq!(f.status_paths(), report.expected_drift);
+    }
+
+    #[tokio::test]
+    async fn ssh_node_predicts_from_its_disk() {
+        predicts_from_disk(false).await;
+        if common::pwsh_exec::gate("ssh_node_predicts_from_its_disk (windows shape)") {
+            predicts_from_disk(true).await;
+        }
+    }
 }

@@ -331,6 +331,12 @@ struct TimedRead<'a> {
 
 #[async_trait::async_trait]
 impl GitHostRead for TimedRead<'_> {
+    async fn project_file_digests(
+        &self,
+        project: &str,
+    ) -> Result<ignition_core::deploy::git_advance::ProjectDisk, CoreError> {
+        self.inner.project_file_digests(project).await
+    }
     async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
         self.inner.read_git_state(project).await
     }
@@ -391,6 +397,104 @@ impl GitHostRead for TimedRead<'_> {
         fetches.1 += files.len();
         fetches.2 += files.iter().map(|f| f.size).sum::<u64>();
         out
+    }
+}
+
+/// The artifact's members as a local staging tree, and the sftp operations that
+/// put them below the disposable project's directory on the host (27-41).
+///
+/// `restore_and_advance` predicts `expected_drift` from the node's own disk, so
+/// the simulated import of a VM gate must leave the project directory holding
+/// the bytes its export returns (the artifact, which is the release's own
+/// files), as the module's import does. The gate removes the top-level
+/// directories of the artifact first ([`tops`](Self::tops), through its own
+/// host command), so every directory the operations make is new and a file at
+/// the top level (`project.json`) is overwritten.
+pub struct ImportStage {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    dirs: Vec<String>,
+    files: Vec<String>,
+    tops: Vec<String>,
+}
+
+/// Unpack `artifact_zip` into a private staging tree.
+pub fn stage_artifact(artifact_zip: &[u8]) -> ImportStage {
+    use std::io::Read;
+    let dir = tempfile::tempdir().expect("staging dir");
+    let root = dir.path().to_path_buf();
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(artifact_zip)).expect("artifact zip");
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut files = Vec::new();
+    let mut tops = std::collections::BTreeSet::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).expect("entry");
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        assert!(
+            !name.starts_with('/') && !name.split('/').any(|c| c.is_empty() || c == ".."),
+            "an artifact member name is a plain relative path: {name:?}"
+        );
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).expect("member");
+        let local = root.join(&name);
+        std::fs::create_dir_all(local.parent().expect("parent")).expect("staging dirs");
+        std::fs::write(&local, bytes).expect("staged member");
+        let parts: Vec<&str> = name.split('/').collect();
+        for depth in 1..parts.len() {
+            dirs.insert(parts[..depth].join("/"));
+        }
+        if parts.len() > 1 {
+            tops.insert(parts[0].to_string());
+        }
+        files.push(name);
+    }
+    // parents before children: a path sorts after its own prefix
+    ImportStage {
+        _dir: dir,
+        root,
+        dirs: dirs.into_iter().collect(),
+        files,
+        tops: tops.into_iter().collect(),
+    }
+}
+
+impl ImportStage {
+    /// The top-level directories of the artifact: the gate removes each below
+    /// the project before the operations run.
+    pub fn tops(&self) -> &[String] {
+        &self.tops
+    }
+
+    /// How many files are put.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// `mkdir` for every directory (parents first), then `put` for every file,
+    /// below `remote_project` (the project directory as sftp spells it).
+    pub fn ops(
+        &self,
+        remote_project: &str,
+    ) -> Vec<ignition_core::deploy::transport::remote::SftpOp> {
+        use ignition_core::deploy::transport::remote::SftpOp;
+        let remote_project = remote_project.trim_end_matches('/');
+        let mut ops = Vec::with_capacity(self.dirs.len() + self.files.len());
+        for dir in &self.dirs {
+            ops.push(SftpOp::Mkdir {
+                path: format!("{remote_project}/{dir}"),
+            });
+        }
+        for file in &self.files {
+            ops.push(SftpOp::Put {
+                local: self.root.join(file),
+                remote: format!("{remote_project}/{file}"),
+            });
+        }
+        ops
     }
 }
 
@@ -647,6 +751,13 @@ impl Handover<'_> {
         assert!(report.restored, "the run restored .git");
         assert!(report.advanced, "the run advanced .git");
         assert!(report.verified, "every written file read back equal");
+        // The gate staged the artifact's files on the node (`ImportStage`), so
+        // the disk holds the release's own bytes everywhere: nothing is drift.
+        assert!(
+            report.expected_drift.is_empty(),
+            "expected_drift is what the node's disk implies (the release's own files): {:?}",
+            report.expected_drift
+        );
 
         // restore plus one manifest compare (the budget names both)
         let restore = timed_writer.span("restore").expect("restored");

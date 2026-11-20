@@ -76,7 +76,11 @@ if [ ! -s "$PIN" ]; then
   echo "Pin the host key only after its ssh-keyscan fingerprint equals the one read on the host console (T-22-50)." >&2
   exit 2
 fi
-case "$(stat -f '%Lp' "$PIN" 2>/dev/null || stat -c '%a' "$PIN")" in
+# BSD stat first, GNU second, each output used only when that stat succeeded:
+# GNU `stat -f` reads '%Lp' as a file name and still prints the file
+# system details of $PIN before it fails.
+pin_mode=$(stat -f '%Lp' "$PIN" 2>/dev/null) || pin_mode=$(stat -c '%a' "$PIN")
+case "$pin_mode" in
   600 | 400) ;;
   *) echo "REFUSING: pinned known_hosts '$PIN' must have mode 0600" >&2; exit 2 ;;
 esac

@@ -300,6 +300,14 @@ pub struct GitSize {
 ///
 /// Every answer is fail-closed: a `.git` that cannot be read is
 /// [`CoreError::TransportFailed`], never an absent one.
+///
+/// On a local node every read is relative to directory handles opened level by
+/// level without following a link (unix: `openat(O_NOFOLLOW)`; Windows: levels
+/// held without delete sharing and a reparse point refused on the handle), so
+/// a level or file swapped for a symlink after the walk fails the read naming
+/// it (tests `local_git_state_refuses_a_level_swapped_after_the_open`,
+/// `local_git_state_refuses_a_file_swapped_after_the_open`,
+/// `local_git_manifest_refuses_a_directory_swapped_during_the_walk`).
 #[async_trait::async_trait]
 pub trait GitHostRead: Send + Sync {
     /// The fixed files of `<data_dir>/projects/<project>/.git`, under the
@@ -311,6 +319,23 @@ pub trait GitHostRead: Send + Sync {
     /// The [`GitManifest`] of the project's live `.git`. A symlink anywhere
     /// inside it refuses.
     async fn git_manifest(&self, project: &str) -> Result<GitManifest, CoreError>;
+
+    /// Size and sha256 of every regular file below
+    /// `<data_dir>/projects/<project>`, the `.git` subtree excluded: what the
+    /// node's disk holds after the import (27-40, D-25). Digests and sizes
+    /// only, never content. Nothing is followed: a symlink or any entry that
+    /// is neither a directory nor a regular file refuses the read, as does a
+    /// tree over the entry cap, and an unreadable host is
+    /// [`CoreError::TransportFailed`], never an empty answer.
+    ///
+    /// Every node kind answers this: the local node walks the directory, an
+    /// `ssh` node runs one host script (27-41), so `expected_drift` is
+    /// predicted from the node's own disk everywhere. Placed next to
+    /// [`git_manifest`](Self::git_manifest), which walks `.git` the same way.
+    async fn project_file_digests(
+        &self,
+        project: &str,
+    ) -> Result<crate::deploy::git_advance::ProjectDisk, CoreError>;
 
     /// The [`GitManifest`] of the save of run `run_id`.
     async fn save_manifest(
@@ -398,11 +423,47 @@ pub trait GitHostRead: Send + Sync {
 ///   leaving no save behind. The save is private (0700 directories on Unix).
 /// - [`restore_git`](Self::restore_git) creates `.git` from that save only when
 ///   `.git` is absent; it never replaces, deletes or renames an existing one.
+///   On a local node the staged copy is published with a rename that cannot
+///   replace (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)`
+///   on macOS), so a `.git` that appears meanwhile, an empty directory
+///   included, is kept (test
+///   `local_git_restore_keeps_an_empty_git_planted_before_the_publish`); a host
+///   whose file system does not know the flag fails closed with "the host
+///   cannot publish without replacing" and there is no plain-rename fallback
+///   (`local_noreplace_unsupported_fails_closed`). On Windows the publish is
+///   `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, which never replaces
+///   either (`local_noreplace_windows_publish_keeps_an_empty_git_planted_at_the_move`).
 /// - [`write_git_files`](Self::write_git_files) writes the fixed
 ///   [`GitWriteName`](crate::deploy::git_advance::GitWriteName) files inside an
 ///   existing `.git`, each through `<name>.lock` created exclusively and then
 ///   renamed over the file (packs through a private sibling). An existing lock
-///   refuses the write and nothing is written.
+///   refuses the write and nothing is written. On a local node every write is
+///   made through handles opened from the held `.git`: each parent is opened or
+///   made one level at a time without following a link, the lock is created
+///   with `O_CREAT | O_EXCL | O_NOFOLLOW` in the parent's handle, and the
+///   publish is a `renameat` inside that handle, so a parent swapped for a
+///   symlink after the preflight is refused and nothing is created behind it
+///   (`local_git_write_refuses_a_parent_swapped_after_the_preflight`,
+///   `local_git_write_refuses_a_git_swapped_after_the_open`). A failed write
+///   removes only the lock this call created, by identity
+///   (`local_git_write_failure_keeps_a_foreign_lock_at_the_same_name`).
+///   Each write also carries what it expects to replace
+///   ([`OldValue`](crate::deploy::git_advance::OldValue), 27-45, CodeRabbit #55
+///   F4): the sha256 of the loose file the run read, or absent, and for a
+///   branch that lives only in `packed-refs` also the state of `packed-refs`.
+///   An implementation compares each value that is not `Unchecked` while it
+///   holds the target's lock, just before the publish, reopening the target
+///   relative to the handle its write goes through. A target that is no
+///   longer what was read removes only the lock this call made and fails with
+///   a [`CoreError::TransportFailed`] whose `operation` is
+///   [`GIT_CHANGED_OPERATION`] and whose detail names the file and no value;
+///   writes made before it stay in place (the index is written first, so a
+///   mismatch on a later ref leaves the release staged on the old commit,
+///   never a revert). The local host does this
+///   (`local_git_write_refuses_a_changed_target`, conformance row
+///   `git_write_refuses_a_changed_target`), and so does an ssh POSIX host
+///   (`GIT_WRITE_SH` exit 7, 27-46); an ssh Windows host does not compare yet
+///   (27-52).
 /// - [`remove_git_save`](Self::remove_git_save) removes the `repo` save tree
 ///   of one run and nothing else; no save directory is named `.git`.
 /// - [`probe_write`](Self::probe_write) creates and removes one probe file in
@@ -449,6 +510,13 @@ pub trait GitStateWriter: Send + Sync {
     /// refused and left alone.
     async fn probe_write(&self, project: &str, run_id: &str) -> Result<(), CoreError>;
 }
+
+/// The `operation` of the [`CoreError::TransportFailed`] a host answers when a
+/// [`GitWrite`](crate::deploy::git_advance::GitWrite)'s target is no longer
+/// what the engine read (27-45, CodeRabbit #55 F4). The engine maps exactly
+/// this operation to the restore reason `git_changed`; every other failure of
+/// a write stays `advance_failed`.
+pub const GIT_CHANGED_OPERATION: &str = "write_git_changed";
 
 /// The name of the probe file [`GitStateWriter::probe_write`] creates.
 pub fn git_probe_name(run_id: &str) -> String {

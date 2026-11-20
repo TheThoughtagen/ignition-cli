@@ -285,6 +285,15 @@ seedgit() {
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git "$@"
 }
 
+# CodeRabbit #58 (W3): the bare repository is shared with the git server
+# container, whose http-backend worker runs as another user and writes objects
+# and refs into it. Each function below sets `core.sharedRepository 0777` on the
+# bare repository before any push, so every writer (host git or http-backend)
+# creates files 0666 and directories 0777, and `chmod -R a+rwX` opens what
+# exists. A reseed or an `rm -rf` of worker-written objects then keeps working
+# on a Linux host whose UID differs from httpd's. $STATE is 0700, so the world
+# bits stay inside it and reach no other host user.
+
 # seed27: project CapApp in the repository root, compact JSON resource files
 # (the gateway pretty-prints them, which is the gateway-form drift), a folder
 # whose resource.json lists code.py only, and out-of-scope paths (tags, images,
@@ -333,12 +342,13 @@ seed27() {
 
   seedgit init -q --bare -b main "$bare"
   seedgit -C "$bare" config http.receivepack true
+  seedgit -C "$bare" config core.sharedRepository 0777
   seedgit -C "$work" push -q -f "$bare" main production v1.0.0 v1.1.0
   [ "$(seedgit -C "$bare" rev-parse production)" = "$(seedgit -C "$bare" rev-parse 'v1.0.0^{commit}')" ] \
     || die "seed27: production is not at v1.0.0"
   [ -z "$(seedgit -C "$bare" branch --list master)" ] || die "seed27: the remote has a master branch"
   # The server runs as another user inside its container and reads this tree.
-  chmod -R a+rX "$bare"
+  chmod -R a+rwX "$bare"
   /bin/rm -rf "$work"
   echo "seed27: $BARE holds main and production (at v1.0.0), tags v1.0.0 and v1.1.0"
 }
@@ -353,8 +363,9 @@ publish27() {
   rel=$(seedgit -C "$bare" rev-parse 'v1.1.0^{commit}')
   old=$(seedgit -C "$bare" rev-parse production)
   seedgit -C "$bare" merge-base --is-ancestor "$old" "$rel" || die "publish27: v1.1.0 does not descend from production"
+  seedgit -C "$bare" config core.sharedRepository 0777
   seedgit -C "$bare" update-ref refs/heads/production "$rel" "$old"
-  chmod -R a+rX "$bare"
+  chmod -R a+rwX "$bare"
   echo "publish27: production on the remote is at v1.1.0; the module's clone is not touched"
 }
 
@@ -402,6 +413,7 @@ seed_prodshape27() {
   rel=$(seedgit -C "$bare" rev-parse 'v1.1.0^{commit}') || die "seedprod27: the emitted remote has no tag v1.1.0"
   seedgit -C "$bare" cat-file -e "$gh^{commit}" || die "seedprod27: the gateway head is not in the emitted remote"
   seedgit -C "$bare" merge-base --is-ancestor "$gh" "$rel" || die "seedprod27: v1.1.0 does not descend from the gateway head"
+  seedgit -C "$bare" config core.sharedRepository 0777
   seedgit -C "$bare" update-ref refs/heads/production "$gh"
   seedgit -C "$bare" config http.receivepack true
   [ -z "$(seedgit -C "$bare" branch --list master)" ] || die "seedprod27: the remote has a master branch"
@@ -420,7 +432,7 @@ seed_prodshape27() {
     seedgit -C "$bare" -c commit.gpgsign=false commit-tree "$tree" -p "$rel" -m 'release deploy descriptor')
   seedgit -C "$bare" update-ref refs/tags/v1.1.0 "$commit"
   /bin/rm -f "$idx"
-  chmod -R a+rX "$bare"
+  chmod -R a+rwX "$bare"
   PRODSHAPE_OUT_REAL=$out
   echo "seed_prodshape27: $BARE seeded from the generator output (production at the gateway head, tag v1.1.0 ahead); no shape value is shown"
 }
@@ -489,6 +501,7 @@ seedtags27() {
   [ -d "$bare" ] || die "seedtags27: no $BARE: run reset27 first"
   [ -z "$(seedgit -C "$bare" tag --list v1.3.0)" ] || die "seedtags27: v1.3.0 exists already: run reset27 first"
   /bin/rm -rf "$work"
+  seedgit -C "$bare" config core.sharedRepository 0777
   seedgit clone -q --no-hardlinks -b production "$bare" "$work"
   mkdir -p "$work/deploy/tag-providers" "$work/tags/CapTags"
   printf 'schema_version: 1\nproject: %s\nenvironments: [rig]\ntag_providers: [CapTags]\n' "$APP" > "$work/deploy/project.yaml"
@@ -500,7 +513,7 @@ seedtags27() {
   seed_commit "$work" 'release 1.3.0' "$when"
   seed_tag "$work" v1.3.0 "$when"
   seedgit -C "$work" push -q "$bare" HEAD:refs/heads/production refs/tags/v1.3.0
-  chmod -R a+rX "$bare"
+  chmod -R a+rwX "$bare"
   /bin/rm -rf "$work"
   echo "seedtags27: production on the remote is at v1.3.0, which owns the tag provider CapTags (two tags)"
 }
@@ -700,9 +713,42 @@ PY
 
 # ------------------------------------------------------------------- reset27
 
+# assert_rig_identity (CodeRabbit #58, W4): reset27 deletes a project, so it
+# acts only on the rig this driver started. The port of IGN_GIT27_RIG_URL (a
+# loopback URL, as assert_local enforces) must be the host port that
+# `docker port` publishes for the rig's gateway (8088/tcp), and gateway-info
+# must name GW_NAME. The name is the top-level `name` of the raw answer, the
+# field GatewayInfo reads; confirm it against the rig in 27-58 (the VM driver
+# reads the same field through ign's envelope, `.data.result.data.name`).
+# Refuses with exit 2 and a message that names no value.
+assert_rig_identity() {
+  local rest authority hostport url_port published line pport name info
+  rest=${BASE#*://}
+  authority=${rest%%[/?#\\]*}
+  hostport=${authority##*@}
+  url_port=${hostport##*:}
+  [[ $url_port =~ ^[0-9]+$ ]] \
+    || { echo "REFUSING: the gateway URL carries no port to compare with the rig's published port" >&2; exit 2; }
+  published=$(docker port "$(cid)" 8088/tcp 2> /dev/null) \
+    || { echo "REFUSING: docker does not report a published port for the rig's gateway" >&2; exit 2; }
+  [ -n "$published" ] \
+    || { echo "REFUSING: the rig's gateway publishes no 8088/tcp port" >&2; exit 2; }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    pport=${line##*:}
+    [ "$pport" = "$url_port" ] \
+      || { echo "REFUSING: the gateway URL port is not the host port the rig publishes: this is not the rig this driver started" >&2; exit 2; }
+  done <<< "$published"
+  info=$(curl_tok IGN_GIT27_RIG_TOKEN -sS -m 20 "$BASE/data/api/v1/gateway-info" 2> /dev/null) || info=
+  name=$(printf '%s' "$info" | jq -r '.name // empty' 2> /dev/null || true)
+  [ "$name" = "$GW_NAME" ] \
+    || { echo "REFUSING: gateway-info does not name the rig's gateway: not deleting any project there" >&2; exit 2; }
+}
+
 reset27() {
   token_env
   [ -n "$(cid)" ] || die "reset27: no running gw container: run up27 first"
+  assert_rig_identity
   case "${GIT27_SEED:-synthetic}" in
     synthetic) seed27 ;;
     prodshape) seed_prodshape27 ;;

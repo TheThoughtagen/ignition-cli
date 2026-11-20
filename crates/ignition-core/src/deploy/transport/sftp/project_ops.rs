@@ -106,7 +106,7 @@
 use super::{Budget, EntryKind, FoundFile, ReadBase, SftpTransport, windows_native_path};
 use crate::deploy::apply::run_store::RunId;
 use crate::deploy::component_problem;
-use crate::deploy::git_advance::{GitWrite, GitWriteName};
+use crate::deploy::git_advance::{DiskFile, GitWrite, GitWriteName, OldValue, ProjectDisk};
 use crate::deploy::git_state::{
     GIT_LOG_TAIL_MAX, GIT_LOOSE_REFS_MAX, GIT_MARKERS, GIT_PACKED_REFS_MAX, GitFiles,
 };
@@ -120,7 +120,7 @@ use std::path::Path;
 use crate::deploy::git_objects::{
     GIT_OBJECTS_FETCH_MAX_BYTES, GIT_OBJECTS_LIST_MAX_ENTRIES, GIT_OBJECTS_LOOSE_MAX,
     GIT_OBJECTS_PACKS_MAX, GitObjectEntry, GitObjectEntryKind, GitObjectFile, GitObjectList,
-    check_object_rel,
+    check_object_rel, verify_fetched_objects,
 };
 use crate::deploy::project_run::{
     PRE_IMAGE_MAX_BYTES, PROJECT_JOURNAL_FILE, PROJECT_JOURNAL_MAX_BYTES, ProjectJournal,
@@ -129,12 +129,15 @@ use crate::deploy::projects::ReleaseRecord;
 use crate::deploy::tag_record::{TAG_RECORD_FILE, TAG_RECORD_MAX_BYTES, TagRecord};
 use crate::deploy::transport::batch::RENAME_RETRIES;
 use crate::deploy::transport::projects::{
-    GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir, ProjectHost,
-    ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write, git_probe_name,
-    project_run_names_problem_on, tag_record_names_problem_on,
+    GIT_CHANGED_OPERATION, GitEntry, GitHostRead, GitManifest, GitSize, GitStateWriter, ImportDir,
+    ProjectHost, ProjectRunWriter, ReleaseRecordWriter, TagRecordWriter, check_pre_image_write,
+    git_probe_name, project_run_names_problem_on, tag_record_names_problem_on,
 };
 use crate::deploy::transport::remote::{RemoteCommand, SftpOp, safe_remote_path};
-use crate::deploy::transport::winps::{LONG_PATH_PREFIX, WinScript, windows_component_problem};
+use crate::deploy::transport::winps::{
+    self, GIT_NATIVE_CS, GIT_NATIVE_STAGED_DIR, GIT_NATIVE_STAGED_FILE, LONG_PATH_PREFIX,
+    WinScript, windows_component_problem,
+};
 use crate::deploy::yamlio::YAML_MAX_BYTES;
 use crate::error::CoreError;
 
@@ -164,6 +167,39 @@ const GIT_PROBE_NAME: &str = "ign-git-probe";
 // reviewed source and kept here as `concat!` lines so a test can run the very
 // same text under the local `sh`.
 
+/// The verified walk every POSIX reader shares (27-46, CodeRabbit #56 C1,
+/// POSIX half), as one fragment so each script carries the same bytes. `sh` has
+/// no `openat`; its anchor is the working directory. `wv DATA REL [o]` enters
+/// `DATA` and then each level of `REL`, and at every level requires a real
+/// directory (`[ -d ]` and not `[ -L ]`) and then, once it is entered, that
+/// `pwd -P` equals the path expected (the physical path of `DATA` plus the
+/// levels so far): a level swapped for a link between the check and the `cd`
+/// lands somewhere else and is refused (exit 4, "changed while it was
+/// entered"). With a third argument `o` a level that does not exist makes it
+/// return 2 instead (nothing was entered past it). Every read after that uses
+/// a basename in the checked current directory, never a path through levels
+/// that may since have been swapped. `an` re-checks `pwd -P` against the path
+/// `wv` expected; a script calls it after it has read from a directory, so a
+/// directory moved while it was read is refused (exit 4, "changed while it was
+/// read"). `sh` offers nothing better: a final component swapped between its
+/// `[ -L ]` and its read is the one window left, and it is inside a directory
+/// the walk checked.
+macro_rules! verified_walk_sh {
+    () => {
+        concat!(
+            "wv() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
+            "cd -- \"$1\" || exit 3; we=$(pwd -P) || exit 3; OI=$IFS; IFS=/; ",
+            "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { ",
+            "if [ -n \"$3\" ] && [ ! -e \"$c\" ] && [ ! -L \"$c\" ]; then IFS=$OI; return 2; fi; ",
+            "if [ -L \"$c\" ]; then printf '%s is a symlink, not a real directory\\n' \"$c\" >&2; ",
+            "else printf '%s is not a real directory\\n' \"$c\" >&2; fi; exit 4; }; ",
+            "cd -- \"$c\" || exit 3; we=${we%/}/$c; wp=$(pwd -P) || exit 3; ",
+            "[ \"$wp\" = \"$we\" ] || { printf '%s changed while it was entered\\n' \"$c\" >&2; exit 4; }; done; IFS=$OI; }; ",
+            "an() { [ \"$(pwd -P)\" = \"$we\" ] || { printf '%s changed while it was read\\n' \"$we\" >&2; exit 4; }; }; "
+        )
+    };
+}
+
 pub(super) const GIT_MANIFEST_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk sort tr ls; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
@@ -173,38 +209,91 @@ pub(super) const GIT_MANIFEST_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
+    verified_walk_sh!(),
+    // A file below `objects/` is only sized. Every other file is hashed by its
+    // basename after the verified walk into its parent (the walk is repeated
+    // only when the parent changes; `find` lists a directory's entries
+    // together), and a parent moved while it was read is refused by `an`.
     "ml() { while IFS= read -r l; do case $l in *' ./'*) s=${l%% ./*}; p=${l#*' ./'}; s=$((s)); ",
     "case $p in objects/*) printf '%s\\001%s\\n' \"$p\" \"$s\";; ",
-    "*) h=$($H -- \"./$p\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; }; ",
-    "mf() { cd -- \"$1\" || exit 3; ",
-    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "*) case $p in */*) pq=${p%/*};; *) pq='';; esac; pb=${p##*/}; ",
+    "if [ \"$pq\" != \"$lw\" ]; then an; wv \"$dd\" \"$gr${pq:+/$pq}\"; lw=$pq; fi; ",
+    "[ ! -L \"$pb\" ] || { printf '%s is a symlink\\n' \"$p\" >&2; exit 4; }; ",
+    "h=$($H -- \"$pb\") || exit 3; printf '%s\\001%s\\n' \"$p\" \"${h%% *}\";; esac;; esac; done; an; }; ",
+    "mf() { x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
     "a=$(find -P . -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
     "w=$(printf '%s\\n' \"$a\" | awk '/ \\.\\// {n++; s=$0; sub(/^ */,\"\",s); b+=s+0} END {printf \"%d %.0f\", n, b}') || exit 3; ",
-    "q=$(printf '%s\\n' \"$a\" | ml) || exit 3; ",
+    "lw=''; q=$(printf '%s\\n' \"$a\" | ml) || exit $?; ",
     "if [ -n \"$q\" ]; then d=$(printf '%s\\n' \"$q\" | sort | tr '\\001' '\\000' | $H) || exit 3; else d=$(: | $H) || exit 3; fi; ",
-    "printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
-    "wk \"$1\" \"$2\"; m=$(mf \"$PWD\") || exit $?; set -- $m; ",
+    "an; printf '%s %s\\n' \"$w\" \"${d%% *}\"; }; ",
+    "wv \"$1\" \"$2\"; dd=$1; gr=$2; m=$(mf) || exit $?; set -- $m; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s,\"digest\":\"%s\"}\\n' \"$1\" \"$2\" \"$3\"",
 );
 
 pub(super) const GIT_SIZE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find ls awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; ",
+    verified_walk_sh!(),
+    "wv \"$1\" \"$2\"; ",
     "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { echo 'the tree holds a symlink, a special file or a name with a control character' >&2; exit 4; }; ",
     "a=$(find -P . -type f -exec ls -ln {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
-    "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; set -- $w; ",
+    "w=$(printf '%s\\n' \"$a\" | awk '/^-/ {n++; b+=$5} END {printf \"%d %.0f\", n, b}') || exit 3; an; set -- $w; ",
     "printf 'IGN-RESULT:{\"files\":%s,\"bytes\":%s}\\n' \"$1\" \"$2\"",
+);
+
+/// The most files `project_file_digests` lists before it refuses (never
+/// truncates). A production project holds about 2,200 files; the answer is one
+/// line of about 150 bytes per file, so this cap keeps it well inside the
+/// 32 MiB stdout cap of a host command, which refuses an answer past it in any
+/// case.
+pub(super) const PROJECT_DIGESTS_MAX_ENTRIES: usize = 100_000;
+
+/// The post-import disk of a project (27-41, D-25): the size and sha256 of every
+/// regular file below `<data>/projects/<p>` except the `.git` subtree, in one
+/// host command. Arguments: `$1` the data directory, `$2` `projects/<p>`,
+/// `$3` the most files it may list. Digests and sizes only, never content.
+///
+/// The walk to the project is verified level by level (each level is a real
+/// directory, entered, and `pwd -P` must then equal the path expected), and
+/// everything is read from that entered directory; the same check at the end
+/// refuses a project directory that was swapped or moved while it was read.
+/// `find -P` follows nothing. A symlink, a special file, a name with a control
+/// character or a backslash anywhere but below `.git` refuses (exit 4, naming
+/// the first such entry); the `.git` subtree is neither listed nor inspected.
+/// Sizes come from `wc -c` and digests from the host's sha256 tool, both in
+/// batches (one process per few thousand files, not one per file), and are
+/// joined on the path by `awk`, which refuses a file the two reads do not both
+/// show (one that changed while it was read) and a project over the cap.
+///
+/// Answers `{"n":<files>,"t":"<base64>"}`; `t` decodes to the lines
+/// `<rel> TAB <size> TAB <sha256>` joined by LF (no control character is
+/// allowed in a name, so the tab and the line break are unambiguous).
+pub(super) const PROJECT_DIGESTS_SH: &str = concat!(
+    "LC_ALL=C; export LC_ALL; set -f; ",
+    "for c in find wc awk tr base64; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
+    "if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; ",
+    "else echo 'the host has neither sha256sum nor shasum' >&2; exit 3; fi; ",
+    "NL=$(printf '\\nx'); NL=${NL%x}; ",
+    verified_walk_sh!(),
+    "wv \"$1\" \"$2\"; gp=$(pwd -P) || exit 3; ",
+    "x=$(find -P . -path ./.git -prune -o \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' -o -name '*\\\\*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    "[ -z \"$x\" ] || { printf '%s is a symlink, a special file or a name with a control character or a backslash\\n' \"${x%%\"$NL\"*}\" >&2; exit 4; }; ",
+    "a=$(find -P . -path ./.git -prune -o -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
+    "e=$(find -P . -path ./.git -prune -o -type f -exec $H -- {} + 2>&1) || { printf '%s\\n' \"$e\" >&2; exit 3; }; ",
+    "u=$( { printf '%s\\n' \"$a\" | awk '{print \"S\" $0}'; printf '%s\\n' \"$e\" | awk '{print \"H\" $0}'; } | awk -v lim=\"$3\" '",
+    r#"/^S/{l=substr($0,2);i=index(l," ./");if(i==0)next;s=substr(l,1,i-1)+0;p=substr(l,i+3);n++;"#,
+    r#"if(n>lim){print "the project holds more files than a read may list" > "/dev/stderr";bad=4;exit}z[p]=s;next} "#,
+    r#"/^H/{l=substr($0,2);if(l=="")next;if(!match(l,/^[0-9a-f]+ [ *]\.\//)||RLENGTH!=68){print "a hash line is not a digest and a name" > "/dev/stderr";bad=3;exit}k[substr(l,69)]=substr(l,1,64);m++;next} "#,
+    r#"END{if(bad)exit bad;if(m!=n){print "the size and digest reads list " n " and " m " files; a file changed while it was read" > "/dev/stderr";exit 3} "#,
+    r#"for(p in z){if(!(p in k)){print p " is not in the digest read; a file changed while it was read" > "/dev/stderr";exit 3}printf "%s\t%.0f\t%s\n",p,z[p],k[p]}}"#,
+    "') || exit $?; ",
+    "n=$(printf '%s' \"$u\" | awk 'END{print NR}') || exit 3; ",
+    "t=$(printf '%s' \"$u\" | base64 | tr -d '\\n') || exit 3; ",
+    "[ \"$(pwd -P)\" = \"$gp\" ] || { echo 'the project directory changed while it was read' >&2; exit 4; }; ",
+    "printf 'IGN-RESULT:{\"n\":%s,\"t\":\"%s\"}\\n' \"$n\" \"$t\"",
 );
 
 /// The most object files a listing reports before it says `more` (a cut-off
@@ -225,11 +314,8 @@ const GIT_OBJECTS_REPORT_MAX: usize = GIT_OBJECTS_LOOSE_MAX + 2 * GIT_OBJECTS_PA
 pub(super) const GIT_OBJECTS_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; set -f; ",
     "for c in find wc awk; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; ",
+    verified_walk_sh!(),
+    "wv \"$1\" \"$2\"; ",
     "x=$(find -P . -maxdepth 2 \\( -type l -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { echo 'objects holds a symlink or a name with a control character' >&2; exit 4; }; ",
     "a=$(find -P . -maxdepth 2 -type f -exec wc -c {} + 2>&1) || { printf '%s\\n' \"$a\" >&2; exit 3; }; ",
@@ -241,7 +327,7 @@ pub(super) const GIT_OBJECTS_SH: &str = concat!(
     r#"if((length(p)==41 && p ~ /^[0-9a-f][0-9a-f]\/[0-9a-f]+$/) || ((length(p)==55 || length(p)==54) && p ~ /^pack\/pack-[0-9a-f]+\.(pack|idx)$/)) "#,
     r#"{if(e>=cap){m=1}else{e++; printf "%.0f objects/%s\\n", s, p}}} "#,
     r#"END{printf "\",\"n\":%d,\"more\":%d}\n", e, m; exit bad}"#,
-    "') || exit $?; ",
+    "') || exit $?; an; ",
     "printf 'IGN-RESULT:%s\\n' \"$j\"",
 );
 
@@ -251,36 +337,49 @@ pub(super) const GIT_STATE_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; shift 2; NL=$(printf '\\nx'); NL=${NL%x}; ",
-    "pd() { q=''; OI=$IFS; IFS=/; for w in $1; do if [ -n \"$q\" ] && [ -L \"$q\" ]; then printf '%s is a symlink\\n' \"$q\" >&2; exit 4; fi; q=${q:+$q/}$w; done; IFS=$OI; }; ",
-    "rd() { pd \"$1\"; if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
+    verified_walk_sh!(),
+    "NL=$(printf '\\nx'); NL=${NL%x}; dd=$1; gr=$2; shift 2; ",
+    // Every read is of a basename in the directory the walk checked.
+    "rd() { if [ -L \"$1\" ]; then printf '%s is a symlink\\n' \"$1\" >&2; exit 4; fi; ",
     "if pr \"$1\"; then [ -f \"$1\" ] || { printf '%s is not a regular file\\n' \"$1\" >&2; exit 4; }; ",
     "[ -r \"$1\" ] || { printf '%s cannot be read\\n' \"$1\" >&2; exit 3; }; ",
     "z=$(wc -c < \"$1\") || exit 3; z=$((z)); ",
     "b=$($3 -c \"$2\" < \"$1\" | base64 | tr -d '\\n'); printf '{\"n\":%s,\"b\":\"%s\"}' \"$z\" \"$b\"; ",
     "else printf null; fi; }; ",
+    // `logs/HEAD`: walk into `logs` (absent is null), read `HEAD` there, then
+    // walk back to `.git`.
+    "lg() { an; wv \"$dd\" \"$gr/logs\" o; r=$?; ",
+    "if [ $r = 0 ]; then rd HEAD 65536 tail; an; else printf null; fi; wv \"$dd\" \"$gr\"; }; ",
+    "wv \"$dd\" \"$gr\"; ",
     "printf 'IGN-RESULT:{\"head\":'; rd HEAD 65537 head; ",
     "printf ',\"config\":'; rd config 65537 head; ",
     "printf ',\"packed\":'; rd packed-refs 8388609 head; ",
-    "printf ',\"log\":'; rd logs/HEAD 65536 tail; ",
+    "printf ',\"log\":'; lg; ",
     "printf ',\"index\":'; if pr index; then printf true; else printf false; fi; ",
-    "printf ',\"markers\":['; s=''; for m in \"$@\"; do if pr \"$m\"; then printf '%s\"%s\"' \"$s\" \"$m\"; s=,; fi; done; printf ']'; ",
-    "printf ',\"refs\":['; s=''; c=0; ",
-    "for d in refs/heads refs/remotes; do pd \"$d\"; if pr \"$d\"; then ",
-    "[ -d \"$d\" ] && [ ! -L \"$d\" ] || { printf '%s is not a real directory\\n' \"$d\" >&2; exit 4; }; ",
-    "x=$(find -P \"$d\" \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
+    // A marker below `.git` (`objects/info/alternates`) is looked for in its
+    // own checked parent directory; only whether it exists is reported.
+    "printf ',\"markers\":['; s=''; for m in \"$@\"; do ",
+    "case $m in */*) wv \"$dd\" \"$gr/${m%/*}\" o; r=$?; mb=${m##*/};; *) r=0; mb=$m;; esac; ",
+    "if [ $r = 0 ] && pr \"$mb\"; then printf '%s\"%s\"' \"$s\" \"$m\"; s=,; fi; ",
+    "case $m in */*) wv \"$dd\" \"$gr\";; esac; done; printf ']'; an; ",
+    // The loose refs: each directory is walked into and listed from there;
+    // each ref is read by its basename after a walk into its own parent
+    // (repeated only when the parent changes), and a directory moved while its
+    // refs were read is refused.
+    "printf ',\"refs\":['; s=''; cn=0; ",
+    "for d in refs/heads refs/remotes; do wv \"$dd\" \"$gr/$d\" o; r=$?; [ $r = 0 ] || continue; ",
+    "x=$(find -P . \\( ! -type f ! -type d -o -name '*[[:cntrl:]]*' \\) -print 2>&1) || { printf '%s\\n' \"$x\" >&2; exit 3; }; ",
     "[ -z \"$x\" ] || { printf '%s holds a symlink, a special file or a name with a control character\\n' \"$d\" >&2; exit 4; }; ",
-    "L=$(find -P \"$d\" -type f 2>&1) || { printf '%s\\n' \"$L\" >&2; exit 3; }; ",
-    "IFS=$NL; for r in $L; do c=$((c+1)); [ \"$c\" -le 4097 ] || break; ",
-    "[ -r \"$r\" ] || { printf '%s cannot be read\\n' \"$r\" >&2; exit 3; }; ",
-    "z=$(wc -c < \"$r\") || exit 3; z=$((z)); ",
-    "b=$(head -c 65537 < \"$r\" | base64 | tr -d '\\n'); p=$(printf '%s' \"$r\" | base64 | tr -d '\\n'); ",
-    "printf '%s{\"p\":\"%s\",\"n\":%s,\"b\":\"%s\"}' \"$s\" \"$p\" \"$z\" \"$b\"; s=,; done; unset IFS; ",
-    "fi; done; printf ']}\\n'",
+    "L=$(find -P . -type f 2>&1) || { printf '%s\\n' \"$L\" >&2; exit 3; }; an; lw=$d; ",
+    "IFS=$NL; for r in $L; do cn=$((cn+1)); [ \"$cn\" -le 4097 ] || break; ",
+    "fr=$d/${r#./}; fp=${fr%/*}; fb=${fr##*/}; ",
+    "if [ \"$fp\" != \"$lw\" ]; then an; wv \"$dd\" \"$gr/$fp\"; lw=$fp; fi; ",
+    "if [ -L \"$fb\" ]; then printf '%s is a symlink\\n' \"$fr\" >&2; exit 4; fi; ",
+    "[ -r \"$fb\" ] || { printf '%s cannot be read\\n' \"$fr\" >&2; exit 3; }; ",
+    "z=$(wc -c < \"$fb\") || exit 3; z=$((z)); ",
+    "b=$(head -c 65537 < \"$fb\" | base64 | tr -d '\\n'); p=$(printf '%s' \"$fr\" | base64 | tr -d '\\n'); ",
+    "printf '%s{\"p\":\"%s\",\"n\":%s,\"b\":\"%s\"}' \"$s\" \"$p\" \"$z\" \"$b\"; s=,; done; unset IFS; an; ",
+    "done; printf ']}\\n'",
 );
 
 pub(super) const GIT_DIGEST_SH: &str = concat!(
@@ -292,16 +391,16 @@ pub(super) const GIT_DIGEST_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; ",
     "case $o in *'No such file or directory') return 1;; esac; ",
     "printf '%s\\n' \"$o\" >&2; exit 3; }; ",
-    "wk() { [ -d \"$1\" ] || { printf '%s is not a directory\\n' \"$1\" >&2; exit 4; }; ",
-    "cd -- \"$1\" || exit 3; OI=$IFS; IFS=/; ",
-    "for c in $2; do [ -d \"$c\" ] && [ ! -L \"$c\" ] || { printf '%s is not a real directory\\n' \"$c\" >&2; exit 4; }; ",
-    "cd -- \"$c\" || exit 3; done; IFS=$OI; }; ",
-    "pd() { q=''; OI=$IFS; IFS=/; for w in $1; do if [ -n \"$q\" ] && [ -L \"$q\" ]; then printf '%s is a symlink\\n' \"$q\" >&2; exit 4; fi; q=${q:+$q/}$w; done; IFS=$OI; }; ",
-    "wk \"$1\" \"$2\"; f=$3; pd \"$f\"; ",
-    "if [ -L \"$f\" ]; then printf '%s is a symlink\\n' \"$f\" >&2; exit 4; fi; ",
-    "if pr \"$f\"; then [ -f \"$f\" ] || { printf '%s is not a regular file\\n' \"$f\" >&2; exit 4; }; ",
-    "h=$($H -- \"./$f\") || exit 3; printf 'IGN-RESULT:{\"digest\":\"%s\"}\\n' \"${h%% *}\"; ",
-    "else printf 'IGN-RESULT:{\"digest\":null}\\n'; fi",
+    verified_walk_sh!(),
+    // Walk into the file's parent (an absent parent is an absent file), hash
+    // the basename there, and refuse a parent moved while it was read.
+    "f=$3; case $f in */*) fp=${f%/*};; *) fp='';; esac; fb=${f##*/}; ",
+    "wv \"$1\" \"$2${fp:+/$fp}\" o; r=$?; ",
+    "if [ $r != 0 ]; then printf 'IGN-RESULT:{\"digest\":null}\\n'; exit 0; fi; ",
+    "if [ -L \"$fb\" ]; then printf '%s is a symlink\\n' \"$f\" >&2; exit 4; fi; ",
+    "if pr \"$fb\"; then [ -f \"$fb\" ] || { printf '%s is not a regular file\\n' \"$f\" >&2; exit 4; }; ",
+    "h=$($H -- \"$fb\") || exit 3; an; printf 'IGN-RESULT:{\"digest\":\"%s\"}\\n' \"${h%% *}\"; ",
+    "else an; printf 'IGN-RESULT:{\"digest\":null}\\n'; fi",
 );
 
 /// `<data>/git.yaml` read into the answer itself (CodeRabbit #56): the bytes
@@ -492,10 +591,14 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
     "printf 'IGN-RESULT:{\"ok\":1}\\n'",
 );
 
-/// 27-31 (WR-B3, WR-B1), step (c) of a POSIX `.git` write. The bytes are
-/// already in the private stage (`<stage>/<index>` for the write at that
-/// position). Arguments: the data dir, the `.git` path below it, the stage
-/// path, then (target, lock, size) triples; every value is data.
+/// 27-31 (WR-B3, WR-B1) and 27-46 (F4), step (c) of a POSIX `.git` write. The
+/// bytes are already in the private stage (`<stage>/<index>` for the write at
+/// that position). Arguments: the data dir, the `.git` path below it, the stage
+/// path, then five fields per write: the target, the lock, the size, the
+/// expected old value of the target and the expected state of `packed-refs`.
+/// The old value is `-` (the target must be absent), `*` (not compared) or 64
+/// lowercase hex (the sha256 the target must have); the `packed-refs` field is
+/// `*` when unused, or `-` or 64 hex. Every value is data.
 ///
 /// No path the gateway account can change is written through. Every walk is
 /// level by level from the data dir: each level is a real directory (`[ -d ]`
@@ -504,10 +607,13 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
 /// refused. Every create, link and move then uses a basename in that checked
 /// current directory.
 ///
-/// 1. check every triple: the stage file is a regular non-symlink file of the
+/// 1. check every write: the stage file is a regular non-symlink file of the
 ///    sent size, the target is absent or a regular file, the lock is absent,
-///    and the final mode is known (the target's permission bits without the
-///    execute bits; `0600` for a new `config`, `0644` otherwise);
+///    the final mode is known (the target's permission bits without the
+///    execute bits; `0600` for a new `config`, `0644` otherwise), and each
+///    expected-value field has its shape (exit 4 otherwise; the hash tool is
+///    looked for here, only when a field is a digest, exit 3 when the host has
+///    neither `sha256sum` nor `shasum`);
 /// 2. when a directory has to be made and the gateway account (owner of
 ///    `projects/<p>`) is neither root nor the deploy account, refuse with exit
 ///    6 unless `setfacl` exists; make each missing directory with its
@@ -519,21 +625,29 @@ pub(super) const GIT_STAGE_SH: &str = concat!(
 /// 4. create each lock by `ln -n` (a hard link: atomic, never follows a
 ///    symlink at the lock path, never replaces anything, whatever the shell);
 ///    a lock that is not the regular file just made is refused;
-/// 5. `mv -f` each lock over its target in plan order;
+/// 5. just before each `mv -f`, in the checked directory of its target,
+///    compare the target with its expected old value (F4): `-` needs it
+///    absent, a digest needs a regular non-link file with that sha256; a
+///    packed-refs field is compared after a verified walk to the `.git` root.
+///    A mismatch is exit 7, after `ab` has removed this script's locks, the
+///    directories it made, its private directory and the stage; the writes
+///    moved before it stay. Then `mv -f` each lock over its target in plan
+///    order;
 /// 6. remove the private directory and the stage.
 ///
 /// The script removes the locks it made, the directories it made (when still
 /// empty), the private directory and the stage on every refusal and failure it
-/// reports itself (exit 3, 4, 5, 6); it never removes a lock it did not
-/// create. Exit 4 is a refusal, 5 a size mismatch, 6 the ACL step, 3 a host
-/// failure.
+/// reports itself (exit 3, 4, 5, 6, 7); it never removes a lock it did not
+/// create. Exit 4 is a refusal, 5 a size mismatch, 6 the ACL step, 7 a target
+/// that changed after the plan (no value is printed, only the file's name),
+/// 3 a host failure.
 pub(super) const GIT_WRITE_SH: &str = concat!(
     "LC_ALL=C; export LC_ALL; ",
     "for c in ls mkdir rmdir rm mv wc cat ln id; do command -v \"$c\" >/dev/null 2>&1 || { printf 'the host has no %s\\n' \"$c\" >&2; exit 3; }; done; ",
     "case $3 in /*/ign-deploy/git-stage-*) ;; *) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "case $3 in */../*|*/..|*/./*|*/.) printf 'refusing the stage %s\\n' \"$3\" >&2; exit 4;; esac; ",
     "[ -d \"$3\" ] && [ ! -L \"$3\" ] || { printf '%s is not a real stage directory\\n' \"$3\" >&2; exit 4; }; ",
-    "umask 077; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; pdn=''; nt=0; dd=$1; rr=$2; stg=$3; shift 3; ",
+    "umask 077; set -f; NL=$(printf '\\nx'); NL=${NL%x}; made=''; mkd=''; pdn=''; nt=0; H=''; dd=$1; rr=$2; stg=$3; shift 3; ",
     "wq() { bc=$dd; bm='cannot enter %s'; cd -- \"$dd\" 2>/dev/null || return 3; we=$(pwd -P) || return 3; IFS=/; ",
     "for w in $1; do ",
     "if [ -L \"$w\" ]; then bc=$w; bm='%s is a symlink'; unset IFS; return 4; ",
@@ -552,8 +666,17 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
     "pr() { if o=$(ls -ld -- \"$1\" 2>&1); then return 0; fi; case $o in *'No such file or directory') return 1;; esac; ab; printf '%s\\n' \"$o\" >&2; exit 3; }; ",
     "mo() { q=$(stat -c %a -- \"$1\" 2>/dev/null) || q=$(stat -f %Lp -- \"$1\" 2>/dev/null) || q=''; case $q in [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) q=${q#${q%???}};; *) return 1;; esac; }; ",
     "gm() { if [ \"$2\" = 1 ]; then mo \"$1\" || fl 3 'the mode of %s cannot be read' \"$t\"; m=$q; else case $t in config) m=600;; *) m=644;; esac; fi; m=$(printf '%03o' \"$((0$m & 0666))\"); }; ",
-    "ws \"$rr\"; gp=$(pwd -P); n=$#; nt=$((n/3)); i=0; nd=0; ms=''; ",
-    "while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; s=$stg/$((i/3)); i=$((i+3)); ",
+    "hd() { [ -n \"$H\" ] && return 0; if command -v sha256sum >/dev/null 2>&1; then H=sha256sum; ",
+    "elif command -v shasum >/dev/null 2>&1; then H='shasum -a 256'; else fl 3 'the host has neither sha256sum nor shasum'; fi; }; ",
+    "ck() { case $1 in -|\\*) ;; *[!0-9a-f]*) fl 4 'the expected value of %s is not a digest, - or *' \"$2\";; ",
+    "*) [ ${#1} = 64 ] || fl 4 'the expected value of %s is not a digest, - or *' \"$2\"; hd;; esac; }; ",
+    "cv() { [ \"$1\" = '*' ] && return 0; if [ \"$1\" = - ]; then ",
+    "if [ -e \"$2\" ] || [ -L \"$2\" ]; then fl 7 '%s changed after the plan; nothing more was moved' \"$3\"; fi; return 0; fi; ",
+    "if [ -f \"$2\" ] && [ ! -L \"$2\" ]; then hv=$($H -- \"$2\") || fl 3 '%s cannot be read' \"$3\"; ",
+    "[ \"${hv%% *}\" = \"$1\" ] || fl 7 '%s changed after the plan; nothing more was moved' \"$3\"; ",
+    "else fl 7 '%s changed after the plan; nothing more was moved' \"$3\"; fi; }; ",
+    "ws \"$rr\"; gp=$(pwd -P); n=$#; nt=$((n/5)); i=0; nd=0; ms=''; ",
+    "while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; s=$stg/$((i/5)); i=$((i+5)); ck \"$ov\" \"$t\"; ck \"$pv\" \"$t\"; ",
     "case $t in */*) par=${t%/*};; *) par='';; esac; tb=${t##*/}; lb=${l##*/}; ",
     "[ -f \"$s\" ] && [ ! -L \"$s\" ] || fl 4 '%s is not a regular file' \"$s\"; ",
     "[ $(( $(wc -c < \"$s\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$s\"; ",
@@ -564,7 +687,7 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
     "fg=0; if [ $nd = 1 ]; then gu=$(ls -ldn -- \"$dd/${rr%/.git}\" 2>/dev/null | { read -r a b c d; printf '%s' \"$c\"; }); me=$(id -u); ",
     "if [ -n \"$gu\" ] && [ \"$gu\" != 0 ] && [ \"$gu\" != \"$me\" ]; then fg=1; ",
     "command -v setfacl >/dev/null 2>&1 || fl 6 'the gateway account needs write access to the new directories in .git and the host has no setfacl'; fi; fi; ",
-    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; i=$((i+5)); ",
     "case $t in */*) rest=${t%/*};; *) rest='';; esac; pp=''; ",
     "while [ -n \"$rest\" ]; do cn=${rest%%/*}; case $rest in */*) rest=${rest#*/};; *) rest='';; esac; ws \"$rr${pp:+/$pp}\"; ",
     "if [ -L \"./$cn\" ]; then fl 4 '%s is a symlink' \"$cn\"; elif [ -d \"./$cn\" ]; then :; elif pr \"./$cn\"; then fl 4 '%s is not a directory' \"$cn\"; ",
@@ -574,20 +697,22 @@ pub(super) const GIT_WRITE_SH: &str = concat!(
     "ws \"$rr\"; pdm=.ign-write-${stg##*/git-stage-}; mkdir -m 700 -- \"./$pdm\" 2>/dev/null || fl 4 '%s exists or cannot be created; it is left alone' \"$pdm\"; pdn=$pdm; ",
     "[ -d \"./$pdn\" ] && [ ! -L \"./$pdn\" ] || fl 4 '%s is not a real directory' \"$pdn\"; cd -- \"./$pdn\" 2>/dev/null || fl 3 'cannot enter %s' \"$pdn\"; ",
     "[ -O . ] && [ \"$(pwd -P)\" = \"$gp/$pdn\" ] || fl 4 '%s is not the directory that was made' \"$pdn\"; ",
-    "i=0; ml=$ms; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; k=$((i/3)); s=$stg/$k; i=$((i+3)); ",
+    "i=0; ml=$ms; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; k=$((i/5)); s=$stg/$k; i=$((i+5)); ",
     "m=${ml%%\"$NL\"*}; ml=${ml#*\"$NL\"}; u=$(printf '%03o' \"$((0777 ^ 0$m))\"); ",
     "( umask \"$u\"; set -C; cat -- \"$s\" > \"./$k\" ) 2>/dev/null || fl 3 '%s cannot be copied from the stage' \"$s\"; ",
     "[ -f \"./$k\" ] && [ ! -L \"./$k\" ] || fl 4 '%s is not a regular file' \"$k\"; ",
     "[ $(( $(wc -c < \"./$k\") )) -eq \"$z\" ] || fl 5 '%s is not the size that was sent' \"$k\"; done; ",
-    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; k=$((i/3)); i=$((i+3)); ",
+    "i=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; k=$((i/5)); i=$((i+5)); ",
     "case $t in */*) par=${t%/*};; *) par='';; esac; lb=${l##*/}; ws \"$rr${par:+/$par}\"; ",
     "ln -n -- \"$gp/$pdn/$k\" \"./$lb\" 2>/dev/null || { if [ -e \"./$lb\" ] || [ -L \"./$lb\" ]; then fl 4 '%s exists or cannot be created; nothing was written' \"$l\"; else fl 3 '%s cannot be created' \"$l\"; fi; }; ",
     "if [ -f \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ \"./$lb\" -ef \"$gp/$pdn/$k\" ]; then made=\"$made$l$NL\"; ",
     "else if [ -d \"./$lb\" ] && [ ! -L \"./$lb\" ] && [ \"./$lb/$k\" -ef \"$gp/$pdn/$k\" ]; then rm -f -- \"./$lb/$k\"; fi; ",
     "fl 4 '%s is not the regular file that was created' \"$l\"; fi; done; ",
-    "i=0; k=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; shift 3; set -- \"$@\" \"$t\" \"$l\" \"$z\"; i=$((i+3)); ",
+    "i=0; k=0; while [ $i -lt $n ]; do t=$1; l=$2; z=$3; ov=$4; pv=$5; shift 5; set -- \"$@\" \"$t\" \"$l\" \"$z\" \"$ov\" \"$pv\"; i=$((i+5)); ",
     "case $t in */*) par=${t%/*};; *) par='';; esac; tb=${t##*/}; lb=${l##*/}; ws \"$rr${par:+/$par}\"; ",
     "if [ -d \"./$tb\" ] && [ ! -L \"./$tb\" ]; then fl 3 '%s became a directory; %s targets were moved before it' \"$t\" \"$k\"; fi; ",
+    "cv \"$ov\" \"./$tb\" \"$t\"; ",
+    "if [ \"$pv\" != '*' ]; then ws \"$rr\"; cv \"$pv\" ./packed-refs \"packed-refs (which lists $t)\"; ws \"$rr${par:+/$par}\"; fi; ",
     "mv -f -- \"./$lb\" \"./$tb\" 2>/dev/null || fl 3 '%s cannot be put in place; %s targets were moved before it' \"$t\" \"$k\"; ",
     "made=${made#*\"$NL\"}; k=$((k+1)); done; ",
     "rmpd; rm -rf -- \"$stg\"; printf 'IGN-RESULT:{\"ok\":1}\\n'",
@@ -766,7 +891,8 @@ impl SftpTransport {
         let projects = windows_native_path(&self.abs(&["projects".to_string()]));
         let project_dir = format!("{projects}\\{project}");
         let git = format!("{project_dir}\\{entry}");
-        let script = WinScript::git_entry(&projects, &project_dir, &git);
+        let script = WinScript::git_entry(&projects, &project_dir, &git, &self.win_home().await?);
+        self.git_native_staged().await?;
         let answer = self.shell.exec_powershell(&script).await?;
         windows_git_entry_of(&answer, project, entry).map_err(|why| self.fail(why))
     }
@@ -1431,6 +1557,7 @@ impl SftpTransport {
 // | `GIT_STATE_SH` | reads the files `classify` needs: HEAD, config, packed-refs, logs/HEAD tail, loose refs, markers, index |
 // | `GIT_MANIFEST_SH` | `GitManifest` of a directory: sizes below `objects/`, sha256 elsewhere |
 // | `GIT_SIZE_SH` | file count and total size from `ls -ln`, nothing opened |
+// | `PROJECT_DIGESTS_SH` | size and sha256 of every file of a project but the `.git` subtree (27-41) |
 // | `GIT_DIGEST_SH` | sha256 of one file below `.git` |
 // | `GIT_SAVE_SH` | `cp -a` of `.git` into the private save, then both manifests compared |
 // | `GIT_RESTORE_SH` | `cp -a` of the save beside `.git`, the D-G1 ACL step, manifest compare, `mv` into place |
@@ -1455,6 +1582,9 @@ impl SftpTransport {
 /// The `$0` the git scripts run under.
 const GIT_SCRIPT_NAME: &str = "ign-git";
 
+/// The operation name of the project digests read in error texts.
+const PROJECT_DISK_OP: &str = "project_file_digests";
+
 /// Longest a heavy git script (a save, restore, manifest or removal of a
 /// whole `.git`) may run.
 const GIT_HEAVY_LIMIT: std::time::Duration = std::time::Duration::from_secs(900);
@@ -1464,18 +1594,136 @@ const GIT_HEAVY_LIMIT: std::time::Duration = std::time::Duration::from_secs(900)
 const STATE_SMALL_READ: usize = crate::deploy::git_state::GIT_SMALL_FILE_MAX + 1;
 
 impl SftpTransport {
-    /// Run one git WinScript and require `ok == 1` in its answer.
+    /// Run one git WinScript and require `ok == 1` in its answer. A script
+    /// that loads the reviewed C# block (`WinScript::loads_native`) runs only
+    /// after the staged source is in place on the host
+    /// ([`git_native_staged`](Self::git_native_staged)).
     async fn git_win(
         &self,
         op: &str,
         script: WinScript,
         limit: std::time::Duration,
     ) -> Result<serde_json::Value, CoreError> {
-        let answer = self.shell.exec_powershell_within(&script, limit).await?;
+        let answer = self.git_win_raw(script, limit).await?;
         if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
             return Err(self.git_unusable(op, "ok is not 1"));
         }
         Ok(answer)
+    }
+
+    /// Run one git WinScript (everything it needs staged first) and answer
+    /// whatever it answered, `ok` or not.
+    async fn git_win_raw(
+        &self,
+        script: WinScript,
+        limit: std::time::Duration,
+    ) -> Result<serde_json::Value, CoreError> {
+        self.ensure_staged(&script).await?;
+        let first = self.shell.exec_powershell_within(&script, limit).await;
+        // A staged script is run first and staged only when the host says its
+        // file is not there with its pin (see `read_powershell`).
+        if let (Some(staged), Err(err)) = (script.staged(), &first)
+            && staging_refused(err)
+        {
+            self.stage_git_files("git_native_stage", Some(staged))
+                .await?;
+            return self.shell.exec_powershell_within(&script, limit).await;
+        }
+        first
+    }
+
+    /// What `script` needs on the host is in place, when it can be checked
+    /// before it runs: the staged source of the reviewed C# block, for a script
+    /// that loads it. The stub of a staged script (27-50) is not checked first:
+    /// it is run, and staged when the host refuses it (`git_win_raw`).
+    pub(super) async fn ensure_staged(&self, script: &WinScript) -> Result<(), CoreError> {
+        if script.staged().is_none() && script.loads_native() {
+            self.git_native_staged().await?;
+        }
+        Ok(())
+    }
+
+    /// The staged source of the reviewed C# block is in place on this host: at
+    /// most once per transport, which is once per run (27-49, the staged layout
+    /// the user chose in 27-48). A failed attempt is not remembered.
+    async fn git_native_staged(&self) -> Result<(), CoreError> {
+        self.native_staged
+            .get_or_try_init(|| self.stage_git_files("git_native_stage", None))
+            .await
+            .map(|_| ())
+    }
+
+    /// Make `ign-deploy\git-native` in the account home and, unless the file
+    /// there already hashes to the pin, upload [`GIT_NATIVE_CS`] to
+    /// `<home>/ign-deploy/git-native/IgnGitNative-<pin12>.cs` in one sftp
+    /// batch. The check is a read-only hash by a script
+    /// (`WinScript::git_native_stage`); the upload is one `put`. Neither is
+    /// trusted later: every script that loads the block hashes the file again
+    /// and compiles only those bytes, so a file that is changed, half written
+    /// by a concurrent run or not the pinned text is a refusal, never code. A
+    /// run never removes the file, and a release with another pin names another
+    /// file.
+    pub(super) async fn stage_git_files(
+        &self,
+        op: &str,
+        script: Option<&'static winps::StagedScript>,
+    ) -> Result<(), CoreError> {
+        let home = self.win_home().await?;
+        let home_sftp = self.account_home().await?;
+        // the block's source first, then the script's text when there is one
+        let mut files: Vec<(&str, &str, &str)> = vec![(
+            GIT_NATIVE_STAGED_FILE,
+            GIT_NATIVE_CS,
+            winps::GIT_NATIVE_SHA256,
+        )];
+        if let Some(staged) = script {
+            files.push((staged.file, staged.text, staged.sha256));
+        }
+        let mut ops = Vec::new();
+        let dir = tempfile::tempdir().map_err(|e| {
+            self.mirror_fail(
+                op,
+                format!("a local copy of the source cannot be made: {e}"),
+            )
+        })?;
+        for (name, text, _) in &files {
+            let remote = format!("{home_sftp}/{GIT_NATIVE_STAGED_DIR}/{name}");
+            safe_remote_path(&remote).map_err(|why| {
+                self.mirror_fail(
+                    op,
+                    format!("the staged source path cannot ride an sftp batch line ({why})"),
+                )
+            })?;
+            let local = dir.path().join(name);
+            std::fs::write(&local, text.as_bytes()).map_err(|e| {
+                self.mirror_fail(
+                    op,
+                    format!("a local copy of the source cannot be made: {e}"),
+                )
+            })?;
+            ops.push(SftpOp::Put { local, remote });
+        }
+        let pairs: Vec<(&str, &str)> = files.iter().map(|(n, _, pin)| (*n, *pin)).collect();
+        let check = if script.is_some() {
+            WinScript::git_stage_files(&home, &pairs)
+        } else {
+            WinScript::git_native_stage(&home)
+        };
+        self.sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let answer = self
+            .shell
+            .exec_powershell_within(&check, self.shell.op_timeout())
+            .await?;
+        if answer.get("ok").and_then(serde_json::Value::as_i64) != Some(1) {
+            return Err(self.git_unusable(op, "ok is not 1"));
+        }
+        match answer.get("present").and_then(serde_json::Value::as_i64) {
+            Some(1) => return Ok(()),
+            Some(0) => {}
+            _ => return Err(self.git_unusable(op, "present is missing")),
+        }
+        self.run_batch(op, ops).await
     }
 
     /// The native spelling of the data directory of a Windows node.
@@ -1489,8 +1737,102 @@ impl SftpTransport {
     }
 
     /// The native account home of a Windows node.
-    async fn win_home(&self) -> Result<String, CoreError> {
+    pub(super) async fn win_home(&self) -> Result<String, CoreError> {
         Ok(windows_native_path(&self.account_home().await?))
+    }
+
+    /// The manifest of the native directory `dir` of a Windows node, read
+    /// through the reviewed C# block ([`winps::GIT_MANIFEST`], 27-50).
+    async fn win_manifest(
+        &self,
+        op: &str,
+        dir: &str,
+        home: &str,
+    ) -> Result<GitManifest, CoreError> {
+        let script = WinScript::git_manifest(LONG_PATH_PREFIX, dir, home);
+        let answer = self.git_win(op, script, GIT_HEAVY_LIMIT).await?;
+        self.git_manifest_of(op, &answer)
+    }
+
+    /// The save of a Windows node (27-50): the manifest of the source through
+    /// the reviewed block (a link or a name with a control character in the tree
+    /// is refused before one byte is copied), the copy ([`winps::GIT_SAVE`]), the
+    /// manifest of the copy, and their comparison. A copy that cannot be read
+    /// back, or that differs, is removed again ([`winps::GIT_SAVE_RM`]) before the
+    /// error is returned. The answer is the manifest of the copy.
+    async fn save_git_windows(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        const OP: &str = "save_git";
+        let home = self.win_home().await?;
+        let before = self.win_manifest(OP, &self.win_git(project), &home).await?;
+        let script = WinScript::git_save(
+            LONG_PATH_PREFIX,
+            &self.win_data(),
+            project,
+            &home,
+            gateway,
+            run_id,
+        );
+        self.git_win(OP, script, GIT_HEAVY_LIMIT).await?;
+        let rel = git_save_rel(gateway, project, run_id);
+        let repo = format!("{home}\\{}", rel.replace('/', "\\"));
+        let after = match self.win_manifest(OP, &repo, &home).await {
+            Ok(after) if after == before => return Ok(after),
+            Ok(_) => self.mirror_fail(
+                OP,
+                "the saved copy does not match the .git it was taken from",
+            ),
+            Err(why) => why,
+        };
+        // best effort: the failure above is the error, a copy that stays is
+        // named by the cleanup of the run (`remove_git_save`)
+        let rm = WinScript::git_save_rm(LONG_PATH_PREFIX, &home, &rel, run_id);
+        let _ = self.git_win("remove_git_save", rm, GIT_HEAVY_LIMIT).await;
+        Err(after)
+    }
+
+    /// The restore of a Windows node (27-50): the stage beside `.git`
+    /// ([`winps::GIT_RESTORE`]), the manifests of the save and of the stage
+    /// through the reviewed block, and only when they are equal the rename
+    /// ([`winps::GIT_RESTORE_MOVE`]). A stage that cannot be compared, or that
+    /// differs, is removed again before the error is returned. The answer is the
+    /// manifest of the restored `.git`.
+    async fn restore_git_windows(
+        &self,
+        gateway: &str,
+        project: &str,
+        run_id: &str,
+    ) -> Result<GitManifest, CoreError> {
+        const OP: &str = "restore_git";
+        let (data, home) = (self.win_data(), self.win_home().await?);
+        let script =
+            WinScript::git_restore(LONG_PATH_PREFIX, &data, project, &home, gateway, run_id);
+        self.git_win(OP, script, GIT_HEAVY_LIMIT).await?;
+        let repo = format!(
+            "{home}\\{}",
+            git_save_rel(gateway, project, run_id).replace('/', "\\")
+        );
+        let stage = format!("{data}\\projects\\{project}\\.ign-restore-{run_id}");
+        let compared = async {
+            let saved = self.win_manifest(OP, &repo, &home).await?;
+            let staged = self.win_manifest(OP, &stage, &home).await?;
+            if saved == staged {
+                Ok(())
+            } else {
+                Err(self.mirror_fail(OP, "the stage does not match the save it was copied from"))
+            }
+        }
+        .await;
+        let drop = compared.is_err();
+        let mv = WinScript::git_restore_move(LONG_PATH_PREFIX, &data, project, &home, run_id, drop);
+        let moved = self.git_win(OP, mv, GIT_HEAVY_LIMIT).await;
+        compared?;
+        moved?;
+        self.win_manifest(OP, &self.win_git(project), &home).await
     }
 
     /// The names gateway, project and run id as safe components on this host's
@@ -1702,7 +2044,7 @@ impl SftpTransport {
         let cap = YAML_MAX_BYTES;
         let limit = self.shell.op_timeout();
         let answer = if self.windows {
-            let script = WinScript::git_yaml(&self.win_data(), cap as u64);
+            let script = WinScript::git_yaml(&self.win_data(), cap as u64, &self.win_home().await?);
             self.git_win(OP, script, limit).await?
         } else {
             let cap_text = cap.to_string();
@@ -1734,6 +2076,65 @@ impl SftpTransport {
         }
     }
 
+    /// The [`ProjectDisk`] of a project digests answer: `count` files in `text`,
+    /// one `rel TAB size TAB sha256` line each. Strict (27-41): a line of any
+    /// other shape, a name that is not a plain relative path, a duplicate, a
+    /// count that does not add up or a listing over the cap is
+    /// `transport_failed`, never a partial disk. The order of the lines is not
+    /// part of the answer (the map is sorted by name).
+    fn project_disk_of(&self, count: Option<u64>, text: &str) -> Result<ProjectDisk, CoreError> {
+        let bad = |what: &str| self.git_unusable(PROJECT_DISK_OP, what);
+        let Some(count) = count else {
+            return Err(bad("n is missing or malformed"));
+        };
+        let mut disk = ProjectDisk::new();
+        if !text.is_empty() {
+            for line in text.split('\n') {
+                let mut parts = line.split('\t');
+                let (Some(rel), Some(size), Some(sha), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(bad("a line is not `name TAB size TAB sha256`"));
+                };
+                if rel.is_empty()
+                    || rel == ".git"
+                    || rel.starts_with(".git/")
+                    || rel
+                        .split('/')
+                        .any(|c| c.is_empty() || c == "." || c == "..")
+                    || rel.chars().any(|c| c.is_control() || c == '\\')
+                {
+                    return Err(bad("a name is not a plain relative path"));
+                }
+                let size = (!size.is_empty() && size.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| size.parse::<u64>().ok())
+                    .flatten()
+                    .ok_or_else(|| bad("a size is not a number"))?;
+                if sha.len() != 64
+                    || !sha
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(bad("a digest is not 64 lowercase hex characters"));
+                }
+                if disk.len() >= PROJECT_DIGESTS_MAX_ENTRIES {
+                    return Err(bad("the listing is longer than it may be"));
+                }
+                let file = DiskFile {
+                    size,
+                    sha256: sha.to_string(),
+                };
+                if disk.insert(rel.to_string(), file).is_some() {
+                    return Err(bad("a name is listed twice"));
+                }
+            }
+        }
+        if disk.len() as u64 != count {
+            return Err(bad("the file count does not match n"));
+        }
+        Ok(disk)
+    }
+
     /// The `ign-deploy/.../git-save/<run>` directory below the account home.
     fn git_save_dir_rel(gateway: &str, project: &str, run_id: &str) -> String {
         let repo = git_save_rel(gateway, project, run_id);
@@ -1743,6 +2144,52 @@ impl SftpTransport {
 
 #[async_trait::async_trait]
 impl GitHostRead for SftpTransport {
+    /// The project's files as the node's disk holds them after the import
+    /// (27-41, D-25): one host command, [`PROJECT_DIGESTS_SH`] on a POSIX host
+    /// and [`WinScript::project_digests`] on a Windows host.
+    async fn project_file_digests(&self, project: &str) -> Result<ProjectDisk, CoreError> {
+        if let Some(why) = self.project_name_problem(project) {
+            return Err(self.fail(why));
+        }
+        if self.windows {
+            let script = WinScript::project_digests(
+                LONG_PATH_PREFIX,
+                &self.win_data(),
+                project,
+                PROJECT_DIGESTS_MAX_ENTRIES as u64,
+                &self.win_home().await?,
+            );
+            let answer = self
+                .git_win(PROJECT_DISK_OP, script, GIT_HEAVY_LIMIT)
+                .await?;
+            let count = answer.get("n").and_then(serde_json::Value::as_u64);
+            let text = answer
+                .get("t")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| self.git_unusable(PROJECT_DISK_OP, "t is missing"))?;
+            return self.project_disk_of(count, text);
+        }
+        let rel = format!("projects/{project}");
+        let cap = PROJECT_DIGESTS_MAX_ENTRIES.to_string();
+        let answer = self
+            .git_run(
+                PROJECT_DISK_OP,
+                PROJECT_DIGESTS_SH,
+                &[&self.data_dir, &rel, &cap],
+                GIT_HEAVY_LIMIT,
+            )
+            .await?;
+        let count = answer.get("n").and_then(serde_json::Value::as_u64);
+        let text = answer
+            .get("t")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|b64| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64).ok()
+            })
+            .and_then(|raw| String::from_utf8(raw).ok())
+            .ok_or_else(|| self.git_unusable(PROJECT_DISK_OP, "t is missing or not UTF-8 text"))?;
+        self.project_disk_of(count, &text)
+    }
     async fn read_git_state(&self, project: &str) -> Result<GitFiles, CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.fail(why));
@@ -1752,11 +2199,20 @@ impl GitHostRead for SftpTransport {
             if kind != GitEntry::Directory {
                 return Ok(GitFiles::without_contents(kind));
             }
-            let script = WinScript::git_state(&self.win_git(project), GIT_MARKERS);
-            let answer = self
-                .git_win("read_git_state", script, self.shell.op_timeout())
-                .await?;
-            return self.git_files_of("read_git_state", &answer);
+            // three scripts, in order, merged into the one answer the old single
+            // script gave (27-49: the staged loader leaves a body of about 1,000
+            // characters at the command budget)
+            let home = self.win_home().await?;
+            let mut answers = Vec::new();
+            for script in WinScript::git_state(&self.win_git(project), GIT_MARKERS, &home) {
+                answers.push(
+                    self.git_win("read_git_state", script, self.shell.op_timeout())
+                        .await?,
+                );
+            }
+            let merged = winps::merge_git_state(&answers)
+                .map_err(|why| self.git_unusable("read_git_state", &why))?;
+            return self.git_files_of("read_git_state", &merged);
         }
         let kind = self.git_entry_posix(project).await?;
         if kind != GitEntry::Directory {
@@ -1781,11 +2237,10 @@ impl GitHostRead for SftpTransport {
             return Err(self.fail(why));
         }
         if self.windows {
-            let script = WinScript::git_manifest(LONG_PATH_PREFIX, &self.win_git(project));
-            let answer = self
-                .git_win("git_manifest", script, GIT_HEAVY_LIMIT)
-                .await?;
-            return self.git_manifest_of("git_manifest", &answer);
+            let home = self.win_home().await?;
+            return self
+                .win_manifest("git_manifest", &self.win_git(project), &home)
+                .await;
         }
         let rel = Self::git_rel(project);
         let answer = self
@@ -1809,11 +2264,9 @@ impl GitHostRead for SftpTransport {
         if self.windows {
             let home = self.win_home().await?;
             let repo = git_save_rel(gateway, project, run_id).replace('/', "\\");
-            let script = WinScript::git_manifest(LONG_PATH_PREFIX, &format!("{home}\\{repo}"));
-            let answer = self
-                .git_win("save_manifest", script, GIT_HEAVY_LIMIT)
-                .await?;
-            return self.git_manifest_of("save_manifest", &answer);
+            return self
+                .win_manifest("save_manifest", &format!("{home}\\{repo}"), &home)
+                .await;
         }
         let home = self.account_home().await?;
         let rel = git_save_rel(gateway, project, run_id);
@@ -1839,7 +2292,8 @@ impl GitHostRead for SftpTransport {
         name.check_shape()
             .map_err(|why| self.fail(format!("a .git file name is refused: {why}")))?;
         if self.windows {
-            let script = WinScript::git_digest(&self.win_git(project), &name.rel());
+            let script =
+                WinScript::git_digest(&self.win_git(project), &name.rel(), &self.win_home().await?);
             let answer = self
                 .git_win("git_file_digest", script, self.shell.op_timeout())
                 .await?;
@@ -1909,7 +2363,11 @@ impl GitHostRead for SftpTransport {
             return Err(self.fail(why));
         }
         let answer = if self.windows {
-            let script = WinScript::git_size(LONG_PATH_PREFIX, &self.win_git(project));
+            let script = WinScript::git_size(
+                LONG_PATH_PREFIX,
+                &self.win_git(project),
+                &self.win_home().await?,
+            );
             self.git_win("git_size", script, self.shell.op_timeout())
                 .await?
         } else {
@@ -2038,11 +2496,18 @@ impl GitHostRead for SftpTransport {
         } else {
             self.fetch_files(&base, &refs, tmp.path()).await?;
         }
+        // Every file is checked against its own name and its partner before
+        // anything is installed (27-47, C3): the `get` follows a link planted
+        // after the listing, and the protocol has no no-follow open. The local
+        // transport's fetch is not changed: its reads are handle-anchored
+        // since 27-43, so the asymmetry is deliberate.
         let (from, to, listed) = (tmp.path().to_path_buf(), dest.to_path_buf(), files.to_vec());
-        let installed =
-            tokio::task::spawn_blocking(move || install_object_files(&from, &to, &listed))
-                .await
-                .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?;
+        let installed = tokio::task::spawn_blocking(move || {
+            verify_fetched_objects(&from, &listed)?;
+            install_object_files(&from, &to, &listed)
+        })
+        .await
+        .map_err(|e| CoreError::Internal(format!("sftp read task failed: {e}")))?;
         drop(tmp);
         installed.map_err(|why| self.mirror_fail(OP, why))
     }
@@ -2225,16 +2690,7 @@ impl GitStateWriter for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
         if self.windows {
-            let script = WinScript::git_save(
-                LONG_PATH_PREFIX,
-                &self.win_data(),
-                project,
-                &self.win_home().await?,
-                gateway,
-                run_id,
-            );
-            let answer = self.git_win("save_git", script, GIT_HEAVY_LIMIT).await?;
-            return self.git_manifest_of("save_git", &answer);
+            return self.save_git_windows(gateway, project, run_id).await;
         }
         let home = self.account_home().await?;
         let (rel, dir) = (
@@ -2260,16 +2716,7 @@ impl GitStateWriter for SftpTransport {
     ) -> Result<GitManifest, CoreError> {
         self.git_names_check("write", gateway, project, run_id)?;
         if self.windows {
-            let script = WinScript::git_restore(
-                LONG_PATH_PREFIX,
-                &self.win_data(),
-                project,
-                &self.win_home().await?,
-                gateway,
-                run_id,
-            );
-            let answer = self.git_win("restore_git", script, GIT_HEAVY_LIMIT).await?;
-            return self.git_manifest_of("restore_git", &answer);
+            return self.restore_git_windows(gateway, project, run_id).await;
         }
         let home = self.account_home().await?;
         let (project_rel, dir) = (
@@ -2287,6 +2734,13 @@ impl GitStateWriter for SftpTransport {
         self.git_manifest_of("restore_git", &answer)
     }
 
+    // Compared on a POSIX host (27-46): `GitWrite::old` and `packed_refs_old`
+    // travel as the fourth and fifth field of each write, and `GIT_WRITE_SH`
+    // compares the target with its expected value just before it moves the
+    // lock over it; a mismatch is exit 7, mapped here to
+    // `GIT_CHANGED_OPERATION`. A Windows host compares the same way (27-52,
+    // `winps::GIT_REPLACE`, answer `err: changed`) under the held parent just
+    // before the move.
     async fn write_git_files(&self, project: &str, writes: &[GitWrite]) -> Result<(), CoreError> {
         if let Some(why) = self.project_name_problem(project) {
             return Err(self.mirror_fail("write", why));
@@ -2300,6 +2754,8 @@ impl GitStateWriter for SftpTransport {
                 self.mirror_fail("write", format!("a .git write is refused: {why}"))
             })?;
             let rel = write.name.rel();
+            write_old_fields(write)
+                .map_err(|why| self.mirror_fail("write", format!("{rel} is refused: {why}")))?;
             if self.windows {
                 for component in rel.split('/') {
                     if let Some(why) = windows_component_problem(component) {
@@ -2434,22 +2890,63 @@ impl SftpTransport {
     }
 }
 
-/// Whether a failed git script ran to one of its own exits (3 a host failure,
-/// 4 a refusal, 5 a size mismatch, 6 the ACL step): such a script took the
-/// locks it made and the stage away itself. Anything else (a dropped
-/// connection, a timeout, a kill, an answer that cannot be read) says nothing
-/// about how far it got.
-fn git_script_settled(err: &CoreError) -> bool {
+/// The exit code a failed host script reported (`exit code N` in the detail of
+/// a transport failure), when it ran to one.
+fn git_script_exit(err: &CoreError) -> Option<u32> {
     let CoreError::TransportFailed { detail, .. } = err else {
-        return false;
+        return None;
     };
-    detail
-        .split_once("exit code ")
-        .and_then(|(_, rest)| {
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse::<u32>().ok()
-        })
-        .is_some_and(|code| (3..=6).contains(&code))
+    git_script_exit_of(detail)
+}
+
+/// [`git_script_exit`] over the detail text itself.
+fn git_script_exit_of(detail: &str) -> Option<u32> {
+    detail.split_once("exit code ").and_then(|(_, rest)| {
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u32>().ok()
+    })
+}
+
+/// Whether a failed git script ran to one of its own exits (3 a host failure,
+/// 4 a refusal, 5 a size mismatch, 6 the ACL step, 7 a target that changed
+/// after the plan): such a script took the locks it made and the stage away
+/// itself. Anything else (a dropped connection, a timeout, a kill, an answer
+/// that cannot be read) says nothing about how far it got.
+fn git_script_settled(err: &CoreError) -> bool {
+    git_script_exit(err).is_some_and(|code| (3..=7).contains(&code))
+}
+
+/// The expected-value field of an old value as `GIT_WRITE_SH` takes it: `-`
+/// for absent, `*` for unchecked, or the 64 lowercase hex digits of the
+/// sha256. A digest of any other shape is refused here, before anything is
+/// sent (T-27-165).
+fn old_value_field(old: &OldValue) -> Result<&str, String> {
+    match old {
+        OldValue::Absent => Ok("-"),
+        OldValue::Unchecked => Ok("*"),
+        OldValue::Sha256(digest) => {
+            if digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                Ok(digest)
+            } else {
+                Err("an expected digest is not 64 lowercase hex digits".to_string())
+            }
+        }
+    }
+}
+
+/// The fourth and fifth field of a write for `GIT_WRITE_SH`: its expected old
+/// value and the expected state of `packed-refs` (`*` when unused).
+fn write_old_fields(write: &GitWrite) -> Result<(&str, &str), String> {
+    let old = old_value_field(&write.old)?;
+    let packed = match &write.packed_refs_old {
+        None => "*",
+        Some(old) => old_value_field(old)?,
+    };
+    Ok((old, packed))
 }
 
 /// `err` with `more` appended to the detail of a transport failure.
@@ -2520,19 +3017,35 @@ impl SftpTransport {
         // (c) every lock created and filled, then moved over its target
         let sizes: Vec<String> = staged.1.iter().map(|s| s.size.to_string()).collect();
         let mut args = vec![self.data_dir.as_str(), rel, stage.as_str()];
-        for (s, size) in staged.1.iter().zip(&sizes) {
+        for ((s, size), (_, _, write)) in staged.1.iter().zip(&sizes).zip(plan) {
             args.push(&s.target);
             args.push(&s.lock);
             args.push(size);
+            let (old, packed) = write_old_fields(write).map_err(|why| {
+                self.mirror_fail("write", format!("{} is refused: {why}", s.target))
+            })?;
+            args.push(old);
+            args.push(packed);
         }
         if let Err(err) = self
             .git_run("write_git_files", GIT_WRITE_SH, &args, limit)
             .await
         {
-            return Err(if git_script_settled(&err) {
-                err
-            } else {
-                self.git_write_leftovers(err, rel, &stage, plan, true).await
+            return Err(match err {
+                // The script compared a target with what the run read and
+                // found it changed (27-46, F4). It removed its own locks and
+                // the stage before it exited, so there is nothing to clean.
+                CoreError::TransportFailed { node, detail, .. }
+                    if git_script_exit_of(&detail) == Some(7) =>
+                {
+                    CoreError::TransportFailed {
+                        operation: GIT_CHANGED_OPERATION.to_string(),
+                        node,
+                        detail,
+                    }
+                }
+                err if git_script_settled(&err) => err,
+                err => self.git_write_leftovers(err, rel, &stage, plan, true).await,
             });
         }
         drop(staged);
@@ -2697,24 +3210,62 @@ impl SftpTransport {
                 return Err(self.git_win_leftovers(err, &ctx, named, owned).await);
             }
         }
-        // (d) each lock over its file, after a size check; the last chunk
-        //     removes the stage
+        // (d) each lock over its file after a size check and the compare of
+        //     the target with the value the run read (27-52, F4); the last
+        //     chunk removes the stage
         let chunks = sized.chunks(GIT_WIN_CHUNK).count();
-        for (n, chunk) in sized.chunks(GIT_WIN_CHUNK).enumerate() {
+        let mut expected: Vec<(String, u64, String, String)> = Vec::with_capacity(sized.len());
+        for ((target, size), (_, _, write)) in sized.iter().zip(plan) {
+            let (old, packed) = write_old_fields(write)
+                .map_err(|why| self.mirror_fail("write", format!("{target} is refused: {why}")))?;
+            expected.push((target.clone(), *size, old.to_string(), packed.to_string()));
+        }
+        for (n, chunk) in expected.chunks(GIT_WIN_CHUNK).enumerate() {
             let script = WinScript::git_replace(
                 &data,
                 project,
                 &home,
                 &stage,
+                n * GIT_WIN_CHUNK,
                 chunk,
                 RENAME_RETRIES,
                 n + 1 == chunks,
             );
-            if let Err(err) = self.git_win("write_git_files", script, limit).await {
-                // the chunks before this one were moved over their targets: a
-                // lock there now is not ours
-                let named = !git_win_script_settled(&err);
-                return Err(self.git_win_leftovers(err, &ctx, named, n..chunks).await);
+            let answer = match self.git_win_raw(script, limit).await {
+                Ok(answer) => answer,
+                Err(err) => {
+                    // the chunks before this one were moved over their targets: a
+                    // lock there now is not ours
+                    let named = !git_win_script_settled(&err);
+                    return Err(self.git_win_leftovers(err, &ctx, named, n..chunks).await);
+                }
+            };
+            let say = |key: &str| answer.get(key).and_then(serde_json::Value::as_i64);
+            match (
+                say("ok"),
+                answer.get("err").and_then(serde_json::Value::as_str),
+            ) {
+                (Some(1), _) => {}
+                (Some(0), Some("changed")) => {
+                    // The script compared a target with what the run read and
+                    // found it changed. It moved nothing from that entry on and
+                    // removed nothing: the unmoved entries' locks and the stage
+                    // go through the unlock by file id, and the new value stays.
+                    let file = match (say("p"), say("i").and_then(|i| usize::try_from(i).ok())) {
+                        (Some(1), _) => "packed-refs".to_string(),
+                        (_, Some(i)) if i < plan.len() => plan[i].0.clone(),
+                        _ => "a .git file".to_string(),
+                    };
+                    let err = self.mirror_fail(
+                        GIT_CHANGED_OPERATION,
+                        format!("{file} changed after the run read it; it is left as it is"),
+                    );
+                    return Err(self.git_win_leftovers(err, &ctx, false, n..chunks).await);
+                }
+                _ => {
+                    let err = self.git_unusable("write_git_files", "ok is not 1");
+                    return Err(self.git_win_leftovers(err, &ctx, true, n..chunks).await);
+                }
             }
         }
         drop(staged);
@@ -2817,6 +3368,18 @@ struct WinWrite<'a> {
     stage: &'a str,
     plan: &'a [(String, String, &'a GitWrite)],
     sized: &'a [(String, u64)],
+}
+
+/// Whether the host refused a staged git script (27-50) before it did anything:
+/// the stub's fixed sentence (its file is missing or is not the pinned text), or
+/// the loader's (the block's source is missing or is not the pinned text). The
+/// transport then stages both files and runs the script once more.
+pub(super) fn staging_refused(err: &CoreError) -> bool {
+    let CoreError::TransportFailed { detail, .. } = err else {
+        return false;
+    };
+    detail.contains("the staged git script is missing or is not the pinned text")
+        || detail.contains("the .git reader cannot declare its native calls")
 }
 
 /// Whether a failed Windows git script ran to its own failure (a terminating
@@ -3051,6 +3614,62 @@ mod tests {
         )
     }
 
+    /// The staging script's answer (27-49): `present` is 1 when the pinned
+    /// source is already on the host with the pinned hash.
+    fn stage_answer(present: i32) -> ProcessOutput {
+        ok(&format!("IGN-RESULT:{{\"ok\":1,\"present\":{present}}}\n"))
+    }
+
+    /// `outs` with the staging check's answer in front: the first script of a
+    /// transport that loads the reviewed block (the probe of a project's `.git`
+    /// is one, since 27-50) is preceded by the check that the staged source is
+    /// there (27-49); here it is, with the pinned hash.
+    fn staged(mut outs: Vec<ProcessOutput>) -> Vec<ProcessOutput> {
+        outs.insert(0, stage_answer(1));
+        outs
+    }
+
+    /// The three answers of a Windows state read (27-49), made from the one
+    /// merged answer the old single script gave: `ok` and the fields of each
+    /// script (`winps::merge_git_state` puts them back together).
+    fn state_answers(merged: &str) -> Vec<ProcessOutput> {
+        let line = merged
+            .trim_end()
+            .strip_prefix("IGN-RESULT:")
+            .expect("the sentinel");
+        let all: serde_json::Value = serde_json::from_str(line).expect("json");
+        let fields: [&[&str]; 3] = [
+            &["head", "config", "packed", "log"],
+            &["index", "markers"],
+            &["refs"],
+        ];
+        fields
+            .iter()
+            .map(|names| {
+                let mut part = serde_json::Map::new();
+                part.insert("ok".to_string(), 1.into());
+                for name in *names {
+                    if let Some(value) = all.get(*name) {
+                        part.insert((*name).to_string(), value.clone());
+                    }
+                }
+                ok(&format!("IGN-RESULT:{}\n", serde_json::Value::Object(part)))
+            })
+            .collect()
+    }
+
+    /// The parameters of every PowerShell script a recorded run sent, in
+    /// order (the sftp sessions between them are skipped).
+    fn script_params(argv: &[Vec<String>]) -> Vec<serde_json::Value> {
+        argv.iter()
+            .filter(|args| {
+                args.last()
+                    .is_some_and(|c| c.starts_with("powershell -NoProfile -NonInteractive "))
+            })
+            .map(|args| win_params(args))
+            .collect()
+    }
+
     #[tokio::test]
     async fn win_git_entry_parse() {
         // (kind, hidden, reparse) of the `.git` entry
@@ -3065,19 +3684,20 @@ mod tests {
             ("none", 0, 0, GitEntry::Absent),
         ];
         for (kind, hidden, reparse, want) in cases {
-            let (runner, t) = host(
-                vec![ok(&win_answer("dir", "dir", kind, hidden, reparse))],
-                true,
-            );
+            let (runner, t) = win_host(staged(vec![ok(&win_answer(
+                "dir", "dir", kind, hidden, reparse,
+            ))]));
             assert_eq!(
                 t.git_entry("CapApp").await.expect(kind),
                 want,
                 "{kind} hidden={hidden} reparse={reparse}"
             );
-            assert_eq!(runner.argv.lock().expect("argv").len(), 1, "one call");
+            // the check of the staged source of the block, then the probe: one
+            // script of its own
+            assert_eq!(runner.argv.lock().expect("argv").len(), 2, "two calls");
         }
         // a missing project directory is absent (the create case)
-        let (_, t) = host(vec![ok(&win_answer("dir", "none", "skip", 0, 0))], true);
+        let (_, t) = win_host(staged(vec![ok(&win_answer("dir", "none", "skip", 0, 0))]));
         assert_eq!(
             t.git_entry("CapApp").await.expect("absent"),
             GitEntry::Absent
@@ -3127,7 +3747,7 @@ mod tests {
             ok("IGN-RESULT:{\"ok\":1,\"projects\":\"dir\",\"project\":\"dir\",\"kind\":\"dir\"}\n"),
         ];
         for out in failures {
-            let (_, t) = host(vec![out], true);
+            let (_, t) = win_host(staged(vec![out]));
             let err = t.git_entry("CapApp").await.expect_err("failure");
             assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
         }
@@ -3139,7 +3759,9 @@ mod tests {
             ("dir", "symlink", "junction or symlink"),
             ("dir", "file", "not a directory"),
         ] {
-            let (_, t) = host(vec![ok(&win_answer(projects, project, "skip", 0, 0))], true);
+            let (_, t) = win_host(staged(vec![ok(&win_answer(
+                projects, project, "skip", 0, 0,
+            ))]));
             let why = detail(t.git_entry("CapApp").await.expect_err(needle));
             assert!(why.contains(needle), "{projects}/{project}: {why}");
         }
@@ -3152,7 +3774,15 @@ mod tests {
         // the body is a constant: no host or repo value is in it, and it never
         // uses the probes C-H ruled out
         assert!(!GIT_ENTRY.chars().any(|c| c == '\n'), "one line");
-        assert!(GIT_ENTRY.contains("Get-Item -LiteralPath $x -Force"));
+        // 27-50: it runs on the reviewed block (the loader first), every level
+        // is held with OpenDir, and the entry is classified from the listing of
+        // the held project directory
+        assert!(GIT_ENTRY.starts_with(winps::GIT_NATIVE_LOAD));
+        assert_eq!(GIT_ENTRY.matches("[IgnGit.N]::OpenDir(").count(), 1);
+        assert!(GIT_ENTRY.contains("GetFileSystemInfos("));
+        let own = GIT_ENTRY
+            .strip_prefix(winps::GIT_NATIVE_LOAD)
+            .unwrap_or_default();
         for forbidden in [
             "Test-Path",
             "Exists(",
@@ -3160,12 +3790,14 @@ mod tests {
             "Remove-",
             "Set-",
             "New-",
+            "Get-Item",
         ] {
-            assert!(!GIT_ENTRY.contains(forbidden), "{forbidden} in GIT_ENTRY");
+            assert!(!own.contains(forbidden), "{forbidden} in GIT_ENTRY");
         }
-        // an error other than ObjectNotFound is rethrown, never read as none
-        assert!(GIT_ENTRY.contains("'ObjectNotFound'){return"));
-        assert!(GIT_ENTRY.contains(";throw}"));
+        // only a failed open with Win32 error 2 or 3 is `none`; any other
+        // failure is rethrown, never read as none (the C-H finding)
+        assert!(own.contains("'error [23]\\)'"));
+        assert!(own.contains("else{throw ($n+': '+$w)}"));
 
         // a hostile project name never reaches the script text: it is refused
         // by the component gate before anything is built, and a legal but odd
@@ -3175,6 +3807,7 @@ mod tests {
             "C:\\gw\\data\\projects",
             &format!("C:\\gw\\data\\projects\\{odd}"),
             &format!("C:\\gw\\data\\projects\\{odd}\\.git"),
+            "C:\\Users\\svc",
         );
         assert_eq!(script.body, GIT_ENTRY);
         let command = encoded_command(&script, COMMAND_BUDGET).expect("fits the budget");
@@ -3189,14 +3822,15 @@ mod tests {
             "C:\\Program Files\\Inductive Automation\\Ignition\\data\\projects",
             &long,
             &format!("{long}\\.git"),
+            "C:\\Users\\svc-ignition-deploy",
         );
         assert!(encoded_command(&script, COMMAND_BUDGET).is_ok());
 
         // through the transport: the paths are native, the sftp spelling is gone
-        let (runner, t) = host(vec![ok(&win_answer("dir", "none", "skip", 0, 0))], true);
+        let (runner, t) = win_host(staged(vec![ok(&win_answer("dir", "none", "skip", 0, 0))]));
         t.git_entry("CapApp").await.expect("absent");
         let argv = runner.argv.lock().expect("argv");
-        let text = argv[0].join(" ");
+        let text = argv[1].join(" ");
         assert!(text.contains("-EncodedCommand"), "{text}");
         assert!(
             !text.contains("CapApp"),
@@ -3366,7 +4000,39 @@ mod tests {
         }
     }
 
-    const ALL_GIT_SCRIPTS: [(&str, &str); 14] = [
+    /// 27-46: the six POSIX readers carry one verified walk, the same bytes
+    /// (`wv`: enter each level, then `pwd -P` must equal the path expected),
+    /// and none of them keeps the older check-then-`cd` walk or the ancestor
+    /// loop. Counted by expansion: the six readers and the two write scripts
+    /// each hold "changed while it was entered" once, eight in all (the source
+    /// holds it three times: the shared fragment and the two write walks).
+    #[test]
+    fn git_readers_share_the_verified_walk() {
+        let walk = verified_walk_sh!();
+        let mut entered = 0;
+        for (name, script) in [
+            ("GIT_STATE_SH", GIT_STATE_SH),
+            ("GIT_DIGEST_SH", GIT_DIGEST_SH),
+            ("GIT_MANIFEST_SH", GIT_MANIFEST_SH),
+            ("GIT_SIZE_SH", GIT_SIZE_SH),
+            ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
+            ("PROJECT_DIGESTS_SH", PROJECT_DIGESTS_SH),
+        ] {
+            assert!(script.contains(walk), "{name} carries the shared walk");
+            assert!(
+                !script.contains("wk() {") && !script.contains("pd() {"),
+                "{name} keeps no check-then-cd walk"
+            );
+            entered += script.matches("changed while it was entered").count();
+        }
+        for script in [GIT_WRITE_SH, GIT_WRITE_CLEAN_SH] {
+            entered += script.matches("changed while it was entered").count();
+        }
+        assert_eq!(entered, 8);
+    }
+
+    const ALL_GIT_SCRIPTS: [(&str, &str); 15] = [
+        ("PROJECT_DIGESTS_SH", PROJECT_DIGESTS_SH),
         ("GIT_OBJECTS_SH", GIT_OBJECTS_SH),
         ("GIT_YAML_SH", GIT_YAML_SH),
         ("GIT_STATE_SH", GIT_STATE_SH),
@@ -3421,26 +4087,43 @@ mod tests {
     async fn sftp_git_windows_arms_run_one_script_each() {
         let name = GitWriteName::Head;
         // (what ran, its answer, the parameters it must carry)
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        // (27-50: a script that loads the reviewed block is preceded, once per
+        // transport, by the check that its staged source is there, and carries
+        // the account home for the loader)
+        let (runner, t) = win_host(staged(vec![ok(WIN_MANIFEST)]));
         let m = t.git_manifest("CapApp").await.expect("manifest");
         assert_eq!((m.files, m.bytes), (3, 42));
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
         assert_eq!(p["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
         assert_eq!(p["x"], "\\\\?\\");
+        assert_eq!(p["h"], "C:\\Users\\svc");
 
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        let (runner, t) = win_host(staged(vec![ok(WIN_MANIFEST)]));
         t.save_manifest("gw", "CapApp", "r1")
             .await
             .expect("save manifest");
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
         assert_eq!(
             p["a"],
             "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\git-save\\r1\\repo"
         );
 
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        // the save: the manifest of the source, the copy, the manifest of the
+        // copy (27-50)
+        let (runner, t) = win_host(staged(vec![
+            ok(WIN_MANIFEST),
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            ok(WIN_MANIFEST),
+        ]));
         t.save_git("gw", "CapApp", "r1").await.expect("save");
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 4);
+        let sent = script_params(&runner.argv.lock().expect("argv"));
+        assert_eq!(sent[1]["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
+        assert_eq!(
+            sent[3]["a"],
+            "C:\\Users\\svc\\ign-deploy\\gw\\projects\\CapApp\\git-save\\r1\\repo"
+        );
+        let p = sent[2].clone();
         for (key, want) in [
             ("d", "C:\\gw\\data"),
             ("j", "CapApp"),
@@ -3451,24 +4134,39 @@ mod tests {
             assert_eq!(p[key], want, "{key}");
         }
 
-        let (runner, t) = win_host(vec![ok(WIN_MANIFEST)]);
+        // the restore: the stage, the check of the staged source, the manifests
+        // of the save and of the stage, the rename, the manifest of the result
+        let (runner, t) = win_host(vec![
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            stage_answer(1),
+            ok(WIN_MANIFEST),
+            ok(WIN_MANIFEST),
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            ok(WIN_MANIFEST),
+        ]);
         t.restore_git("gw", "CapApp", "r1").await.expect("restore");
-        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 6);
+        let sent = script_params(&runner.argv.lock().expect("argv"));
+        assert_eq!(sent[4]["j"], "CapApp");
+        assert_eq!(sent[4]["i"], "r1");
+        assert!(sent[4].get("k").is_none(), "the rename, not the removal");
 
-        let (runner, t) = win_host(vec![ok(
+        let (runner, t) = win_host(staged(vec![ok(
             "IGN-RESULT:{\"ok\":1,\"digest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}\n",
-        )]);
+        )]));
         let digest = t.git_file_digest("CapApp", &name).await.expect("digest");
         assert_eq!(digest.as_deref().map(str::len), Some(64));
-        let p = win_params(&runner.argv.lock().expect("argv")[0]);
+        let p = win_params(&runner.argv.lock().expect("argv")[1]);
         assert_eq!(p["f"], "HEAD");
-        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"digest\":null}\n")]);
+        let (_, t) = win_host(staged(vec![ok("IGN-RESULT:{\"ok\":1,\"digest\":null}\n")]));
         assert_eq!(
             t.git_file_digest("CapApp", &name).await.expect("none"),
             None
         );
 
-        let (_, t) = win_host(vec![ok("IGN-RESULT:{\"ok\":1,\"files\":7,\"bytes\":9}\n")]);
+        let (_, t) = win_host(staged(vec![ok(
+            "IGN-RESULT:{\"ok\":1,\"files\":7,\"bytes\":9}\n",
+        )]));
         let size = t.git_size("CapApp").await.expect("size");
         assert_eq!((size.files, size.bytes), (7, 9));
 
@@ -3492,20 +4190,39 @@ mod tests {
         assert_eq!(p["j"], "CapApp");
         assert_eq!(p["n"], ".ign-probe-r1");
 
-        // state: the probe, then one script, with the marker names as data
+        // state (27-49, 27-50): the check of the staged source of the reviewed
+        // block (it is there; the probe loads the block too), the probe, then
+        // three scripts, the marker names as data and the account home in every
+        // script that loads the block
         let state = "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":3,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[\"shallow\"],\"refs\":[]}\n";
-        let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), ok(state)]);
+        let mut outs = vec![stage_answer(1), ok(&win_answer("dir", "dir", "dir", 1, 0))];
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
         let files = t.read_git_state("CapApp").await.expect("state");
         assert!(files.index_present);
         assert_eq!(files.markers, ["shallow"]);
-        assert_eq!(runner.argv.lock().expect("argv").len(), 2);
-        let p = win_params(&runner.argv.lock().expect("argv")[1]);
-        assert_eq!(p["m"].as_array().map(Vec::len), Some(GIT_MARKERS.len()));
+        assert_eq!(runner.argv.lock().expect("argv").len(), 5);
+        let sent = script_params(&runner.argv.lock().expect("argv"));
+        assert_eq!(sent.len(), 5);
+        assert_eq!(sent[0]["n"], GIT_NATIVE_STAGED_FILE);
+        assert_eq!(sent[0]["s"], winps::GIT_NATIVE_SHA256);
+        assert_eq!(sent[0]["h"], "C:\\Users\\svc");
+        assert_eq!(sent[1]["h"], "C:\\Users\\svc", "the probe carries the home");
+        for script in &sent[2..] {
+            assert_eq!(script["a"], "C:\\gw\\data\\projects\\CapApp\\.git");
+            assert_eq!(script["h"], "C:\\Users\\svc");
+        }
+        assert_eq!(
+            sent[3]["m"].as_array().map(Vec::len),
+            Some(GIT_MARKERS.len()),
+            "the markers go to the second script only"
+        );
+        assert!(sent[2].get("m").is_none() && sent[4].get("m").is_none());
         // a `.git` that is not a directory is answered by kind, never read
-        let (runner, t) = win_host(vec![ok(&win_answer("dir", "dir", "file", 0, 0))]);
+        let (runner, t) = win_host(staged(vec![ok(&win_answer("dir", "dir", "file", 0, 0))]));
         let files = t.read_git_state("CapApp").await.expect("file");
         assert_eq!(files, GitFiles::without_contents(GitEntry::File));
-        assert_eq!(runner.argv.lock().expect("argv").len(), 1);
+        assert_eq!(runner.argv.lock().expect("argv").len(), 2);
     }
 
     /// Every Windows arm refuses an answer that does not say `ok: 1` with the
@@ -3513,6 +4230,8 @@ mod tests {
     #[tokio::test]
     async fn sftp_git_windows_answers_are_checked_strictly() {
         let write = [GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::Head,
             bytes: vec![1],
         }];
@@ -3528,24 +4247,34 @@ mod tests {
             "no result\n",
         ];
         for answer in bad_answers {
-            let (_, t) = win_host(vec![ok(answer)]);
+            let (_, t) = win_host(staged(vec![ok(answer)]));
             assert!(t.git_manifest("CapApp").await.is_err(), "manifest {answer}");
             if !answer.contains("\"files\":3") {
                 // (an answer with a count and a size is a good size answer)
-                let (_, t) = win_host(vec![ok(answer)]);
+                let (_, t) = win_host(staged(vec![ok(answer)]));
                 assert!(t.git_size("CapApp").await.is_err(), "size {answer}");
             }
-            let (_, t) = win_host(vec![ok(answer)]);
+            let (_, t) = win_host(staged(vec![ok(answer)]));
             assert!(
                 t.save_git("gw", "CapApp", "r1").await.is_err(),
                 "save {answer}"
             );
-            let (_, t) = win_host(vec![ok(answer)]);
+            // the restore: the stage answers `answer`; when that is `ok: 1` the
+            // manifest of the save does too (and is unusable), and the stage is
+            // removed (27-50), so there are answers left for those calls
+            let (_, t) = win_host(vec![
+                ok(answer),
+                stage_answer(1),
+                ok(answer),
+                ok(answer),
+                ok("IGN-RESULT:{\"ok\":1}\n"),
+                ok("IGN-RESULT:{\"ok\":1}\n"),
+            ]);
             assert!(
                 t.restore_git("gw", "CapApp", "r1").await.is_err(),
                 "restore {answer}"
             );
-            let (_, t) = win_host(vec![ok(answer)]);
+            let (_, t) = win_host(staged(vec![ok(answer)]));
             assert!(
                 t.git_file_digest("CapApp", &name).await.is_err(),
                 "digest {answer}"
@@ -3574,8 +4303,20 @@ mod tests {
             "IGN-RESULT:{\"ok\":1,\"head\":{\"n\":9,\"b\":\"eHgK\"},\"config\":null,\"packed\":null,\"log\":null,\"index\":true,\"markers\":[],\"refs\":[]}\n",
         ];
         for answer in bad_state {
-            let (_, t) = win_host(vec![ok(&win_answer("dir", "dir", "dir", 1, 0)), ok(answer)]);
+            let mut outs = vec![stage_answer(1), ok(&win_answer("dir", "dir", "dir", 1, 0))];
+            outs.extend(state_answers(answer));
+            let (_, t) = win_host(outs);
             assert!(t.read_git_state("CapApp").await.is_err(), "state {answer}");
+        }
+        // a script of the state read that does not say ok, or a staging check
+        // that does not say whether the source is there, is unusable too
+        for stage in [
+            ok("IGN-RESULT:{\"ok\":0,\"present\":1}\n"),
+            ok("IGN-RESULT:{\"ok\":1}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"present\":2}\n"),
+        ] {
+            let (_, t) = win_host(vec![stage, ok(&win_answer("dir", "dir", "dir", 1, 0))]);
+            assert!(t.read_git_state("CapApp").await.is_err(), "stage answer");
         }
         // a script that died is transport_failed
         let died = ProcessOutput {
@@ -3587,6 +4328,100 @@ mod tests {
         let (_, t) = win_host(vec![died]);
         let err = t.restore_git("gw", "CapApp", "r1").await.expect_err("died");
         assert!(matches!(err, CoreError::TransportFailed { .. }), "{err:?}");
+    }
+
+    /// 27-49: the staged source of the reviewed block is checked and, when it
+    /// is not there with the pinned hash, uploaded once per run, before the
+    /// first script that loads the block. A second state read of the same
+    /// run runs no staging check and makes no upload; a failed upload is not
+    /// remembered, so the next read tries again.
+    #[tokio::test]
+    async fn sftp_git_native_stage_runs_once_per_run_and_uploads_only_when_missing() {
+        let probe = || ok(&win_answer("dir", "dir", "dir", 1, 0));
+        let state = "IGN-RESULT:{\"ok\":1,\"head\":null,\"config\":null,\"packed\":null,\"log\":null,\"index\":false,\"markers\":[],\"refs\":[]}\n";
+        // an empty host: check (absent), the upload, the probe, three scripts;
+        // then the second read of the run: probe and three scripts, nothing else
+        let mut outs = vec![stage_answer(0), ok(""), probe()];
+        outs.extend(state_answers(state));
+        outs.push(probe());
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
+        t.read_git_state("CapApp").await.expect("first read");
+        t.read_git_state("CapApp").await.expect("second read");
+        let argv = runner.argv.lock().expect("argv").clone();
+        let stdins = runner.stdins.lock().expect("stdins").clone();
+        assert_eq!(argv.len(), 3 + 3 + 1 + 3, "{argv:?}");
+        let puts: Vec<&String> = stdins.iter().filter(|text| text.contains("put ")).collect();
+        assert_eq!(puts.len(), 1, "one upload in the run: {stdins:?}");
+        assert!(
+            puts[0].contains(&format!(
+                "\"/C:/Users/svc/{GIT_NATIVE_STAGED_DIR}/{GIT_NATIVE_STAGED_FILE}\""
+            )),
+            "{}",
+            puts[0]
+        );
+        assert!(
+            puts[0].contains("IgnGitNative-a58702afa266.cs"),
+            "named by the first 12 digits of the pin: {}",
+            puts[0]
+        );
+        let checks = script_params(&argv)
+            .iter()
+            .filter(|params| params.get("n").is_some())
+            .count();
+        assert_eq!(checks, 1, "one staging check in the run");
+        // the upload is before the first script that loads the block
+        let order: Vec<&str> = argv
+            .iter()
+            .map(|args| {
+                let command = args.last().map(String::as_str).unwrap_or_default();
+                if command.starts_with("powershell ") {
+                    "script"
+                } else {
+                    "sftp"
+                }
+            })
+            .collect();
+        assert_eq!(order[..4], ["script", "sftp", "script", "script"]);
+
+        // the pinned source is already there: no upload at all
+        let mut outs = vec![stage_answer(1), probe()];
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
+        t.read_git_state("CapApp").await.expect("present");
+        assert!(
+            runner
+                .stdins
+                .lock()
+                .expect("stdins")
+                .iter()
+                .all(|text| !text.contains("put ")),
+            "nothing to upload"
+        );
+
+        // an upload that fails fails the read and is tried again by the next
+        let failed = ProcessOutput {
+            stdout: Vec::new(),
+            stderr: b"Couldn't create file: Permission denied\n".to_vec(),
+            code: 1,
+            timed_out: false,
+        };
+        let mut outs = vec![stage_answer(0), failed, stage_answer(0), ok(""), probe()];
+        outs.extend(state_answers(state));
+        let (runner, t) = win_host(outs);
+        assert!(
+            t.read_git_state("CapApp").await.is_err(),
+            "the upload failed"
+        );
+        t.read_git_state("CapApp").await.expect("the retry");
+        let puts = runner
+            .stdins
+            .lock()
+            .expect("stdins")
+            .iter()
+            .filter(|text| text.contains("put "))
+            .count();
+        assert_eq!(puts, 2, "the failed upload is not remembered");
     }
 
     fn objects_answer(lines: &[&str], n: usize, more: i32) -> ProcessOutput {
@@ -3771,6 +4606,8 @@ mod tests {
         for hostile in ["CON", "a:b", "trail.", "a<b", "a/b", ".."] {
             let (runner, t) = win_host(Vec::new());
             let write = [GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::Head,
                 bytes: vec![1],
             }];
@@ -3807,6 +4644,8 @@ mod tests {
         // a ref name Windows cannot hold is refused before any lock is made
         let (runner, t) = win_host(Vec::new());
         let write = [GitWrite {
+            old: Default::default(),
+            packed_refs_old: None,
             name: GitWriteName::BranchRef("con".to_string()),
             bytes: vec![1],
         }];
@@ -3820,7 +4659,10 @@ mod tests {
     /// `objects/pack/` prefix on both sides.
     #[test]
     fn git_lock_suffix_matches_the_script_rule() {
-        use crate::deploy::transport::winps::{GIT_LOCK, GIT_REPLACE};
+        use crate::deploy::transport::winps::{
+            GIT_LOCK_STAGED as GIT_LOCK, GIT_REPLACE_STAGED as GIT_REPLACE,
+            GIT_UNLOCK_STAGED as GIT_UNLOCK,
+        };
         let hash = "a".repeat(40);
         let packs = [
             GitWriteName::PackFile(hash.clone()),
@@ -3844,7 +4686,7 @@ mod tests {
             assert_eq!(git_lock_suffix(name), ".lock");
             assert!(!name.rel().starts_with("objects/pack/"));
         }
-        for script in [GIT_LOCK, GIT_REPLACE] {
+        for script in [GIT_LOCK, GIT_UNLOCK, GIT_REPLACE] {
             assert!(
                 script.contains("if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'}"),
                 "the script derives the lock name by the same rule"
@@ -3858,6 +4700,8 @@ mod tests {
         WIN_WRITE
             .iter()
             .map(|(branch, bytes)| GitWrite {
+                old: Default::default(),
+                packed_refs_old: None,
                 name: GitWriteName::BranchRef((*branch).to_string()),
                 bytes: bytes.to_vec(),
             })
@@ -3918,7 +4762,10 @@ mod tests {
         assert_eq!(lock["o"], 0);
         assert_eq!(lock["w"][0], "refs/heads/production:5");
         let replace = win_params(&argv[3]);
-        assert_eq!(replace["w"][0], "refs/heads/production:5");
+        // the expected old values travel with each write (27-52, F4): unchecked
+        // for a write with the default old value
+        assert_eq!(replace["w"][0], "refs/heads/production:5:*:*");
+        assert_eq!(replace["o"], 0);
         assert_eq!(replace["q"], RENAME_RETRIES);
         assert_eq!(replace["r"], true, "the replace removes the stage");
         assert_eq!(replace["s"], name.as_str());
@@ -3988,6 +4835,129 @@ mod tests {
         let why = detail(t.write_git_files("CapApp", &write).await.expect_err("dead"));
         assert!(why.contains("the cleanup also failed"), "{why}");
         assert!(why.contains("production.lock"), "{why}");
+    }
+
+    /// 27-52 (F4): a replace that answers `err: changed` is a
+    /// `GIT_CHANGED_OPERATION` failure naming the file, followed by the unlock
+    /// over the unmoved entries (which removes the stage), and nothing else.
+    #[tokio::test]
+    async fn sftp_git_windows_changed_target_is_a_changed_operation() {
+        let write = win_write();
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
+        let (runner, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            ok_answer(),
+            ok("IGN-RESULT:{\"ok\":0,\"err\":\"changed\",\"i\":0,\"p\":0}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":1,\"kept\":0}\n"),
+        ]);
+        let err = t
+            .write_git_files("CapApp", &write)
+            .await
+            .expect_err("a changed target");
+        let CoreError::TransportFailed {
+            operation, detail, ..
+        } = &err
+        else {
+            panic!("expected transport_failed, got {err:?}");
+        };
+        assert_eq!(operation, GIT_CHANGED_OPERATION);
+        assert!(
+            detail.contains("refs/heads/production changed after the run read it"),
+            "{detail}"
+        );
+        assert!(!detail.contains("0123"), "no value in the error: {detail}");
+        let argv = runner.argv.lock().expect("argv").clone();
+        assert_eq!(argv.len(), 5, "stage, put, lock, replace, unlock");
+        let unlock = win_params(&argv[4]);
+        assert_eq!(unlock["r"], true, "the unlock removes the stage");
+        // packed-refs is named when it is what changed
+        let (_, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            ok_answer(),
+            ok("IGN-RESULT:{\"ok\":0,\"err\":\"changed\",\"i\":0,\"p\":1}\n"),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":1,\"kept\":0}\n"),
+        ]);
+        let err = t
+            .write_git_files("CapApp", &write)
+            .await
+            .expect_err("packed");
+        assert!(format!("{err:?}").contains("packed-refs changed after the run read it"));
+    }
+
+    /// 27-50: a staged script is run first and staged only when the host
+    /// refuses it (its file is missing or is not the pinned text): the check of
+    /// the staged files, one upload of the block's source and the script's text,
+    /// then the script again. The file stays between runs, so the next script
+    /// needs no check.
+    #[tokio::test]
+    async fn sftp_git_staged_script_is_staged_only_when_the_host_refuses_it() {
+        let write = win_write();
+        let ok_answer = || ok("IGN-RESULT:{\"ok\":1}\n");
+        let refused = fail(
+            1,
+            "Exception: the staged git script is missing or is not the pinned text",
+        );
+        let (runner, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            refused,
+            stage_answer(0),
+            ok(""),
+            ok_answer(),
+            ok_answer(),
+        ]);
+        t.write_git_files("CapApp", &write).await.expect("write");
+        let argv = runner.argv.lock().expect("argv").clone();
+        let stdins = runner.stdins.lock().expect("stdins").clone();
+        assert_eq!(
+            argv.len(),
+            7,
+            "stage, put, lock (refused), check, upload, lock, replace"
+        );
+        let check = win_params(&argv[3]);
+        let lock_file = winps::STAGED_SCRIPTS
+            .iter()
+            .find(|st| st.name == "lock")
+            .expect("lock")
+            .file;
+        assert_eq!(
+            check["n"],
+            serde_json::json!([GIT_NATIVE_STAGED_FILE, lock_file])
+        );
+        let puts: Vec<&str> = stdins[4]
+            .lines()
+            .filter(|l| l.starts_with("put "))
+            .collect();
+        assert_eq!(
+            puts.len(),
+            2,
+            "the block's source and the script: {}",
+            stdins[4]
+        );
+        assert!(puts[1].contains(lock_file), "{}", puts[1]);
+        // a script refused once more after it was staged is the error
+        let (_, t) = win_host(vec![
+            ok_answer(),
+            ok(""),
+            fail(
+                1,
+                "Exception: the staged git script is missing or is not the pinned text",
+            ),
+            stage_answer(1),
+            fail(
+                1,
+                "Exception: the staged git script is missing or is not the pinned text",
+            ),
+            ok("IGN-RESULT:{\"ok\":1,\"removed\":0,\"kept\":0}\n"),
+        ]);
+        let why = detail(
+            t.write_git_files("CapApp", &write)
+                .await
+                .expect_err("refused twice"),
+        );
+        assert!(why.contains("not the pinned text"), "{why}");
     }
 
     /// 27-33: a stage that exists is refused by the stage script and left
@@ -4760,6 +5730,8 @@ mod tests {
                     "config",
                     "config.lock",
                     "99",
+                    "*",
+                    "*",
                 ],
                 &system_path(),
             );
@@ -4771,6 +5743,130 @@ mod tests {
             );
             assert!(!rig.git().join("config.lock").exists(), "no lock is made");
             assert!(!Path::new(&stage).exists(), "the stage is taken away");
+        }
+
+        /// 27-46 (T-27-165): an expected-value field that is not `-`, `*` or 64
+        /// lowercase hex is refused (exit 4) before any lock is made, whatever
+        /// it looks like; it is data, never script text.
+        #[test]
+        fn write_script_refuses_a_malformed_old_field() {
+            let rig = Rig::new();
+            let injected = rig.root.path().join("injected");
+            let command = format!("$(touch {})", injected.display());
+            for (position, bad) in [
+                (0, ""),
+                (0, "abc"),
+                (0, command.as_str()),
+                (0, "A".repeat(64).as_str()),
+                (0, "a".repeat(63).as_str()),
+                (0, "g".repeat(64).as_str()),
+                (1, "a;b"),
+                (1, "--"),
+            ] {
+                let stage = stage_with(&rig, &["12345"]);
+                let (old, packed) = if position == 0 {
+                    (bad, "*")
+                } else {
+                    ("*", bad)
+                };
+                let out = run(
+                    GIT_WRITE_SH,
+                    &[
+                        &rig.data(),
+                        "projects/CapApp/.git",
+                        &stage,
+                        "config",
+                        "config.lock",
+                        "5",
+                        old,
+                        packed,
+                    ],
+                    &system_path(),
+                );
+                assert_eq!(out.code, 4, "{bad:?}: {}", out.stderr);
+                assert!(
+                    out.stderr.contains("not a digest"),
+                    "{bad:?}: {}",
+                    out.stderr
+                );
+                assert!(!rig.git().join("config.lock").exists(), "no lock is made");
+                assert_eq!(
+                    std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                    "[core]\n"
+                );
+                assert!(!injected.exists(), "a field is never run");
+            }
+        }
+
+        /// 27-46: the compare runs in the script itself: a matching digest, an
+        /// absent target and an unchecked field go through; a wrong digest is
+        /// exit 7, which removes the script's own stage and leaves the target.
+        #[test]
+        fn write_script_compares_the_target_before_the_move() {
+            let rig = Rig::new();
+            let bytes = "[core]\n\tnew = 1\n";
+            let digest = |text: &str| crate::deploy::tree::sha256_hex(text.as_bytes());
+            let write = |old: &str, packed: &str| {
+                let stage = stage_with(&rig, &[bytes]);
+                run(
+                    GIT_WRITE_SH,
+                    &[
+                        &rig.data(),
+                        "projects/CapApp/.git",
+                        &stage,
+                        "config",
+                        "config.lock",
+                        &bytes.len().to_string(),
+                        old,
+                        packed,
+                    ],
+                    &system_path(),
+                )
+            };
+            // wrong digest: exit 7, nothing replaced, nothing left
+            let wrong = write(&digest("not what is there\n"), "*");
+            assert_eq!(wrong.code, 7, "{}", wrong.stderr);
+            assert!(wrong.stderr.contains("config changed after the plan"));
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                "[core]\n"
+            );
+            assert!(!rig.git().join("config.lock").exists());
+            assert!(!rig.root.path().join("home/ign-deploy/git-stage-t").exists());
+            // absent expected, but the file is there
+            assert_eq!(write("-", "*").code, 7);
+            // packed-refs expected absent, but it is there
+            std::fs::write(rig.git().join("packed-refs"), "# pack-refs\n").expect("packed");
+            assert_eq!(write("*", "-").code, 7);
+            assert_eq!(write("*", &digest("other\n")).code, 7);
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                "[core]\n"
+            );
+            // the right digests go through
+            let ok = write(&digest("[core]\n"), &digest("# pack-refs\n"));
+            assert_eq!(ok.code, 0, "{}", ok.stderr);
+            assert_eq!(
+                std::fs::read_to_string(rig.git().join("config")).expect("config"),
+                bytes
+            );
+        }
+
+        /// 27-46: exit 7 is one of the script's own exits (it cleaned up), the
+        /// same as 3 to 6; a dropped connection or a kill is not.
+        #[test]
+        fn git_script_settled_counts_exit_7() {
+            let exit = |code: &str| CoreError::TransportFailed {
+                operation: "write_git_files".to_string(),
+                node: "n".to_string(),
+                detail: format!("the command failed with exit code {code}: refs changed"),
+            };
+            for code in ["3", "4", "5", "6", "7"] {
+                assert!(git_script_settled(&exit(code)), "exit {code} is settled");
+            }
+            for code in ["1", "2", "8", "255"] {
+                assert!(!git_script_settled(&exit(code)), "exit {code} is not");
+            }
         }
 
         #[test]
@@ -4794,6 +5890,8 @@ mod tests {
                             "config",
                             "config.lock",
                             "1",
+                            "*",
+                            "*",
                         ],
                         &system_path(),
                     );
@@ -4930,6 +6028,55 @@ mod tests {
             );
             assert_eq!(out.code, 0, "{}", out.stderr);
             assert!(out.stdout.contains("\"digest\":null"), "{}", out.stdout);
+        }
+
+        /// 27-41: more files than the cap refuses (exit 4) and never answers
+        /// a truncated listing; at the cap it answers every file.
+        #[test]
+        fn sftp_project_digests_posix_answer_over_the_cap_refuses() {
+            let rig = Rig::new();
+            let project = rig.root.path().join("data/projects/CapApp");
+            for i in 0..5 {
+                std::fs::write(project.join(format!("f{i}.txt")), format!("{i}\n")).expect("file");
+            }
+            let data = rig.data();
+            let at_cap = run(
+                PROJECT_DIGESTS_SH,
+                &[&data, "projects/CapApp", "5"],
+                &system_path(),
+            );
+            assert_eq!(at_cap.code, 0, "{}", at_cap.stderr);
+            assert!(at_cap.stdout.contains("\"n\":5"), "{}", at_cap.stdout);
+            let over = run(
+                PROJECT_DIGESTS_SH,
+                &[&data, "projects/CapApp", "4"],
+                &system_path(),
+            );
+            assert_eq!(over.code, 4, "{}", over.stderr);
+            assert!(over.stderr.contains("more files"), "{}", over.stderr);
+            assert!(
+                !over.stdout.contains("IGN-RESULT"),
+                "no answer: {}",
+                over.stdout
+            );
+        }
+
+        /// 27-41: a project named with a glob character is walked as that
+        /// literal name, and the `.git` subtree is not listed.
+        #[test]
+        fn project_digests_script_takes_a_glob_character_literally() {
+            let rig = Rig::new();
+            let glob = rig.root.path().join("data/projects/proj*");
+            std::fs::create_dir_all(glob.join(".git")).expect("glob project");
+            std::fs::write(glob.join(".git/HEAD"), "ref: refs/heads/glob\n").expect("head");
+            std::fs::write(glob.join("project.json"), "{}\n").expect("manifest");
+            let out = run(
+                PROJECT_DIGESTS_SH,
+                &[&rig.data(), "projects/proj*", "9"],
+                &system_path(),
+            );
+            assert_eq!(out.code, 0, "{}", out.stderr);
+            assert!(out.stdout.contains("\"n\":1"), "{}", out.stdout);
         }
 
         #[test]

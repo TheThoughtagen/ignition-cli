@@ -17,7 +17,9 @@
 use ignition_core::actions::apicall::ApiCallOutcome;
 use ignition_core::actions::backup::{BackupDownloadResult, BackupRestoreResult};
 use ignition_core::actions::connections::ConnectionsResult;
-use ignition_core::actions::deploy_projects::git::REASON_BACKUP_PROJECT_JSON_MISSING;
+use ignition_core::actions::deploy_projects::git::{
+    REASON_BACKUP_PROJECT_JSON_MISSING, REASON_GIT_CHANGED, REASON_GIT_SAVE_MISSING,
+};
 use ignition_core::actions::diagnostics::{BundleDownloadResult, BundleStatusWire};
 use ignition_core::actions::eam::{
     EamDeleteResult, EamHistoryResult, EamLifecycleResult, EamModifyResult, EamTaskCreateResult,
@@ -1724,7 +1726,7 @@ fn deploy_projects_human_lines(
         // and recorded; only the gateway repository was not handed over.
         let git_failed = result.outcome == ProjectOutcome::GitRestoreFailed;
         if let Some(slug) = result.slug.as_ref().filter(|_| git_failed) {
-            let (manifest, repository) = git_failure_kinds(result);
+            let (manifest, repository, changed, missing) = git_failure_kinds(result);
             if manifest {
                 // 27-37: the repository is not the problem. The backup lost
                 // the project's manifest file, so no `.git` instruction.
@@ -1736,16 +1738,43 @@ fn deploy_projects_human_lines(
                     escape_control(slug)
                 ));
             }
+            if changed {
+                // 27-45: a file of `.git` changed while the run wrote it. The
+                // repository is the other writer's, with the writes before it
+                // in place; the saved copy must not be put over it unchecked.
+                lines.push(format!(
+                    "verdict: {}: the project was deployed, read back equal and recorded; a file \
+                     of the gateway's .git changed while ign was writing it (git_changed), so the \
+                     writes before it, the index first, are in place and nothing was overwritten; \
+                     check the repository's state on the gateway, do not put the saved copy over \
+                     it without checking, then deploy again",
+                    escape_control(slug)
+                ));
+            }
+            if missing {
+                // 27-54: a `--rollback-run` retry found the save the journal
+                // names gone. There is no copy to restore from, so the verdict
+                // names none; nothing was written and the journal stays.
+                lines.push(format!(
+                    "verdict: {}: the saved .git the journal names is gone ({}), so the \
+                     repository was not put back and nothing was written to .git; the journal was \
+                     kept; restore the repository from its remote with the git module, then clear \
+                     the journal as the README's Undoing a run says",
+                    escape_control(slug),
+                    REASON_GIT_SAVE_MISSING
+                ));
+            }
             // Any other reason (or none named) keeps the 27-36 verdict, also
             // beside the finding when both kinds are present.
-            if (repository || !manifest) && git_failed_node_kept_save(result) {
+            let repository = repository || !(manifest || changed || missing);
+            if repository && git_failed_node_kept_save(result) {
                 lines.push(format!(
                     "verdict: {}: the project was deployed, read back equal and recorded; its \
                      git repository was not handed over and nothing was rolled back; restore \
                      the .git by hand from the copy named in the outcome line",
                     escape_control(slug)
                 ));
-            } else if repository || !manifest {
+            } else if repository {
                 // CodeRabbit #57: no copy was kept (the save itself failed),
                 // and the `.git` was never written.
                 lines.push(format!(
@@ -1926,11 +1955,13 @@ fn git_restore_failed_line(
     )
 }
 
-/// Which kinds of failed node a `git_restore_failed` run holds (27-37): one
-/// with the backup's `project.json` finding, and one with any other reason.
+/// Which kinds of failed node a `git_restore_failed` run holds: one with the
+/// backup's `project.json` finding (27-37), one whose advance found a file
+/// changed under its lock (27-45), one with any other reason, and one whose
+/// pending save is gone (27-54).
 fn git_failure_kinds(
     result: &ignition_core::actions::deploy_projects::DeployProjectsResult,
-) -> (bool, bool) {
+) -> (bool, bool, bool, bool) {
     let reasons: Vec<&str> = result.git.as_deref().map_or_else(Vec::new, |g| {
         g.nodes
             .iter()
@@ -1939,9 +1970,13 @@ fn git_failure_kinds(
     });
     (
         reasons.contains(&REASON_BACKUP_PROJECT_JSON_MISSING),
-        reasons
-            .iter()
-            .any(|r| *r != REASON_BACKUP_PROJECT_JSON_MISSING),
+        reasons.iter().any(|r| {
+            *r != REASON_BACKUP_PROJECT_JSON_MISSING
+                && *r != REASON_GIT_CHANGED
+                && *r != REASON_GIT_SAVE_MISSING
+        }),
+        reasons.contains(&REASON_GIT_CHANGED),
+        reasons.contains(&REASON_GIT_SAVE_MISSING),
     )
 }
 
@@ -2019,15 +2054,39 @@ fn git_lines(
             ));
         }
         if let Some(save) = &node.save {
-            lines.push(format!(
-                "  saved .git: {} ({} file(s), {} byte(s))",
-                escape_control(&save.path),
-                save.files,
-                save.bytes
-            ));
+            // CodeRabbit #61: a missing save (`git_save_missing`) carries the
+            // journal's entry, not a copy that exists.
+            let missing = node.restore.as_ref().and_then(|r| r.reason.as_deref())
+                == Some(REASON_GIT_SAVE_MISSING);
+            if missing {
+                lines.push(format!(
+                    "  saved .git (as the journal names it; it could not be found or read): {}",
+                    escape_control(&save.path)
+                ));
+            } else {
+                lines.push(format!(
+                    "  saved .git: {} ({} file(s), {} byte(s))",
+                    escape_control(&save.path),
+                    save.files,
+                    save.bytes
+                ));
+            }
         }
         if let Some(restore) = &node.restore {
             match restore.reason.as_deref() {
+                // 27-45: the writes before the changed file are in place.
+                Some(reason) if reason == REASON_GIT_CHANGED => lines.push(format!(
+                    "  restore: failed ({}); the repository was partly advanced (the writes \
+                     before the changed file are in place)",
+                    escape_control(reason)
+                )),
+                // 27-54: the save the journal names is gone; nothing was
+                // written, so there is no copy to put back.
+                Some(reason) if reason == REASON_GIT_SAVE_MISSING => lines.push(format!(
+                    "  restore: failed ({}); the saved .git the journal names is gone, so the \
+                     repository was not put back",
+                    escape_control(reason)
+                )),
                 Some(reason) => lines.push(format!(
                     "  restore: failed ({}){}",
                     escape_control(reason),
@@ -2066,7 +2125,7 @@ fn git_lines(
                     restore.dropped_count
                 ));
             }
-            if node.save.is_some() {
+            if node.save.is_some() && restore.reason.as_deref() != Some(REASON_GIT_SAVE_MISSING) {
                 lines.push(
                     if restore.save_kept {
                         "  save kept"
@@ -5231,6 +5290,7 @@ mod tests {
             hazards: Vec::new(),
             save: None,
             restore: None,
+            pending_removal: None,
         }
     }
 
@@ -5700,6 +5760,153 @@ mod tests {
         // Another reason keeps the 27-36 verdict.
         let other = deploy_projects_human_lines(&failed_pair_result("backup_unsynced")).join("\n");
         assert!(other.contains("restore the .git by hand"), "{other}");
+    }
+
+    /// 27-45 (F4): a ref, HEAD, config or index changed while the run wrote
+    /// it. The repository is the other writer's, with the writes before it in
+    /// place, so the verdict never sends the operator to put the saved copy
+    /// over it; it says what happened and to check the repository first. The
+    /// restore line does not say "not advanced".
+    #[test]
+    fn git_verdict_for_git_changed() {
+        let mut result = failed_pair_result("git_changed");
+        // The save was restored and the index written before the change.
+        let backup = result.git.as_mut().expect("git").nodes[1]
+            .restore
+            .as_mut()
+            .expect("restore");
+        backup.restored = true;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        let verdict = text
+            .lines()
+            .find(|l| l.starts_with("verdict:"))
+            .expect("a verdict line");
+        for needle in [
+            "verdict: deploy_git_restore_failed",
+            "the project was deployed, read back equal and recorded",
+            "changed while ign was writing it (git_changed)",
+            "the writes before it, the index first, are in place",
+            "check the repository's state on the gateway",
+            "do not put the saved copy over it without checking",
+            "then deploy again",
+        ] {
+            assert!(verdict.contains(needle), "{needle:?} is missing: {verdict}");
+        }
+        assert!(
+            !verdict.contains("restore the .git by hand"),
+            "no restore-from-copy instruction: {verdict}"
+        );
+        let outcome = text
+            .lines()
+            .find(|l| l.starts_with("outcome:"))
+            .expect("an outcome line");
+        assert!(outcome.contains("nodes.backup: git_changed"), "{outcome}");
+        assert!(
+            text.contains(
+                "restore: failed (git_changed); the repository was partly advanced (the writes \
+                 before the changed file are in place)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("restore: failed (git_changed); the repository was not advanced"),
+            "{text}"
+        );
+        // Another reason keeps the 27-36 verdict and its restore instruction.
+        let other = deploy_projects_human_lines(&failed_pair_result("backup_unsynced")).join("\n");
+        assert!(other.contains("restore the .git by hand"), "{other}");
+        assert!(
+            !other.contains("changed while ign was writing it"),
+            "{other}"
+        );
+    }
+
+    /// 27-54: a pending save the journal names is gone (`git_save_missing`).
+    /// The verdict says so, that the repository was not put back and that the
+    /// journal was kept; it never sends the operator to restore a copy that
+    /// does not exist (the lesson of CodeRabbit #57, P7).
+    #[test]
+    fn rollback_verdict_names_a_missing_save() {
+        let mut result = failed_pair_result("git_save_missing");
+        let git = result.git.as_mut().expect("git");
+        git.nodes.truncate(1);
+        let mut failed = restore_info();
+        failed.restored = false;
+        failed.advanced = false;
+        failed.verified = false;
+        failed.post_status = None;
+        failed.reason = Some("git_save_missing".into());
+        failed.save_kept = false;
+        git.nodes[0].restore = Some(failed);
+        let text = deploy_projects_human_lines(&result).join("\n");
+        let verdict = text
+            .lines()
+            .find(|l| l.starts_with("verdict:"))
+            .expect("a verdict line");
+        for needle in [
+            "the saved .git the journal names is gone",
+            "git_save_missing",
+            "the repository was not put back",
+            "the journal was kept",
+        ] {
+            assert!(verdict.contains(needle), "{needle:?} is missing: {verdict}");
+        }
+        assert!(
+            !verdict.contains("restore the .git by hand") && !verdict.contains("copy named"),
+            "no copy to restore from: {verdict}"
+        );
+        assert!(
+            !text.contains("save kept") && !text.contains("save removed"),
+            "the save is neither kept nor removed: {text}"
+        );
+        assert!(
+            text.contains(
+                "restore: failed (git_save_missing); the saved .git the journal names is \
+                 gone, so the repository was not put back"
+            ),
+            "{text}"
+        );
+        let outcome = text
+            .lines()
+            .find(|l| l.starts_with("outcome:"))
+            .expect("an outcome line");
+        assert!(
+            outcome.contains("git_save_missing") && !outcome.contains("copy at"),
+            "{outcome}"
+        );
+    }
+
+    /// CodeRabbit #61: a node whose save is missing (`git_save_missing`) does
+    /// not show the journal's path, files and bytes as an available save; the
+    /// line says the copy the journal names could not be found or read. An
+    /// available save keeps its line.
+    #[test]
+    fn missing_save_is_not_shown_as_an_available_save() {
+        let mut result = failed_pair_result("git_save_missing");
+        let git = result.git.as_mut().expect("git");
+        git.nodes[1].restore.as_mut().expect("restore").save_kept = false;
+        let text = deploy_projects_human_lines(&result).join("\n");
+        assert!(
+            !text.contains(
+                "saved .git: ign-deploy/gw/projects/App/git-save/r1/backup-repo (9 file(s), \
+                 2100 byte(s))"
+            ),
+            "the missing save is not shown as available: {text}"
+        );
+        assert!(
+            text.contains(
+                "saved .git (as the journal names it; it could not be found or read): \
+                 ign-deploy/gw/projects/App/git-save/r1/backup-repo"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "saved .git: ign-deploy/gw/projects/App/git-save/r1/repo (12 file(s), 3400 \
+                 byte(s))"
+            ),
+            "an available save keeps its line: {text}"
+        );
     }
 
     /// CodeRabbit #57: a `.git` that could not be saved was never touched and

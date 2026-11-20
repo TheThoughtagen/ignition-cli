@@ -33,7 +33,10 @@
 //!   `Get-Item -Force` per level, so a Hidden entry is seen and a denied one is
 //!   an error rather than "absent".
 //! - The git host channel (Phase 27, 27-09), one script per operation, every
-//!   path and name in `$p`: [`GIT_STATE`] (the fixed files in one pass),
+//!   path and name in `$p`: [`GIT_STATE`], [`GIT_STATE_MARKS`] and
+//!   [`GIT_STATE_REFS`] (the state read, three scripts since the reviewed C#
+//!   block of 27-49 took the budget; [`GIT_NATIVE_STAGE`] puts that block's
+//!   source in place),
 //!   [`GIT_SAVE`] and [`GIT_RESTORE`] (one host-local `robocopy` each, with the
 //!   manifest compare inside the script), [`GIT_MANIFEST`], [`GIT_SIZE`] (one
 //!   enumeration, no file read), [`GIT_DIGEST`], [`GIT_OBJECTS`] (the object files of a gateway `.git`, 27-11), [`GIT_LOCK`] and
@@ -284,35 +287,171 @@ pub const BUNDLE_CLEAN: &str = concat!(
     "if(@($i.EnumerateFileSystemInfos()).Count -gt 0){E @{ok=0;err='left'}}else{[IO.Directory]::Delete($d);E @{ok=1}}}}"
 );
 
-/// The `.git` probe of `deploy projects` (Phase 25, 25-08, K9): what is at
-/// `$p.c` (`<data>\projects\<name>\.git`), asked only when `$p.a`
-/// (`<data>\projects`) and `$p.b` (the project directory) are real
-/// directories.
+// Phase 27 (27-48): the one reviewed C# block of the Windows git scripts.
+//
+// The block is one line of printable ASCII (a GIT_* body is one line), built
+// from one piece per line of C# so this source can be read and a diff of it is
+// a diff of the C#. C# 5 only: Windows PowerShell 5.1 compiles it with the
+// .NET Framework's csc, so no string interpolation, no expression-bodied
+// members, no `out var`.
+macro_rules! git_native_cs {
+    () => {
+        concat!(
+            "using System;using System.IO;using System.Runtime.InteropServices;using Microsoft.Win32.SafeHandles;",
+            "namespace IgnGit{public static class N{",
+            "/* Win32 constants, named as in the Windows headers. */",
+            "const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,DELETE=0x10000,FILE_LIST_DIRECTORY=1,FILE_READ_ATTRIBUTES=0x80,",
+            "FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,FILE_SHARE_DELETE=4,CREATE_NEW=1,OPEN_EXISTING=3,",
+            "FILE_FLAG_BACKUP_SEMANTICS=0x2000000,FILE_FLAG_OPEN_REPARSE_POINT=0x200000,",
+            "FILE_ATTRIBUTE_DIRECTORY=0x10,FILE_ATTRIBUTE_REPARSE_POINT=0x400,",
+            "MOVEFILE_REPLACE_EXISTING=1,MOVEFILE_WRITE_THROUGH=8;",
+            "const int FileDispositionInfo=4,FileAttributeTagInfo=9,FileIdInfo=18;",
+            "[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]",
+            "static extern SafeFileHandle CreateFileW(string n,uint a,uint s,IntPtr z,uint d,uint f,IntPtr t);",
+            "[DllImport(\"kernel32.dll\",SetLastError=true)]",
+            "static extern bool GetFileInformationByHandleEx(SafeFileHandle h,int c,byte[] b,uint n);",
+            "[DllImport(\"kernel32.dll\",SetLastError=true)]",
+            "static extern bool SetFileInformationByHandle(SafeFileHandle h,int c,byte[] b,uint n);",
+            "[DllImport(\"kernel32.dll\",SetLastError=true,CharSet=CharSet.Unicode)]",
+            "static extern bool MoveFileExW(string a,string b,uint f);",
+            "static IOException X(string w){return new IOException(w+\" (Win32 error \"+Marshal.GetLastWin32Error()+\")\");}",
+            // The only CreateFileW call. It never follows a reparse point. k=0: no
+            // check (a new file), k=1: must be a directory, k=2: must be a regular
+            // file; both checks read the attribute tag of the handle just opened.
+            "static SafeFileHandle O(string p,uint a,uint s,uint d,uint f,int k){",
+            "SafeFileHandle h=CreateFileW(p,a,s,IntPtr.Zero,d,f|FILE_FLAG_OPEN_REPARSE_POINT,IntPtr.Zero);",
+            "if(h.IsInvalid)throw X(\"cannot open the path\");if(k==0)return h;",
+            "try{byte[] b=new byte[8];",
+            "if(!GetFileInformationByHandleEx(h,FileAttributeTagInfo,b,8))throw X(\"cannot read the attributes\");",
+            "uint t=BitConverter.ToUInt32(b,0);",
+            "if((t&FILE_ATTRIBUTE_REPARSE_POINT)!=0)throw new IOException(\"the path is a reparse point\");",
+            "if(((t&FILE_ATTRIBUTE_DIRECTORY)!=0)!=(k==1))throw new IOException(k==1?\"the path is not a directory\":\"the path is not a regular file\");",
+            "return h;}catch{h.Dispose();throw;}}",
+            // No FILE_SHARE_DELETE: while held, the directory cannot be renamed or replaced.
+            // FILE_LIST_DIRECTORY is what makes the share mode count: Windows skips the
+            // sharing check for a handle whose access is only attributes (F4, 2026-11-19).
+            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
+            "public static SafeFileHandle OpenFile(string p){return O(p,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+            // No sharing at all: nobody else can open, delete or replace the new file while it is held.
+            // It can read its own attributes, so FileId can be taken from the handle that created it.
+            "public static SafeFileHandle CreateNew(string p){return O(p,GENERIC_WRITE|FILE_READ_ATTRIBUTES,0,CREATE_NEW,0,0);}",
+            "public static SafeFileHandle OpenForDelete(string p){return O(p,DELETE|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
+            // Volume serial number (8 bytes) and 128-bit file id, as 48 hex digits.
+            "public static string FileId(SafeFileHandle h){byte[] b=new byte[24];",
+            "if(!GetFileInformationByHandleEx(h,FileIdInfo,b,24))throw X(\"cannot read the file id\");",
+            "return BitConverter.ToString(b).Replace(\"-\",\"\");}",
+            // The file is deleted when the last handle to it is closed.
+            "public static void DeleteOnClose(SafeFileHandle h){",
+            "if(!SetFileInformationByHandle(h,FileDispositionInfo,new byte[]{1},1))throw X(\"cannot mark the file for deletion\");}",
+            "public static void Move(string a,string b,bool replace){",
+            "if(!MoveFileExW(a,b,MOVEFILE_WRITE_THROUGH|(replace?MOVEFILE_REPLACE_EXISTING:0)))throw X(\"cannot move the file\");}",
+            "}}"
+        )
+    };
+}
+
+/// The one reviewed C# block of the Windows git scripts (Phase 27, 27-48; the
+/// user decision of 2026-11-18 allows exactly this much `Add-Type`). It is the
+/// handle-anchored `.git` I/O that Windows PowerShell 5.1 cannot do with a
+/// managed API: `FileStream` rejects a `FileOptions` that opens a reparse point
+/// itself, so the block declares `CreateFileW`.
 ///
-/// Each level is one `Get-Item -LiteralPath ... -Force` and nothing else. The
-/// 25-03 captures (`## C-H before grant`, `## Host grant and prod git.yaml
-/// (25-03)`) showed why: `-Force` sees a Hidden entry, the .NET `Exists`
-/// methods and `Test-Path` answer false (or, run to run, throw) for a
-/// directory the account cannot traverse, and `Get-Item` throws
-/// `UnauthorizedAccessException` there. Only an `ObjectNotFound` error record
-/// is `none`; every other error is rethrown, which under the prelude's `Stop`
-/// is a non-zero exit and so `transport_failed`, never "absent". A reparse
-/// point (junction or symlink) is reported with `r=1` and never opened or
-/// followed; a Hidden `.git` is reported with `h=1` and counts like any other.
+/// `IgnGit.N`, every method throwing `IOException` with a fixed English text and
+/// the Win32 error number (no path in any message):
 ///
-/// Result: `projects` and `project` are `none | dir | file | symlink | skip`,
-/// `kind` is `none | dir | file | skip` for the `.git` entry, `hidden` and
-/// `reparse` are 0 or 1 for it.
-pub const GIT_ENTRY: &str = concat!(
-    "function T($x){try{$i=Get-Item -LiteralPath $x -Force -ErrorAction Stop}",
-    "catch{if($_.CategoryInfo.Category -eq 'ObjectNotFound'){return @{k='none';h=0;r=0}};throw};",
-    "$a=[int]$i.Attributes;",
-    "return @{k=$(if($a -band 16){'dir'}else{'file'});h=[int](($a -band 2) -ne 0);r=[int](($a -band 1024) -ne 0)}};",
-    "function W($t){if($t.r){'symlink'}else{$t.k}};",
-    "$s=@{k='skip';h=0;r=0};$a=T $p.a;$b=$s;$c=$s;",
-    "if($a.k -eq 'dir' -and !$a.r){$b=T $p.b;if($b.k -eq 'dir' -and !$b.r){$c=T $p.c}};",
-    "E @{ok=1;projects=(W $a);project=(W $b);kind=$c.k;hidden=$c.h;reparse=$c.r}"
-);
+/// - `OpenDir(path)`: `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES`, shared for
+///   read and write and NOT for delete, so a directory that is held cannot be
+///   renamed or replaced (the Windows anchor, there being no `openat`); must be
+///   a directory and not a reparse point, read from the attribute tag of the
+///   handle that is returned. `FILE_LIST_DIRECTORY` is needed: a handle whose
+///   access is only attributes is exempt from the sharing check, so it would
+///   not stop a rename (`win_git_state_holds_its_levels`, re-pinned 2026-11-19).
+/// - `OpenFile(path)`: `GENERIC_READ` only, shared for read, write and delete;
+///   must be a regular file, not a reparse point.
+/// - `CreateNew(path)`: `GENERIC_WRITE | FILE_READ_ATTRIBUTES` (so `FileId` can
+///   be read from the handle that created the file), no sharing, `CREATE_NEW`.
+/// - `OpenForDelete(path)`: `DELETE | FILE_READ_ATTRIBUTES`, shared for read,
+///   write and delete; a regular file, not a reparse point.
+/// - `FileId(handle)`: `GetFileInformationByHandleEx(FileIdInfo)` as hex.
+/// - `DeleteOnClose(handle)`: `SetFileInformationByHandle(FileDispositionInfo)`,
+///   so a file is removed by the handle whose file id was just compared.
+/// - `Move(from, to, replace)`: `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, and
+///   `MOVEFILE_REPLACE_EXISTING` only when `replace`.
+///
+/// Every `CreateFileW` is made with `FILE_FLAG_OPEN_REPARSE_POINT`. The text is
+/// pinned by [`GIT_NATIVE_SHA256`]. It is compiled only on Windows (by `csc`
+/// through `Add-Type`, C# 5): nothing here compiles or runs it, and the first
+/// compile is the Windows test VM and the windows-latest leg of 27-49.
+pub const GIT_NATIVE_CS: &str = git_native_cs!();
+
+// The SHA-256 pin of `GIT_NATIVE_CS` and its first twelve digits (the staged
+// file's name), as literals so `concat!` can build the loader from them. A test
+// pins the text of the block to the first, and checks the second is its prefix.
+macro_rules! git_native_pin {
+    () => {
+        "a58702afa2665b0779b50e937dd144a63776584a9987a4a9312a4c8930d9e9bf"
+    };
+}
+macro_rules! git_native_pin12 {
+    () => {
+        "a58702afa266"
+    };
+}
+
+/// The SHA-256 of [`GIT_NATIVE_CS`], lowercase hex. A test compares it with the
+/// block, so an edit of the block fails until this changes in the same diff,
+/// after the block has been reviewed again.
+pub const GIT_NATIVE_SHA256: &str = git_native_pin!();
+
+/// Where the staged layout (27-48, the user's choice) puts the block's source
+/// below the deploy account's ledger root (its home): this directory, relative
+/// to the home and `/`-separated. A run uploads [`GIT_NATIVE_CS`] there once
+/// ([`WinScript::git_native_stage`] decides whether it must).
+pub const GIT_NATIVE_STAGED_DIR: &str = "ign-deploy/git-native";
+
+/// The staged file's name: `IgnGitNative-<first 12 digits of the pin>.cs`. A
+/// release whose block has another pin writes another name and never touches
+/// this one.
+pub const GIT_NATIVE_STAGED_FILE: &str = concat!("IgnGitNative-", git_native_pin12!(), ".cs");
+
+// The loader (27-49, the staged layout): the RECORD_REPLACE fail-closed head
+// (FullLanguage first, the bounded-cause helpers character for character), then
+// one guarded `Add-Type` whose source is the staged file, read once as bytes;
+// the SHA-256 of those bytes is compared with the pin written in this text, and
+// the same bytes, decoded, are what is compiled. A changed file only refuses.
+macro_rules! git_native_load {
+    () => {
+        concat!(
+            r#"if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw ('the .git reader needs a FullLanguage PowerShell session, not '+$ExecutionContext.SessionState.LanguageMode)};"#,
+            r#"function IgnLine($t){$s=[regex]::Replace([string]$t,'[\x00-\x1f]+',' ');$s=[regex]::Replace($s,'(?:[A-Za-z]:[\\/]|\\\\)[^''"]*','<path>');$s=[regex]::Replace($s,'[^\x20-\x7e]','?').Trim();if($s.Length -gt 200){$s=$s.Substring(0,200)+'...'};$s};"#,
+            r#"function IgnCause($x){try{while($x.InnerException){$x=$x.InnerException};$m=[string]$x.Message;$k=$x.GetType().FullName+' '+('0x{0:X8}' -f $x.HResult);if($m){$k+=': '+$m};IgnLine $k}catch{'the cause could not be read'}};"#,
+            "if(-not ('IgnGit.N' -as [type])){try{$ib=[IO.File]::ReadAllBytes([IO.Path]::Combine($p.h,'ign-deploy','git-native','IgnGitNative-",
+            git_native_pin12!(),
+            ".cs'));if([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($ib)).Replace('-','').ToLower() -ne '",
+            git_native_pin!(),
+            "'){throw 'the staged source is not the pinned text'};Add-Type -TypeDefinition ([Text.Encoding]::ASCII.GetString($ib))",
+            r#"}catch{throw ('the .git reader cannot declare its native calls: '+(IgnCause $_.Exception))}};"#,
+        )
+    };
+}
+
+/// The loader a Windows git script puts at the start of its body to use
+/// [`GIT_NATIVE_CS`] (the staged layout): the RECORD_REPLACE form. It fails
+/// closed. Unless the session is `FullLanguage` it throws naming the language
+/// mode; the type is compiled only when `IgnGit.N` is not loaded yet; it reads
+/// `<$p.h>\ign-deploy\git-native\IgnGitNative-<pin12>.cs` as bytes, throws
+/// `the staged source is not the pinned text` unless their SHA-256 is
+/// [`GIT_NATIVE_SHA256`] (written in this text), and compiles those same bytes,
+/// so the bytes hashed are the bytes compiled. A failing read, hash or
+/// `Add-Type` throws "the .git reader cannot declare its native calls: " plus
+/// the bounded cause (`IgnLine`, `IgnCause`: one line of printable ASCII, at
+/// most 200 characters, every drive-letter or UNC path replaced by `<path>`),
+/// so no script falls back to a path-based read.
+///
+/// The only parameter it reads is `$p.h`, the native account home, so every
+/// script that carries the loader carries `h`. This is the only text in which
+/// `Add-Type` is allowed in a GIT_* body (`winps_git_params_only`).
+pub const GIT_NATIVE_LOAD: &str = git_native_load!();
 
 // Phase 27 (27-09): the Windows half of the git host channel. Each script is
 // one `const` built from shared pieces so the text a test runs is the text a
@@ -329,14 +468,21 @@ macro_rules! git_ps_yc {
         r##"function Yc($s,$d){& robocopy $s $d /E /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /XJ|Out-Null;if($LASTEXITCODE -ge 8){throw "robocopy failed with exit $LASTEXITCODE"}};"##
     };
 }
+// The held directories of a reader on the reviewed block (27-50). `U` holds one
+// directory with `[IgnGit.N]::OpenDir` (a reparse point refused on the handle
+// itself, no delete sharing) and keeps the handle in `$o`, which the script's
+// `finally` disposes; a refusal names the level (`$r`, relative to the tree the
+// script reads), because the block's own text names no path. Every reader lists
+// a directory only after `U` held it. (Not `H`: that is the alias of
+// `Get-History`, and an alias wins over a function of the same name.)
+macro_rules! git_ps_h {
+    () => {
+        r##"$o=[Collections.ArrayList]@();function U($d,$r){try{[void]$o.Add([IgnGit.N]::OpenDir($d))}catch{throw ($r+': '+$_.Exception.Message)}};"##
+    };
+}
 macro_rules! git_ps_x {
     () => {
         r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};"##
-    };
-}
-macro_rules! git_ps_m {
-    () => {
-        r##"function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function M($d){$d=$p.x+$d;$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=0;$l=@();$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$d,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){$a=[int]$f.Attributes;if(($a -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.File]::Open($f.FullName,'Open','Read','ReadWrite,Delete');$v=X $h.ComputeHash($m);$m.Dispose()};$l+=$r+"`0"+$v}}};[Array]::Sort($l,[StringComparer]::Ordinal);@{ok=1;files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($(if($l.Length){($l-join"`n")+"`n"}else{''}))))}}"##
     };
 }
 macro_rules! git_ps_dr {
@@ -344,61 +490,170 @@ macro_rules! git_ps_dr {
         r##"function Dy($i){foreach($f in $i.GetFileSystemInfos()){$a=[int]$f.Attributes;if($a -band 1024){}elseif($a -band 16){Dy $f}elseif($a -band 1 -and !(Z $f.FullName).LinkType){$f.Attributes=128}}};function Dr($d){$null=K (Z $d);$d=$p.x+$d;Dy ([IO.DirectoryInfo]$d);[IO.Directory]::Delete($d,$true)};"##
     };
 }
-macro_rules! git_ps_l {
+// The `.git` state reader on the reviewed block (27-49). Every script below
+// starts with the loader and then holds each level it reads with
+// `[IgnGit.N]::OpenDir` (a handle without delete sharing, a reparse point
+// refused on the handle itself), so a level swapped for a junction or renamed
+// after the check cannot send a read elsewhere. The staged loader leaves a body
+// about 1,000 characters at the command budget, so the old one-pass script is
+// three scripts, run in order and merged (`merge_git_state`): the fixed files,
+// the markers with the index, and the loose refs.
+//
+// `Q` opens one path below `$p.a` through a block method and answers `$null`
+// when the path is absent (Win32 error 2 or 3 on the open itself); any other
+// failure is rethrown naming the path relative to `.git` (the block's own text
+// holds none). `D` holds a directory in `$o`, which a `finally` disposes. The
+// paths below `.git` use `/` throughout: Win32 takes `/` in a path that is not
+// `\\?\`-prefixed, which `.git` paths here never are.
+macro_rules! git_ps_nq {
     () => {
-        r##"function L($t){$g+$c+($t+$(if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'})).Replace('/',$c)};"##
+        r##"$o=[Collections.ArrayList]@();$g=$p.a;function Q($f,$x){try{[IgnGit.N]::$f($g+'/'+$x)}catch{if($_.Exception.Message -notmatch 'error [23]\)'){throw ($x+': '+$_.Exception.Message)}}};function D($x){$h=Q OpenDir $x;if($h){[void]$o.Add($h)};!!$h};"##
     };
 }
 
-macro_rules! git_ps_w {
-    () => {
-        r##"function G(){$q=$p.d+$c+'projects';$null=K (Z $q);$q+=$c+$p.j;$null=K (Z $q);$q+=$c+'.git';$null=K (Z $q);$q};$g=G;$u=$p.h+$c+'ign-deploy';function Pc($t,$m){$q=G;$x=$t.Split('/');for($k=0;$k -lt $x.Length-1;$k++){$q+=$c+$x[$k];$y=Z $q;if(!$y -and $m){$null=[IO.Directory]::CreateDirectory($q);$y=Z $q};$null=K $y}};"##
-    };
-}
-macro_rules! git_ps_sn {
-    () => {
-        r##"if($p.s -notmatch '^git-stage-[A-Za-z0-9._-]+$'){throw 'refusing the stage name'};"##
-    };
-}
-macro_rules! git_ps_sx {
-    () => {
-        r##"function Sx(){foreach($f in ([IO.DirectoryInfo]$u).GetFileSystemInfos()){if(!([int]$f.Attributes -band 1040)){$f.Delete()}};[IO.Directory]::Delete($u)};"##
-    };
-}
-
-/// The fixed files of a gateway's `.git` in one pass (Phase 27, 27-09), the
-/// Windows half of the POSIX `GIT_STATE_SH`: `HEAD`, `config`, `packed-refs`,
-/// the tail of `logs/HEAD`, whether `index` exists, the markers of
-/// [`GIT_MARKERS`](crate::deploy::git_state::GIT_MARKERS) that are present and
-/// every loose ref below `refs/heads` and `refs/remotes`.
+/// The fixed files of a gateway's `.git` (Phase 27, 27-09; on the block in
+/// 27-49): `HEAD`, `config`, `packed-refs` and the tail of `logs/HEAD`, the
+/// first of the three scripts of the state read (the Windows half of the POSIX
+/// `GIT_STATE_SH`).
 ///
-/// Parameters (`$p`): `a` the native `.git` path, `m` the marker names. Each
-/// file is read with `FileShare.ReadWrite|Delete` (a running gateway is not
-/// blocked) and answered as `{n:size,b:base64}` or `null` when absent; a file
-/// is read up to one byte past its cap, so the caller's cap check names an
-/// oversized one. A reparse point, a directory where a file belongs or a name
-/// with a control character is a terminating error, never an absent file:
-/// presence is decided by `Get-Item -Force`, which throws unless the error is
-/// `ObjectNotFound` (the 25-03 captures). Every directory above a file and
-/// above each loose-ref root (`logs`, `refs`) must be a real directory too,
-/// checked before anything below it is touched (CodeRabbit #56: `Get-Item` on
-/// the final path does not see a junction above it); an absent one is an
-/// absent file. Loose refs stop at 4097 entries.
+/// Parameters (`$p`): `a` the native `.git` path, `h` the native account home
+/// (the loader's). `.git` and `logs` are held (`OpenDir`); each file is opened
+/// with `OpenFile` (a regular file, never a reparse point, shared for read,
+/// write and delete so a running gateway is not blocked) and read through a
+/// `FileStream` over that handle, answered as `{n:size,b:base64}` or `null`
+/// when absent; a file is read up to one byte past its cap, so the caller's
+/// cap check names an oversized one. A reparse point or a directory where a
+/// file belongs is a terminating error naming the path, never an absent file:
+/// absence is only a failed open with Win32 error 2 or 3 (the 25-03 captures).
+/// An absent `logs` makes `logs/HEAD` absent too. An absent file is an explicit
+/// `$null`: a function that outputs nothing is AutomationNull, which Windows
+/// PowerShell 5.1's `ConvertTo-Json` writes as `{}` where PowerShell 7 writes
+/// `null`, and `{}` is refused as a file with no size or bytes.
 pub const GIT_STATE: &str = concat!(
-    git_ps_base!(),
-    r##"$g=$p.a;K (Z $g)|Out-Null;function P($f){$x=$f.Split('/');$h=$g;for($i=0;$i -lt $x.Length-1;$i++){$h+=$c+$x[$i];$j=Z $h;if(!$j){return $false};$null=K $j};$true};function F($f,$k,$t){if(!(P $f)){return $null};$q=$g+$c+$f.Replace('/',$c);$y=Z $q;if(!$y){return $null};if($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw "$f is not a regular file"};$n=$y.Length;$e=[int][Math]::Min([long]$n,[long]$k);$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{if($t -and $n -gt $e){[void]$s.Seek($n-$e,0)};$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};@{n=$n;b=[Convert]::ToBase64String($u,0,$o)}};$k=@();foreach($m in @($p.m)){if(Z ($g+$c+$m.Replace('/',$c))){$k+=$m}};$u=@();$z=0;foreach($d in 'refs/heads','refs/remotes'){$y=$null;if(P $d){$y=Z ($g+$c+$d.Replace('/',$c))};if($y){K $y|Out-Null;$s=New-Object Collections.Stack;$s.Push(@($y,$d));while($s.Count -and $z -le 4097){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'refs holds a link or a name with a control character'};$r=$q[1]+'/'+$f.Name;if($a -band 16){$s.Push(@($f,$r))}else{$z++;if($z -le 4097){$v=F $r 65537 $false;$v.p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r));$u+=,$v}}}}}};E @{ok=1;head=(F 'HEAD' 65537 $false);config=(F 'config' 65537 $false);packed=(F 'packed-refs' 8388609 $false);log=(F 'logs/HEAD' 65536 $true);index=[bool](Z ($g+$c+'index'));markers=$k;refs=$u}"##,
+    git_native_load!(),
+    git_ps_nq!(),
+    r##"function F($x,$k,$t){$h=Q OpenFile $x;if($h){$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;$e=[Math]::Min($n,$k);if($t){[void]$s.Seek($n-$e,0)};@{n=$n;b=[Convert]::ToBase64String([IO.BinaryReader]::new($s).ReadBytes($e))}}finally{$s.Dispose()}}else{$null}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));[void](D logs);E @{ok=1;head=(F HEAD 65537 $false);config=(F config 65537 $false);packed=(F packed-refs 8388609 $false);log=(F logs/HEAD 65536 $true)}}finally{$o|%{$_.Dispose()}}"##,
 );
 
-/// `<data>\git.yaml` read into the answer (CodeRabbit #56): the Windows half of
-/// the POSIX `GIT_YAML_SH`. Parameters: `a` the native data directory, `m` the
-/// byte cap. Answers `k` = `none`, `symlink` (a reparse point, never opened),
-/// `other` (a directory), `big` (with `n`) or `file` with `n` and `b`, the
-/// base64 of at most one byte past the cap, read through a
-/// `FileShare.ReadWrite|Delete` stream. The bytes may hold a credential: they
-/// travel only in the answer, never in a file.
-pub const GIT_YAML: &str = concat!(
+/// The index and the markers of a gateway's `.git`, the second script of the
+/// state read. Parameters: `a` the native `.git`, `h` the native account home,
+/// `m` the marker names (`/`-separated below `.git`). Answers `index` (whether
+/// an entry named `index` exists) and `markers` (the names of `m` that exist, as
+/// an entry of any kind: a file, a directory or a link, none of which is
+/// opened). Presence is `Get-Item -Force`, which throws unless the error is
+/// `ObjectNotFound` (the 25-03 captures). Every directory above a marker is
+/// held first (`objects` and `objects/info` for `objects/info/alternates`), so a
+/// marker below a swapped level is never looked up; an absent level is an
+/// absent marker.
+pub const GIT_STATE_MARKS: &str = concat!(
+    git_native_load!(),
+    git_ps_nq!(),
+    r##"function Z($x){try{Get-Item -LiteralPath ($g+'/'+$x) -Force}catch{if($_.CategoryInfo.Category -ne 'ObjectNotFound'){throw}}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));$k=@();foreach($m in @($p.m)){$q='';$y=$true;$a=$m.Split('/');for($i=0;$i -lt $a.Length-1;$i++){$q+=$a[$i];if(!(D $q)){$y=$false;break};$q+='/'};if($y -and (Z $m)){$k+=$m}};E @{ok=1;index=[bool](Z index);markers=$k}}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// Every loose ref below `refs/heads` and `refs/remotes`, the third script of
+/// the state read. Parameters: `a` the native `.git`, `h` the native account
+/// home. `refs` is held, then each root, then each directory below it before its
+/// entries are listed (`EnumerateFileSystemInfos` runs only on a held
+/// directory), and every listed entry is opened through the block before it is
+/// used (a directory with `OpenDir`, a file with `OpenFile`): a reparse point
+/// anywhere is a terminating error naming the path, as is a name with a control
+/// character. An absent root lists nothing. Answers `refs`, one `{p,n,b}` per
+/// file: `p` the base64 of the UTF-8 path below `.git`, `n` the size and `b` the
+/// base64 of at most 65,537 bytes. The walk stops at 4097 files.
+pub const GIT_STATE_REFS: &str = concat!(
+    git_native_load!(),
+    git_ps_nq!(),
+    r##"$u=[Collections.ArrayList]@();function F($x){$h=Q OpenFile $x;$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;@{p=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($x));n=$n;b=[Convert]::ToBase64String([IO.BinaryReader]::new($s).ReadBytes([Math]::Min($n,65537)))}}finally{$s.Dispose()}};function W($r){foreach($f in ([IO.DirectoryInfo]($g+'/'+$r)).EnumerateFileSystemInfos()){if($u.Count -ge 4097){return};if($f.Name -match '[\x00-\x1f]'){throw 'a ref name holds a control character'};$n=$r+'/'+$f.Name;if($f.Attributes -band 16){if(D $n){W $n}}else{[void]$u.Add((F $n))}}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));if(D refs){foreach($y in 'refs/heads','refs/remotes'){if(D $y){W $y}}};E @{ok=1;refs=$u}}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// Put the staged files in place (Phase 27, 27-49, the staged layout; 27-50: a
+/// list): `ign-deploy\git-native` below the deploy account's home, and whether
+/// every named file is already there with its pinned hash. Parameters: `h` the
+/// native account home, `n` a file name or a list of them (`IgnGitNative-<pin12>.cs`
+/// or `IgnGitScript-<name>-<pin12>.ps1`), `s` the pin or the list of pins in the
+/// same order. `ign-deploy` and `git-native` are made when absent and refused
+/// when they are links; a file that is not a regular file is refused, and so is a
+/// name of another shape (before anything is made). Answers `present` 1 only
+/// when every file is there, no larger than 64 KiB and hashes to its pin;
+/// otherwise 0, and the transport uploads the pinned texts over sftp. The script
+/// compiles nothing and trusts nothing it reads: the loader and the stub hash a
+/// file again on every use, so a file changed after this check, or not changed by
+/// the upload, only refuses.
+pub const GIT_NATIVE_STAGE: &str = concat!(
     git_ps_base!(),
-    r##"$null=K (Z $p.a);$q=$p.a+$c+'git.yaml';$y=Z $q;if(!$y){E @{ok=1;k='none'}}elseif(([int]$y.Attributes -band 1024) -ne 0){E @{ok=1;k='symlink'}}elseif($y.PSIsContainer){E @{ok=1;k='other'}}elseif($y.Length -gt $p.m){E @{ok=1;k='big';n=$y.Length}}else{$n=$y.Length;$e=[int]$p.m+1;$u=New-Object byte[] $e;$s=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{$o=0;while($o -lt $e){$w=$s.Read($u,$o,$e-$o);if($w -le 0){break};$o+=$w}}finally{$s.Dispose()};E @{ok=1;k='file';n=$n;b=[Convert]::ToBase64String($u,0,$o)}}"##,
+    git_ps_x!(),
+    r##"$a=@($p.n);$b=@($p.s);foreach($n in $a){if($n -notmatch '^(IgnGitNative-[0-9a-f]{12}\.cs|IgnGitScript-[a-z]+-[0-9a-f]{12}\.ps1)$'){throw 'refusing the staged name'}};$u=$p.h+$c+'ign-deploy';$d=$u+$c+'git-native';foreach($q in $u,$d){$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$k=1;for($i=0;$i -lt $a.Count;$i++){$f=$d+$c+$a[$i];$y=Z $f;$m=0;if($y){if($y.PSIsContainer -or ([int]$y.Attributes -band 1024)){throw 'the staged source is not a regular file'};if($y.Length -le 65536){$s=[IO.File]::Open($f,'Open','Read','ReadWrite,Delete');try{$m=[int]((X ([Security.Cryptography.SHA256]::Create().ComputeHash($s))) -eq $b[$i])}finally{$s.Dispose()}}};if(!$m){$k=0}};E @{ok=1;present=$k}"##,
+);
+
+/// The `.git` probe of `deploy projects` (Phase 25, 25-08, K9; on the reviewed
+/// block since 27-50): what is at `$p.c` (`<data>\projects\<name>\.git`),
+/// asked only when `$p.a` (`<data>\projects`) and `$p.b` (the project
+/// directory) are real directories. `$p.h` is the native account home (the
+/// loader's).
+///
+/// `projects` and the project directory are each held with
+/// `[IgnGit.N]::OpenDir` (a handle without delete sharing that refuses a reparse
+/// point on the handle itself), and the entry is classified from the listing of
+/// the held project directory (its names compared exactly, not as a search
+/// pattern), which reports an entry's own attributes and never follows it. The 25-03 captures (`## C-H before grant`, `## Host grant and
+/// prod git.yaml (25-03)`) still decide what is "absent": only a failed open
+/// with Win32 error 2 or 3 is `none`; every other failure, an access denied
+/// included, is rethrown, which under the prelude's `Stop` is a non-zero exit and
+/// so `transport_failed`, never "absent". A listing sees a Hidden entry, which
+/// the .NET `Exists` methods and `Test-Path` do not (the C-H finding). A reparse
+/// point (junction or symlink) is reported with `r=1` and never opened or
+/// followed; a Hidden `.git` is reported with `h=1` and counts like any other.
+///
+/// Result: `projects` and `project` are `none | dir | file | symlink | skip`,
+/// `kind` is `none | dir | file | skip` for the `.git` entry, `hidden` and
+/// `reparse` are 0 or 1 for it.
+pub const GIT_ENTRY: &str = concat!(
+    git_native_load!(),
+    r##"$o=[Collections.ArrayList]@();function T($x,$n){try{[void]$o.Add([IgnGit.N]::OpenDir($x));'dir'}catch{$w=$_.Exception.Message;if($w -match 'error [23]\)'){'none'}elseif($w -match 'reparse point'){'symlink'}elseif($w -match 'not a directory'){'file'}else{throw ($n+': '+$w)}}};try{$a=T $p.a 'projects';$b='skip';$k='skip';$h=0;$r=0;if($a -eq 'dir'){$b=T $p.b 'project';if($b -eq 'dir'){$k='none';$n=[IO.Path]::GetFileName($p.c);foreach($f in ([IO.DirectoryInfo]$p.b).GetFileSystemInfos()){if($f.Name -eq $n){$t=[int]$f.Attributes;$k=$(if($t -band 16){'dir'}else{'file'});$h=[int](($t -band 2) -ne 0);$r=[int](($t -band 1024) -ne 0)}}}};E @{ok=1;projects=$a;project=$b;kind=$k;hidden=$h;reparse=$r}}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// `<data>\git.yaml` read into the answer (CodeRabbit #56; on the reviewed block
+/// since 27-50): the Windows half of the POSIX `GIT_YAML_SH`. Parameters: `a`
+/// the native data directory, `m` the byte cap, `h` the native account home (the
+/// loader's). The data directory is held (`OpenDir`) and `git.yaml` is opened
+/// through `OpenFile` and read from that handle, so a link swapped in after a
+/// check is never followed. Answers `k` = `none` (Win32 error 2 or 3 on the
+/// open), `symlink` (a reparse point, refused on the handle, never read),
+/// `other` (not a regular file), `big` (with `n`) or `file` with `n` and `b`, the
+/// base64 of at most one byte past the cap. Any other failure is a terminating
+/// error. The bytes may hold a credential: they travel only in the answer,
+/// never in a file.
+pub const GIT_YAML: &str = concat!(
+    git_native_load!(),
+    git_ps_h!(),
+    r##"try{U $p.a 'data';$r=$null;try{$h=[IgnGit.N]::OpenFile($p.a+[IO.Path]::DirectorySeparatorChar+'git.yaml')}catch{$w=$_.Exception.Message;$k=$(if($w -match 'error [23]\)'){'none'}elseif($w -match 'reparse point'){'symlink'}elseif($w -match 'not a regular file'){'other'}else{throw ('git.yaml: '+$w)});$r=@{ok=1;k=$k}};if(!$r){$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;if($n -gt $p.m){$r=@{ok=1;k='big';n=$n}}else{$e=[int]$p.m+1;$u=New-Object byte[] $e;$t=0;while($t -lt $e){$w=$s.Read($u,$t,$e-$t);if($w -le 0){break};$t+=$w};$r=@{ok=1;k='file';n=$n;b=[Convert]::ToBase64String($u,0,$t)}}}finally{$s.Dispose()}};E $r}finally{$o|%{$_.Dispose()}}"##,
+);
+
+/// The post-import disk of a project (Phase 27, 27-41, D-25; on the reviewed block
+/// since 27-50): the Windows half of the POSIX `PROJECT_DIGESTS_SH`. Size and
+/// SHA-256 of every regular file below `projects\<project>` except the `.git`
+/// child of the project directory, in one walk.
+///
+/// Parameters: `x` the long path prefix, `d` the native data directory, `j` the
+/// project, `m` the most files it may list, `h` the native account home (the
+/// loader's). The project directory and every directory below it are held
+/// (`OpenDir`) before they are listed, and each file is hashed from a handle
+/// opened through `OpenFile`, so a junction or link swapped in after a check is
+/// refused on the handle used; a project that is itself a link, or missing, is
+/// refused naming `project`. The walk is the one of [`GIT_MANIFEST`]: a reparse
+/// point or a name with a control character anywhere below the project is a
+/// terminating error and nothing is followed; the `.git` entry of the project
+/// directory is neither listed, held nor inspected. A walk past `m` files is a
+/// terminating error, never a cut-off listing. Answers
+/// `{ok:1,n:<files>,t:<lines joined by LF>}`, each line
+/// `<rel> TAB <size> TAB <sha256>` with `/` separators; the order is the
+/// directory's, and the caller reads the lines into a map.
+pub const PROJECT_DIGESTS: &str = concat!(
+    git_native_load!(),
+    git_ps_h!(),
+    git_ps_x!(),
+    r##"try{$a=[IO.Path]::Combine($p.x+$p.d,'projects',$p.j);U $a 'project';$h=[Security.Cryptography.SHA256]::Create();$n=0;$l=[Collections.ArrayList]::new();$s=[Collections.Stack]::new();$s.Push(@([IO.DirectoryInfo]$a,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){if(!$q[1] -and $f.Name -eq '.git'){continue};$t=[int]$f.Attributes;if(($t -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'a link or a name with a control character'};$r=$q[1]+$f.Name;if($t -band 16){U $f.FullName $r;$s.Push(@($f,($r+'/')))}else{$n++;if($n -gt $p.m){throw 'the project holds more files than a read may list'};$m=[IO.FileStream]::new([IgnGit.N]::OpenFile($f.FullName),'Read');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()};[void]$l.Add($r+"`t"+$f.Length+"`t"+$v)}}};E @{ok=1;n=$n;t=($l -join "`n")}}finally{$o|%{$_.Dispose()}}"##,
 );
 
 /// Save a project's `.git` below the account home with ONE host-local copy
@@ -409,16 +664,21 @@ pub const GIT_YAML: &str = concat!(
 /// Parameters: `x` the long path prefix, `d` the native data directory, `j` the
 /// project, `h` the account home, `g` the gateway, `i` the run id; the paths
 /// are built in the script from those components so a long project name costs
-/// the command budget once. The script takes the manifest of the source first
-/// (it refuses a link or a name with a control character anywhere in the
-/// tree), walks `ign-deploy\<g>\projects\<j>\git-save\<i>` below the home
-/// (a reparse point on the way is refused, missing levels are created), makes
-/// `repo` with `New-Item`, which fails when anything is there (a save is never
-/// overwritten and a planted link is never written through), copies, carries
-/// the source's Hidden attribute to `repo` (robocopy copies the contents of a
-/// directory, not the directory's own attributes) and compares the manifest of
-/// the copy with the source's. A failure removes the partial `repo`
-/// (`Dr`, below). The answer is the copy's manifest.
+/// the command budget once. The script walks `ign-deploy\<g>\projects\<j>\git-save\<i>`
+/// below the home (a reparse point on the way is refused, missing levels are
+/// created), makes `repo` with `New-Item`, which fails when anything is there (a
+/// save is never overwritten and a planted link is never written through),
+/// copies, and carries the source's Hidden attribute to `repo` (robocopy copies
+/// the contents of a directory, not the directory's own attributes). A failure
+/// removes the partial `repo` (`Dr`, below). The answer is `{ok:1}`.
+///
+/// 27-50: the two manifests of the old script (the source before the copy, the
+/// copy after it) read through the reviewed block, which this script cannot also
+/// carry within the command budget, so the transport runs [`GIT_MANIFEST`] on
+/// the source before this script and on the copy after it, compares the two,
+/// and removes the copy ([`GIT_SAVE_RM`]) when they differ. The source manifest
+/// is still taken first, so a link or a name with a control character anywhere
+/// in the tree is refused before one byte is copied.
 ///
 /// WR-B5 (27-33, confirmed on the Windows test VM under 5.1): robocopy
 /// `/COPY:DAT` keeps the ReadOnly attribute of git's pack and object files, and
@@ -433,61 +693,72 @@ pub const GIT_YAML: &str = concat!(
 pub const GIT_SAVE: &str = concat!(
     git_ps_base!(),
     git_ps_yc!(),
-    git_ps_m!(),
     git_ps_dr!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$m=M $a;$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$r=$q+$c+'repo';$null=ni -Type Directory $r;try{Yc $a $r;if([int]$i.Attributes -band 2){($h=Z $r).Attributes=$h.Attributes -bor 2};$n=M $r;if($n.digest -ne $m.digest){throw 'the saved copy does not match the .git it was taken from'}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};E $n"##,
+    r##"$a=$p.d+$c+'projects'+$c+$p.j+$c+'.git';$i=K (Z $a);$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i){$q+=$c+$e;$y=Z $q;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($q)}};$r=$q+$c+'repo';$null=ni -Type Directory $r;try{Yc $a $r;if([int]$i.Attributes -band 2){($h=Z $r).Attributes=$h.Attributes -bor 2}}catch{$e=$_;try{Dr $r}catch{$e=$e.Exception.Message+' (the partial copy at '+$r+' could not be removed)'};throw $e};E @{ok=1}"##,
 );
 
-/// Restore the save of a run as the project's `.git` (Phase 27, D-06):
-/// the staged copy, the manifest compare and one rename.
+/// Stage the save of a run beside a project's `.git` (Phase 27, D-06): the
+/// first half of a restore, the copy.
 ///
 /// Parameters as [`GIT_SAVE`] (`d` is the data directory, `j` the project). It
 /// refuses when `.git` exists (it is never replaced), checks the project
-/// directory and every level of the save path are real directories, takes the
-/// manifest of the save, creates the stage `<project>\.ign-restore-<run>` with
-/// `New-Item` (which fails when anything is there), copies the save into it
-/// with robocopy, re-applies the Hidden attribute the save recorded (G8: the
-/// module's `.git` is Hidden; the stage is a new directory and robocopy would
-/// otherwise leave it visible), proves the stage equals the save and renames it
-/// to `.git` with `Directory.Move`, which fails when the target exists. The
+/// directory and every level of the save path are real directories, creates the
+/// stage `<project>\.ign-restore-<run>` with `New-Item` (which fails when
+/// anything is there), copies the save into it with robocopy and re-applies the
+/// Hidden attribute the save recorded (G8: the module's `.git` is Hidden; the
+/// stage is a new directory and robocopy would otherwise leave it visible). The
 /// stage inherits the project directory's ACL, so the LocalSystem gateway
-/// account holds the FullControl G1 found. The answer is the manifest of the
-/// restored `.git`; a failure removes the stage.
+/// account holds the FullControl G1 found. A failure removes the stage. The
+/// answer is `{ok:1}`.
+///
+/// 27-50: the manifest compare of the old one-script restore (the stage against
+/// the save, before the rename) read through the reviewed block, which this
+/// script cannot also carry within the command budget. The transport runs
+/// [`GIT_MANIFEST`] on the save and on the stage after this script, and
+/// [`GIT_RESTORE_MOVE`] (the rename, or with `k` the removal of the stage) only
+/// when they are equal.
 pub const GIT_RESTORE: &str = concat!(
     git_ps_base!(),
     git_ps_yc!(),
-    git_ps_m!(),
     git_ps_dr!(),
-    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw '.git exists; never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$m=M $q;$t=$a+$c+'.ign-restore-'+$p.i;$null=ni -Type Directory $t;try{Yc $q $t;if([int]$i.Attributes -band 2){($h=Z $t).Attributes=$h.Attributes -bor 2};$n=M $t;if($n.digest -ne $m.digest){throw 'the copy differs'};[IO.Directory]::Move($t,$g)}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};E (M $g)"##,
+    r##"$a=$p.d+$c+'projects'+$c+$p.j;$null=K (Z $a);$g=$a+$c+'.git';if(Z $g){throw '.git exists; never replaced'};$q=$p.h;foreach($e in 'ign-deploy',$p.g,'projects',$p.j,'git-save',$p.i,'repo'){$q+=$c+$e;$i=K (Z $q)};$t=$a+$c+'.ign-restore-'+$p.i;$null=ni -Type Directory $t;try{Yc $q $t;if([int]$i.Attributes -band 2){($h=Z $t).Attributes=$h.Attributes -bor 2}}catch{$e=$_;try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'};throw $e};E @{ok=1}"##,
 );
 
-/// The manifest of a tree: file count, total bytes and one digest (Phase 27).
+/// The manifest of a tree: file count, total bytes and one digest (Phase 27; on
+/// the reviewed block since 27-50).
 ///
 /// Parameters: `x` the long path prefix, `a` the native directory (a project's
-/// `.git` or a save's `repo`). The digest is the SHA-256 over the lines `path
-/// NUL size LF` for every file below `objects/` and `path NUL sha256 LF` for
-/// every other file, sorted by the ordinal order of the whole path (the order
-/// `LC_ALL=C sort` and the local walk give for the ASCII names a `.git` holds),
-/// with `/` separators, so the three host families compute one value. The
-/// relative path is built from entry names during the walk (as in
-/// [`ENUMERATE`]); a reparse point or a name with a control character
-/// anywhere in the tree is a terminating error and nothing is followed; the
-/// root itself must be a real directory, so a junction at `a` is refused
-/// rather than walked as its target. Files are hashed through a
-/// `FileShare.ReadWrite|Delete` stream.
+/// `.git` or a save's `repo`), `h` the native account home (the loader's). The
+/// digest is the SHA-256 over the lines `path NUL size LF` for every file below
+/// `objects/` and `path NUL sha256 LF` for every other file, sorted by the
+/// ordinal order of the whole path (the order `LC_ALL=C sort` and the local walk
+/// give for the ASCII names a `.git` holds), with `/` separators, so the three
+/// host families compute one value. The root and every directory below it are
+/// held (`OpenDir`) before they are listed, and each file below the first level
+/// that is hashed is opened through `OpenFile` and read from that handle, so a
+/// junction or link swapped in after a check is refused on the handle used,
+/// naming the level. The relative path is built from entry names during the walk
+/// (as in [`ENUMERATE`]); a reparse point or a name with a control character
+/// anywhere in the tree is a terminating error and nothing is followed; a root
+/// that is a junction is refused rather than walked as its target. A file below
+/// `objects/` is sized from the listing of its held directory and is not opened.
 pub const GIT_MANIFEST: &str = concat!(
-    git_ps_base!(),
-    git_ps_m!(),
-    r##"$null=K (Z $p.a);E (M $p.a)"##,
+    git_native_load!(),
+    git_ps_h!(),
+    git_ps_x!(),
+    r##"try{$d=$p.x+$p.a;U $d '.';$h=[Security.Cryptography.SHA256]::Create();$n=0;$b=0;$l=@();$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$d,''));while($s.Count){$q=$s.Pop();foreach($f in $q[0].GetFileSystemInfos()){$a=[int]$f.Attributes;if(($a -band 1024) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){U $f.FullName $r;$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length;if($r.StartsWith('objects/')){$v=$f.Length}else{$m=[IO.FileStream]::new([IgnGit.N]::OpenFile($f.FullName),'Read');try{$v=X $h.ComputeHash($m)}finally{$m.Dispose()}};$l+=$r+"`0"+$v+"`n"}}};[Array]::Sort($l,[StringComparer]::Ordinal);E @{ok=1;files=$n;bytes=$b;digest=(X $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($l-join'')))}}finally{$o|%{$_.Dispose()}}"##,
 );
 
-/// How big a `.git` is, from one enumeration (Phase 27, checker W-5):
-/// file count and the sum of the file lengths. Parameters: `x`, `a` as
-/// [`GIT_MANIFEST`]. The directory listing carries each length, so no file is
-/// opened; a reparse point or a name with a control character is refused.
+/// How big a `.git` is, from one enumeration (Phase 27, checker W-5; on the
+/// reviewed block since 27-50): file count and the sum of the file lengths.
+/// Parameters: `x`, `a` as [`GIT_MANIFEST`], `h` the native account home. Every
+/// directory is held (`OpenDir`) before it is listed and the directory listing
+/// carries each length, so no file is opened; a reparse point or a name with a
+/// control character is refused, a linked level naming itself.
 pub const GIT_SIZE: &str = concat!(
-    git_ps_base!(),
-    r##"K (Z $p.a)|Out-Null;$s=New-Object Collections.Stack;$s.Push([IO.DirectoryInfo]($p.x+$p.a));$n=0;$b=[long]0;while($s.Count){foreach($f in $s.Pop().EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};if($a -band 16){$s.Push($f)}else{$n++;$b+=$f.Length}}};E @{ok=1;files=$n;bytes=$b}"##,
+    git_native_load!(),
+    git_ps_h!(),
+    r##"try{$d=$p.x+$p.a;U $d '.';$s=New-Object Collections.Stack;$s.Push(@([IO.DirectoryInfo]$d,''));$n=0;$b=[long]0;while($s.Count){$q=$s.Pop();foreach($f in $q[0].EnumerateFileSystemInfos()){$a=[int]$f.Attributes;if((($a -band 1024) -ne 0) -or $f.Name -match '[\x00-\x1f]'){throw 'the tree holds a link or a name with a control character'};$r=$q[1]+$f.Name;if($a -band 16){U $f.FullName $r;$s.Push(@($f,($r+'/')))}else{$n++;$b+=$f.Length}}};E @{ok=1;files=$n;bytes=$b}}finally{$o|%{$_.Dispose()}}"##,
 );
 
 /// The object files of a gateway's `.git` in one enumeration (Phase 27, 27-11,
@@ -512,14 +783,18 @@ pub const GIT_OBJECTS: &str = concat!(
 );
 
 /// The SHA-256 of one file below a `.git` (Phase 27, the read-back of an
-/// advance's writes). Parameters: `a` the native `.git`, `f` the `/`-separated
-/// path below it. Every directory on the way must be a real directory; a
-/// missing level or file answers `digest:null`; a link or a directory in the
-/// file's place is refused.
+/// advance's writes; on the reviewed block since 27-50). Parameters: `a` the
+/// native `.git`, `f` the `/`-separated path below it, `h` the native account
+/// home (the loader's). `.git` and every directory on the way are held
+/// (`OpenDir`), and the file is opened through `OpenFile` and hashed from that
+/// handle. A missing level or file (Win32 error 2 or 3 on the open) answers
+/// `digest:null`; a link or a directory in a level's or the file's place is a
+/// terminating error naming it.
 pub const GIT_DIGEST: &str = concat!(
-    git_ps_base!(),
+    git_native_load!(),
+    git_ps_nq!(),
     git_ps_x!(),
-    r##"K (Z $p.a)|Out-Null;$q=$p.a;$o=0;$u=$p.f.Split('/');for($k=0;$k -lt $u.Length;$k++){$q+=$c+$u[$k];$y=Z $q;if(!$y){$o=1;break};if($k -lt $u.Length-1){K $y|Out-Null}elseif($y.PSIsContainer -or (([int]$y.Attributes -band 1024) -ne 0)){throw 'the file is not a regular file'}};if($o){E @{ok=1;digest=$null}}else{$m=[IO.File]::Open($q,'Open','Read','ReadWrite,Delete');try{$d=X ([Security.Cryptography.SHA256]::Create().ComputeHash($m))}finally{$m.Dispose()};E @{ok=1;digest=$d}}"##,
+    r##"try{[void]$o.Add([IgnGit.N]::OpenDir($g));$u=$p.f.Split('/');$q='';$z=1;for($k=0;$k -lt $u.Length-1;$k++){$q+=$u[$k];if(!(D $q)){$z=0;break};$q+='/'};$d=$null;if($z){$h=Q OpenFile $p.f;if($h){$s=[IO.FileStream]::new($h,'Read');try{$d=X ([Security.Cryptography.SHA256]::Create().ComputeHash($s))}finally{$s.Dispose()}}};E @{ok=1;digest=$d}}finally{$o|%{$_.Dispose()}}"##,
 );
 
 /// The private stage of a `.git` write (Phase 27, 27-33, WR-B3): `ign-deploy\<stage>`
@@ -533,69 +808,295 @@ pub const GIT_STAGE: &str = concat!(
     r##"if($p.s -notmatch '^git-stage-[A-Za-z0-9._-]+$'){throw 'refusing the stage name'};$u=$p.h+$c+'ign-deploy';$y=Z $u;if($y){$null=K $y}else{$null=[IO.Directory]::CreateDirectory($u)};$null=ni -Type Directory ($u+$c+$p.s);E @{ok=1}"##,
 );
 
+// ---- staged scripts (27-50, user decision of 2026-11-19: option A) ----
+//
+// A script that needs the reviewed block (the loader, 1188 characters, costs 3168
+// encoded characters) does not fit `COMMAND_BUDGET` with its own text. The
+// Windows git scripts that cannot fit are staged as files, `.ps1`, below
+// `<home>\ign-deploy\git-native\` beside the block's source, and the command is
+// a short stub (`git_stub!`) that reads the file as bytes, compares the SHA-256
+// of those bytes with the pin written in the stub's own text, and runs exactly
+// those bytes. The staged text is ASCII, one line, pinned by a constant that a
+// test compares (as for the block), and begins with the block's loader, so the
+// Add-Type rule admits it as it does any body. The stub takes the account home
+// from `$p.h` (as the loader does) and no other path; everything it refuses
+// says one fixed sentence with no path.
+macro_rules! git_stub {
+    ($name:literal, $pin12:expr, $pin:expr) => {
+        concat!(
+            r#"if($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage'){throw 'the staged git script needs a FullLanguage PowerShell session'};"#,
+            "try{$ib=[IO.File]::ReadAllBytes([IO.Path]::Combine($p.h,'ign-deploy','git-native','IgnGitScript-",
+            $name,
+            "-",
+            $pin12,
+            ".ps1'));if([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($ib)).Replace('-','').ToLower() -ne '",
+            $pin,
+            "'){throw 'x'};$sb=[ScriptBlock]::Create([Text.Encoding]::ASCII.GetString($ib))}",
+            "catch{throw 'the staged git script is missing or is not the pinned text'};& $sb"
+        )
+    };
+}
+
+// The helpers of the staged write scripts. `Hd` holds one directory with the
+// block (`$m`: 0 it must exist, 1 make it under its held parent, 2 absent is
+// `$false`), keeps the handle in `$o`, and names the level in a refusal (the
+// block's own text holds no path). `Lv` holds every level from `projects` down
+// to the parent of the file `$t` below `.git` and answers the parent's path.
+// `Op` opens a file through the block and answers its handle, or `$null` when it
+// is absent; a link or a directory in its place is refused. `Hh` hashes a handle.
+// `Sx` removes the stage (its `ids` too) after every held handle is released.
+macro_rules! git_ps_wh {
+    () => {
+        r##"if($p.s -notmatch '^git-stage-[A-Za-z0-9._-]+$'){throw 'refusing the stage name'};$o=[Collections.ArrayList]@();function J($a,$b){[IO.Path]::Combine($a,$b)};function X($b){[BitConverter]::ToString($b).Replace('-','').ToLower()};function Hd($q,$r,$m){try{[void]$o.Add([IgnGit.N]::OpenDir($q));$true}catch{$w=$_.Exception.Message;if($w -match 'error [23]\)'){if($m -eq 1){[void][IO.Directory]::CreateDirectory($q);Hd $q $r 0}elseif($m -eq 2){$false}else{throw ($r+': '+$w)}}else{throw ($r+': '+$w)}}};function Lv($t,$m){$q=$p.d;$r='';$z=$(if($m -eq 1){0}else{$m});foreach($e in 'projects',$p.j,'.git'){$q=J $q $e;$r+=$e;if(!(Hd $q $r $z)){return $false};$r+='/'};$x=$t.Split('/');for($k=0;$k -lt $x.Length-1;$k++){$q=J $q $x[$k];$r+=$x[$k];if(!(Hd $q $r $m)){return $false};$r+='/'};$q};function Op($q,$t){try{[IgnGit.N]::OpenFile($q)}catch{$w=$_.Exception.Message;if($w -match 'error [23]\)'){}elseif($w -match 'reparse point|not a regular file'){throw ($t+' is not a regular file; it is left alone')}else{throw ($t+': '+$w)}}};function Hh($h){$s=[IO.FileStream]::new($h,'Read');try{X ([Security.Cryptography.SHA256]::Create().ComputeHash($s))}finally{$s.Dispose()}};function Sx(){$o|%{$_.Dispose()};$o.Clear();$i=[IO.DirectoryInfo](J $u 'ids');if($i.Exists -and !([int]$i.Attributes -band 1024)){foreach($f in $i.GetFileSystemInfos()){if(!([int]$f.Attributes -band 1040)){$f.Delete()}};$i.Delete()};foreach($f in ([IO.DirectoryInfo]$u).GetFileSystemInfos()){if(!([int]$f.Attributes -band 1040)){$f.Delete()}};[IO.Directory]::Delete($u)};"##
+    };
+}
+
+macro_rules! git_lock_pin {
+    () => {
+        "387c5dd908c06465a6108a4c1a038c9342ed1a700c6d773269ae880a4b0f7a23"
+    };
+}
+macro_rules! git_lock_pin12 {
+    () => {
+        "387c5dd908c0"
+    };
+}
+macro_rules! git_unlock_pin {
+    () => {
+        "f6026ab8cfc2e0875d64e2373aa58fabf45f7bc59e332df968f278260d09efaa"
+    };
+}
+macro_rules! git_unlock_pin12 {
+    () => {
+        "f6026ab8cfc2"
+    };
+}
+macro_rules! git_replace_pin {
+    () => {
+        "82e1de5e54412c717bd09c4d0c3a48a4a06838b54b0b9d9ffaec8ffe76b4446b"
+    };
+}
+macro_rules! git_replace_pin12 {
+    () => {
+        "82e1de5e5441"
+    };
+}
+macro_rules! git_restore_pin {
+    () => {
+        "2d8bc1ffe6fbb6041c4c93c64b23d0c244345e4acbba00ba9567e3098ef1f21c"
+    };
+}
+macro_rules! git_restore_pin12 {
+    () => {
+        "2d8bc1ffe6fb"
+    };
+}
+macro_rules! git_bundle_pin {
+    () => {
+        "3d801c3f6069fb1236eb8aa3b932b5e2a7c37124a2f0efaa13b9adf44005609f"
+    };
+}
+macro_rules! git_bundle_pin12 {
+    () => {
+        "3d801c3f6069"
+    };
+}
+
+/// The staged text of the lock script (see [`GIT_LOCK`]).
+pub const GIT_LOCK_STAGED: &str = concat!(
+    git_native_load!(),
+    git_ps_wh!(),
+    r##"try{$a=J $p.h 'ign-deploy';$null=Hd $a 'ign-deploy' 0;$u=J $a $p.s;$null=Hd $u 'stage' 0;$ids=J $u 'ids';[void][IO.Directory]::CreateDirectory($ids);$made=@();$s=$null;$n=$null;$lh=$null;try{$i=[int]$p.o;foreach($e in @($p.w)){$f=$e.Split(':');$t=$f[0];$z=[long]$f[1];$d=Lv $t 1;$x=$t.Split('/');$b=$x[$x.Length-1];$h=Op (J $d $b) $t;if($h){$h.Dispose()};$lock=J $d ($b+$(if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'}));$sf=Op (J $u ([string]$i)) ('the staged bytes of '+$t);if(!$sf){throw ('the staged bytes of '+$t+' are not a file of the size sent')};$n=[IO.FileStream]::new($sf,'Read');if($n.Length -ne $z){throw ('the staged bytes of '+$t+' are not a file of the size sent')};try{$lh=[IgnGit.N]::CreateNew($lock)}catch{$w=$_.Exception.Message;if($w -match 'error (80|183)\)'){throw ($lock+' already exists')};throw ($lock+': '+$w)};$id=[IgnGit.N]::FileId($lh);[IO.File]::WriteAllText((J $ids ([string]$i)),$id);$made+=,@($lock,$id,$i);$s=[IO.FileStream]::new($lh,'Write');$lh=$null;$n.CopyTo($s);$s.Dispose();$s=$null;$n.Dispose();$n=$null;$i++};E @{ok=1}}catch{$e=$_;if($s){$s.Dispose()};if($lh){$lh.Dispose()};if($n){$n.Dispose()};foreach($m in $made){try{$dh=[IgnGit.N]::OpenForDelete($m[0]);try{if([IgnGit.N]::FileId($dh) -eq $m[1]){[IgnGit.N]::DeleteOnClose($dh)}}finally{$dh.Dispose()}}catch{};[IO.File]::Delete((J $ids ([string]$m[2])))};throw $e}}finally{$o|%{$_.Dispose()}}"##,
+);
+
 /// Create each lock of a `.git` write exclusively and fill it from the stage
-/// (Phase 27, 27-33, WR-B3), the Windows half of the POSIX `GIT_WRITE_SH`.
+/// (Phase 27, 27-33, WR-B3; on the reviewed block since 27-51), the Windows half
+/// of the POSIX `GIT_WRITE_SH`. The command is the stub of the staged script
+/// [`GIT_LOCK_STAGED`].
 ///
 /// Parameters: `d` the native data directory, `j` the project, `h` the account
-/// home, `s` the stage name, `o` the plan index of the first entry, `w` entries
-/// `<path>:<size>` (the paths below `.git`; the lock of a path below
-/// `objects/pack/` is `<path>.ign-tmp`, any other `<path>.lock`). The bytes of
-/// plan index `o + n` are in `<home>\ign-deploy\<stage>\<o + n>`.
+/// home (the stub's and the loader's), `s` the stage name, `o` the plan index of
+/// the first entry, `w` entries `<path>:<size>` (the paths below `.git`; the
+/// lock of a path below `objects/pack/` is `<path>.ign-tmp`, any other
+/// `<path>.lock`). The bytes of plan index `o + n` are in
+/// `<home>\ign-deploy\<stage>\<o + n>`.
 ///
-/// Nothing is written through a path the gateway account can change. The walk
-/// from `projects` down to the lock's directory checks every level (`K`: a real
-/// directory, not a reparse point); a missing level is made one directory at a
-/// time and checked. The target must be absent or a regular file, and the lock
-/// must be absent (`Get-Item -Force` also sees a dangling link). The stage file
-/// must be a regular file of the size that was sent. The lock is opened with
-/// `FileMode.CreateNew` and `FileShare.None`, so nobody can delete, rename or
-/// replace it while it is open; before one byte is written the whole walk is
-/// checked again and the lock must be a regular, empty file (a link swapped in
-/// between would have sent the create elsewhere, and nothing was written). Only
-/// then is the stage file copied into the open lock. On any failure the locks
-/// this call made are removed and the error is rethrown.
-pub const GIT_LOCK: &str = concat!(
-    git_ps_base!(),
-    git_ps_l!(),
-    git_ps_w!(),
-    r##"$null=K (Z $u);$u+=$c+$p.s;$null=K (Z $u);$made=@();$s=$null;$n=$null;try{$i=[int]$p.o;foreach($e in @($p.w)){$k=$e.LastIndexOf(':');$t=$e.Substring(0,$k);$z=[long]$e.Substring($k+1);Pc $t 1;$y=Z ($g+$c+$t.Replace('/',$c));if($y -and ($y.PSIsContainer -or ([int]$y.Attributes -band 1024))){throw "$t is not a regular file"};$l=L $t;if(Z $l){throw "$l already exists"};$f=$u+$c+$i;$y=Z $f;if(!$y -or $y.PSIsContainer -or ([int]$y.Attributes -band 1024) -or $y.Length -ne $z){throw "the staged bytes of $t are not a file of the size sent"};$n=[IO.File]::Open($f,'Open','Read','Read');$s=[IO.File]::Open($l,'CreateNew','Write','None');$made+=$l;Pc $t;$y=Z $l;if(!$y -or $y.PSIsContainer -or ([int]$y.Attributes -band 1024) -or $y.Length){throw "$l changed while it was created"};$n.CopyTo($s);$s.Dispose();$s=$null;$n.Dispose();$n=$null;$i++}}catch{$e=$_;if($s){$s.Dispose()};if($n){$n.Dispose()};foreach($l in $made){$y=Z $l;if($y -and !$y.PSIsContainer -and !([int]$y.Attributes -band 1024)){[IO.File]::Delete($l)}};throw $e};E @{ok=1}"##,
+/// Every level from `projects` down to the lock's directory, and `ign-deploy`
+/// and the stage, is held with `[IgnGit.N]::OpenDir` (a handle without delete
+/// sharing, a reparse point refused on the handle); a missing level of the
+/// path below `.git` is made under its held parent and then held. The target
+/// must be absent or a regular file (opened through the block). The lock is
+/// created with `[IgnGit.N]::CreateNew` (`CREATE_NEW`, share none,
+/// `FILE_FLAG_OPEN_REPARSE_POINT`), so a link planted there is never written
+/// through and an existing lock, a link included, is refused ("already
+/// exists"). The file id of the lock is written to `<stage>\ids\<index>` from the
+/// creating handle before one byte is written, so the unlock can prove a lock is
+/// the one this write made. The stage file must be a regular file of the size
+/// that was sent. On any failure the locks this call made are removed, each
+/// only when its file id is still the recorded one, through a handle opened for
+/// delete.
+pub const GIT_LOCK: &str = git_stub!("lock", git_lock_pin12!(), git_lock_pin!());
+
+/// The staged text of the unlock script (see [`GIT_UNLOCK`]).
+pub const GIT_UNLOCK_STAGED: &str = concat!(
+    git_native_load!(),
+    git_ps_wh!(),
+    r##"try{$a=J $p.h 'ign-deploy';$u=J $a $p.s;$r=0;$k=0;$st=$false;if(Hd $a 'ign-deploy' 2){$st=Hd $u 'stage' 2};$ids=J $u 'ids';$i=[int]$p.o;foreach($e in @($p.w)){$t=$e.Split(':')[0];$d=Lv $t 2;if($d){$x=$t.Split('/');$b=$x[$x.Length-1];$lock=J $d ($b+$(if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'}));$dh=$null;try{$dh=[IgnGit.N]::OpenForDelete($lock)}catch{$w=$_.Exception.Message;if($w -match 'reparse point|not a regular file'){$k++}elseif($w -notmatch 'error [23]\)'){throw ($t+': '+$w)}};if($dh){try{$rec=J $ids ([string]$i);$want=$null;if([IO.File]::Exists($rec)){$want=[IO.File]::ReadAllText($rec)};if($want -and [IgnGit.N]::FileId($dh) -eq $want){[IgnGit.N]::DeleteOnClose($dh);$r++}else{$k++}}finally{$dh.Dispose()}}};$i++};if($p.r -and $st){Sx};E @{ok=1;removed=$r;kept=$k}}finally{$o|%{$_.Dispose()}}"##,
 );
 
-/// Take away the locks of a failed `.git` write that hold ign's own bytes
-/// (Phase 27, 27-33, WR-B2). Parameters as [`GIT_LOCK`], plus `r`: remove the
-/// stage afterwards. A lock is removed only when it is a regular file and its
-/// length and SHA-256 equal those of the matching stage file; a lock that holds
-/// other bytes (a JGit `index.lock`), a lock whose stage file is missing and a
-/// link are left alone. The answer is `{ok:1,removed,kept}`. A stage that is
-/// missing is not an error. With `r` the stage is removed (its files, then the
-/// directory, which fails and names itself when anything else is in it).
-pub const GIT_UNLOCK: &str = concat!(
-    git_ps_base!(),
-    git_ps_x!(),
-    git_ps_l!(),
-    git_ps_w!(),
-    git_ps_sn!(),
-    git_ps_sx!(),
-    r##"$s=$null;$y=Z $u;$u+=$c+$p.s;if($y){$null=K $y;$s=Z $u;if($s){$null=K $s}};function Hs($f){$m=[IO.File]::Open($f,'Open','Read','ReadWrite,Delete');try{X ([Security.Cryptography.SHA256]::Create().ComputeHash($m))}finally{$m.Dispose()}};$r=0;$h=0;$i=[int]$p.o;foreach($e in @($p.w)){$t=$e.Substring(0,$e.LastIndexOf(':'));$l=L $t;$y=Z $l;if($y -and !$y.PSIsContainer -and !([int]$y.Attributes -band 1024)){$f=$u+$c+$i;$v=$null;if($s){$v=Z $f};if($v -and !$v.PSIsContainer -and !([int]$v.Attributes -band 1024) -and $v.Length -eq $y.Length -and (Hs $l) -eq (Hs $f)){[IO.File]::Delete($l);$r++}else{$h++}};$i++};if($p.r -and $s){Sx};E @{ok=1;removed=$r;kept=$h}"##,
+/// Take away the locks of a failed `.git` write that this write made (Phase 27,
+/// 27-33, WR-B2; by file id since 27-52). Parameters as [`GIT_LOCK`], plus `r`:
+/// remove the stage afterwards. The command is the stub of [`GIT_UNLOCK_STAGED`].
+///
+/// A lock is removed only when its file id equals the one [`GIT_LOCK`] recorded
+/// in `<stage>\ids\<index>` for it when it created it: the lock is opened for
+/// delete through the block and, when the ids are equal, marked for deletion on
+/// that same handle (`DeleteOnClose`). A lock with no record (never made by this
+/// write, or no stage to hold a record in), a lock whose id differs (another writer's, whatever bytes it holds,
+/// ign's included), a link and a directory are counted as kept and left alone.
+/// The answer is `{ok:1,removed,kept}`. A stage or a level that is missing is
+/// not an error. With `r` the stage is removed (its `ids` directory and files,
+/// then the directory, which fails and names itself when anything else is in
+/// it).
+pub const GIT_UNLOCK: &str = git_stub!("unlock", git_unlock_pin12!(), git_unlock_pin!());
+
+/// The staged text of the replace script (see [`GIT_REPLACE`]).
+pub const GIT_REPLACE_STAGED: &str = concat!(
+    git_native_load!(),
+    git_ps_wh!(),
+    r##"function Cm($q,$w,$t){if($w -eq '*'){return $true};$h=Op $q $t;if($w -eq '-'){if($h){$h.Dispose();return $false};return $true};if(!$h){return $false};return ((Hh $h) -eq $w)};try{$a=J $p.h 'ign-deploy';$null=Hd $a 'ign-deploy' 0;$u=J $a $p.s;$null=Hd $u 'stage' 0;$gd=J (J (J $p.d 'projects') $p.j) '.git';$res=$null;$i=[int]$p.o;foreach($e in @($p.w)){$f=$e.Split(':');$t=$f[0];$z=[long]$f[1];$d=Lv $t 0;$x=$t.Split('/');$b=$x[$x.Length-1];$lock=J $d ($b+$(if($t.StartsWith('objects/pack/')){'.ign-tmp'}else{'.lock'}));$tgt=J $d $b;$lh=Op $lock ($t+'.lock');if(!$lh){throw ($t+'.lock is not a regular file')};$s=[IO.FileStream]::new($lh,'Read');try{$ln=$s.Length}finally{$s.Dispose()};if($ln -ne $z){throw ($t+'.lock is not the size that was sent')};if(!(Cm $tgt $f[2] $t)){$res=@{ok=0;err='changed';i=$i;p=0};break};if(!(Cm (J $gd 'packed-refs') $f[3] 'packed-refs')){$res=@{ok=0;err='changed';i=$i;p=1};break};$th=Op $tgt $t;$ex=[bool]$th;if($th){$th.Dispose()};for($n=0;;$n++){try{[IgnGit.N]::Move($lock,$tgt,$ex);break}catch{if($n -ge $p.q -or $_.Exception.Message -notmatch 'error (32|5)\)'){throw};Start-Sleep 1}};$i++};if(!$res){if($p.r){Sx};$res=@{ok=1}};E $res}finally{$o|%{$_.Dispose()}}"##,
 );
 
-/// Put each filled lock over its target (Phase 27), after [`GIT_LOCK`], and
-/// with `r` remove the stage. Parameters: `d`, `j`, `h`, `s` as [`GIT_LOCK`], `w`
-/// entries `<path>:<size>`, `q` the retries, `r` remove the stage at the end.
-/// The walk to the target's directory is checked again before each replace. The
-/// lock must be a regular file of exactly the size that was sent; the target
-/// must be a regular file or absent. An existing target is replaced with
-/// `File.Replace` (atomic for readers), a new one is moved in; a sharing
-/// violation is retried `q` times a second apart and then fails, leaving the
-/// previous file in place. Not an `Add-Type` P/Invoke: nothing is compiled.
-pub const GIT_REPLACE: &str = concat!(
+/// Put each filled lock over its target (Phase 27), after [`GIT_LOCK`], and with
+/// `r` remove the stage; the compare-and-swap of 27-52 (F4). Parameters: `d`,
+/// `j`, `h`, `s`, `o` as [`GIT_LOCK`], `w` entries
+/// `<path>:<size>:<old>:<packed>`, `q` the retries, `r` remove the stage at the
+/// end. The command is the stub of [`GIT_REPLACE_STAGED`].
+///
+/// Every level down to the target's directory is held before the entry is looked
+/// at. The lock must be a regular file of exactly the size that was sent
+/// (opened through the block). The target is compared with its expected old
+/// value under the held parent before the move: `old` is `-` (the target must be
+/// absent), `*` (unchecked) or the 64 hex digits of the SHA-256 the target must
+/// hash to; `packed` is the same for `packed-refs` below `.git`. A mismatch
+/// answers `{ok:0,err:'changed',i:<plan index>,p:<0|1>}` (`p` 1 when it was `packed-refs`), nothing after it is moved, and
+/// what was moved before stays. Otherwise the lock is moved over the target with
+/// `[IgnGit.N]::Move` (`MoveFileExW`, `REPLACE_EXISTING` only for an existing
+/// target); a sharing violation (Win32 error 32, or 5 while held) is retried
+/// `q` times a second apart and then fails, leaving the previous file in place.
+pub const GIT_REPLACE: &str = git_stub!("replace", git_replace_pin12!(), git_replace_pin!());
+
+/// The staged text of the restore-publish script (see [`GIT_RESTORE_MOVE`]).
+pub const GIT_RESTORE_MOVE_STAGED: &str = concat!(
+    git_native_load!(),
     git_ps_base!(),
-    git_ps_l!(),
-    git_ps_w!(),
-    git_ps_sn!(),
-    git_ps_sx!(),
-    r##"$null=K (Z $u);$u+=$c+$p.s;$null=K (Z $u);foreach($e in @($p.w)){$k=$e.LastIndexOf(':');$t=$e.Substring(0,$k);$z=[long]$e.Substring($k+1);$l=L $t;$d=$g+$c+$t.Replace('/',$c);Pc $t;$y=Z $l;if(!$y -or $y.PSIsContainer -or ([int]$y.Attributes -band 1024)){throw "$t.lock is not a regular file"};if($y.Length -ne $z){throw "$t.lock is not the size that was sent"};$y=Z $d;if($y -and ($y.PSIsContainer -or ([int]$y.Attributes -band 1024))){throw "$t is not a regular file; it is left alone"};for($n=0;;$n++){try{if($y){[IO.File]::Replace($l,$d,[NullString]::Value)}else{[IO.File]::Move($l,$d)};break}catch{if($n -ge $p.q){throw};Start-Sleep 1}}};if($p.r){Sx};E @{ok=1}"##,
+    git_ps_dr!(),
+    r##"$o=[Collections.ArrayList]@();try{$a=$p.d+$c+'projects'+$c+$p.j;try{[void]$o.Add([IgnGit.N]::OpenDir($a))}catch{throw ('project: '+$_.Exception.Message)};$g=$a+$c+'.git';$t=$a+$c+'.ign-restore-'+$p.i;$null=K (Z $t);try{if($p.k){Dr $t}else{if(Z $g){throw '.git exists; never replaced'};[IO.Directory]::Move($t,$g)}}catch{$e=$_;if(!$p.k){try{Dr $t}catch{$e=$e.Exception.Message+' (the partial copy at '+$t+' could not be removed)'}};throw $e};E @{ok=1}}finally{$o|%{$_.Dispose()}}"##,
 );
+
+/// Publish the stage of a restore (Phase 27, D-06): the second half. Parameters:
+/// `d`, `j`, `i` as [`GIT_RESTORE`], `h` the account home (the stub's), and `k`:
+/// absent to rename the stage to `.git`, present to remove the stage instead
+/// (the compare failed). The command is the stub of
+/// [`GIT_RESTORE_MOVE_STAGED`].
+///
+/// The project directory is held with `[IgnGit.N]::OpenDir` for the whole script
+/// (27-52, C12), so it cannot be swapped while the publish runs, and the stage
+/// must be a real directory. The rename is `[IO.Directory]::Move`, which fails
+/// when the target exists, and `.git` is checked absent first, so an existing
+/// `.git`, an empty one included, is never replaced (proved on Windows
+/// PowerShell 5.1 by `win_git_restore_keeps_an_empty_git_planted_before_the_move`;
+/// were it ever to replace an empty directory, the publish would switch to
+/// `[IgnGit.N]::Move($t,$g,$false)`); either way the stage is removed (`Dr`) and
+/// the error rethrown with the leftover path appended when the removal fails
+/// too. The answer is `{ok:1}`.
+pub const GIT_RESTORE_MOVE: &str = git_stub!("restore", git_restore_pin12!(), git_restore_pin!());
+
+/// The staged text of the git-object archive script (see [`BUNDLE_GIT`]).
+pub const BUNDLE_GIT_STAGED: &str = concat!(
+    git_native_load!(),
+    "Add-Type -AssemblyName System.IO.Compression;",
+    r##"$x=$p.x;$c=[IO.Path]::DirectorySeparatorChar;$o=[Collections.ArrayList]@();$r=$null;$s=$null;$a=$null;$k=$false;$d=[IO.Compression.CompressionLevel]::Optimal;if($p.c -eq 'NoCompression'){$d=[IO.Compression.CompressionLevel]::NoCompression};try{$t=[IO.File]::ReadAllBytes($x+$p.l);$h=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($t)).Replace('-','').ToLowerInvariant();if($h -ne $p.s){$r=@{ok=0;err='list'}}else{$v=(New-Object IO.DriveInfo([IO.Path]::GetPathRoot($p.z))).AvailableFreeSpace;if($v -lt [int64]$p.f){$r=@{ok=0;err='space';free=$v}}else{$w=[Text.Encoding]::UTF8.GetString($t).Split([char[]]@([char]10),[StringSplitOptions]::RemoveEmptyEntries);$q0=$x+$p.b;try{[void]$o.Add([IgnGit.N]::OpenDir($q0))}catch{throw ('.git: '+$_.Exception.Message)};$hd=@{};foreach($e in $w){$m=$e.Substring($e.IndexOf([char]9)+1);$u=$m.Split('/');$q=$q0;$nm='';for($j=0;$j -lt $u.Length-1;$j++){$q+=$c+$u[$j];$nm+=$u[$j];if(!$hd[$q]){$hd[$q]=1;try{[void]$o.Add([IgnGit.N]::OpenDir($q))}catch{throw ($nm+': '+$_.Exception.Message)}};$nm+='/'}};$s=[IO.File]::Open($x+$p.z,'CreateNew','ReadWrite','None');$k=$true;$a=New-Object IO.Compression.ZipArchive($s,[IO.Compression.ZipArchiveMode]::Create);$u=New-Object byte[] 65536;for($i=0;$i -lt $w.Count;$i++){$j=$w[$i].IndexOf([char]9);$n=[int64]$w[$i].Substring(0,$j);$m=$w[$i].Substring($j+1);$q=$q0+$c+$m.Replace('/',[string]$c);try{$e=[IgnGit.N]::OpenFile($q)}catch{$y=$_.Exception.Message;if($y -match 'error [23]\)'){$r=@{ok=0;err='missing';i=$i}}elseif($y -match 'reparse point|not a regular file'){$r=@{ok=0;err='changed';i=$i;n=0}}else{throw ($m+': '+$y)};break};$in=[IO.FileStream]::new($e,'Read');$g=[int64]0;try{$ent=$a.CreateEntry($m,$d).Open();try{while($g -le $n){$z=$n-$g+1;if($z -gt $u.Length){$z=$u.Length};$y=$in.Read($u,0,[int]$z);if($y -le 0){break};$ent.Write($u,0,$y);$g+=$y}}finally{$ent.Dispose()}}finally{$in.Dispose()};if($g -ne $n){$r=@{ok=0;err='changed';i=$i;n=$g};break}};$a.Dispose();$a=$null;$s.Dispose();$s=$null;if($null -eq $r){$r=@{ok=1;n=$w.Count;z=(New-Object IO.FileInfo($x+$p.z)).Length}}}}}finally{if($a){try{$a.Dispose()}catch{}};if($s){try{$s.Dispose()}catch{}};[IO.File]::Delete($x+$p.l);if($k -and ($null -eq $r -or $r.ok -ne 1)){[IO.File]::Delete($x+$p.z)};$o|%{$_.Dispose()}};E $r"##,
+);
+
+/// [`BUNDLE`] for the gateway-object fetch (27-50, C3 Windows half): the same
+/// archive, protocol and answers, with the reads anchored on held handles. The
+/// command is the stub of [`BUNDLE_GIT_STAGED`]; the resource read keeps
+/// [`BUNDLE`].
+///
+/// Parameters: `x` the long path prefix, `b` the native `.git`, `l` the list,
+/// `z` the archive, `s` the lowercase hex SHA-256 of the list bytes (`BUNDLE`'s
+/// `h`: here `h` is the account home, which the stub and the loader read), `f`
+/// the free bytes the archive's drive must have, `c` the compression level as
+/// for `BUNDLE`. After the list check and the free-space check the script holds
+/// `.git`, `objects`, `objects\pack` and every fan directory the list names
+/// with `[IgnGit.N]::OpenDir`, before the archive exists and before any entry is
+/// read, so a level that is a link or a junction is refused naming it, with no
+/// archive. Each entry's source is then opened through `[IgnGit.N]::OpenFile`
+/// and read from that handle: an absent source answers `err='missing'` and a
+/// link or a directory in its place `err='changed'`, each with the entry index
+/// `i` as `BUNDLE` does; nothing but the held levels and the opened file is
+/// followed. The list-hash check, the free-space check, `CreateNew` of the
+/// archive and the byte-exact copy loop are `BUNDLE`'s. It holds
+/// `Add-Type -AssemblyName System.IO.Compression` (the GAC assembly, nothing
+/// compiled): the one `Add-Type` besides the loader, and only in this script
+/// (`winps_git_params_only`).
+pub const BUNDLE_GIT: &str = git_stub!("bundle", git_bundle_pin12!(), git_bundle_pin!());
+
+/// One staged Windows git script: its stub is the command, its text the file.
+#[derive(Debug, Clone, Copy)]
+pub struct StagedScript {
+    /// The name in the file name and in the pin tests.
+    pub name: &'static str,
+    /// `IgnGitScript-<name>-<first 12 digits of the pin>.ps1`.
+    pub file: &'static str,
+    /// The staged text, exactly the bytes of the file.
+    pub text: &'static str,
+    /// The pin: the lowercase hex SHA-256 of `text`, written in the stub.
+    pub sha256: &'static str,
+    /// The command body (the stub).
+    pub stub: &'static str,
+}
+
+/// Every staged script. A host holds each as `<home>\ign-deploy\git-native\<file>`
+/// before its stub runs ([`WinScript::staged`]).
+pub const STAGED_SCRIPTS: [StagedScript; 5] = [
+    StagedScript {
+        name: "lock",
+        file: concat!("IgnGitScript-lock-", git_lock_pin12!(), ".ps1"),
+        text: GIT_LOCK_STAGED,
+        sha256: git_lock_pin!(),
+        stub: GIT_LOCK,
+    },
+    StagedScript {
+        name: "unlock",
+        file: concat!("IgnGitScript-unlock-", git_unlock_pin12!(), ".ps1"),
+        text: GIT_UNLOCK_STAGED,
+        sha256: git_unlock_pin!(),
+        stub: GIT_UNLOCK,
+    },
+    StagedScript {
+        name: "replace",
+        file: concat!("IgnGitScript-replace-", git_replace_pin12!(), ".ps1"),
+        text: GIT_REPLACE_STAGED,
+        sha256: git_replace_pin!(),
+        stub: GIT_REPLACE,
+    },
+    StagedScript {
+        name: "restore",
+        file: concat!("IgnGitScript-restore-", git_restore_pin12!(), ".ps1"),
+        text: GIT_RESTORE_MOVE_STAGED,
+        sha256: git_restore_pin!(),
+        stub: GIT_RESTORE_MOVE,
+    },
+    StagedScript {
+        name: "bundle",
+        file: concat!("IgnGitScript-bundle-", git_bundle_pin12!(), ".ps1"),
+        text: BUNDLE_GIT_STAGED,
+        sha256: git_bundle_pin!(),
+        stub: BUNDLE_GIT,
+    },
+];
 
 /// Prove the grant before any other write (Phase 27): create exclusively and
 /// delete one probe file in the project directory and in its `.git`. Parameters:
@@ -717,6 +1218,22 @@ pub struct WinScript {
 }
 
 impl WinScript {
+    /// Whether the body starts with the loader of the reviewed block
+    /// ([`GIT_NATIVE_LOAD`]), so a host must have the staged source in place
+    /// before it runs.
+    pub fn loads_native(&self) -> bool {
+        self.body.starts_with(GIT_NATIVE_LOAD) || self.staged().is_some()
+    }
+
+    /// The staged script this command is the stub of, if it is one: a host must
+    /// hold its file ([`StagedScript::file`]) below `<home>\ign-deploy\git-native`
+    /// as well as the block's source before the command runs.
+    pub fn staged(&self) -> Option<&'static StagedScript> {
+        STAGED_SCRIPTS
+            .iter()
+            .find(|staged| staged.stub == self.body)
+    }
+
     /// The script that replaces `dst` with `src` ([`MOVE_REPLACE`]).
     pub fn move_replace(src: &str, dst: &str) -> WinScript {
         WinScript {
@@ -740,11 +1257,13 @@ impl WinScript {
     /// The script that probes the `.git` entry of one project ([`GIT_ENTRY`]).
     /// The three native paths are `<data>\projects`, the project directory and
     /// its `.git`; they travel only as parameters.
-    pub fn git_entry(projects_dir: &str, project_dir: &str, git: &str) -> WinScript {
+    pub fn git_entry(projects_dir: &str, project_dir: &str, git: &str, home: &str) -> WinScript {
         WinScript {
             name: "git_entry",
             body: GIT_ENTRY,
-            params: serde_json::json!({ "a": projects_dir, "b": project_dir, "c": git }),
+            params: serde_json::json!({
+                "a": projects_dir, "b": project_dir, "c": git, "h": home,
+            }),
         }
     }
 
@@ -826,13 +1345,56 @@ impl WinScript {
         }
     }
 
-    /// The script that reads the fixed files of the `.git` at `git` (native),
-    /// asking for the presence of `markers` ([`GIT_STATE`]).
-    pub fn git_state(git: &str, markers: &[&str]) -> WinScript {
+    /// The scripts that read the state of the `.git` at `git` (native), in the
+    /// order they run: [`GIT_STATE`] (the fixed files), [`GIT_STATE_MARKS`]
+    /// (the index and the presence of `markers`) and [`GIT_STATE_REFS`] (the
+    /// loose refs). `home` is the native account home, where the loader reads
+    /// the staged source. Each answers `ok: 1` and its own fields;
+    /// [`merge_git_state`] makes the one answer of the old single script.
+    pub fn git_state(git: &str, markers: &[&str], home: &str) -> Vec<WinScript> {
+        vec![
+            WinScript {
+                name: "git_state",
+                body: GIT_STATE,
+                params: serde_json::json!({ "a": git, "h": home }),
+            },
+            WinScript {
+                name: "git_state_marks",
+                body: GIT_STATE_MARKS,
+                params: serde_json::json!({ "a": git, "h": home, "m": markers }),
+            },
+            WinScript {
+                name: "git_state_refs",
+                body: GIT_STATE_REFS,
+                params: serde_json::json!({ "a": git, "h": home }),
+            },
+        ]
+    }
+
+    /// The script that makes `ign-deploy\git-native` in the native account
+    /// `home` and says whether the staged source is there with the pinned hash
+    /// ([`GIT_NATIVE_STAGE`]).
+    pub fn git_native_stage(home: &str) -> WinScript {
         WinScript {
-            name: "git_state",
-            body: GIT_STATE,
-            params: serde_json::json!({ "a": git, "m": markers }),
+            name: "git_native_stage",
+            body: GIT_NATIVE_STAGE,
+            params: serde_json::json!({
+                "h": home,
+                "n": GIT_NATIVE_STAGED_FILE,
+                "s": GIT_NATIVE_SHA256,
+            }),
+        }
+    }
+
+    /// [`git_native_stage`](Self::git_native_stage) for several files: `files`
+    /// are `(name, pin)` pairs, the block's source first.
+    pub fn git_stage_files(home: &str, files: &[(&str, &str)]) -> WinScript {
+        let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
+        let pins: Vec<&str> = files.iter().map(|(_, pin)| *pin).collect();
+        WinScript {
+            name: "git_native_stage",
+            body: GIT_NATIVE_STAGE,
+            params: serde_json::json!({ "h": home, "n": names, "s": pins }),
         }
     }
 
@@ -871,23 +1433,47 @@ impl WinScript {
         }
     }
 
+    /// The script that publishes the stage of a restore ([`GIT_RESTORE_MOVE`]):
+    /// the rename to `.git`, or with `drop` the removal of the stage.
+    pub fn git_restore_move(
+        prefix: &str,
+        data: &str,
+        project: &str,
+        home: &str,
+        run_id: &str,
+        drop: bool,
+    ) -> WinScript {
+        let mut params = serde_json::json!({
+            "x": prefix, "d": data, "j": project, "h": home, "i": run_id,
+        });
+        if let (true, Some(map)) = (drop, params.as_object_mut()) {
+            map.insert("k".to_string(), Value::from(1));
+        }
+        WinScript {
+            name: "git_restore_move",
+            body: GIT_RESTORE_MOVE,
+            params,
+        }
+    }
+
     /// The script that takes the manifest of the native directory `dir`
-    /// ([`GIT_MANIFEST`]).
-    pub fn git_manifest(prefix: &str, dir: &str) -> WinScript {
+    /// ([`GIT_MANIFEST`]); `home` is the native account home, where the loader
+    /// reads the staged source of the reviewed block.
+    pub fn git_manifest(prefix: &str, dir: &str, home: &str) -> WinScript {
         WinScript {
             name: "git_manifest",
             body: GIT_MANIFEST,
-            params: serde_json::json!({ "x": prefix, "a": dir }),
+            params: serde_json::json!({ "x": prefix, "a": dir, "h": home }),
         }
     }
 
     /// The script that sizes the native directory `dir` from one enumeration
     /// ([`GIT_SIZE`]).
-    pub fn git_size(prefix: &str, dir: &str) -> WinScript {
+    pub fn git_size(prefix: &str, dir: &str, home: &str) -> WinScript {
         WinScript {
             name: "git_size",
             body: GIT_SIZE,
-            params: serde_json::json!({ "x": prefix, "a": dir }),
+            params: serde_json::json!({ "x": prefix, "a": dir, "h": home }),
         }
     }
 
@@ -906,21 +1492,40 @@ impl WinScript {
 
     /// The script that hashes `file` (a `/`-separated path) below the native
     /// `.git` ([`GIT_DIGEST`]).
-    pub fn git_digest(git: &str, file: &str) -> WinScript {
+    pub fn git_digest(git: &str, file: &str, home: &str) -> WinScript {
         WinScript {
             name: "git_digest",
             body: GIT_DIGEST,
-            params: serde_json::json!({ "a": git, "f": file }),
+            params: serde_json::json!({ "a": git, "f": file, "h": home }),
         }
     }
 
     /// The script that reads `git.yaml` of the native data directory `data`,
     /// up to one byte past `cap` ([`GIT_YAML`]).
-    pub fn git_yaml(data: &str, cap: u64) -> WinScript {
+    pub fn git_yaml(data: &str, cap: u64, home: &str) -> WinScript {
         WinScript {
             name: "git_yaml",
             body: GIT_YAML,
-            params: serde_json::json!({ "a": data, "m": cap }),
+            params: serde_json::json!({ "a": data, "m": cap, "h": home }),
+        }
+    }
+
+    /// The script that reads the post-import disk of `project` below the native
+    /// data directory `data` ([`PROJECT_DIGESTS`]): `cap` is the most files it
+    /// may list.
+    pub fn project_digests(
+        prefix: &str,
+        data: &str,
+        project: &str,
+        cap: u64,
+        home: &str,
+    ) -> WinScript {
+        WinScript {
+            name: "project_digests",
+            body: PROJECT_DIGESTS,
+            params: serde_json::json!({
+                "x": prefix, "d": data, "j": project, "m": cap, "h": home,
+            }),
         }
     }
 
@@ -976,23 +1581,65 @@ impl WinScript {
     }
 
     /// The script that puts each lock over its target ([`GIT_REPLACE`]):
-    /// `writes` are `(path below .git, size sent)`.
+    /// `writes` are `(path below .git, size sent, expected old value, expected
+    /// packed-refs)` as [`GIT_REPLACE`] documents them, the first of which is plan
+    /// index `offset`.
+    #[allow(clippy::too_many_arguments)]
     pub fn git_replace(
         data: &str,
         project: &str,
         home: &str,
         stage: &str,
-        writes: &[(String, u64)],
+        offset: usize,
+        writes: &[(String, u64, String, String)],
         retries: u32,
         remove_stage: bool,
     ) -> WinScript {
+        let entries: Vec<String> = writes
+            .iter()
+            .map(|(path, size, old, packed)| format!("{path}:{size}:{old}:{packed}"))
+            .collect();
         WinScript {
             name: "git_replace",
             body: GIT_REPLACE,
             params: serde_json::json!({
-                "d": data, "j": project, "h": home, "s": stage,
-                "w": Self::git_entries(writes), "q": retries, "r": remove_stage,
+                "d": data, "j": project, "h": home, "s": stage, "o": offset,
+                "w": entries, "q": retries, "r": remove_stage,
             }),
+        }
+    }
+
+    /// [`bundle_level`](Self::bundle_level) for a read of the gateway's `.git`
+    /// ([`BUNDLE_GIT`]): `root` is the native `.git`, `home` the native account
+    /// home, where the stub finds the staged script. The list's SHA-256 travels
+    /// as `s` (`h` is the home).
+    #[allow(clippy::too_many_arguments)]
+    pub fn bundle_git(
+        prefix: &str,
+        root: &str,
+        list: &str,
+        archive: &str,
+        list_sha256: &str,
+        need: u64,
+        level: Option<&str>,
+        home: &str,
+    ) -> WinScript {
+        let mut params = serde_json::json!({
+            "x": prefix,
+            "b": root,
+            "l": list,
+            "z": archive,
+            "s": list_sha256,
+            "f": need,
+            "h": home,
+        });
+        if let (Some(level), Some(map)) = (level, params.as_object_mut()) {
+            map.insert("c".to_string(), Value::String(level.to_string()));
+        }
+        WinScript {
+            name: "bundle",
+            body: BUNDLE_GIT,
+            params,
         }
     }
 
@@ -1047,6 +1694,37 @@ fn git_run_params(
     serde_json::json!({
         "x": prefix, "d": data, "j": project, "h": home, "g": gateway, "i": run_id,
     })
+}
+
+/// The one answer of the old single state script, from the answers of the
+/// three scripts of [`WinScript::git_state`] in their order: `head`, `config`,
+/// `packed` and `log` from the first, `index` and `markers` from the second,
+/// `refs` from the third. A field a script did not answer is left out, so the
+/// caller's own check names it; a field a script should not answer is dropped.
+/// Anything but three answers is refused.
+pub fn merge_git_state(answers: &[Value]) -> Result<Value, String> {
+    const FIELDS: [&[&str]; 3] = [
+        &["head", "config", "packed", "log"],
+        &["index", "markers"],
+        &["refs"],
+    ];
+    if answers.len() != FIELDS.len() {
+        return Err(format!(
+            "the state read has {} scripts, not {}",
+            answers.len(),
+            FIELDS.len()
+        ));
+    }
+    let mut merged = serde_json::Map::new();
+    merged.insert("ok".to_string(), Value::from(1));
+    for (answer, fields) in answers.iter().zip(FIELDS) {
+        for field in fields {
+            if let Some(value) = answer.get(*field) {
+                merged.insert((*field).to_string(), value.clone());
+            }
+        }
+    }
+    Ok(Value::Object(merged))
 }
 
 /// The remote command for `script`, or why it cannot be sent: the parameters

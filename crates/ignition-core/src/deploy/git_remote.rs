@@ -2067,6 +2067,96 @@ impl HostGit {
     }
 }
 
+/// Checks of fetched object files (27-47, C3): the id of a loose object and
+/// the pack files, hashed by host git. The files are in a private directory
+/// ign made; the git dir is an empty one ign makes beside them, so no gateway
+/// byte is ever a git dir, a config or a hook.
+impl HostGit {
+    /// A fresh, empty bare git dir below `parent` (no alternates, no objects).
+    pub(crate) fn empty_git_dir(parent: &Path) -> Result<PathBuf, CoreError> {
+        let git_dir = parent.join("verify.git");
+        for sub in ["objects/info", "objects/pack", "refs/heads", "refs/tags"] {
+            std::fs::create_dir_all(git_dir.join(sub))
+                .map_err(|e| host_failure(format!("a scratch git dir could not be made: {e}")))?;
+        }
+        write_scratch(
+            &git_dir.join("config"),
+            b"[core]\n\trepositoryformatversion = 0\n",
+        )?;
+        write_scratch(&git_dir.join("HEAD"), b"ref: refs/heads/scratch\n")?;
+        Ok(git_dir)
+    }
+
+    /// The ids git computes for the files `names` (relative to `work`), each
+    /// hashed as an object of `kind` (`blob`, `tree`, `commit` or `tag`)
+    /// exactly as it is, in order: `git hash-object --literally --no-filters
+    /// -t <kind> --stdin-paths`. Nothing is written to any object store.
+    pub(crate) async fn hash_object_files(
+        &self,
+        git_dir: &Path,
+        work: &Path,
+        kind: &str,
+        names: &[String],
+    ) -> Result<Vec<String>, CoreError> {
+        let mut args = GitDir::Bare(git_dir.to_path_buf()).prefix();
+        args.extend(
+            [
+                "hash-object",
+                "--literally",
+                "--no-filters",
+                "-t",
+                kind,
+                "--stdin-paths",
+            ]
+            .map(OsString::from),
+        );
+        let mut stdin = String::new();
+        for name in names {
+            stdin.push_str(name);
+            stdin.push('\n');
+        }
+        let call = Call::new(args)
+            .cwd(work)
+            .isolated()
+            .stdin(stdin.into_bytes());
+        let done = self.run_ok("hash-object", call).await?;
+        let text = String::from_utf8_lossy(&done.stdout);
+        let ids: Vec<String> = text.lines().map(str::to_string).collect();
+        if ids.len() != names.len() || ids.iter().any(|id| !is_object_id(id)) {
+            return Err(host_failure(
+                "git hash-object answered something unexpected",
+            ));
+        }
+        Ok(ids)
+    }
+
+    /// Whether `git verify-pack` accepts the pack whose index is `idx` (a
+    /// file name in `work`, its `.pack` beside it): the pack's trailing
+    /// checksum over its own bytes, the index's recorded pack checksum, the
+    /// index's own trailing checksum, and every object against the index.
+    /// `Ok(false)` is git saying no; an error is git not able to answer.
+    pub(crate) async fn verify_pack_files(
+        &self,
+        git_dir: &Path,
+        work: &Path,
+        idx: &str,
+    ) -> Result<bool, CoreError> {
+        let mut args = GitDir::Bare(git_dir.to_path_buf()).prefix();
+        args.extend(["verify-pack", idx].map(OsString::from));
+        let done = self.run(Call::new(args).cwd(work).isolated()).await?;
+        // git reports a refused pack with exit 1; anything else (a signal, a
+        // usage error) is git failing to answer, never read as a verdict.
+        match done.code {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            other => Err(host_failure(format!(
+                "git verify-pack did not answer ({})",
+                other.map_or_else(|| "no exit status".to_string(), |c| format!("exit {c}"))
+            ))),
+        }
+    }
+}
+
 /// What a tree entry is, from its mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {

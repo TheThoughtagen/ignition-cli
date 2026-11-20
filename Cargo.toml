@@ -60,6 +60,12 @@ base64 = "0.22"
 # artifact fetch's streaming sha256 verification — still not a new
 # dependency, just a second, production-side consumer of the same pin.
 sha2 = "0.10"
+# Phase 27 (27-47): flate2 is promoted from the graph (it comes in through zip's
+# `deflate`) for the post-download check of gateway git objects: a loose object
+# is inflated in process, then hashed by host git. Same feature set as zip
+# resolves (zlib-rs, no default backend), so Cargo.lock does not change: NOT a
+# new package. No SHA-1 crate (host git stays the only git engine, 27-47 Task 1).
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 # Phase 6 (TUI): ratatui floor-pinned at 0.30.2 — 0.30.1 bumped MSRV 1.86→1.88
 # in a PATCH release, so patch drift can move MSRV; the floor rides the
 # 1.88-MSRV release and CI (stable) catches future bumps. crossterm takes the
@@ -84,6 +90,12 @@ crossbeam-channel = "0.5"
 # io::Error conversion) is enabled and the dependency is cfg(unix) in
 # ignition-core.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+# Phase 27 (27-gaps, PR #61 windows-latest): windows-sys is promoted from the
+# graph (tempfile resolves it at 0.61.2 with the same two features) for the
+# Windows restore publish: MoveFileExW without MOVEFILE_REPLACE_EXISTING, the
+# no-replace move std::fs::rename is not (it replaces an empty directory).
+# Cargo.lock does not change: NOT a new package. cfg(windows) in ignition-core.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 # dev
 wiremock = "0.6"
 snapbox = { version = "1.2", features = ["cmd", "json", "regex"] } # dev-dep only

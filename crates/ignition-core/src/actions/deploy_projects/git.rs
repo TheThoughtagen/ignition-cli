@@ -115,6 +115,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
     ),
     ("git_recreated", "git_handover::restore_and_advance (27-02)"),
     (
+        "git_changed",
+        "git_handover::restore_and_advance, write under lock (27-45)",
+    ),
+    (
         "backup_unsynced",
         "git_after_backup, the wait for the backup's project (27-22)",
     ),
@@ -130,6 +134,10 @@ pub const REASON_PRODUCERS: &[(&str, &str)] = &[
         "backup_project_json_missing",
         "advance_after and settle_backup_git, the backup's project.json check after it converged (27-37)",
     ),
+    (
+        "git_save_missing",
+        "git_after_pending, --rollback-run, a pending save that is gone (27-54)",
+    ),
 ];
 
 /// The words [`REASON_PRODUCERS`] names this module as the producer of.
@@ -139,6 +147,7 @@ pub const PRODUCED_HERE: &[&str] = &[
     "post_status_mismatch",
     "designer_attached",
     "backup_project_json_missing",
+    "git_save_missing",
 ];
 
 /// The restore reason of a restore that was not attempted because a Designer
@@ -162,6 +171,21 @@ pub const REASON_BACKUP_UNSYNCED: &str = "backup_unsynced";
 /// only detects it: it never repairs the file and never hides the deletion
 /// from the index it writes.
 pub const REASON_BACKUP_PROJECT_JSON_MISSING: &str = "backup_project_json_missing";
+
+/// The restore reason of an advance whose write found its target changed under
+/// the lock (27-45, CodeRabbit #55 F4; checkpoint option-a): a Designer or the
+/// module moved a ref, `HEAD`, `config` or `index` after the run read the
+/// repository. The writes before it, the index first, are in place and
+/// nothing was overwritten, so the repository is the other writer's: the
+/// verdict never sends the operator to put the saved copy over it.
+pub const REASON_GIT_CHANGED: &str = "git_changed";
+
+/// The restore reason of a `--rollback-run` retry whose journal names a saved
+/// `.git` (`git_pending`, 27-53, P3) that cannot be found or read on the host
+/// (27-54). The repository was not put back and ign has no copy to put back:
+/// nothing was written, the journal keeps the entry, and the verdict never
+/// sends the operator to restore a copy that does not exist.
+pub const REASON_GIT_SAVE_MISSING: &str = "git_save_missing";
 
 /// The manifest file the finding is about, as a status path.
 const PROJECT_JSON: &str = "project.json";
@@ -257,6 +281,17 @@ pub struct RestoreInfo {
     pub save_kept: bool,
 }
 
+/// A backup node's save that waits for the run's backup step before it goes
+/// (27-55, Q3). Never serialized: it is run state, not a published fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRemoval {
+    /// The manifest of the `.git` the backup was advanced to, the one the
+    /// recheck must find again for the save to go.
+    pub advanced: GitManifest,
+    /// The save that goes once the recheck holds.
+    pub saved: GitSaveReport,
+}
+
 /// One node's git facts in `data.git.nodes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeGitReport {
@@ -297,6 +332,11 @@ pub struct NodeGitReport {
     pub save: Option<SaveInfo>,
     /// The restore and advance, once attempted.
     pub restore: Option<RestoreInfo>,
+    /// On a tag-owning pair the backup's save is kept as pending removal
+    /// through `backup_step` and its resync (27-55, Q3); the recheck
+    /// ([`recheck_backup_git`]) takes it. Not serialized.
+    #[serde(skip)]
+    pub pending_removal: Option<PendingRemoval>,
 }
 
 /// `data.git`: the published block for a project the git module manages.
@@ -717,6 +757,7 @@ impl HostSeen {
                 hazards: Vec::new(),
                 save: None,
                 restore: None,
+                pending_removal: None,
             }],
             expected_drift: None,
             expected_drift_count: None,
@@ -909,6 +950,7 @@ async fn prepare_git_host_inner(
             hazards: hazards.found.iter().map(|h| h.word().to_string()).collect(),
             save: None,
             restore: None,
+            pending_removal: None,
         }],
         expected_drift: None,
         expected_drift_count: None,
@@ -1779,7 +1821,9 @@ fn failed_restore(report: &mut GitReport, failure: &GitRestoreFailure) -> GitAft
             .collect();
         line.push_str(&format!(" ({})", shown.join(", ")));
     }
-    if failure.reason == "git_recreated" {
+    // Only a failure that names the `.git` it found: a save that no longer
+    // matches the journal (27-54) names none.
+    if failure.reason == "git_recreated" && !failure.paths.is_empty() {
         // Pitfall 1, D-07, D-09: a repository someone else created (a Designer
         // open runs `setupLocalRepo` while `.git` is absent) is never
         // overwritten; the save is the module's pre-run repository.
@@ -1836,6 +1880,18 @@ struct SettleHold {
     advanced: Option<GitManifest>,
 }
 
+/// How the backup's settle runs (27-35, 27-55).
+#[derive(Clone, Copy)]
+struct Settle {
+    /// How long the `.git` settles before the second look.
+    interval: Duration,
+    /// On a tag-owning run the save is not removed here: the run's backup step
+    /// can still send a resync that deletes the backup's `.git` again, so the
+    /// save is marked pending removal and [`recheck_backup_git`] removes it
+    /// after that step (27-55, Q3).
+    defer: bool,
+}
+
 /// [`git_after_verify`], and for the backup of a pair the settle of 27-35
 /// (WR-08, D-19, D-G5): with `settle` set, a `.git` that was present at the
 /// end of the wait and advanced in place keeps its save through the advance
@@ -1846,7 +1902,7 @@ async fn after_verify(
     report: &mut GitReport,
     saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
-    settle: Option<Duration>,
+    settle: Option<Settle>,
 ) -> GitAfter {
     let mut polls = Vec::new();
     let gate =
@@ -1856,13 +1912,14 @@ async fn after_verify(
         Err(failure) => failed_restore(report, &failure),
         Ok(()) => {
             let slot = settle.is_some().then_some(&mut hold);
-            advance_after(prepared, report, saved, inputs, slot).await
+            let defer = settle.is_some_and(|s| s.defer);
+            advance_after(prepared, report, saved, inputs, slot, defer).await
         }
     };
     if hold.held
-        && let Some(interval) = settle
+        && let Some(settle) = settle
     {
-        after = settle_backup_git(prepared, report, saved, inputs, interval, hold, after).await;
+        after = settle_backup_git(prepared, report, saved, inputs, settle, hold, after).await;
     }
     after.events.splice(
         0..0,
@@ -1961,13 +2018,15 @@ pub async fn git_record_advance(
 /// was advanced in place (not restored), the manifest of the advanced `.git`
 /// is read right after the advance was read back (before the post-advance
 /// status), the save is not removed here and `hold.held` is set, so the caller
-/// can look at `.git` again first.
+/// can look at `.git` again first. With `defer` (a tag-owning pair's backup,
+/// 27-55) a save that would go here is marked pending removal instead.
 async fn advance_after(
     prepared: &PreparedGit,
     report: &mut GitReport,
     saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
     mut hold: Option<&mut SettleHold>,
+    defer: bool,
 ) -> GitAfter {
     let save_path = saved.path.clone();
     let node_name = report.master().node.clone();
@@ -2189,7 +2248,7 @@ async fn advance_after(
                 let blocked =
                     is_backup && project_json_gate(report, saved, inputs, &mut after).await;
                 if !blocked {
-                    remove_save(report, saved, inputs, &mut after).await;
+                    finish_save(report, saved, inputs, &mut after, defer).await;
                 }
             }
         }
@@ -2316,11 +2375,12 @@ async fn project_json_gate(
 /// later; removing the save on the strength of that read would leave the backup
 /// with neither. So the save was kept through the advance ([`advance_after`]
 /// with `hold`), and one poll interval later the `.git` is probed again
-/// through the backup's host:
+/// through the backup's host ([`look_again`]):
 ///
 /// - a directory whose manifest equals `advanced`, the one read right after the
 ///   advance was read back:
-///   the save is removed ([`remove_save`]);
+///   the save is removed ([`remove_save`]), or on a tag-owning run marked
+///   pending removal for [`recheck_backup_git`] (27-55, Q3);
 /// - absent: the Designer gate runs (D-07) and the handover runs again from the
 ///   save, which restores it and advances it, and the save is removed only
 ///   after that;
@@ -2332,17 +2392,83 @@ async fn settle_backup_git(
     report: &mut GitReport,
     saved: &GitSaveReport,
     inputs: &AfterInputs<'_>,
-    interval: Duration,
+    settle: Settle,
     hold: SettleHold,
-    mut after: GitAfter,
+    after: GitAfter,
 ) -> GitAfter {
     let SettleHold {
         advanced,
         keep_save,
         ..
     } = hold;
+    tokio::time::sleep(settle.interval).await;
+    look_again(
+        prepared,
+        report,
+        saved,
+        inputs,
+        Look {
+            when: When::Settle,
+            advanced,
+            keep_save,
+            defer: settle.defer,
+        },
+        after,
+    )
+    .await
+}
+
+/// After which step of the run the backup's `.git` is looked at again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum When {
+    /// The settle, one poll interval after the advance (27-35).
+    Settle,
+    /// The recheck after `backup_step` and its resync (27-55, Q3).
+    Recheck,
+}
+
+/// What [`look_again`] compares against and does at the end.
+struct Look {
+    when: When,
+    /// The manifest of the advanced `.git`; `None` when it could not be read.
+    advanced: Option<GitManifest>,
+    /// The save stays whatever the look finds (27-15, D-05).
+    keep_save: bool,
+    /// Mark the save pending removal instead of removing it.
+    defer: bool,
+}
+
+/// The second look at the backup's `.git` of the settle and of the recheck:
+/// equal to the advanced manifest means the save goes (or is marked), absent
+/// means restore and advance again, anything else keeps the save and names it.
+async fn look_again(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    look: Look,
+    mut after: GitAfter,
+) -> GitAfter {
+    let Look {
+        when,
+        advanced,
+        keep_save,
+        defer,
+    } = look;
     let project = inputs.project;
-    tokio::time::sleep(interval).await;
+    // What the words of the two looks differ in.
+    let (step, late) = match when {
+        When::Settle => (
+            "the advance",
+            "the backup's .git changed after it was advanced (the redundancy sync reached it \
+             late); it is left as it is",
+        ),
+        When::Recheck => (
+            "the backup's tag check",
+            "the backup's .git changed after it was advanced (a redundancy resync reached it \
+             after the backup's tag check); it is left as it is",
+        ),
+    };
     let files = match inputs.read.read_git_state(project).await {
         Ok(files) => files,
         Err(err) => {
@@ -2352,8 +2478,8 @@ async fn settle_backup_git(
                 &mut after,
                 "restore_failed",
                 &format!(
-                    "the backup's .git could not be probed again after the advance ({}); it \
-                     was not touched",
+                    "the backup's .git could not be probed again after {step} ({}); it was not \
+                     touched",
                     err.code()
                 ),
             );
@@ -2367,25 +2493,25 @@ async fn settle_backup_git(
                 // sync's late delete takes it with the `.git`. A finding
                 // fails the node and the save stays.
                 if !project_json_gate(report, saved, inputs, &mut after).await && !keep_save {
-                    remove_save(report, saved, inputs, &mut after).await;
+                    if defer {
+                        report.master_mut().pending_removal = Some(PendingRemoval {
+                            advanced: now,
+                            saved: saved.clone(),
+                        });
+                    } else {
+                        remove_save(report, saved, inputs, &mut after).await;
+                    }
                 }
             }
-            Ok(_) => settle_failed(
-                report,
-                saved,
-                &mut after,
-                "git_recreated",
-                "the backup's .git changed after it was advanced (the redundancy sync reached \
-                 it late); it is left as it is",
-            ),
+            Ok(_) => settle_failed(report, saved, &mut after, "git_recreated", late),
             Err(err) => settle_failed(
                 report,
                 saved,
                 &mut after,
                 "restore_failed",
                 &format!(
-                    "the backup's .git could not be read again after the advance ({}); it was \
-                     not touched",
+                    "the backup's .git could not be read again after {step} ({}); it was not \
+                     touched",
                     err.code()
                 ),
             ),
@@ -2403,13 +2529,31 @@ async fn settle_backup_git(
             let more = match gate {
                 Err(failure) => failed_restore(report, &failure),
                 Ok(()) => {
-                    after.warnings.push(format!(
-                        "project {}: the backup's .git was removed after the advance (the \
-                         redundancy sync reached it late); it was restored from the save and \
-                         advanced again",
-                        saved.project
-                    ));
-                    advance_after(prepared, report, saved, inputs, None).await
+                    after.warnings.push(match when {
+                        When::Settle => format!(
+                            "project {}: the backup's .git was removed after the advance (the \
+                             redundancy sync reached it late); it was restored from the save and \
+                             advanced again",
+                            saved.project
+                        ),
+                        When::Recheck => format!(
+                            "project {}: the backup's .git was removed after the backup's tag \
+                             check (a redundancy resync reached it); it was restored from the \
+                             save and advanced again",
+                            saved.project
+                        ),
+                    });
+                    // The re-advance removes the save at its end on the
+                    // recheck, the last step; the settle may still defer it.
+                    advance_after(
+                        prepared,
+                        report,
+                        saved,
+                        inputs,
+                        None,
+                        defer && when == When::Settle,
+                    )
+                    .await
                 }
             };
             after.failed = more.failed;
@@ -2426,6 +2570,74 @@ async fn settle_backup_git(
         ),
     }
     after
+}
+
+/// The recheck of a tag-owning pair's backup (27-55, Q3): after `backup_step`
+/// returns, and after any `redundancy_resync` it sent and the convergence that
+/// follows, the backup's `.git` is looked at once more with the settle's check
+/// ([`look_again`], without the sleep). Equal to the advanced manifest: the
+/// `project.json` check, then the save is removed. Absent: the Designer gate,
+/// then restore from the save and advance again, and the save goes after that.
+/// Anything else: `git_recreated`, `.git` left as it is and the save kept and
+/// named. A no-op for a node that holds no pending removal. `report` is the
+/// backup's single-node report.
+pub async fn recheck_backup_git(
+    prepared: &PreparedGit,
+    report: &mut GitReport,
+    inputs: &AfterInputs<'_>,
+) -> GitAfter {
+    let after = GitAfter::new();
+    let Some(PendingRemoval { advanced, saved }) = report.master_mut().pending_removal.take()
+    else {
+        return after;
+    };
+    look_again(
+        prepared,
+        report,
+        &saved,
+        inputs,
+        Look {
+            when: When::Recheck,
+            advanced: Some(advanced),
+            keep_save: false,
+            defer: false,
+        },
+        after,
+    )
+    .await
+}
+
+/// The point where a save would go (27-55): removed at once, or on a
+/// tag-owning pair's backup marked pending removal so the save outlives
+/// `backup_step`. A manifest that cannot be read to mark it leaves the save in
+/// place and says so (fail closed).
+async fn finish_save(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &AfterInputs<'_>,
+    after: &mut GitAfter,
+    defer: bool,
+) {
+    if !defer {
+        remove_save(report, saved, inputs, after).await;
+        return;
+    }
+    match inputs.read.git_manifest(inputs.project).await {
+        Ok(now) => {
+            report.master_mut().pending_removal = Some(PendingRemoval {
+                advanced: now,
+                saved: saved.clone(),
+            });
+        }
+        Err(err) => after.warnings.push(format!(
+            "project {}: the saved .git at {} is kept: the backup's advanced .git could not be \
+             read to defer its removal past the backup's tag check ({}); remove the copy by hand \
+             once the backup holds the repository",
+            inputs.project,
+            saved.path,
+            err.code()
+        )),
+    }
 }
 
 /// Everything held: the save goes. A save that cannot be removed is left and
@@ -2663,6 +2875,113 @@ pub async fn git_after_rollback(
     RollbackGit { after, left }
 }
 
+/// The pending save of a `--rollback-run` retry (27-54, P3): the journal names
+/// a `.git` save an earlier rollback could not put back (`git_pending`).
+///
+/// The save is looked at first, by what the journal recorded: one that cannot
+/// be found or read ends the node `git_save_missing`, one whose manifest is not
+/// the journal's ends it `git_recreated`, and in both nothing is written and
+/// the save is not touched. Otherwise the step is [`git_after_rollback`]: the
+/// Designer gate, then the save put back unchanged if `.git` is still absent,
+/// never over a repository that is there.
+pub async fn git_after_pending(
+    report: &mut GitReport,
+    saved: &GitSaveReport,
+    inputs: &UnverifiedInputs<'_>,
+) -> RollbackGit {
+    let refusal = match inputs
+        .read
+        .save_manifest(inputs.gateway, inputs.project, &saved.run_id)
+        .await
+    {
+        Err(_) => Some((
+            REASON_GIT_SAVE_MISSING,
+            "the saved .git the journal names could not be found or read; nothing was restored",
+            false,
+        )),
+        Ok(now) if now != saved.manifest => Some((
+            "git_recreated",
+            "the saved .git is not the copy the journal names (its manifest differs); nothing \
+             was restored",
+            true,
+        )),
+        Ok(_) => None,
+    };
+    let Some((reason, detail, kept)) = refusal else {
+        return git_after_rollback(report, saved, inputs).await;
+    };
+    let after = failed_restore(
+        report,
+        &GitRestoreFailure {
+            reason,
+            restored: false,
+            paths: Vec::new(),
+            detail: detail.to_string(),
+            save_path: saved.path.clone(),
+        },
+    );
+    if !kept && let Some(restore) = report.master_mut().restore.as_mut() {
+        restore.save_kept = false;
+    }
+    let line = if kept {
+        format!(
+            "project {}: the saved .git the journal names ({}) is not the copy it recorded \
+             ({reason}); its repository was not put back",
+            inputs.project, saved.path
+        )
+    } else {
+        format!(
+            "project {}: the saved .git the journal names ({}) could not be found or read \
+             ({reason}); its repository was not put back",
+            inputs.project, saved.path
+        )
+    };
+    RollbackGit {
+        after,
+        left: vec![line],
+    }
+}
+
+/// `data.git` of a `--rollback-run` retry whose journal names pending saves
+/// (27-54): `report` (the repositories the retry found, or none) with each
+/// pending node's entry present and carrying its save, so the pending step has
+/// a node to report on. A node without `.git` is an `absent` entry, as on a
+/// pair everywhere else.
+pub fn with_pending(
+    report: Option<GitReport>,
+    pending: &[crate::deploy::project_run::PendingSave],
+    pair: bool,
+) -> Option<GitReport> {
+    if pending.is_empty() {
+        return report;
+    }
+    let mut report = report.unwrap_or_else(|| GitReport {
+        release_commit: String::new(),
+        nodes: vec![absent_node(MASTER)],
+        expected_drift: None,
+        expected_drift_count: None,
+        expected_drift_complete: false,
+        would_discard: None,
+        discarded: None,
+        hazards_acknowledged: None,
+    });
+    if pair && report.nodes.len() < 2 {
+        report.nodes.push(absent_node(BACKUP));
+    }
+    for entry in pending {
+        if let Some(node) = report.nodes.iter_mut().find(|n| n.node == entry.node)
+            && node.save.is_none()
+        {
+            node.save = Some(SaveInfo {
+                path: entry.path.clone(),
+                files: usize::try_from(entry.manifest.files).unwrap_or(usize::MAX),
+                bytes: entry.manifest.bytes,
+            });
+        }
+    }
+    Some(report)
+}
+
 /// `--rollback-run` over a project whose `.git` exists (D-08): classify it.
 /// An unsupported shape refuses `project_git_managed` with its reason before
 /// anything is written; a managed or adoptable repo is reported (state,
@@ -2708,6 +3027,7 @@ pub async fn check_rollback_run(
             hazards: Vec::new(),
             save: None,
             restore: None,
+            pending_removal: None,
         }],
         expected_drift: None,
         expected_drift_count: None,
@@ -2831,6 +3151,7 @@ fn absent_node(node: &str) -> NodeGitReport {
         hazards: Vec::new(),
         save: None,
         restore: None,
+        pending_removal: None,
     }
 }
 
@@ -3093,6 +3414,13 @@ pub struct BackupWait<'a> {
 /// converged export bytes come back for the read-back of the handover; a wait
 /// that did not converge returns the reason text (a code or a count, never
 /// content).
+///
+/// Each export is bounded by what is left of the budget plus one poll
+/// interval (27-55, P6), so one stalled request cannot outlast
+/// `--backup-timeout` by the client's request timeout. An answer that arrives
+/// inside that window is taken even after the budget ran out: a match proves
+/// the backup holds the release. A request that does not answer inside it ends
+/// the wait, since the budget is spent.
 pub async fn wait_for_backup_project(
     wait: &BackupWait<'_>,
     project: &str,
@@ -3101,8 +3429,11 @@ pub async fn wait_for_backup_project(
     let start = std::time::Instant::now();
     let mut last: String;
     loop {
-        match wait.backup.project_export(project).await {
-            Ok(zip) => match crate::deploy::project_artifact::canonical_digest(&zip) {
+        let remaining = wait.policy.budget.saturating_sub(start.elapsed());
+        let bound = remaining.saturating_add(wait.policy.interval);
+        match tokio::time::timeout(bound, wait.backup.project_export(project)).await {
+            Err(_) => return Err("the backup's export did not answer within the wait".to_string()),
+            Ok(Ok(zip)) => match crate::deploy::project_artifact::canonical_digest(&zip) {
                 Ok(digest) if !digest.members.is_empty() && digest.sha256 == want => {
                     return Ok(zip);
                 }
@@ -3111,7 +3442,7 @@ pub async fn wait_for_backup_project(
                     last = format!("the backup's export is unusable ({})", err.code());
                 }
             },
-            Err(err) => {
+            Ok(Err(err)) => {
                 last = format!("the backup's export could not be read ({})", err.code());
             }
         }
@@ -3140,6 +3471,10 @@ pub async fn wait_for_backup_project(
 /// advanced again, and a changed one ends the node `git_recreated` with the
 /// save kept ([`settle_backup_git`]). Implemented as a backup-only option of
 /// the shared step, so the master's path and timing are untouched.
+///
+/// With `defer_removal` (a tag-owning run, 27-55) the backup's save is not
+/// removed here but marked pending removal on `report`, so it outlives
+/// `backup_step` and its resync; [`recheck_backup_git`] takes it from there.
 pub async fn git_after_backup(
     prepared: &PreparedGit,
     report: &mut GitReport,
@@ -3147,6 +3482,7 @@ pub async fn git_after_backup(
     inputs: &AfterInputs<'_>,
     wait: &BackupWait<'_>,
     want: &str,
+    defer_removal: bool,
 ) -> GitAfter {
     match wait_for_backup_project(wait, inputs.project, want).await {
         Ok(zip) => {
@@ -3159,7 +3495,10 @@ pub async fn git_after_backup(
                 report,
                 saved,
                 &converged,
-                Some(wait.policy.interval),
+                Some(Settle {
+                    interval: wait.policy.interval,
+                    defer: defer_removal,
+                }),
             )
             .await
         }
@@ -3194,6 +3533,7 @@ pub async fn git_rollback_backup(
     inputs: &UnverifiedInputs<'_>,
     wait: &BackupWait<'_>,
     want: Option<&str>,
+    pending: bool,
 ) -> RollbackGit {
     let unsynced = match want {
         None => Some("the master's project digest could not be read".to_string()),
@@ -3223,7 +3563,13 @@ pub async fn git_rollback_backup(
             )],
         };
     }
-    let mut step = git_after_rollback(report, saved, inputs).await;
+    // 27-54: a save the journal names (a pending one) is checked against the
+    // journal first.
+    let mut step = if pending {
+        git_after_pending(report, saved, inputs).await
+    } else {
+        git_after_rollback(report, saved, inputs).await
+    };
     // 27-37: the backup converged on the rolled-back project, so its
     // `project.json` is looked at too. Only a warning: these paths already
     // exit 6 and keep their outcome.
@@ -3249,6 +3595,7 @@ pub async fn git_record_backup(
     inputs: &AfterInputs<'_>,
     wait: &BackupWait<'_>,
     want: &str,
+    defer_removal: bool,
 ) -> GitAfter {
     let saved = match git_before_import(
         prepared,
@@ -3306,7 +3653,8 @@ pub async fn git_record_backup(
         }
     };
     report.set_save(&saved);
-    let mut after = git_after_backup(prepared, report, &saved, inputs, wait, want).await;
+    let mut after =
+        git_after_backup(prepared, report, &saved, inputs, wait, want, defer_removal).await;
     after.events.insert(
         0,
         ProjectsEvent::GitSaved {
@@ -3448,7 +3796,7 @@ mod tests {
             assert!(!producer.is_empty(), "{word}");
             let here = producer.contains("(27-12");
             let known = HOST_REASONS.contains(word) || RESTORE_REASONS.contains(word);
-            let later = ["27-13", "27-17", "27-22", "27-37"]
+            let later = ["27-13", "27-17", "27-22", "27-37", "27-54"]
                 .iter()
                 .any(|plan| producer.contains(plan));
             assert!(
