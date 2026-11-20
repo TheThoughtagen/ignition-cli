@@ -6929,9 +6929,11 @@ mod winps_git_native {
         );
         // the access, sharing, disposition and flags of each open, as reviewed
         // (27-48 review: `OpenFile` takes no `write` and reads only, and the
-        // new lock's handle can read its own attributes for `FileId`)
+        // new lock's handle can read its own attributes for `FileId`; F4,
+        // 2026-11-19: `OpenDir` asks `FILE_LIST_DIRECTORY` too, since an
+        // attributes-only handle is exempt from the sharing check)
         for call in [
-            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
+            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
             "public static SafeFileHandle OpenFile(string p){return O(p,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
             "public static SafeFileHandle CreateNew(string p){return O(p,GENERIC_WRITE|FILE_READ_ATTRIBUTES,0,CREATE_NEW,0,0);}",
             "public static SafeFileHandle OpenForDelete(string p){return O(p,DELETE|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
@@ -7502,6 +7504,36 @@ mod winps_git_native {
                 .find(|r| decode(&r["p"]) == b"refs/heads/feature/x")
                 .unwrap_or_else(|| panic!("feature/x is listed: {refs:?}"));
             assert_eq!(decode(&found["b"]), loose);
+        }
+
+        /// An absent file is `null` in the answer under 5.1, not `{}` (F5,
+        /// 2026-11-19): 5.1's `ConvertTo-Json` writes the AutomationNull of a
+        /// function that output nothing as `{}`, which the reader refuses. Here
+        /// `packed-refs` is absent, then `logs/HEAD` (error 2 on the open), then
+        /// the whole `logs` level (error 3); each reads as `null`.
+        #[test]
+        fn win_git_state_answers_null_for_absent_files_under_5_1() {
+            let fx = fixture();
+            let first = |fx: &Fixture| {
+                let part = &state_parts(fx)[0];
+                run_local(part).unwrap_or_else(|why| panic!("{}: {why}", part.name))
+            };
+            assert!(!fx.git.join("packed-refs").exists());
+            let answer = first(&fx);
+            assert!(answer["packed"].is_null(), "absent packed-refs: {answer}");
+            assert!(answer["log"].is_object(), "logs/HEAD is read: {answer}");
+            std::fs::remove_file(fx.git.join("logs").join("HEAD")).expect("rm logs/HEAD");
+            let answer = first(&fx);
+            assert!(answer["log"].is_null(), "absent logs/HEAD: {answer}");
+            assert!(answer["packed"].is_null(), "{answer}");
+            assert!(answer["head"].is_object(), "HEAD is still read: {answer}");
+            std::fs::remove_dir_all(fx.git.join("logs")).expect("rm logs");
+            let answer = first(&fx);
+            assert!(answer["log"].is_null(), "absent logs: {answer}");
+            assert!(
+                answer["config"].is_object(),
+                "config is still read: {answer}"
+            );
         }
 
         /// A junction swapped in for a level of the `.git` is refused on the

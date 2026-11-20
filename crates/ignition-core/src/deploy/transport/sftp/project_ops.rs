@@ -4361,7 +4361,7 @@ mod tests {
             puts[0]
         );
         assert!(
-            puts[0].contains("IgnGitNative-d7e591c96cb6.cs"),
+            puts[0].contains("IgnGitNative-a58702afa266.cs"),
             "named by the first 12 digits of the pin: {}",
             puts[0]
         );

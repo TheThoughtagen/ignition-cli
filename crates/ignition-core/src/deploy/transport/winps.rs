@@ -300,7 +300,7 @@ macro_rules! git_native_cs {
             "using System;using System.IO;using System.Runtime.InteropServices;using Microsoft.Win32.SafeHandles;",
             "namespace IgnGit{public static class N{",
             "/* Win32 constants, named as in the Windows headers. */",
-            "const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,DELETE=0x10000,FILE_READ_ATTRIBUTES=0x80,",
+            "const uint GENERIC_READ=0x80000000,GENERIC_WRITE=0x40000000,DELETE=0x10000,FILE_LIST_DIRECTORY=1,FILE_READ_ATTRIBUTES=0x80,",
             "FILE_SHARE_READ=1,FILE_SHARE_WRITE=2,FILE_SHARE_DELETE=4,CREATE_NEW=1,OPEN_EXISTING=3,",
             "FILE_FLAG_BACKUP_SEMANTICS=0x2000000,FILE_FLAG_OPEN_REPARSE_POINT=0x200000,",
             "FILE_ATTRIBUTE_DIRECTORY=0x10,FILE_ATTRIBUTE_REPARSE_POINT=0x400,",
@@ -328,7 +328,9 @@ macro_rules! git_native_cs {
             "if(((t&FILE_ATTRIBUTE_DIRECTORY)!=0)!=(k==1))throw new IOException(k==1?\"the path is not a directory\":\"the path is not a regular file\");",
             "return h;}catch{h.Dispose();throw;}}",
             // No FILE_SHARE_DELETE: while held, the directory cannot be renamed or replaced.
-            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
+            // FILE_LIST_DIRECTORY is what makes the share mode count: Windows skips the
+            // sharing check for a handle whose access is only attributes (F4, 2026-11-19).
+            "public static SafeFileHandle OpenDir(string p){return O(p,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,1);}",
             "public static SafeFileHandle OpenFile(string p){return O(p,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,OPEN_EXISTING,0,2);}",
             // No sharing at all: nobody else can open, delete or replace the new file while it is held.
             // It can read its own attributes, so FileId can be taken from the handle that created it.
@@ -357,10 +359,13 @@ macro_rules! git_native_cs {
 /// `IgnGit.N`, every method throwing `IOException` with a fixed English text and
 /// the Win32 error number (no path in any message):
 ///
-/// - `OpenDir(path)`: `FILE_READ_ATTRIBUTES`, shared for read and write and NOT
-///   for delete, so a directory that is held cannot be renamed or replaced (the
-///   Windows anchor, there being no `openat`); must be a directory and not a
-///   reparse point, read from the attribute tag of the handle that is returned.
+/// - `OpenDir(path)`: `FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES`, shared for
+///   read and write and NOT for delete, so a directory that is held cannot be
+///   renamed or replaced (the Windows anchor, there being no `openat`); must be
+///   a directory and not a reparse point, read from the attribute tag of the
+///   handle that is returned. `FILE_LIST_DIRECTORY` is needed: a handle whose
+///   access is only attributes is exempt from the sharing check, so it would
+///   not stop a rename (`win_git_state_holds_its_levels`, re-pinned 2026-11-19).
 /// - `OpenFile(path)`: `GENERIC_READ` only, shared for read, write and delete;
 ///   must be a regular file, not a reparse point.
 /// - `CreateNew(path)`: `GENERIC_WRITE | FILE_READ_ATTRIBUTES` (so `FileId` can
@@ -384,12 +389,12 @@ pub const GIT_NATIVE_CS: &str = git_native_cs!();
 // pins the text of the block to the first, and checks the second is its prefix.
 macro_rules! git_native_pin {
     () => {
-        "d7e591c96cb694c2688198b0d72987cd8adb9bbca361d6afb6632cf44be9c145"
+        "a58702afa2665b0779b50e937dd144a63776584a9987a4a9312a4c8930d9e9bf"
     };
 }
 macro_rules! git_native_pin12 {
     () => {
-        "d7e591c96cb6"
+        "a58702afa266"
     };
 }
 
@@ -520,11 +525,14 @@ macro_rules! git_ps_nq {
 /// cap check names an oversized one. A reparse point or a directory where a
 /// file belongs is a terminating error naming the path, never an absent file:
 /// absence is only a failed open with Win32 error 2 or 3 (the 25-03 captures).
-/// An absent `logs` makes `logs/HEAD` absent too.
+/// An absent `logs` makes `logs/HEAD` absent too. An absent file is an explicit
+/// `$null`: a function that outputs nothing is AutomationNull, which Windows
+/// PowerShell 5.1's `ConvertTo-Json` writes as `{}` where PowerShell 7 writes
+/// `null`, and `{}` is refused as a file with no size or bytes.
 pub const GIT_STATE: &str = concat!(
     git_native_load!(),
     git_ps_nq!(),
-    r##"function F($x,$k,$t){$h=Q OpenFile $x;if($h){$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;$e=[Math]::Min($n,$k);if($t){[void]$s.Seek($n-$e,0)};@{n=$n;b=[Convert]::ToBase64String([IO.BinaryReader]::new($s).ReadBytes($e))}}finally{$s.Dispose()}}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));[void](D logs);E @{ok=1;head=(F HEAD 65537 $false);config=(F config 65537 $false);packed=(F packed-refs 8388609 $false);log=(F logs/HEAD 65536 $true)}}finally{$o|%{$_.Dispose()}}"##,
+    r##"function F($x,$k,$t){$h=Q OpenFile $x;if($h){$s=[IO.FileStream]::new($h,'Read');try{$n=$s.Length;$e=[Math]::Min($n,$k);if($t){[void]$s.Seek($n-$e,0)};@{n=$n;b=[Convert]::ToBase64String([IO.BinaryReader]::new($s).ReadBytes($e))}}finally{$s.Dispose()}}else{$null}};try{[void]$o.Add([IgnGit.N]::OpenDir($g));[void](D logs);E @{ok=1;head=(F HEAD 65537 $false);config=(F config 65537 $false);packed=(F packed-refs 8388609 $false);log=(F logs/HEAD 65536 $true)}}finally{$o|%{$_.Dispose()}}"##,
 );
 
 /// The index and the markers of a gateway's `.git`, the second script of the
@@ -845,52 +853,52 @@ macro_rules! git_ps_wh {
 
 macro_rules! git_lock_pin {
     () => {
-        "1a81907a62cbf32a69ceb618b665f2207fb3c69aadcb8172b4e7a58b42f1dd80"
+        "387c5dd908c06465a6108a4c1a038c9342ed1a700c6d773269ae880a4b0f7a23"
     };
 }
 macro_rules! git_lock_pin12 {
     () => {
-        "1a81907a62cb"
+        "387c5dd908c0"
     };
 }
 macro_rules! git_unlock_pin {
     () => {
-        "5de62d24ceb1e98ccc2beafa1a0840520c9ecccd2698c4962305cee355ada59d"
+        "f6026ab8cfc2e0875d64e2373aa58fabf45f7bc59e332df968f278260d09efaa"
     };
 }
 macro_rules! git_unlock_pin12 {
     () => {
-        "5de62d24ceb1"
+        "f6026ab8cfc2"
     };
 }
 macro_rules! git_replace_pin {
     () => {
-        "c1676e48556439bb1e5fa1c64d63a2e1e81f62852d400e84fac26bb451583ffe"
+        "82e1de5e54412c717bd09c4d0c3a48a4a06838b54b0b9d9ffaec8ffe76b4446b"
     };
 }
 macro_rules! git_replace_pin12 {
     () => {
-        "c1676e485564"
+        "82e1de5e5441"
     };
 }
 macro_rules! git_restore_pin {
     () => {
-        "9103d17b98a791f278eec5d3a7504f64b966e0b90d9ca00fa6e20dd9a51c10bb"
+        "2d8bc1ffe6fbb6041c4c93c64b23d0c244345e4acbba00ba9567e3098ef1f21c"
     };
 }
 macro_rules! git_restore_pin12 {
     () => {
-        "9103d17b98a7"
+        "2d8bc1ffe6fb"
     };
 }
 macro_rules! git_bundle_pin {
     () => {
-        "9c7d24de1248a58b6b3e23dceb349fc9263906f164256f20ba2d4663de047c4b"
+        "3d801c3f6069fb1236eb8aa3b932b5e2a7c37124a2f0efaa13b9adf44005609f"
     };
 }
 macro_rules! git_bundle_pin12 {
     () => {
-        "9c7d24de1248"
+        "3d801c3f6069"
     };
 }
 
