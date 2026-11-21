@@ -4,7 +4,7 @@
 # Phase 27 (27-04) pair rig driver: the disposable two-node 8.3.6 pair of
 # setup-pair.sh (compose project `ign-pair-rig`, gw-a Master on 127.0.0.1:18300,
 # gw-b Backup on 127.0.0.1:18301) with the signed git module named by
-# IGN_PAIR_MODULE_VER (default 2.3.5) on BOTH nodes, a git server both nodes
+# IGN_PAIR_MODULE_VER (default 2.3.6) on BOTH nodes, a git server both nodes
 # reach, and the same `CapApp` seed and `git.yaml` (template variant) on both
 # nodes. G5 records what redundancy sync does to the backup's `.git`.
 #
@@ -103,10 +103,11 @@ DEPLOY_FIX=$HERE/../live-rig-deploy
 PROJECT=ign-pair-rig
 APP=CapApp
 BARE=capapp.git
-# IGN_PAIR_MODULE_VER: the git module version both nodes run (default 2.3.5,
-# the release that fixes the backup project.json deletion). Set 2.3.4 to
+# IGN_PAIR_MODULE_VER: the git module version both nodes run (default 2.3.6,
+# the release that fixes the backup project.json deletion and keeps
+# non-module files across a restart). Set 2.3.4 to
 # rebuild the defect for git_pair_detect_live.
-MODULE_VER=${IGN_PAIR_MODULE_VER:-2.3.5}
+MODULE_VER=${IGN_PAIR_MODULE_VER:-2.3.6}
 CDATA=/usr/local/bin/ignition/data
 # IGN_PAIR_WAIT_S: how long up waits for each node (default 600 s; a loaded
 # machine running the amd64 image under emulation needs more).
