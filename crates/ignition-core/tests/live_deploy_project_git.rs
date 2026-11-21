@@ -564,7 +564,13 @@ struct Advanced {
 
 /// `prepare_advance`, `save`, the real overwrite import of the v1.1.0
 /// artifact, the read-back export, `restore_and_advance`.
-async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
+async fn run_handover(
+    rig: &Rig,
+    api: &ReqwestGatewayApi,
+    // version-matched restore expectation: begin
+    restore_expect: RestoreExpect,
+    // version-matched restore expectation: end
+) -> Advanced {
     let host = HostGit::new();
     let node = rig.node();
     let (_keep, checkout, c2) = release_checkout(rig, "v1.1.0");
@@ -611,7 +617,14 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
         .project_import(APP, artifact.zip.clone(), true)
         .await
         .unwrap_or_else(|err| panic!("overwrite import: {} ({err})", err.code()));
-    let git_gone_secs = wait_git_gone(rig, Duration::from_secs(90)).await;
+    // version-matched restore expectation: begin
+    // Only 2.3.4 deletes `.git` on import; on 2.3.5+ it stays, so waiting for
+    // it to go would only burn the full limit.
+    let git_gone_secs = match restore_expect {
+        RestoreExpect::Restored => wait_git_gone(rig, Duration::from_secs(90)).await,
+        RestoreExpect::InPlace => None,
+    };
+    // version-matched restore expectation: end
     eprintln!("LIVE-IMPORT git_removed_after_secs={git_gone_secs:?}");
     // Let the module's own import of the project settle before the read-back.
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -671,7 +684,7 @@ async fn git_advance_status() {
     // version-matched restore expectation: begin
     let identity_before = identity_before(&rig, &HostGit::new(), restore_expect, true).await;
     // version-matched restore expectation: end
-    let advanced = run_handover(&rig, &api).await;
+    let advanced = run_handover(&rig, &api, restore_expect).await;
     let report = &advanced.report;
     eprintln!(
         "LIVE-HANDOVER restored={} advanced={} verified={} expected_drift={} dropped={}",
@@ -1285,7 +1298,7 @@ async fn git_pull_push_roundtrip() {
     // version-matched restore expectation: begin
     let identity_before = identity_before(&rig, &host, restore_expect, true).await;
     // version-matched restore expectation: end
-    let advanced = run_handover(&rig, &api).await;
+    let advanced = run_handover(&rig, &api, restore_expect).await;
     // version-matched restore expectation: begin
     if restore_expect == RestoreExpect::Restored {
         assert!(
