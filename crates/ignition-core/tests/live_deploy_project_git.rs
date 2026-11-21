@@ -655,6 +655,9 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
 async fn git_advance_status() {
     let Some(rig) = rig().await else { return };
     let api = rig.api();
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(&api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(&api, &rig.url).await;
 
     let before = jgit(&api, &config).await;
@@ -666,8 +669,7 @@ async fn git_advance_status() {
     );
 
     // version-matched restore expectation: begin
-    let (restore_expect, identity_before) =
-        restore_expect_before(&rig, &api, &HostGit::new(), true).await;
+    let identity_before = identity_before(&rig, &HostGit::new(), restore_expect, true).await;
     // version-matched restore expectation: end
     let advanced = run_handover(&rig, &api).await;
     let report = &advanced.report;
@@ -1274,11 +1276,14 @@ async fn git_pull_push_roundtrip() {
     let Some(rig) = rig().await else { return };
     let api = rig.api();
     let host = HostGit::new();
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(&api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(&api, &rig.url).await;
 
     // 1. ign's advance to v1.1.0 (as git_advance_status does).
     // version-matched restore expectation: begin
-    let (restore_expect, identity_before) = restore_expect_before(&rig, &api, &host, true).await;
+    let identity_before = identity_before(&rig, &host, restore_expect, true).await;
     // version-matched restore expectation: end
     let advanced = run_handover(&rig, &api).await;
     // version-matched restore expectation: begin
@@ -2081,6 +2086,9 @@ async fn managed_deploy(
     branch: &str,
     expect: Expect,
 ) -> ManagedOutcome {
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(api, &rig.url).await;
     let gitdir = rig.project_dir().join(".git");
 
@@ -2155,8 +2163,13 @@ async fn managed_deploy(
     // 27-61: the module version decides what the handover must show. An
     // adoptable repo is not a managed one and keeps its expression on every
     // version, so its identity is not captured.
-    let (restore_expect, identity_before) =
-        restore_expect_before(rig, api, &HostGit::new(), expect.state != "adoptable").await;
+    let identity_before = identity_before(
+        rig,
+        &HostGit::new(),
+        restore_expect,
+        expect.state != "adoptable",
+    )
+    .await;
     // version-matched restore expectation: end
     let started = Instant::now();
     let applied = deploy_in_process(rig, false, ENV, release, &flags, label)
@@ -3292,6 +3305,9 @@ async fn git_prodscale_rig() {
         off.is_empty(),
         "REFUSING: the live .git does not have the configured shape (differing: {off:?}); run seedprod27 again"
     );
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(&api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(&api, &rig.url).await;
 
     let first = DeployFlags {
@@ -3341,7 +3357,7 @@ async fn git_prodscale_rig() {
         "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
     );
     // version-matched restore expectation: begin
-    let (restore_expect, identity_before) = restore_expect_before(&rig, &api, &host, true).await;
+    let identity_before = identity_before(&rig, &host, restore_expect, true).await;
     // version-matched restore expectation: end
     let timed = TimedWriter::new(rig.node(), rig.data.clone());
     let timeline = Timeline::new();
@@ -5564,16 +5580,11 @@ fn restore_row_in_place(span: Option<Duration>) -> Option<String> {
     })
 }
 
-/// The master's git module version, the restore expectation it implies, and
-/// (on an advance-in-place module, when `capture` is set) the repository's
-/// identity before the write. An unknown version panics here, before anything
-/// is written. Prints `LIVE-RESTORE-EXPECT module=<version> expect=...`.
-async fn restore_expect_before(
-    rig: &Rig,
-    api: &dyn GatewayApi,
-    host: &HostGit,
-    capture: bool,
-) -> (RestoreExpect, Option<RepoIdentity>) {
+/// The master's git module version and the restore expectation it implies.
+/// Each gate calls it before its first write (the script route included), so
+/// an unknown version panics before the rig is changed. Prints
+/// `LIVE-RESTORE-EXPECT module=<version> expect=...`.
+async fn module_restore_expect(api: &dyn GatewayApi) -> RestoreExpect {
     let version = git_module_version(api, "master").await;
     let expect = restore_expectation(&version).unwrap_or_else(|err| panic!("{err}"));
     eprintln!(
@@ -5583,10 +5594,20 @@ async fn restore_expect_before(
             RestoreExpect::InPlace => "in_place",
         }
     );
-    let before = if capture && expect == RestoreExpect::InPlace {
+    expect
+}
+
+/// On an advance-in-place module, when `capture` is set, the repository's
+/// identity right before the handover or apply.
+async fn identity_before(
+    rig: &Rig,
+    host: &HostGit,
+    expect: RestoreExpect,
+    capture: bool,
+) -> Option<RepoIdentity> {
+    if capture && expect == RestoreExpect::InPlace {
         Some(repo_identity(rig, host).await)
     } else {
         None
-    };
-    (expect, before)
+    }
 }
