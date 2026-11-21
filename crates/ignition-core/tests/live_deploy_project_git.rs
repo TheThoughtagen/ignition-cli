@@ -1,6 +1,7 @@
 //! Phase 27's live gates on a git-module rig (27-03, the phase tracer's last
 //! step): the keep-and-advance handover of 27-01/27-02 runs against JGit inside
-//! the git module 2.3.4 on an Ignition 8.3.6 gateway. Nothing here is mocked.
+//! the git module on an Ignition 8.3.6 gateway. The rigs default to module 2.3.5
+//! (27-61); 2.3.4 is for `git_pair_detect_live` only. Nothing here is mocked.
 //!
 //! ```text
 //! cd crates/ignition-core/tests/fixtures/live-rig-deploy
@@ -52,6 +53,7 @@ use ignition_core::actions::deploy_projects::{
 use ignition_core::actions::script::script_run;
 use ignition_core::actions::webdev::webdev_deploy_with;
 use ignition_core::client::deploy_api::scan_and_wait;
+use ignition_core::client::query::ListQuery;
 use ignition_core::client::scan::ScanKind;
 use ignition_core::client::{DeployApi, GatewayApi, ReqwestGatewayApi};
 use ignition_core::config::{self, Config, Credential, Secret};
@@ -59,7 +61,9 @@ use ignition_core::deploy::apply::preflight::DesignersPolicy;
 use ignition_core::deploy::git_advance::{AdvancePrep, GitWrite, prepare_advance};
 use ignition_core::deploy::git_handover::{GitSaveReport, restore_and_advance, save};
 use ignition_core::deploy::git_remote::HostGit;
-use ignition_core::deploy::git_state::{GitHead, GitRefs, GitState, GitStateKind, classify};
+use ignition_core::deploy::git_state::{
+    GitHead, GitRefs, GitRemote, GitState, GitStateKind, classify,
+};
 use ignition_core::deploy::ledger::{LedgerRoot, git_save_rel};
 use ignition_core::deploy::pair::{BACKUP_POLL_S, BackupNode, BackupPolicy};
 use ignition_core::deploy::project_artifact::{Artifact, build_artifact, canonical_digest};
@@ -70,6 +74,7 @@ use ignition_core::deploy::transport::projects::{
 };
 use ignition_core::deploy::transport::{self, projects::project_host_for_node};
 use ignition_core::error::CoreError;
+use ignition_core::module::GIT_MODULE;
 use ignition_core::poll::PollConfig;
 
 mod common;
@@ -559,7 +564,13 @@ struct Advanced {
 
 /// `prepare_advance`, `save`, the real overwrite import of the v1.1.0
 /// artifact, the read-back export, `restore_and_advance`.
-async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
+async fn run_handover(
+    rig: &Rig,
+    api: &ReqwestGatewayApi,
+    // version-matched restore expectation: begin
+    restore_expect: RestoreExpect,
+    // version-matched restore expectation: end
+) -> Advanced {
     let host = HostGit::new();
     let node = rig.node();
     let (_keep, checkout, c2) = release_checkout(rig, "v1.1.0");
@@ -606,7 +617,14 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
         .project_import(APP, artifact.zip.clone(), true)
         .await
         .unwrap_or_else(|err| panic!("overwrite import: {} ({err})", err.code()));
-    let git_gone_secs = wait_git_gone(rig, Duration::from_secs(90)).await;
+    // version-matched restore expectation: begin
+    // Only 2.3.4 deletes `.git` on import; on 2.3.5+ it stays, so waiting for
+    // it to go would only burn the full limit.
+    let git_gone_secs = match restore_expect {
+        RestoreExpect::Restored => wait_git_gone(rig, Duration::from_secs(90)).await,
+        RestoreExpect::InPlace => None,
+    };
+    // version-matched restore expectation: end
     eprintln!("LIVE-IMPORT git_removed_after_secs={git_gone_secs:?}");
     // Let the module's own import of the project settle before the read-back.
     tokio::time::sleep(Duration::from_secs(8)).await;
@@ -650,6 +668,9 @@ async fn run_handover(rig: &Rig, api: &ReqwestGatewayApi) -> Advanced {
 async fn git_advance_status() {
     let Some(rig) = rig().await else { return };
     let api = rig.api();
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(&api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(&api, &rig.url).await;
 
     let before = jgit(&api, &config).await;
@@ -660,7 +681,10 @@ async fn git_advance_status() {
         before.branch
     );
 
-    let advanced = run_handover(&rig, &api).await;
+    // version-matched restore expectation: begin
+    let identity_before = identity_before(&rig, &HostGit::new(), restore_expect, true).await;
+    // version-matched restore expectation: end
+    let advanced = run_handover(&rig, &api, restore_expect).await;
     let report = &advanced.report;
     eprintln!(
         "LIVE-HANDOVER restored={} advanced={} verified={} expected_drift={} dropped={}",
@@ -670,10 +694,29 @@ async fn git_advance_status() {
         report.expected_drift.len(),
         report.dropped.len()
     );
-    assert!(
-        report.restored && report.advanced && report.verified,
-        "{report:?}"
-    );
+    // version-matched restore expectation: begin
+    if restore_expect == RestoreExpect::Restored {
+        assert!(
+            report.restored && report.advanced && report.verified,
+            "{report:?}"
+        );
+    } else {
+        assert!(
+            !report.restored && report.advanced && report.verified,
+            "{report:?}"
+        );
+        let before = identity_before
+            .as_ref()
+            .expect("the identity is captured before the handover");
+        let after = repo_identity(&rig, &HostGit::new()).await;
+        let problems =
+            in_place_problems(before, &after, old_head_present(&rig, before), &advanced.c2);
+        assert!(
+            problems.is_empty(),
+            "the repository after the handover is not the one before, advanced to the release: {problems:?}"
+        );
+    }
+    // version-matched restore expectation: end
 
     // JGit's status equals the prediction (as sets: none extra, none missing).
     let after = jgit(&api, &config).await;
@@ -1246,15 +1289,41 @@ async fn git_pull_push_roundtrip() {
     let Some(rig) = rig().await else { return };
     let api = rig.api();
     let host = HostGit::new();
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(&api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(&api, &rig.url).await;
 
     // 1. ign's advance to v1.1.0 (as git_advance_status does).
-    let advanced = run_handover(&rig, &api).await;
-    assert!(
-        advanced.report.restored && advanced.report.advanced && advanced.report.verified,
-        "{:?}",
-        advanced.report
-    );
+    // version-matched restore expectation: begin
+    let identity_before = identity_before(&rig, &host, restore_expect, true).await;
+    // version-matched restore expectation: end
+    let advanced = run_handover(&rig, &api, restore_expect).await;
+    // version-matched restore expectation: begin
+    if restore_expect == RestoreExpect::Restored {
+        assert!(
+            advanced.report.restored && advanced.report.advanced && advanced.report.verified,
+            "{:?}",
+            advanced.report
+        );
+    } else {
+        assert!(
+            !advanced.report.restored && advanced.report.advanced && advanced.report.verified,
+            "{:?}",
+            advanced.report
+        );
+        let before = identity_before
+            .as_ref()
+            .expect("the identity is captured before the handover");
+        let after = repo_identity(&rig, &host).await;
+        let problems =
+            in_place_problems(before, &after, old_head_present(&rig, before), &advanced.c2);
+        assert!(
+            problems.is_empty(),
+            "the repository after the handover is not the one before, advanced to the release: {problems:?}"
+        );
+    }
+    // version-matched restore expectation: end
     let drift = jgit(&api, &config).await;
     eprintln!(
         "LIVE-JGIT after advance: uncommitted={} unpushed={} branch={}",
@@ -2030,6 +2099,9 @@ async fn managed_deploy(
     branch: &str,
     expect: Expect,
 ) -> ManagedOutcome {
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(api, &rig.url).await;
     let gitdir = rig.project_dir().join(".git");
 
@@ -2100,6 +2172,18 @@ async fn managed_deploy(
         allow_manual_undo: expect.tags,
         ..DeployFlags::default()
     };
+    // version-matched restore expectation: begin
+    // 27-61: the module version decides what the handover must show. An
+    // adoptable repo is not a managed one and keeps its expression on every
+    // version, so its identity is not captured.
+    let identity_before = identity_before(
+        rig,
+        &HostGit::new(),
+        restore_expect,
+        expect.state != "adoptable",
+    )
+    .await;
+    // version-matched restore expectation: end
     let started = Instant::now();
     let applied = deploy_in_process(rig, false, ENV, release, &flags, label)
         .await
@@ -2136,15 +2220,46 @@ async fn managed_deploy(
         restore["dropped"],
         restore["reason"]
     );
-    // The import left the partial repo in place (observed live in 27-24), so
-    // there was nothing to put back and `restored` is false for an adoption;
-    // the advance and its read-back are what the adoption must show.
-    assert!(
-        (restore["restored"] == true || expect.state == "adoptable")
-            && restore["advanced"] == true
-            && restore["verified"] == true,
-        "{label}: the handover did not complete: {restore}"
-    );
+    // version-matched restore expectation: begin
+    if restore_expect == RestoreExpect::Restored || expect.state == "adoptable" {
+        // The import left the partial repo in place (observed live in 27-24), so
+        // there was nothing to put back and `restored` is false for an adoption;
+        // the advance and its read-back are what the adoption must show.
+        assert!(
+            (restore["restored"] == true || expect.state == "adoptable")
+                && restore["advanced"] == true
+                && restore["verified"] == true,
+            "{label}: the handover did not complete: {restore}"
+        );
+    } else {
+        // 27-61: the module kept `.git` through the import, so nothing is
+        // restored and the same repository is advanced to the release.
+        assert!(
+            restore["restored"] == false
+                && restore["advanced"] == true
+                && restore["verified"] == true,
+            "{label}: the handover did not advance in place: {restore}"
+        );
+        let (_keep, _tree, release_commit) = release_checkout(rig, release);
+        let before = identity_before
+            .as_ref()
+            .expect("the identity is captured before the apply");
+        let after = repo_identity(rig, &HostGit::new()).await;
+        let problems = in_place_problems(
+            before,
+            &after,
+            old_head_present(rig, before),
+            &release_commit,
+        );
+        assert!(
+            problems.is_empty(),
+            "{label}: the repository after the deploy is not the one before, advanced to the release: {problems:?}"
+        );
+        eprintln!(
+            "LIVE-RESTORE-INPLACE {label} same repository at the release, pre-deploy HEAD kept"
+        );
+    }
+    // version-matched restore expectation: end
     assert_eq!(
         restore["post_status"], "matched",
         "{label}: the master is a local node, so the run's own post-advance disk status ran (D-25): {restore}"
@@ -3203,6 +3318,9 @@ async fn git_prodscale_rig() {
         off.is_empty(),
         "REFUSING: the live .git does not have the configured shape (differing: {off:?}); run seedprod27 again"
     );
+    // version-matched restore expectation: begin
+    let restore_expect = module_restore_expect(&api).await;
+    // version-matched restore expectation: end
     let (_work, config) = script_config(&api, &rig.url).await;
 
     let first = DeployFlags {
@@ -3251,6 +3369,9 @@ async fn git_prodscale_rig() {
         changed_since.is_empty(),
         "REFUSING: the live .git changed or lost the configured shape before the timed apply (differing: {changed_since:?}); wait for the module's start sync and run the gate again"
     );
+    // version-matched restore expectation: begin
+    let identity_before = identity_before(&rig, &host, restore_expect, true).await;
+    // version-matched restore expectation: end
     let timed = TimedWriter::new(rig.node(), rig.data.clone());
     let timeline = Timeline::new();
     let extras = Extras {
@@ -3293,13 +3414,41 @@ async fn git_prodscale_rig() {
             ),
         );
     }
-    if !(restore["restored"] == true && restore["advanced"] == true && restore["verified"] == true)
-    {
-        find(
-            &mut findings,
-            format!("the handover did not complete: {restore}"),
-        );
+    // version-matched restore expectation: begin
+    match restore_expect {
+        RestoreExpect::Restored => {
+            if !(restore["restored"] == true
+                && restore["advanced"] == true
+                && restore["verified"] == true)
+            {
+                find(
+                    &mut findings,
+                    format!("the handover did not complete: {restore}"),
+                );
+            }
+        }
+        RestoreExpect::InPlace => {
+            if !(restore["restored"] == false
+                && restore["advanced"] == true
+                && restore["verified"] == true)
+            {
+                find(
+                    &mut findings,
+                    format!("the handover did not advance in place: {restore}"),
+                );
+            }
+            let before = identity_before
+                .as_ref()
+                .expect("the identity is captured before the timed apply");
+            let after = repo_identity(&rig, &host).await;
+            for problem in
+                in_place_problems(before, &after, old_head_present(&rig, before), &release)
+            {
+                find(&mut findings, problem);
+            }
+        }
     }
+    // version-matched restore expectation: end
     if restore["post_status"] != "matched" {
         find(
             &mut findings,
@@ -3309,19 +3458,37 @@ async fn git_prodscale_rig() {
 
     // The budgets (D-18): none is scaled and none is skipped, and each row is
     // printed whatever the outcome.
-    for (row, span, budget) in [
-        ("save", timed.span("save"), HOST_LINUX_SAVE),
-        (
-            "restore_verify",
-            timed.span("restore"),
-            HOST_LINUX_RESTORE_VERIFY,
-        ),
-        ("upload", timed.span("upload"), HOST_LINUX_UPLOAD),
-    ] {
-        if let Some(finding) = within(row, span, budget) {
-            find(&mut findings, finding);
+    // version-matched restore expectation: begin
+    match restore_expect {
+        RestoreExpect::Restored => {
+            for (row, span, budget) in [
+                ("save", timed.span("save"), HOST_LINUX_SAVE),
+                (
+                    "restore_verify",
+                    timed.span("restore"),
+                    HOST_LINUX_RESTORE_VERIFY,
+                ),
+                ("upload", timed.span("upload"), HOST_LINUX_UPLOAD),
+            ] {
+                if let Some(finding) = within(row, span, budget) {
+                    find(&mut findings, finding);
+                }
+            }
+        }
+        RestoreExpect::InPlace => {
+            if let Some(finding) = within("save", timed.span("save"), HOST_LINUX_SAVE) {
+                find(&mut findings, finding);
+            }
+            eprintln!("LIVE-SCALE restore_verify: not applicable: advanced in place");
+            if let Some(finding) = restore_row_in_place(timed.span("restore")) {
+                find(&mut findings, finding);
+            }
+            if let Some(finding) = within("upload", timed.span("upload"), HOST_LINUX_UPLOAD) {
+                find(&mut findings, finding);
+            }
         }
     }
+    // version-matched restore expectation: end
 
     // Y3 follow-up (27-42): the save's `.git`, measured right after the timed
     // save and outside its span, has the configured shape and the counts
@@ -3702,7 +3869,10 @@ async fn git_designer_evidence() {
     eprintln!("LIVE-RAN git_designer_evidence");
 }
 
-// ---- 27-25 Task 1: the pair rig, git module 2.3.4 on both nodes -----------------
+// ---- 27-25 Task 1: the pair rig, the same git module on both nodes ---------------
+//
+// The pair driver defaults to git module 2.3.5 (27-61); a pair built with
+// `IGN_PAIR_MODULE_VER=2.3.4` is for `git_pair_detect_live` only.
 //
 // `capture27-pair.sh live <log> git_pair_e2e` (it sources `tokens.env` and exports
 // `IGNITION_LIVE_PAIR=1`, `IGN_PAIR_DATA_A`, `IGN_PAIR_DATA_B`,
@@ -4296,23 +4466,41 @@ async fn git_pair_e2e() {
     eprintln!("LIVE-RAN git_pair_e2e");
 }
 
-/// 27-38 (GITDEP-09 detection, never the passing gate): on the rig pair, with
-/// the git module's backup `project.json` deletion present, one apply of v1.1.0
-/// must end `git_restore_failed` (slug `deploy_git_restore_failed`, exit 6) with
-/// `restore.reason` `backup_project_json_missing` on `nodes.backup` and the
-/// backup's save kept, while the master is as strict and green as
-/// `git_pair_e2e` demands. Its last line is `LIVE-DETECT git_pair_detect_live`,
-/// a different line kind from the passing-gate line, so a proof that the guard
-/// fires is never read as a green pair. When the defect does not reproduce (the
-/// module fix is installed) it prints `LIVE-DETECT-NA defect not reproduced`
-/// and fails: retire or rewrite this check when `git_pair_e2e` goes green.
+/// 27-38 (GITDEP-09 detection, never the passing gate): proves ign's
+/// `backup_project_json_missing` guard on a real pair that runs the defective
+/// git module 2.3.4 on both nodes. With the module's backup `project.json`
+/// deletion present, one apply of v1.1.0 must end `git_restore_failed` (slug
+/// `deploy_git_restore_failed`, exit 6) with `restore.reason`
+/// `backup_project_json_missing` on `nodes.backup` and the backup's save kept,
+/// while the master is as strict and green as `git_pair_e2e` demands.
+///
+/// 27-61: on any other release the check skips before any state read or
+/// deploy, because 27-60 showed the fix on 2.3.5 and `git_pair_e2e` asserts it
+/// there. The counted proof is `capture27-pair.sh detect`, which needs the
+/// anchored `LIVE-DETECT git_pair_detect_live` line, a different line kind from
+/// the passing-gate line; a skip prints neither, so it never counts. When the
+/// defect does not reproduce on 2.3.4 the check prints
+/// `LIVE-DETECT-NA defect not reproduced` and fails.
 #[tokio::test]
-#[ignore = "needs the pair rig with the git module on both nodes: IGNITION_LIVE_PAIR=1"]
+#[ignore = "needs the pair rig with git module 2.3.4 on both nodes (IGN_PAIR_MODULE_VER=2.3.4): IGNITION_LIVE_PAIR=1"]
 async fn git_pair_detect_live() {
     let Some(rig) = pair_rig().await else { return };
     let backup = rig.backup.as_ref().expect("pair");
     let api_a = rig.api();
     let api_b = pair_api_b(&rig);
+    // 27-61: the guard's live proof needs the defective release on both nodes.
+    let version_a = git_module_version(&api_a, "master").await;
+    let version_b = git_module_version(&api_b, "backup").await;
+    if !(is_defect_release(&version_a) && is_defect_release(&version_b)) {
+        skip(&format!(
+            "git module {version_a} on the master and {version_b} on the backup: \
+             this check proves ign's backup_project_json_missing guard on \
+             {DEFECT_MODULE_RELEASE} only (build the pair with \
+             IGN_PAIR_MODULE_VER={DEFECT_MODULE_RELEASE}); git_pair_e2e is the gate \
+             on a fixed module"
+        ));
+        return;
+    }
     let host = HostGit::new();
     let node_a = LocalFsTransport::new(rig.data.clone(), "nodes.master");
     let node_b = LocalFsTransport::new(backup.data.clone(), "nodes.backup");
@@ -5054,4 +5242,385 @@ async fn git_g2norm() {
         patch.len()
     );
     println!("LIVE-RAN git_g2norm");
+}
+
+// ---- 27-61: the git module version a gate runs against -------------------------
+
+/// 27-61: the detection predicate matches the defective release only, read the
+/// way the gateway reports it (`2.3.4 (b0)`).
+#[test]
+fn is_defect_release_matches_only_the_2_3_4_release() {
+    assert!(is_defect_release("2.3.4 (b0)"));
+    assert!(is_defect_release("2.3.4"));
+    for other in ["2.3.5 (b0)", "2.3.40", "2.3.4-rc1", ""] {
+        assert!(
+            !is_defect_release(other),
+            "{other:?} is not the defect release"
+        );
+    }
+}
+
+/// The git module release with the backup `project.json` deletion (27-38).
+const DEFECT_MODULE_RELEASE: &str = "2.3.4";
+
+/// Whether the gateway-reported module `version` (`2.3.4 (b0)`) is the
+/// defective release: its first whitespace-separated token is exactly
+/// [`DEFECT_MODULE_RELEASE`].
+fn is_defect_release(version: &str) -> bool {
+    version.split_whitespace().next() == Some(DEFECT_MODULE_RELEASE)
+}
+
+/// The git module's version on one node, as the gateway's module list reports
+/// it. A failed read or a missing module panics, naming the node.
+async fn git_module_version(api: &dyn GatewayApi, node: &str) -> String {
+    let listed = api
+        .modules(false, &ListQuery::default())
+        .await
+        .unwrap_or_else(|err| panic!("{node}: the module list failed: {}", err.code()));
+    listed
+        .items
+        .iter()
+        .find(|module| module.id == GIT_MODULE.gateway_module_id)
+        .map(|module| module.version.clone())
+        .unwrap_or_else(|| {
+            panic!(
+                "{node}: the git module {} is not installed",
+                GIT_MODULE.gateway_module_id
+            )
+        })
+}
+
+/// 27-61: the restore expectation follows the module version; any version it
+/// does not know fails rather than being guessed.
+#[test]
+fn restore_expectation_follows_the_module_version() {
+    for restored in ["2.3.4 (b0)", "2.3.4"] {
+        assert_eq!(restore_expectation(restored), Ok(RestoreExpect::Restored));
+    }
+    for in_place in ["2.3.5 (b0)", "2.3.5", "2.3.10", "2.4.0 (b2)", "3.0.0"] {
+        assert_eq!(
+            restore_expectation(in_place),
+            Ok(RestoreExpect::InPlace),
+            "{in_place:?}"
+        );
+    }
+    for unknown in [
+        "2.3.3",
+        "2.2.9 (b0)",
+        "",
+        "2.3",
+        "2.3.5-rc1",
+        "2.3.x",
+        "abc",
+    ] {
+        let err = restore_expectation(unknown).expect_err(unknown);
+        assert!(err.contains(&format!("{unknown:?}")), "{err}");
+    }
+}
+
+/// A managed [`RepoIdentity`] for the unit cases below.
+fn identity(head: &str) -> RepoIdentity {
+    RepoIdentity {
+        kind: GitStateKind::Managed,
+        remote: Some(GitRemote {
+            name: "origin".to_string(),
+            url_redacted: "http://git.example/capapp.git".to_string(),
+            url_key: "git.example/capapp".to_string(),
+        }),
+        tracked: Some("production".to_string()),
+        head: Some(head.to_string()),
+    }
+}
+
+/// 27-61: the in-place identity check names every difference, and never the
+/// value of a remote URL.
+#[test]
+fn in_place_problems_names_every_difference() {
+    let (old, release) = ("1".repeat(40), "2".repeat(40));
+    let before = identity(&old);
+    let same = identity(&release);
+    assert_eq!(
+        in_place_problems(&before, &same, true, &release),
+        Vec::<String>::new()
+    );
+
+    let mut renamed = same.clone();
+    renamed.remote.as_mut().expect("remote").name = "upstream".to_string();
+    let problems = in_place_problems(&before, &renamed, true, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("remote name"),
+        "{problems:?}"
+    );
+
+    let mut moved = same.clone();
+    let remote = moved.remote.as_mut().expect("remote");
+    remote.url_redacted = "http://other.example/elsewhere.git".to_string();
+    remote.url_key = "other.example/elsewhere".to_string();
+    let problems = in_place_problems(&before, &moved, true, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("remote URL"),
+        "{problems:?}"
+    );
+    for value in ["git.example", "other.example", "elsewhere", "capapp"] {
+        assert!(
+            !problems[0].contains(value),
+            "a URL value is printed: {problems:?}"
+        );
+    }
+
+    let mut retracked = same.clone();
+    retracked.tracked = Some("main".to_string());
+    let problems = in_place_problems(&before, &retracked, true, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("tracked branch"),
+        "{problems:?}"
+    );
+
+    let problems = in_place_problems(&before, &same, false, &release);
+    assert!(
+        problems.len() == 1
+            && problems[0].contains("pre-deploy HEAD")
+            && problems[0].contains(&old),
+        "{problems:?}"
+    );
+
+    let behind = identity(&old);
+    let problems = in_place_problems(&before, &behind, true, &release);
+    assert!(
+        problems.len() == 1 && problems[0].contains("not the release commit"),
+        "{problems:?}"
+    );
+
+    let mut gone = same.clone();
+    gone.kind = GitStateKind::Unsupported;
+    let problems = in_place_problems(&before, &gone, true, &release);
+    assert!(
+        problems.iter().any(|p| p.contains("unsupported")),
+        "{problems:?}"
+    );
+}
+
+/// 27-61: on an advance-in-place module the `restore_verify` row does not
+/// apply, and only a restore that ran anyway is a finding.
+#[test]
+fn restore_row_in_place_fails_only_on_a_restore_span() {
+    assert_eq!(restore_row_in_place(None), None);
+    let finding =
+        restore_row_in_place(Some(Duration::from_millis(1234))).expect("a restore span fails");
+    assert!(
+        finding.contains("advance-in-place") && finding.contains("1234 ms"),
+        "{finding}"
+    );
+}
+
+/// The first git module release whose start import skips `.git`, so a managed
+/// repo is advanced in place (upstream ignition-git-module #53, 27-60).
+const IN_PLACE_FROM: (u64, u64, u64) = (2, 3, 5);
+
+/// What a managed deploy must show about the restore, by module version
+/// (27-61, user decision 2026-11-20: a version match, not a loosening).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreExpect {
+    /// 2.3.4: the overwrite import deletes `.git`, and ign restores it from
+    /// its save (`restored == true`).
+    Restored,
+    /// 2.3.5 and later: `.git` survives the import, and ign advances the same
+    /// repository in place (`restored == false`).
+    InPlace,
+}
+
+/// The restore expectation for the gateway-reported module `version`. A
+/// version that is neither the defect release nor a plain `X.Y.Z` at or above
+/// [`IN_PLACE_FROM`] is an error: the expectation is never guessed.
+fn restore_expectation(version: &str) -> Result<RestoreExpect, String> {
+    if is_defect_release(version) {
+        return Ok(RestoreExpect::Restored);
+    }
+    let token = version.split_whitespace().next().unwrap_or("");
+    let parts: Vec<&str> = token.split('.').collect();
+    let numbers: Option<Vec<u64>> = (parts.len() == 3)
+        .then(|| {
+            parts
+                .iter()
+                .map(|part| {
+                    if !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) {
+                        part.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .flatten();
+    match numbers.as_deref() {
+        Some(&[major, minor, patch]) if (major, minor, patch) >= IN_PLACE_FROM => {
+            Ok(RestoreExpect::InPlace)
+        }
+        _ => {
+            let (major, minor, patch) = IN_PLACE_FROM;
+            Err(format!(
+                "git module version {version:?}: the restore expectation is defined for \
+                 {DEFECT_MODULE_RELEASE} and for {major}.{minor}.{patch} or later only"
+            ))
+        }
+    }
+}
+
+/// The repository on the rig node, as far as an advance in place must keep
+/// it: the class, the remote, the tracked branch and HEAD. That the history
+/// is kept is checked by [`old_head_present`].
+#[derive(Debug, Clone)]
+struct RepoIdentity {
+    kind: GitStateKind,
+    remote: Option<GitRemote>,
+    tracked: Option<String>,
+    head: Option<String>,
+}
+
+/// Read the [`RepoIdentity`] of the rig's project. A missing or unreadable
+/// `.git` is read as what it is (absent, unsupported), not a panic, so a
+/// finding-based gate still prints its later rows.
+async fn repo_identity(rig: &Rig, host: &HostGit) -> RepoIdentity {
+    let files = rig
+        .node()
+        .read_git_state(APP)
+        .await
+        .expect("host read of .git");
+    let config = match files.config.as_deref() {
+        Some(raw) => host.parse_config(raw).await.ok(),
+        None => None,
+    };
+    let refs = host.parse_refs(&files).await.ok().flatten();
+    let state = classify(&files, config.as_ref(), refs.as_ref());
+    RepoIdentity {
+        kind: state.kind,
+        head: state
+            .head
+            .as_ref()
+            .and_then(|head| head.commit())
+            .map(str::to_string),
+        remote: state.remote,
+        tracked: state.tracked,
+    }
+}
+
+/// Whether the commit HEAD named before the write is still in the rig
+/// repository (`git cat-file -e <commit>^{commit}` in its work tree). No HEAD
+/// before, or any answer but a clean yes, is `false`: the check fails closed.
+fn old_head_present(rig: &Rig, before: &RepoIdentity) -> bool {
+    let Some(commit) = before.head.as_deref() else {
+        return false;
+    };
+    git_command(
+        &rig.project_dir(),
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .output()
+    .expect("git runs")
+    .status
+    .success()
+}
+
+/// Every way `after` is not `before` advanced in place to `release_commit`;
+/// `old_head_present` is whether `before`'s HEAD commit is still in the
+/// repository after the write ([`old_head_present`]). A remote URL difference
+/// is named without either value.
+fn in_place_problems(
+    before: &RepoIdentity,
+    after: &RepoIdentity,
+    old_head_present: bool,
+    release_commit: &str,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (when, identity) in [("before", before), ("after", after)] {
+        if identity.kind != GitStateKind::Managed {
+            problems.push(format!(
+                "the repository {when} the deploy is {}, not managed",
+                identity.kind.as_str()
+            ));
+        }
+    }
+    let name = |identity: &RepoIdentity| identity.remote.as_ref().map(|r| r.name.clone());
+    if name(before) != name(after) {
+        problems.push(format!(
+            "the remote name differs: {:?} before, {:?} after",
+            name(before),
+            name(after)
+        ));
+    }
+    let url = |identity: &RepoIdentity| {
+        identity
+            .remote
+            .as_ref()
+            .map(|r| (r.url_redacted.clone(), r.url_key.clone()))
+    };
+    if url(before) != url(after) {
+        problems.push("the remote URL differs (the values are not printed)".to_string());
+    }
+    if before.tracked != after.tracked {
+        problems.push(format!(
+            "the tracked branch differs: {:?} before, {:?} after",
+            before.tracked, after.tracked
+        ));
+    }
+    if !old_head_present {
+        problems.push(format!(
+            "the pre-deploy HEAD commit {} is missing from the repository after the deploy",
+            before
+                .head
+                .as_deref()
+                .unwrap_or("(none: HEAD named no commit before)")
+        ));
+    }
+    if after.head.as_deref() != Some(release_commit) {
+        problems.push(format!(
+            "HEAD is {:?}, not the release commit {release_commit}",
+            after.head
+        ));
+    }
+    problems
+}
+
+/// The `restore_verify` row on an advance-in-place module: not applicable,
+/// so no span is the expected case; a `restore` span means a restore ran on a
+/// module that keeps `.git`, which is a finding.
+fn restore_row_in_place(span: Option<Duration>) -> Option<String> {
+    span.map(|measured| {
+        format!(
+            "restore_verify: a restore ran on an advance-in-place module ({} ms)",
+            measured.as_millis()
+        )
+    })
+}
+
+/// The master's git module version and the restore expectation it implies.
+/// Each gate calls it before its first write (the script route included), so
+/// an unknown version panics before the rig is changed. Prints
+/// `LIVE-RESTORE-EXPECT module=<version> expect=...`.
+async fn module_restore_expect(api: &dyn GatewayApi) -> RestoreExpect {
+    let version = git_module_version(api, "master").await;
+    let expect = restore_expectation(&version).unwrap_or_else(|err| panic!("{err}"));
+    eprintln!(
+        "LIVE-RESTORE-EXPECT module={version} expect={}",
+        match expect {
+            RestoreExpect::Restored => "restored",
+            RestoreExpect::InPlace => "in_place",
+        }
+    );
+    expect
+}
+
+/// On an advance-in-place module, when `capture` is set, the repository's
+/// identity right before the handover or apply.
+async fn identity_before(
+    rig: &Rig,
+    host: &HostGit,
+    expect: RestoreExpect,
+    capture: bool,
+) -> Option<RepoIdentity> {
+    if capture && expect == RestoreExpect::InPlace {
+        Some(repo_identity(rig, host).await)
+    } else {
+        None
+    }
 }
