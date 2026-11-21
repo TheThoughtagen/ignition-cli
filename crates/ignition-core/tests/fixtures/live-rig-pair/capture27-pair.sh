@@ -208,7 +208,7 @@ module_path() {
       n=$((n + 1))
     done
   done
-  [ "$n" -eq 1 ] || die "expected exactly one cached git module $MODULE_VER, found $n: run capture27.sh up27 once (ign rig up --with-module git@$MODULE_VER) to fill ign's verified cache"
+  [ "$n" -eq 1 ] || die "expected exactly one cached git module $MODULE_VER, found $n: run GIT27_MODULE_VERSION=$MODULE_VER capture27.sh up27 once (ign rig up --with-module git@$MODULE_VER) to fill ign's verified cache"
   # The cache file name carries the sha256 of the signed module.
   local want got
   want=${found##*/}
