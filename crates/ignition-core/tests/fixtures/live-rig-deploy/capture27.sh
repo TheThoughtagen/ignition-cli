@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # capture27.sh SUBCOMMAND [ARG ...]
 #
-# Phase 27 (27-03) rig driver: a disposable Ignition 8.3.6 gateway with the
+# Phase 27 (27-03) rig driver: a disposable Ignition gateway (8.3.6 unless
+# IGNITION_LIVE_RIG_IMAGE_TAG names another image tag) with the
 # signed git module named by GIT27_MODULE_VERSION (default 2.3.6) and a git
 # server whose remote has the branches `main` and `production` and no `master`
 # (D-17), so the keep-and-advance handover of the 27-01/27-02 engine can be
@@ -203,7 +204,7 @@ services:
     volumes:
       - ./repo:/srv/git
   gw:
-    image: inductiveautomation/ignition:8.3.6
+    image: inductiveautomation/ignition:${IGNITION_LIVE_RIG_IMAGE_TAG:-8.3.6}
     platform: linux/amd64
     hostname: gw
     depends_on:
