@@ -462,9 +462,11 @@ pub struct DiskDrift {
     /// bytes on disk differ from the release (a path whose disk bytes equal
     /// the release is never in it, whatever the export renders).
     pub prediction: DriftPrediction,
-    /// Export members whose disk bytes equal the release blob: clean, so the
-    /// self-check's work tree holds the release bytes for them.
-    pub release_form: BTreeSet<String>,
+    /// Export members whose disk bytes are known from the release: the
+    /// release blob itself (clean), or the blob with CRLF line endings
+    /// (modified). The self-check's work tree holds these bytes for them,
+    /// which are the bytes the node's disk holds.
+    pub disk_form: BTreeMap<String, Vec<u8>>,
     /// Export members whose disk bytes equal neither the release blob nor the
     /// export's bytes. Nothing is guessed: the advance stops on them.
     pub unknown: Vec<String>,
@@ -472,6 +474,21 @@ pub struct DiskDrift {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// `bytes` with every LF that is not already part of a CRLF written as CRLF:
+/// the form a Windows editor or a checkout with `core.autocrlf=true` writes.
+fn crlf_form(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 16);
+    let mut prev = 0u8;
+    for &b in bytes {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
 }
 
 /// The drift of the work tree the node will hold once its index holds the
@@ -486,6 +503,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///   left it alone, whatever the export renders);
 /// - on disk with the export's bytes: drift (`modified`, or `untracked` when
 ///   the release tree lacks it);
+/// - on disk with the release blob's bytes in CRLF form: drift (`modified`).
+///   An import leaves a resource whose content did not change as it was, so
+///   a file a Windows checkout wrote with CRLF endings stays CRLF, and git
+///   (no `autocrlf`, as the module's JGit and ign's host git run) lists it;
 /// - on disk with any other bytes: unknown, and the caller refuses;
 /// - absent on disk: the export's own bytes decide, as before (git then sees
 ///   a deletion, which the post-advance check on a local node reports; the
@@ -500,7 +521,7 @@ pub fn predict_drift_from_disk(
     let mut prediction = predict_drift(prep, export_members);
     let in_tree: BTreeSet<&str> = prep.tree_paths.iter().map(String::as_str).collect();
     let mut modified: BTreeSet<String> = prediction.modified.iter().cloned().collect();
-    let mut release_form = BTreeSet::new();
+    let mut disk_form = BTreeMap::new();
     let mut unknown = BTreeSet::new();
     for (path, bytes) in export_members {
         if !prep.artifact_members.contains(path) {
@@ -511,18 +532,26 @@ pub fn predict_drift_from_disk(
         };
         let export_sha = sha256_hex(bytes);
         let tracked = in_tree.contains(path.as_str());
-        let release_sha = if tracked {
-            prep.release_blobs.get(path).map(|b| sha256_hex(b))
+        let release = if tracked {
+            prep.release_blobs.get(path)
         } else {
             None
         };
-        if release_sha.as_deref() == Some(file.sha256.as_str()) {
+        if let Some(blob) = release
+            && sha256_hex(blob) == file.sha256
+        {
             modified.remove(path);
-            release_form.insert(path.clone());
+            disk_form.insert(path.clone(), blob.clone());
         } else if file.sha256 == export_sha {
             if tracked {
                 modified.insert(path.clone());
             }
+        } else if let Some(crlf) = release
+            .map(|blob| crlf_form(blob))
+            .filter(|crlf| sha256_hex(crlf) == file.sha256)
+        {
+            modified.insert(path.clone());
+            disk_form.insert(path.clone(), crlf);
         } else {
             unknown.insert(path.clone());
         }
@@ -530,7 +559,7 @@ pub fn predict_drift_from_disk(
     prediction.modified = modified.into_iter().collect();
     DiskDrift {
         prediction,
-        release_form,
+        disk_form,
         unknown: unknown.into_iter().collect(),
     }
 }
@@ -668,8 +697,8 @@ impl AdvancePlan {
 /// failure leaves the gateway repo as it was.
 ///
 /// In order: unpack the export; [`predict_drift_from_disk`] (a member whose
-/// disk bytes are neither the release's nor the export's is a mismatch, naming
-/// the path); a member outside the artifact is a mismatch; assume-unchanged is
+/// disk bytes are neither the release's, the release's in CRLF form, nor the
+/// export's is a mismatch, naming the path); a member outside the artifact is a mismatch; assume-unchanged is
 /// the release tree minus the export's members; build the index; host git's
 /// status over the extracted export must equal the prediction (modified and
 /// untracked) with no deleted path. A non-empty `dropped` alone is not a
@@ -689,7 +718,7 @@ pub async fn finish_advance(
     if !stop.is_empty() {
         return Err(AdvanceFailure::Mismatch(AdvanceMismatch::of(stop)));
     }
-    let (prediction, release_form) = (drift.prediction, drift.release_form);
+    let (prediction, disk_form) = (drift.prediction, drift.disk_form);
 
     let assume_unchanged: Vec<String> = prep
         .tree_paths
@@ -705,12 +734,9 @@ pub async fn finish_advance(
         detail: format!("a private temp dir could not be made: {e}"),
     })?;
     for (path, bytes) in &export {
-        // A member whose disk bytes are the release blob's is clean there.
-        let held = release_form
-            .contains(path)
-            .then(|| prep.release_blobs.get(path))
-            .flatten();
-        write_member(work.path(), path, held.unwrap_or(bytes))?;
+        // A member whose disk bytes are known from the release holds them
+        // here, as on the node (clean, or modified in CRLF form).
+        write_member(work.path(), path, disk_form.get(path).unwrap_or(bytes))?;
     }
     let status = git.status_over(checkout, &index, work.path()).await?;
     let mut differ: BTreeSet<String> = BTreeSet::new();
@@ -1509,8 +1535,10 @@ pub(crate) mod tests {
         assert_eq!(got.prediction.modified, vec!["b", "c"]);
         assert_eq!(got.prediction.untracked, vec!["d", "f"]);
         assert_eq!(
-            got.release_form,
-            ["a".to_string()].into_iter().collect::<BTreeSet<_>>()
+            got.disk_form,
+            [("a".to_string(), b"A".to_vec())]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
         );
         assert_eq!(got.unknown, vec!["c", "f"]);
         // A path absent from the disk keeps the export's judgement.
@@ -1583,6 +1611,58 @@ pub(crate) mod tests {
         // The export-only prediction would have listed it.
         let members = read_export(&export).expect("export").0;
         assert_eq!(predict_drift(&prep, &members).modified, vec![UTIL_RES]);
+    }
+
+    #[test]
+    fn crlf_form_converts_bare_lf_only() {
+        assert_eq!(crlf_form(b"a\nb\r\nc\n"), b"a\r\nb\r\nc\r\n".to_vec());
+        assert_eq!(crlf_form(b"no newline"), b"no newline".to_vec());
+        assert_eq!(crlf_form(b""), Vec::<u8>::new());
+    }
+
+    /// A disk holding the release blob in CRLF form, which an import leaves
+    /// in place when the resource's content did not change, is drift
+    /// (`modified`), never unknown; a CRLF form of anything else still is.
+    #[test]
+    fn predict_drift_from_disk_crlf_release_is_modified() {
+        let prep = prep_of(
+            &["a", "b"],
+            &["a", "b"],
+            &[("a", "x\ny\n"), ("b", "p\nq\n")],
+        );
+        let export: BTreeMap<String, Vec<u8>> = [("a", "x\ny"), ("b", "p\nq")]
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.as_bytes().to_vec()))
+            .collect();
+        let disk = disk_of(&[("a", "x\r\ny\r\n"), ("b", "p\r\nq")]);
+        let got = predict_drift_from_disk(&prep, &export, &disk);
+        assert_eq!(got.prediction.modified, vec!["a", "b"]);
+        assert_eq!(got.disk_form.get("a"), Some(&b"x\r\ny\r\n".to_vec()));
+        assert_eq!(got.unknown, vec!["b"]);
+    }
+
+    /// End to end over host git: the release's descriptor rewritten with CRLF
+    /// endings on disk is planned as expected drift, and a git status over the
+    /// advanced repo lists exactly that.
+    #[tokio::test]
+    async fn finish_with_a_crlf_disk_predicts_what_status_lists() {
+        let f = Fixture::new();
+        let host = HostGit::new();
+        let prep = prepared(&f, &host, &[]).await;
+        let export = f.import(&host, &[NOTES], &[], Some(UTIL_RES)).await;
+        let crlf = crlf_form(&prep.release_blobs[UTIL_RES]);
+        assert_ne!(
+            crlf, prep.release_blobs[UTIL_RES],
+            "the fixture has a newline"
+        );
+        std::fs::write(f.gw.join(UTIL_RES), &crlf).expect("write the CRLF form");
+        let disk = disk_below(&f.gw);
+        let plan = finish_advance(&host, &f.seed, &prep, &export, &disk)
+            .await
+            .expect("a CRLF form of the release is not a mismatch");
+        assert_eq!(plan.expected_drift, vec![UTIL_RES.to_string()]);
+        f.apply(&plan);
+        assert_eq!(f.status_paths(), plan.expected_drift);
     }
 
     #[test]

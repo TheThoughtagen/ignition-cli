@@ -6171,11 +6171,14 @@ keep are listed under `restore.dropped` and are not drift.
 host, the run reads the digests (size and sha256, never content) of the
 project's files on the node after the import, `.git` excluded and nothing
 followed. For each member the read-back export holds, a file whose bytes equal
-the release's is clean, a file whose bytes equal the export's is drift, and a
-file that matches neither ends the run `git_restore_failed` with
-`restore.reason` `status_unexpected` before any write to `.git`. The proof is
-the status computed over a work tree rebuilt from those digests (the release's
-bytes or the export's bytes per path), before any write to `.git`: it must
+the release's is clean, a file whose bytes equal the export's is drift, a file
+whose bytes equal the release's with CRLF line endings is drift (an import
+leaves a resource whose content did not change as it was, so a file a Windows
+checkout wrote with CRLF stays CRLF, and git lists it), and a file that matches
+none of these ends the run `git_restore_failed` with `restore.reason`
+`status_unexpected` before any write to `.git`. The proof is the status
+computed over a work tree rebuilt from those digests (the release's bytes, its
+CRLF form or the export's bytes per path), before any write to `.git`: it must
 equal the prediction. A read-back of every file written follows. On a `local`
 node the run also runs a status over the project directory on disk after the
 advance (`restore.post_status` `matched`, or `mismatch` and the reason
