@@ -636,9 +636,9 @@ async fn drop_provider(gateway: &dyn ProjectGateway, name: &str) -> Result<(), C
 /// What seeding one provider found.
 struct Seeded {
     report: SeedProvider,
-    /// The settings the run plans against instead of the repo's, when the
-    /// provider's settings are not rehearsed.
-    substitute: Option<(bool, Option<String>, Value)>,
+    /// The rehearsal gateway's record of the provider, whose settings the run
+    /// plans against instead of the repo's, when they are not rehearsed.
+    substitute: Option<TagProviderRecord>,
 }
 
 /// Seed `name` on the rehearsal gateway `rig` from `<ENV>`'s `record` and
@@ -661,7 +661,10 @@ async fn seed_provider(
             record.config.clone(),
         );
         match rig.tag_provider_create(&[sent]).await {
-            Ok(()) => match rig.tag_provider_record(name).await? {
+            // An 8.3.10 gateway answers a read of a provider it is still
+            // starting with HTTP 500 (a NullPointerException in its tag
+            // evaluation manager); the read goes again (`retry_transient`).
+            Ok(()) => match retry_transient(|| rig.tag_provider_record(name)).await? {
                 Some(back) if settings_equal(&back, record) => {}
                 _ => {
                     reason = Some("the rehearsal gateway stores other settings".to_string());
@@ -710,18 +713,15 @@ async fn seed_provider(
     }
     let substitute = match &reason {
         None => None,
-        Some(_) => {
-            let back = rig.tag_provider_record(name).await?.ok_or_else(|| {
-                CoreError::Internal(format!(
-                    "the rehearsal gateway lists no provider {name} after its create"
-                ))
-            })?;
-            Some((
-                back.enabled,
-                back.description().map(str::to_string),
-                back.config.clone(),
-            ))
-        }
+        Some(_) => Some(
+            retry_transient(|| rig.tag_provider_record(name))
+                .await?
+                .ok_or_else(|| {
+                    CoreError::Internal(format!(
+                        "the rehearsal gateway lists no provider {name} after its create"
+                    ))
+                })?,
+        ),
     };
     Ok(Seeded {
         report: SeedProvider {
@@ -769,6 +769,38 @@ fn seed_mismatches(
             .map(|path| format!("{} (not in the export)", full_tag_path(name, path))),
     );
     out
+}
+
+/// A provider whose settings are not rehearsed: the rehearsal's run plans
+/// `name` against the settings the rehearsal gateway stored (`back`), so its
+/// settings step is `same` and leaves the provider alone. `providers` and
+/// `settings` are the project file's provider list and the rehearsal's
+/// settings, in the same order; `entries` is the rehearsal plan's settings
+/// plan. The entry is re-planned against `back` as a whole, its
+/// `live_sha256` included: the run reads the provider again before it writes
+/// ([`fresh_provider_settings`]) and refuses `plan_stale` unless that read
+/// plans to the same entry. The record keeps `<ENV>`'s settings hash: it is
+/// computed from `<ENV>`'s plan, not from the rehearsal's.
+fn plan_settings_as_stored(
+    providers: &[String],
+    settings: &mut [ProviderSettings],
+    entries: &mut [ProviderSettingsPlan],
+    name: &str,
+    back: &TagProviderRecord,
+) -> Result<(), CoreError> {
+    let settings = providers
+        .iter()
+        .position(|p| p == name)
+        .and_then(|i| settings.get_mut(i))
+        .ok_or_else(|| CoreError::Internal(format!("no settings of {name}")))?;
+    settings.enabled = back.enabled;
+    settings.description = back.description().map(str::to_string);
+    settings.config = back.config.clone();
+    let replanned = plan_provider_settings(name, settings, Some(back));
+    if let Some(entry) = entries.iter_mut().find(|p| p.provider == name) {
+        *entry = replanned;
+    }
+    Ok(())
 }
 
 /// The seed of every owned provider, the substitutions it made in `rloaded`
@@ -855,25 +887,14 @@ async fn seed_all(
         };
         let mut seeded = seed_provider(rig, &name, &record, &bytes, PROVIDER_WAIT, settle).await?;
         seeded.report.nodes = env_live.get(&name).map_or(0, BTreeMap::len);
-        if let Some((enabled, description, config)) = seeded.substitute {
-            let i = loaded
-                .file
-                .tag_providers
-                .iter()
-                .position(|p| *p == name)
-                .ok_or_else(|| CoreError::Internal(format!("no settings of {name}")))?;
-            let settings = &mut rloaded.provider_settings[i];
-            settings.enabled = enabled;
-            settings.description = description;
-            settings.config = config;
-            if let Some(entry) = tags
-                .provider_settings
-                .iter_mut()
-                .find(|p| p.provider == name)
-            {
-                entry.action = ProviderSettingsAction::Same;
-                entry.properties.clear();
-            }
+        if let Some(back) = &seeded.substitute {
+            plan_settings_as_stored(
+                &loaded.file.tag_providers,
+                &mut rloaded.provider_settings,
+                &mut tags.provider_settings,
+                &name,
+                back,
+            )?;
         }
         providers.push(seeded.report);
     }
@@ -1727,6 +1748,10 @@ mod tests {
         created: Option<tokio::time::Instant>,
         /// The time from that create to the first import after it.
         settled: Option<Duration>,
+        /// How many provider reads after a create still answer HTTP 500, as
+        /// an 8.3.10 gateway answers a read of a provider it is still
+        /// starting.
+        record_errors: usize,
     }
 
     /// A rehearsal gateway that keeps providers in memory and answers each
@@ -1745,6 +1770,12 @@ mod tests {
                 not_ready,
                 then,
             }
+        }
+
+        /// The next `n` provider reads after a create answer HTTP 500.
+        fn with_record_errors(self, n: usize) -> Self {
+            self.state.lock().expect("state").record_errors = n;
+            self
         }
 
         fn attempts(&self) -> usize {
@@ -1834,6 +1865,13 @@ mod tests {
         ) -> Result<Option<TagProviderRecord>, CoreError> {
             let mut state = self.state.lock().expect("state");
             state.log.push(format!("record:{name}"));
+            if state.created.is_some() && state.record_errors > 0 {
+                state.record_errors -= 1;
+                return Err(CoreError::Internal(format!(
+                    "unexpected HTTP 500 Internal Server Error from \
+                     http://rig.invalid/data/api/v1/resources/find/ignition/tag-provider/{name}"
+                )));
+            }
             Ok(state.providers.get(name).cloned())
         }
         async fn tag_provider_create(&self, body: &[TagProviderCreate]) -> Result<(), CoreError> {
@@ -2104,6 +2142,105 @@ mod tests {
         assert_eq!(seeded.report.settings, "not_rehearsed");
         assert_eq!(rig.attempts(), 1);
         assert!(rig.settled() >= settle, "{:?}", rig.settled());
+    }
+
+    /// 8.3.10: a read of a provider the gateway is still starting answers
+    /// HTTP 500. The read-back after the with-settings create goes again,
+    /// and the seed is green with the settings rehearsed.
+    #[tokio::test]
+    async fn the_seed_reads_a_starting_provider_again() {
+        let rig = SeedRig::new(Some(0), clean()).with_record_errors(1);
+        let seeded = seed_provider(
+            &rig,
+            "Edge",
+            &env_record(standard_config()),
+            EMPTY_EXPORT,
+            quick(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("a green seed");
+        assert_eq!(seeded.report.settings, "rehearsed");
+        let log = rig.log();
+        let after_create = &log[position(&log, "create:Edge")..];
+        assert_eq!(
+            after_create.iter().filter(|e| *e == "record:Edge").count(),
+            2,
+            "{log:?}"
+        );
+    }
+
+    /// The read of the STANDARD fallback's stored settings goes again as
+    /// well, and returns the stored record.
+    #[tokio::test]
+    async fn the_seed_reads_a_starting_standard_provider_again() {
+        let rig = SeedRig::new(Some(0), clean()).with_record_errors(1);
+        let record = env_record(serde_json::json!({"profile": {"type": "DATASOURCE"}}));
+        let seeded = seed_provider(&rig, "Edge", &record, EMPTY_EXPORT, quick(), Duration::ZERO)
+            .await
+            .expect("a green seed");
+        assert_eq!(seeded.report.settings, "not_rehearsed");
+        let stored = seeded.substitute.expect("the stored record");
+        assert_eq!(stored.config, standard_config());
+    }
+
+    fn settings(config: Value) -> ProviderSettings {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "enabled": true,
+            "config": config,
+        }))
+        .expect("provider settings")
+    }
+
+    /// 8.3.10: a database-backed provider whose datasource the rehearsal
+    /// gateway lacks is stored there with other settings. Its plan entry is
+    /// re-planned against the stored record, `live_sha256` included, so the
+    /// run's fresh read of it ([`fresh_provider_settings`]) plans to the same
+    /// entry and the run does not refuse `plan_stale`.
+    #[test]
+    fn a_not_rehearsed_provider_plans_against_the_stored_record() {
+        let db_backed = serde_json::json!({
+            "profile": {"type": "STANDARD"},
+            "settings": {"defaultDatasourceName": "DB_A", "valuePersistence": "Database"},
+        });
+        let repo = settings(db_backed.clone());
+        let env = env_record(db_backed);
+        let env_entry = plan_provider_settings("Edge", &repo, Some(&env));
+        let mut entries = vec![env_entry.clone()];
+        let mut rsettings = vec![repo];
+        let stored = env_record(serde_json::json!({
+            "profile": {"type": "STANDARD"},
+            "settings": {"defaultDatasourceName": null, "valuePersistence": null},
+        }));
+        plan_settings_as_stored(
+            &["Edge".to_string()],
+            &mut rsettings,
+            &mut entries,
+            "Edge",
+            &stored,
+        )
+        .expect("the provider is listed");
+        // What the run's read of the rehearsal gateway plans to.
+        let fresh = plan_provider_settings("Edge", &rsettings[0], Some(&stored));
+        assert_eq!(entries[0], fresh);
+        assert_eq!(entries[0].action, ProviderSettingsAction::Same);
+        assert!(entries[0].properties.is_empty());
+        assert_ne!(entries[0].live_sha256, env_entry.live_sha256);
+        assert_eq!(rsettings[0].config, stored.config);
+    }
+
+    #[test]
+    fn plan_settings_as_stored_refuses_an_unlisted_provider() {
+        let err = plan_settings_as_stored(
+            &["Edge".to_string()],
+            &mut [settings(standard_config())],
+            &mut [],
+            "Other",
+            &env_record(standard_config()),
+        )
+        .expect_err("not listed");
+        assert_eq!(err.code(), "internal");
     }
 
     /// A birth pin: a real rehearsal settles 20 s.
