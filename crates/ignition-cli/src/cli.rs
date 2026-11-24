@@ -78,9 +78,11 @@ pub enum Commands {
     /// terminate one via the `terminate` subcommand
     Sessions(SessionsArgs),
 
-    /// List database/OPC connections with healthcheck status as reported
+    /// List database/OPC connections with healthcheck status as reported;
+    /// `--type device` lists OPC UA devices with their status
     Connections {
-        /// Filter to one connection family (default: both)
+        /// Filter to one connection family (default: database and opc;
+        /// `device` is opt-in and never part of the default listing)
         #[arg(long, value_enum)]
         r#type: Option<ConnectionType>,
     },
@@ -2715,6 +2717,8 @@ pub enum ConnectionType {
     Database,
     /// OPC connections
     Opc,
+    /// OPC UA devices (opt-in: not part of the default listing)
+    Device,
 }
 
 impl From<ConnectionType> for ignition_core::actions::connections::ConnectionType {
@@ -2722,6 +2726,7 @@ impl From<ConnectionType> for ignition_core::actions::connections::ConnectionTyp
         match value {
             ConnectionType::Database => Self::Database,
             ConnectionType::Opc => Self::Opc,
+            ConnectionType::Device => Self::Device,
         }
     }
 }

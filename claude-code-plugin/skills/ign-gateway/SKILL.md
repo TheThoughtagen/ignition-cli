@@ -26,6 +26,7 @@ ign modules --json       # module list (healthy by default)
 ign metrics --json       # performance gauges + thread counts
 ign sessions --json      # designers, Perspective, Vision sessions
 ign connections --json   # DB/OPC connections with healthcheck status
+ign connections --type device --json   # OPC UA devices: driver + status healthcheck (opt-in, never in the default listing)
 ```
 
 ## Doctor: diagnose before you fix

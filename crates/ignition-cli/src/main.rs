@@ -65,7 +65,7 @@ enum ActionOutput {
     Sessions(actions::sessions::SessionsResult),
     /// `ign sessions terminate` — the FIRST destructive command.
     SessionsTerminate(actions::sessions::TerminateResult),
-    /// `ign connections` — DB/OPC connection status.
+    /// `ign connections` — DB/OPC connection status (+ OPC UA devices).
     Connections(actions::connections::ConnectionsResult),
     /// `ign logs` — the queried page (newest first).
     LogsList(actions::logs::LogPage),

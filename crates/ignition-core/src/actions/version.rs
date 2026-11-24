@@ -360,6 +360,14 @@ mod tests {
         > {
             unimplemented!("version FakeApi only serves gateway_info")
         }
+        async fn device_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayDevice>,
+            CoreError,
+        > {
+            unimplemented!("version FakeApi only serves gateway_info")
+        }
 
         async fn logs(
             &self,

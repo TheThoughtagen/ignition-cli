@@ -67,7 +67,7 @@ pub mod workspace;
 /// [`GatewayApi`] and its test doubles stay untouched).
 pub use deploy_api::DeployApi;
 
-use crate::client::connections::GatewayConnection;
+use crate::client::connections::{GatewayConnection, GatewayDevice};
 use crate::client::diagnostics::BundleStatusWire;
 use crate::client::eam::{
     DeleteOutcome, EamHistoryItem, EamScheduledTask, EamTaskRecord, ModifyOutcome,
@@ -192,6 +192,12 @@ pub trait GatewayApi: Send + Sync {
     /// Fetch `/data/api/v1/resources/list/ignition/opc-connection`
     /// (authed) — the Connections→OPC poll (HLTH-06), same family.
     async fn opc_connections(&self) -> Result<ListEnvelope<GatewayConnection>, CoreError>;
+    /// Fetch `/data/api/v1/resources/list/com.inductiveautomation.opcua/device`
+    /// (authed) — the OPC UA device list with each device's `status`
+    /// healthcheck. Returns the redacted [`GatewayDevice`] model: the
+    /// wire `config.settings` (hostnames, credentials) is dropped at
+    /// parse time and never reaches a caller.
+    async fn device_connections(&self) -> Result<ListEnvelope<GatewayDevice>, CoreError>;
     /// Fetch `/data/api/v1/logs` (authed) with [`LogQuery`] — the tail
     /// primitive: `startTime` (epoch ms) is the cursor, no server push
     /// exists (02-04, HLTH-03). The query ALWAYS carries an explicit
@@ -1292,6 +1298,20 @@ impl GatewayApi for ReqwestGatewayApi {
             true,
         )
         .await
+    }
+
+    async fn device_connections(&self) -> Result<ListEnvelope<GatewayDevice>, CoreError> {
+        let wire: ListEnvelope<connections::GatewayDeviceWire> = self
+            .get_json(
+                connections::DEVICE_CONNECTIONS_PATH,
+                Some(&query::ListQuery::default().to_query_pairs()),
+                true,
+            )
+            .await?;
+        Ok(ListEnvelope {
+            items: wire.items.into_iter().map(GatewayDevice::from).collect(),
+            metadata: wire.metadata,
+        })
     }
 
     async fn logs(&self, filter: &LogQuery) -> Result<ListEnvelope<LogEntry>, CoreError> {
