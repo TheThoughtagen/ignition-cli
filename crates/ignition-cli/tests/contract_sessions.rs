@@ -851,3 +851,71 @@ async fn connections_default_and_family_filters_never_request_devices() {
         "device endpoint was requested: {paths:?}"
     );
 }
+
+/// A device (and a database connection) whose gateway-supplied name,
+/// driver and message carry ESC / newline / carriage-return must never
+/// put a raw control byte on the human output: it is written out as
+/// text. (JSON escapes control characters itself.)
+#[tokio::test]
+async fn connections_human_output_escapes_control_characters() {
+    let server = wiremock::MockServer::start().await;
+    for (path, item) in [
+        (
+            "/data/api/v1/resources/list/com.inductiveautomation.opcua/device",
+            serde_json::json!({
+                "name": "Dev\u{1b}[2Jice\nA",
+                "enabled": true,
+                "config": {"profile": {"type": "Logix\rDriver\u{1b}[31m"}},
+                "healthchecks": {"status": {"result": {
+                    "healthy": false,
+                    "message": "Connecting\u{1b}[H\r\nforged  true"
+                }}}
+            }),
+        ),
+        (
+            "/data/api/v1/resources/list/ignition/database-connection",
+            serde_json::json!({
+                "name": "My\u{1b}[2JPostgres\r\nforged  true",
+                "enabled": true,
+                "healthchecks": {"jdbc": "FAIR"}
+            }),
+        ),
+        (
+            "/data/api/v1/resources/list/ignition/opc-connection",
+            serde_json::json!({"name": "Opc\u{1b}]0;title\u{7}", "enabled": true}),
+        ),
+    ] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "items": [item],
+                    "metadata": {"total": 1, "matching": 1, "limit": -1, "offset": 0}
+                })),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    for args in [
+        &["connections", "--type", "device"][..],
+        &["connections"][..],
+    ] {
+        let out = ign(&config, &server.uri(), args);
+        assert!(out.status.success(), "{args:?} failed");
+        let stdout = stdout_for_golden(&out);
+        assert!(
+            !stdout.bytes().any(|byte| byte == 0x1b || byte == b'\r'),
+            "{args:?} wrote a raw control byte: {stdout:?}"
+        );
+        // One physical line per row: the embedded newlines are text.
+        let rows = stdout.lines().count();
+        // device: profile line, 3 section headers, table header, 1 row;
+        // default: profile line, 2 section headers, 2 rows.
+        let expected = if args.len() == 3 { 6 } else { 5 };
+        assert_eq!(rows, expected, "{args:?} split a row: {stdout:?}");
+    }
+}
