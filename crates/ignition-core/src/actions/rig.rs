@@ -3124,6 +3124,14 @@ mod tests {
         > {
             unreachable!("not part of this action")
         }
+        async fn device_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayDevice>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
         async fn logs(
             &self,
             _filter: &crate::client::logs::LogQuery,

@@ -2,11 +2,19 @@
 //! serde models OUT, no printing. Mirrors [`super::sessions`]: both
 //! family keys are ALWAYS present in the data shape; a filter excludes
 //! without calling the other endpoint.
+//!
+//! OPC UA devices are a third, OPT-IN family: only `--type device`
+//! fetches them, and only then does the `device` key appear. The default
+//! listing (and every caller that passes `None` — the TUI dashboard and
+//! itop poll it on a timer) stays two requests with a byte-identical
+//! shape: the device list carries every device's full config, and a
+//! default call that started failing on a gateway whose device list
+//! answers non-2xx would turn a green `ign connections` red.
 
 use serde::Serialize;
 
 use crate::client::GatewayApi;
-use crate::client::connections::GatewayConnection;
+use crate::client::connections::{GatewayConnection, GatewayDevice};
 use crate::error::CoreError;
 
 /// Which connection family a filter targets.
@@ -17,6 +25,10 @@ pub enum ConnectionType {
     Database,
     /// OPC connections (`opc-connection` resources).
     Opc,
+    /// OPC UA device connections
+    /// (`com.inductiveautomation.opcua/device` resources) — opt-in,
+    /// never part of the unfiltered listing.
+    Device,
 }
 
 impl ConnectionType {
@@ -25,6 +37,7 @@ impl ConnectionType {
         match self {
             Self::Database => "database",
             Self::Opc => "opc",
+            Self::Device => "device",
         }
     }
 }
@@ -35,37 +48,56 @@ impl std::fmt::Display for ConnectionType {
     }
 }
 
-/// `ign connections` output model — both families, always present.
+/// `ign connections` output model — the database and OPC keys are
+/// always present; `device` appears only when devices were requested.
 #[derive(Debug, Serialize)]
 pub struct ConnectionsResult {
     /// Database connections (empty when filtered out).
     pub database: Vec<GatewayConnection>,
     /// OPC connections (empty when filtered out).
     pub opc: Vec<GatewayConnection>,
+    /// OPC UA devices — `Some` only for `--type device` (an empty
+    /// `Some` means "asked, none configured"; `None` means "not asked",
+    /// and the key is absent from the JSON).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<Vec<GatewayDevice>>,
 }
 
 /// List DB/OPC connections (or just the requested family; the excluded
 /// key stays present-but-empty and its endpoint is never called).
+/// Devices are fetched only for `Some(ConnectionType::Device)`.
 pub async fn connections(
     api: &dyn GatewayApi,
     filter: Option<ConnectionType>,
 ) -> Result<ConnectionsResult, CoreError> {
-    let (database, opc) = match filter {
+    let (database, opc, device) = match filter {
         None => (
             api.database_connections().await?.items,
             api.opc_connections().await?.items,
+            None,
         ),
-        Some(ConnectionType::Database) => (api.database_connections().await?.items, Vec::new()),
-        Some(ConnectionType::Opc) => (Vec::new(), api.opc_connections().await?.items),
+        Some(ConnectionType::Database) => {
+            (api.database_connections().await?.items, Vec::new(), None)
+        }
+        Some(ConnectionType::Opc) => (Vec::new(), api.opc_connections().await?.items, None),
+        Some(ConnectionType::Device) => (
+            Vec::new(),
+            Vec::new(),
+            Some(api.device_connections().await?.items),
+        ),
     };
-    Ok(ConnectionsResult { database, opc })
+    Ok(ConnectionsResult {
+        database,
+        opc,
+        device,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ConnectionType, connections};
     use crate::client::GatewayApi;
-    use crate::client::connections::GatewayConnection;
+    use crate::client::connections::{GatewayConnection, GatewayDevice};
     use crate::client::query::{ListEnvelope, ListMetadata};
     use crate::error::CoreError;
 
@@ -323,6 +355,24 @@ mod tests {
             self.calls.lock().unwrap().push("opc");
             Ok(page(Vec::new()))
         }
+        async fn device_connections(&self) -> Result<ListEnvelope<GatewayDevice>, CoreError> {
+            self.calls.lock().unwrap().push("device");
+            Ok(ListEnvelope {
+                items: vec![GatewayDevice {
+                    name: "Device-A".into(),
+                    description: None,
+                    enabled: true,
+                    driver: Some("LogixDriver".into()),
+                    healthchecks: serde_json::Value::Null,
+                }],
+                metadata: ListMetadata {
+                    total: 1,
+                    matching: 1,
+                    limit: -1,
+                    offset: 0,
+                },
+            })
+        }
 
         async fn logs(
             &self,
@@ -458,5 +508,42 @@ mod tests {
             .collect();
         keys.sort_unstable();
         assert_eq!(keys, ["database", "opc"], "both keys always present");
+    }
+
+    /// Devices are opt-in: the unfiltered and family-filtered listings
+    /// never call the device endpoint and never emit a `device` key;
+    /// `Device` calls ONLY the device endpoint and emits the key.
+    #[tokio::test]
+    async fn device_family_is_opt_in() {
+        let rig = ConnectionsRig::default();
+        let default = connections(&rig, None).await.expect("default");
+        assert!(default.device.is_none());
+        assert!(
+            serde_json::to_value(&default)
+                .unwrap()
+                .get("device")
+                .is_none(),
+            "default JSON carries no device key"
+        );
+        assert_eq!(*rig.calls.lock().unwrap(), vec!["database", "opc"]);
+
+        let rig = ConnectionsRig::default();
+        let devices = connections(&rig, Some(ConnectionType::Device))
+            .await
+            .expect("devices");
+        assert!(devices.database.is_empty() && devices.opc.is_empty());
+        assert_eq!(devices.device.as_ref().map(Vec::len), Some(1));
+        assert_eq!(*rig.calls.lock().unwrap(), vec!["device"]);
+
+        let json = serde_json::to_value(&devices).expect("serialize");
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["database", "device", "opc"]);
+        assert_eq!(json["device"][0]["driver"], "LogixDriver");
     }
 }

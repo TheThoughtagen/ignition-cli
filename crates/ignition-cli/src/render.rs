@@ -57,6 +57,7 @@ use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::actions::workspace::{
     CheckoutOutcome, PushOutcome, StatusKind, WorkspaceStatus,
 };
+use ignition_core::client::connections::GatewayDevice;
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
 use ignition_core::error::CoreError;
@@ -643,7 +644,8 @@ fn render_terminate_human(result: &TerminateResult) {
 /// `ign connections` human lines: `database (N)` / `opc (N)` sections
 /// with `name  enabled  healthchecks-as-reported` rows — healthchecks
 /// render as compact JSON, verbatim (the shape is passthrough by
-/// design; LOW-confidence populated detail).
+/// design; LOW-confidence populated detail). `--type device` appends a
+/// `device (N)` section ([`render_devices_human`]).
 fn render_connections_human(result: &ConnectionsResult) {
     println!("database ({})", result.database.len());
     for connection in &result.database {
@@ -663,6 +665,42 @@ fn render_connections_human(result: &ConnectionsResult) {
             serde_json::to_string(&connection.healthchecks).unwrap_or_default()
         );
     }
+    if let Some(devices) = &result.device {
+        render_devices_human(devices);
+    }
+}
+
+/// `ign connections --type device` human section: `device (N)` then an
+/// aligned NAME / DRIVER / ENABLED / HEALTHY / MESSAGE table (no table
+/// when there are no devices). HEALTHY reads the `status` healthcheck:
+/// `true` / `false`, or `unknown` when the gateway reported none —
+/// never healthy by default. A missing driver or message shows `-`.
+fn render_devices_human(devices: &[GatewayDevice]) {
+    println!("device ({})", devices.len());
+    if devices.is_empty() {
+        return;
+    }
+    let columns: Vec<String> = ["NAME", "DRIVER", "ENABLED", "HEALTHY", "MESSAGE"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let rows: Vec<Vec<String>> = devices
+        .iter()
+        .map(|device| {
+            let health = device.health();
+            vec![
+                device.name.clone(),
+                device.driver.clone().unwrap_or_else(|| "-".to_string()),
+                device.enabled.to_string(),
+                match health.healthy {
+                    Some(healthy) => healthy.to_string(),
+                    None => "unknown".to_string(),
+                },
+                health.message.unwrap_or("-").to_string(),
+            ]
+        })
+        .collect();
+    render_aligned_columns(&columns, &rows);
 }
 
 /// One log entry as a human line — the SAME format the list and the

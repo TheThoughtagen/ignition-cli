@@ -507,3 +507,161 @@ async fn database_connections_html_401_classifies_auth() {
     );
     assert_eq!(err.exit_code(), 5);
 }
+
+// ---------------------------------------------------------------------------
+// OPC UA devices (`ign connections --type device`) — the same
+// resource-list mechanism under `com.inductiveautomation.opcua/device`.
+// The wire item's `config.settings` (hostnames, credentials) must never
+// survive parsing.
+// ---------------------------------------------------------------------------
+
+const DEVICE_LIST_PATH: &str = "/data/api/v1/resources/list/com.inductiveautomation.opcua/device";
+
+/// Four neutral devices: healthy, unhealthy ("Connecting"), no
+/// healthchecks at all, and disabled. Every item carries `settings` with
+/// a documentation-range host and a secret-shaped field.
+fn device_list_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "items": [
+            {
+                "name": "Device-A",
+                "description": "Primary line controller",
+                "enabled": true,
+                "collection": "core",
+                "signature": "sig-a",
+                "config": {
+                    "profile": {"type": "LogixDriver"},
+                    "settings": {
+                        "connectivity": {"hostname": "192.0.2.10"},
+                        "advanced": {"password": {"type": "Embedded", "data": "secret-a"}}
+                    }
+                },
+                "healthchecks": {"status": {
+                    "name": "devices.device-Device-A.status",
+                    "result": {"healthy": true, "time": 1700000000000_i64, "message": "Connected"}
+                }}
+            },
+            {
+                "name": "Device-B",
+                "description": null,
+                "enabled": true,
+                "config": {
+                    "profile": {"type": "ModbusTcp"},
+                    "settings": {"connectivity": {"hostname": "192.0.2.11"}}
+                },
+                "healthchecks": {"status": {
+                    "name": "devices.device-Device-B.status",
+                    "result": {"healthy": false, "time": 1700000000000_i64, "message": "Connecting"}
+                }}
+            },
+            {
+                "name": "Device-C",
+                "enabled": true,
+                "config": {
+                    "profile": {"type": "TCPDriver"},
+                    "settings": {"connectivity": {"hostname": "192.0.2.12"}}
+                }
+            },
+            {
+                "name": "Device-D",
+                "enabled": false,
+                "config": {
+                    "profile": {"type": "com.inductiveautomation.Micro800DeviceType"},
+                    "settings": {"connectivity": {"hostname": "192.0.2.13"}}
+                }
+            }
+        ],
+        "metadata": {"total": 4, "matching": 4, "limit": -1, "offset": 0}
+    })
+}
+
+/// The device list parses through the redacted model with the UI's
+/// `limit=-1` convention (matcher-pinned); health reads from
+/// `healthchecks.status.result`; a device without healthchecks is
+/// UNKNOWN, never healthy; `config.settings` never reaches the model.
+#[tokio::test]
+async fn device_connections_parse_redacted_with_limit_minus_one() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(DEVICE_LIST_PATH))
+        .and(wiremock::matchers::query_param("limit", "-1"))
+        .and(wiremock::matchers::query_param("offset", "0"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(device_list_fixture()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = ReqwestGatewayApi::for_tests(&server.uri(), None);
+    let page = api
+        .device_connections()
+        .await
+        .expect("device list must parse");
+    assert_eq!(page.metadata.total, 4);
+    let [a, b, c, d] = &page.items[..] else {
+        panic!("expected four devices, got {}", page.items.len());
+    };
+
+    assert_eq!(a.name, "Device-A");
+    assert_eq!(a.description.as_deref(), Some("Primary line controller"));
+    assert_eq!(a.driver.as_deref(), Some("LogixDriver"));
+    assert_eq!(a.health().healthy, Some(true));
+    assert_eq!(a.health().message, Some("Connected"));
+
+    assert_eq!(b.driver.as_deref(), Some("ModbusTcp"));
+    assert_eq!(b.description, None);
+    assert_eq!(b.health().healthy, Some(false));
+    assert_eq!(b.health().message, Some("Connecting"));
+
+    assert_eq!(c.driver.as_deref(), Some("TCPDriver"));
+    assert_eq!(c.healthchecks, serde_json::Value::Null);
+    assert_eq!(c.health().healthy, None, "no healthchecks is unknown");
+
+    assert!(!d.enabled);
+    assert_eq!(
+        d.driver.as_deref(),
+        Some("com.inductiveautomation.Micro800DeviceType")
+    );
+
+    let everything = format!("{page:?}{}", serde_json::to_string(&page).expect("json"));
+    for leaked in ["192.0.2.", "secret-a", "hostname", "password", "sig-a"] {
+        assert!(
+            !everything.contains(leaked),
+            "{leaked} survived parsing: {everything}"
+        );
+    }
+}
+
+/// An empty device list is a valid answer (a gateway with the OPC UA
+/// module and no devices).
+#[tokio::test]
+async fn device_connections_empty_list() {
+    let mock = IgnitionMock::start().await;
+    mock.list_json(
+        "GET",
+        DEVICE_LIST_PATH,
+        serde_json::json!({
+            "items": [],
+            "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+        }),
+    )
+    .await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let page = api.device_connections().await.expect("empty list parses");
+    assert!(page.items.is_empty());
+}
+
+/// HTML 401 on the device list → Auth (exit 5), like every authed read.
+#[tokio::test]
+async fn device_connections_html_401_classifies_auth() {
+    let mock = IgnitionMock::start().await;
+    mock.html_error("GET", DEVICE_LIST_PATH, 401).await;
+
+    let api = ReqwestGatewayApi::for_tests(&mock.uri(), None);
+    let err = api.device_connections().await.expect_err("401 must fail");
+    assert!(
+        matches!(&err, CoreError::Auth { status: 401, .. }),
+        "wrong class: {err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+}

@@ -609,3 +609,245 @@ opc (0)
     assert_eq!(body["data"]["opc"].as_array().unwrap().len(), 0);
     assert_eq!(body["data"]["database"][0]["name"], "MyPostgres");
 }
+
+/// The OPC UA device resource list: healthy, unhealthy ("Connecting"),
+/// no healthchecks, disabled — each with `config.settings` carrying a
+/// documentation-range host and a secret-shaped field that must never
+/// reach `ign` output.
+async fn mount_devices(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/list/com.inductiveautomation.opcua/device",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    {
+                        "name": "Device-A",
+                        "description": "Primary line controller",
+                        "enabled": true,
+                        "collection": "core",
+                        "signature": "sig-a",
+                        "config": {
+                            "profile": {"type": "LogixDriver"},
+                            "settings": {
+                                "connectivity": {"hostname": "192.0.2.10"},
+                                "advanced": {"password": {"type": "Embedded", "data": "secret-a"}}
+                            }
+                        },
+                        "healthchecks": {"status": {
+                            "name": "devices.device-Device-A.status",
+                            "result": {"healthy": true, "time": 1700000000000_i64, "message": "Connected"}
+                        }}
+                    },
+                    {
+                        "name": "Device-B",
+                        "description": null,
+                        "enabled": true,
+                        "config": {
+                            "profile": {"type": "ModbusTcp"},
+                            "settings": {"connectivity": {"hostname": "192.0.2.11"}}
+                        },
+                        "healthchecks": {"status": {
+                            "name": "devices.device-Device-B.status",
+                            "result": {"healthy": false, "time": 1700000000000_i64, "message": "Connecting"}
+                        }}
+                    },
+                    {
+                        "name": "Device-C",
+                        "enabled": true,
+                        "config": {
+                            "profile": {"type": "TCPDriver"},
+                            "settings": {"connectivity": {"hostname": "192.0.2.12"}}
+                        }
+                    },
+                    {
+                        "name": "Device-D",
+                        "enabled": false,
+                        "config": {
+                            "profile": {"type": "com.inductiveautomation.Micro800DeviceType"},
+                            "settings": {"connectivity": {"hostname": "192.0.2.13"}}
+                        }
+                    }
+                ],
+                "metadata": {"total": 4, "matching": 4, "limit": -1, "offset": 0}
+            })),
+        )
+        .expect(1..)
+        .mount(server)
+        .await;
+}
+
+/// Request paths the mock recorded, in order.
+async fn requested_paths(server: &wiremock::MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on by default")
+        .iter()
+        .map(|request| request.url.path().to_string())
+        .collect()
+}
+
+/// `ign connections --type device` goldens: the NAME/DRIVER/ENABLED/
+/// HEALTHY/MESSAGE table (healthy, "Connecting", missing healthchecks as
+/// `unknown`, disabled), compact JSON with the gateway's healthchecks as
+/// reported, and no settings/host/secret anywhere in stdout or stderr.
+#[tokio::test]
+async fn connections_type_device_golden_and_never_leaks_settings() {
+    let server = wiremock::MockServer::start().await;
+    mount_devices(&server).await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let human = ign(&config, &server.uri(), &["connections", "--type", "device"]);
+    assert!(
+        human.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&human),
+        snapbox::str![[r#"
+[profile: dev]
+database (0)
+opc (0)
+device (4)
+NAME      DRIVER                                      ENABLED  HEALTHY  MESSAGE
+Device-A  LogixDriver                                 true     true     Connected
+Device-B  ModbusTcp                                   true     false    Connecting
+Device-C  TCPDriver                                   true     unknown  -
+Device-D  com.inductiveautomation.Micro800DeviceType  false    unknown  -
+"#]],
+    );
+
+    let compact = ign(
+        &config,
+        &server.uri(),
+        &["connections", "--type", "device", "--compact"],
+    );
+    assert!(compact.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&compact),
+        snapbox::str![[r#"{"ok":true,"profile":"dev","data":{"database":[],"opc":[],"device":[{"name":"Device-A","description":"Primary line controller","enabled":true,"driver":"LogixDriver","healthchecks":{"status":{"name":"devices.device-Device-A.status","result":{"healthy":true,"message":"Connected","time":1700000000000}}}},{"name":"Device-B","description":null,"enabled":true,"driver":"ModbusTcp","healthchecks":{"status":{"name":"devices.device-Device-B.status","result":{"healthy":false,"message":"Connecting","time":1700000000000}}}},{"name":"Device-C","description":null,"enabled":true,"driver":"TCPDriver","healthchecks":null},{"name":"Device-D","description":null,"enabled":false,"driver":"com.inductiveautomation.Micro800DeviceType","healthchecks":null}]}}"#]],
+    );
+
+    // Pretty JSON too: no mode may surface the gateway's settings.
+    let pretty = ign(
+        &config,
+        &server.uri(),
+        &["connections", "--type", "device", "--json"],
+    );
+    for out in [&human, &compact, &pretty] {
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for leaked in [
+            "192.0.2.", "secret-a", "hostname", "password", "settings", "sig-a",
+        ] {
+            assert!(!all.contains(leaked), "{leaked} leaked into: {all}");
+        }
+    }
+
+    // Only the device list was requested — neither connection family.
+    let paths = requested_paths(&server).await;
+    assert!(
+        paths.iter().all(|path| path.contains("opcua/device")),
+        "unexpected requests: {paths:?}"
+    );
+}
+
+/// An empty device list: `device (0)` and a `device: []` key (asked,
+/// none configured) — distinct from the key being absent.
+#[tokio::test]
+async fn connections_type_device_empty_list() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/list/com.inductiveautomation.opcua/device",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [],
+                "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    let human = ign(&config, &server.uri(), &["connections", "--type", "device"]);
+    assert!(human.status.success());
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&human),
+        snapbox::str![[r#"
+[profile: dev]
+database (0)
+opc (0)
+device (0)
+"#]],
+    );
+
+    let compact = ign(
+        &config,
+        &server.uri(),
+        &["connections", "--type", "device", "--compact"],
+    );
+    snapbox::Assert::new().action_env("SNAPSHOTS").eq(
+        stdout_for_golden(&compact),
+        snapbox::str![[
+            r#"{"ok":true,"profile":"dev","data":{"database":[],"opc":[],"device":[]}}"#
+        ]],
+    );
+}
+
+/// Devices are opt-in: the default listing and the family filters never
+/// request the device endpoint and carry no `device` key (the existing
+/// `ign connections` shape is unchanged).
+#[tokio::test]
+async fn connections_default_and_family_filters_never_request_devices() {
+    let server = wiremock::MockServer::start().await;
+    mount_connections(&server).await;
+    // The device list answers 200 but must never be asked: `expect(0)`
+    // fails the test on drop if any command below requests it.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/data/api/v1/resources/list/com.inductiveautomation.opcua/device",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [],
+                "metadata": {"total": 0, "matching": 0, "limit": -1, "offset": 0}
+            })),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let (_dir, config) = isolated_config();
+    write_profile_config(&config, "http://ignored.example.com");
+
+    for args in [
+        &["connections", "--compact"][..],
+        &["connections", "--type", "database", "--compact"][..],
+        &["connections", "--type", "opc", "--compact"][..],
+    ] {
+        let out = ign(&config, &server.uri(), args);
+        assert!(out.status.success(), "{args:?} failed");
+        let body: Value = serde_json::from_slice(&out.stdout).expect("envelope parses");
+        assert!(
+            body["data"].get("device").is_none(),
+            "{args:?} grew a device key: {body}"
+        );
+    }
+    let paths = requested_paths(&server).await;
+    assert!(
+        paths.iter().all(|path| !path.contains("opcua")),
+        "device endpoint was requested: {paths:?}"
+    );
+}

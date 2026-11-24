@@ -503,6 +503,14 @@ mod tests {
         > {
             unreachable!("not part of this double's actions")
         }
+        async fn device_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayDevice>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
 
         async fn logs(
             &self,
@@ -885,6 +893,14 @@ mod tests {
             &self,
         ) -> Result<
             crate::client::query::ListEnvelope<crate::client::connections::GatewayConnection>,
+            CoreError,
+        > {
+            unreachable!("not part of this action")
+        }
+        async fn device_connections(
+            &self,
+        ) -> Result<
+            crate::client::query::ListEnvelope<crate::client::connections::GatewayDevice>,
             CoreError,
         > {
             unreachable!("not part of this action")
