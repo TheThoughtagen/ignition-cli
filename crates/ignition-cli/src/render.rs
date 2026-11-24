@@ -57,7 +57,7 @@ use ignition_core::actions::webdev::{WebdevDeployResult, WebdevStatusResult};
 use ignition_core::actions::workspace::{
     CheckoutOutcome, PushOutcome, StatusKind, WorkspaceStatus,
 };
-use ignition_core::client::connections::GatewayDevice;
+use ignition_core::client::connections::{GatewayConnection, GatewayDevice};
 use ignition_core::client::logs::LogEntry;
 use ignition_core::client::query::ListEnvelope;
 use ignition_core::error::CoreError;
@@ -649,32 +649,65 @@ fn render_terminate_human(result: &TerminateResult) {
 fn render_connections_human(result: &ConnectionsResult) {
     println!("database ({})", result.database.len());
     for connection in &result.database {
-        println!(
-            "{}  {}  {}",
-            connection.name,
-            connection.enabled,
-            serde_json::to_string(&connection.healthchecks).unwrap_or_default()
-        );
+        println!("{}", connection_line(connection));
     }
     println!("opc ({})", result.opc.len());
     for connection in &result.opc {
-        println!(
-            "{}  {}  {}",
-            connection.name,
-            connection.enabled,
-            serde_json::to_string(&connection.healthchecks).unwrap_or_default()
-        );
+        println!("{}", connection_line(connection));
     }
     if let Some(devices) = &result.device {
         render_devices_human(devices);
     }
 }
 
+/// One database/OPC connection row. The name is gateway-supplied text, so
+/// it goes through [`escape_control`] (an ESC byte in it must reach the
+/// terminal as text); the healthchecks are compact JSON, which already
+/// escapes control characters.
+fn connection_line(connection: &GatewayConnection) -> String {
+    format!(
+        "{}  {}  {}",
+        escape_control(&connection.name),
+        connection.enabled,
+        serde_json::to_string(&connection.healthchecks).unwrap_or_default()
+    )
+}
+
+/// The cells of the `--type device` table, one row per device. Name,
+/// driver and message are gateway-supplied text, so each goes through
+/// [`escape_control`] BEFORE the column widths are measured: an ESC byte,
+/// newline or carriage return in a device name cannot move the cursor,
+/// recolour the screen or split a row, and the padding matches what is
+/// printed. HEALTHY reads the `status` healthcheck: `true` / `false`, or
+/// `unknown` when the gateway reported none — never healthy by default.
+/// A missing driver or message shows `-`.
+fn device_rows(devices: &[GatewayDevice]) -> Vec<Vec<String>> {
+    devices
+        .iter()
+        .map(|device| {
+            let health = device.health();
+            vec![
+                escape_control(&device.name),
+                device
+                    .driver
+                    .as_deref()
+                    .map_or_else(|| "-".to_string(), escape_control),
+                device.enabled.to_string(),
+                match health.healthy {
+                    Some(healthy) => healthy.to_string(),
+                    None => "unknown".to_string(),
+                },
+                health
+                    .message
+                    .map_or_else(|| "-".to_string(), escape_control),
+            ]
+        })
+        .collect()
+}
+
 /// `ign connections --type device` human section: `device (N)` then an
 /// aligned NAME / DRIVER / ENABLED / HEALTHY / MESSAGE table (no table
-/// when there are no devices). HEALTHY reads the `status` healthcheck:
-/// `true` / `false`, or `unknown` when the gateway reported none —
-/// never healthy by default. A missing driver or message shows `-`.
+/// when there are no devices); see [`device_rows`] for the cells.
 fn render_devices_human(devices: &[GatewayDevice]) {
     println!("device ({})", devices.len());
     if devices.is_empty() {
@@ -684,23 +717,7 @@ fn render_devices_human(devices: &[GatewayDevice]) {
         .into_iter()
         .map(String::from)
         .collect();
-    let rows: Vec<Vec<String>> = devices
-        .iter()
-        .map(|device| {
-            let health = device.health();
-            vec![
-                device.name.clone(),
-                device.driver.clone().unwrap_or_else(|| "-".to_string()),
-                device.enabled.to_string(),
-                match health.healthy {
-                    Some(healthy) => healthy.to_string(),
-                    None => "unknown".to_string(),
-                },
-                health.message.unwrap_or("-").to_string(),
-            ]
-        })
-        .collect();
-    render_aligned_columns(&columns, &rows);
+    render_aligned_columns(&columns, &device_rows(devices));
 }
 
 /// One log entry as a human line — the SAME format the list and the
@@ -4393,9 +4410,11 @@ fn human_bytes(bytes: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        civil_from_days, delete_route_line, deploy_projects_human_lines, describe_apply_event,
-        describe_projects_event, escape_control, escape_error_text, iso_utc, orphan_lines,
+        civil_from_days, connection_line, delete_route_line, deploy_projects_human_lines,
+        describe_apply_event, describe_projects_event, device_rows, escape_control,
+        escape_error_text, iso_utc, orphan_lines,
     };
+    use ignition_core::client::connections::{GatewayConnection, GatewayDevice};
     use ignition_core::deploy::apply::{ApplyEvent, RollbackCause};
     use ignition_core::rig::OrphanedModule;
 
@@ -4601,6 +4620,81 @@ mod tests {
         assert_eq!(
             escape_control("caf\u{e9} \u{4e2d}/x.py"),
             "caf\u{e9} \u{4e2d}/x.py"
+        );
+    }
+
+    /// Device name, driver and message are gateway-supplied: ESC, newline
+    /// and carriage return in any of them must reach the terminal as text,
+    /// and the rest of the row (enabled, healthy) is untouched.
+    #[test]
+    fn device_rows_escape_control_characters_in_name_driver_and_message() {
+        let device = GatewayDevice {
+            name: "Dev\u{1b}[2Jice\nA".into(),
+            description: None,
+            enabled: true,
+            driver: Some("Logix\rDriver\u{1b}[31m".into()),
+            healthchecks: serde_json::json!({"status": {"result": {
+                "healthy": false,
+                "message": "Connecting\u{1b}[H\r\nforged  true"
+            }}}),
+        };
+        let rows = device_rows(&[device]);
+        assert_eq!(
+            rows,
+            vec![vec![
+                "Dev\\u{1b}[2Jice\\nA".to_string(),
+                "Logix\\rDriver\\u{1b}[31m".to_string(),
+                "true".to_string(),
+                "false".to_string(),
+                "Connecting\\u{1b}[H\\r\\nforged  true".to_string(),
+            ]]
+        );
+        for cell in &rows[0] {
+            assert!(
+                !cell.chars().any(char::is_control),
+                "raw control character in cell {cell:?}"
+            );
+        }
+    }
+
+    /// Missing driver / healthchecks render as `-` / `unknown`, never as a
+    /// healthy device.
+    #[test]
+    fn device_rows_mark_missing_health_unknown_and_missing_text_dash() {
+        let device = GatewayDevice {
+            name: "Device-C".into(),
+            description: None,
+            enabled: false,
+            driver: None,
+            healthchecks: serde_json::Value::Null,
+        };
+        assert_eq!(
+            device_rows(&[device]),
+            vec![vec!["Device-C", "-", "false", "unknown", "-"]]
+        );
+    }
+
+    /// The database/OPC rows share the device fix: a control character in a
+    /// connection name is written out, a plain name is unchanged.
+    #[test]
+    fn connection_line_escapes_the_name_and_keeps_plain_names() {
+        let mut connection = GatewayConnection {
+            name: "My\u{1b}[2JPostgres\r\nforged  true".into(),
+            enabled: true,
+            healthchecks: serde_json::json!({"jdbc": "FAIR"}),
+            extra: Default::default(),
+        };
+        let line = connection_line(&connection);
+        assert_eq!(
+            line,
+            "My\\u{1b}[2JPostgres\\r\\nforged  true  true  {\"jdbc\":\"FAIR\"}"
+        );
+        assert!(!line.chars().any(char::is_control));
+
+        connection.name = "MyPostgres".into();
+        assert_eq!(
+            connection_line(&connection),
+            "MyPostgres  true  {\"jdbc\":\"FAIR\"}"
         );
     }
 
